@@ -12,6 +12,7 @@ pub mod frame;
 pub mod pipe;
 
 use kam_core::audit::Record;
+use kam_storage::{Scan, Volume};
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
@@ -40,6 +41,11 @@ pub enum Request {
     /// Most recent audit entries, newest first. `limit` is clamped to
     /// [`MAX_AUDIT_ROWS`] by the agent rather than rejected.
     GetRecentAudit { limit: u32 },
+    /// Drives on the machine, with capacity and free space.
+    ListVolumes,
+    /// Measure everything beneath `path`. Seconds on a full drive, so callers
+    /// should expect this one to take a while.
+    ScanPath { path: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +55,12 @@ pub enum Response {
     RecentAudit {
         entries: Vec<Record>,
     },
+    Volumes {
+        volumes: Vec<Volume>,
+    },
+    /// Boxed because a scan result dwarfs every other variant, and an enum is
+    /// as large as its largest member wherever it is passed.
+    Scan(Box<Scan>),
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {
         message: String,

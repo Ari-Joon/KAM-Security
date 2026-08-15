@@ -75,7 +75,7 @@ displays. Phase 2 can start on top of it.
 |---|---|---|
 | 0 | Workspace, CI, tooling | Done |
 | 1 | Agent, IPC, audit log, shell skeleton | Done |
-| 2 | Storage intelligence | Not started |
+| 2 | Storage intelligence | In progress — scan and treemap done |
 | 3 | Scanner | Not started |
 | 4 | Firewall | Not started |
 | 5 | Installer, scheduler, polish | Not started |

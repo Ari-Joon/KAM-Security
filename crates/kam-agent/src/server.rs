@@ -1,6 +1,8 @@
 //! The accept loop, and the policy deciding who is allowed to drive the agent.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use kam_core::audit::{AuditLog, Effect, Entry};
 use kam_core::{Error, Result, Store};
@@ -11,14 +13,24 @@ use kam_ipc::{Request, Response};
 use crate::dispatch::{self, Context};
 use crate::service::Shutdown;
 
+/// Most connections served at once.
+///
+/// Only trusted clients get this far, so the cap is not the security boundary —
+/// it is a guard against a buggy client opening connections in a loop and
+/// spawning threads inside a SYSTEM process until something gives way.
+const MAX_CONCURRENT_CONNECTIONS: usize = 16;
+
 /// Serve connections until `shutdown` is signalled.
 ///
-/// One connection is handled to completion before the next is accepted. The
-/// work is IO-bound against the local system and the only client is the shell,
-/// so concurrency here would add failure modes without buying anything.
-pub fn serve(listener: &PipeListener, context: &Context, shutdown: &Shutdown) -> Result<()> {
-    let trusted_directory = trusted_directory()?;
+/// Each connection is handled on its own thread. That was not true at first,
+/// and sequential service was defensible while every request answered in
+/// microseconds. A full-drive scan takes about a minute, and with one worker it
+/// blocks the shell's status polling for that whole time — the UI would report
+/// the agent as unreachable precisely while it was busiest.
+pub fn serve(listener: &PipeListener, context: &Arc<Context>, shutdown: &Shutdown) -> Result<()> {
+    let trusted_directory = Arc::new(trusted_directory()?);
     tracing::info!(directory = %trusted_directory.display(), "accepting clients from");
+    let active = Arc::new(AtomicUsize::new(0));
 
     while !shutdown.is_signalled() {
         let mut stream = match listener.accept() {
@@ -38,9 +50,35 @@ pub fn serve(listener: &PipeListener, context: &Context, shutdown: &Shutdown) ->
             break;
         }
 
-        if let Err(error) = handle_connection(&mut stream, context, &trusted_directory) {
-            // A bad peer must not be able to stop the agent serving good ones.
-            tracing::warn!(%error, "dropping connection");
+        if active.load(Ordering::SeqCst) >= MAX_CONCURRENT_CONNECTIONS {
+            tracing::warn!("connection limit reached; turning a client away");
+            let _ = write_frame(
+                &mut stream,
+                &Response::Error {
+                    message: "the agent is busy; try again shortly".to_owned(),
+                },
+            );
+            continue;
+        }
+
+        active.fetch_add(1, Ordering::SeqCst);
+        let context = Arc::clone(context);
+        let trusted_directory = Arc::clone(&trusted_directory);
+        let active_now = Arc::clone(&active);
+
+        let spawned = std::thread::Builder::new()
+            .name("kam-connection".to_owned())
+            .spawn(move || {
+                if let Err(error) = handle_connection(&mut stream, &context, &trusted_directory) {
+                    // A bad peer must not stop the agent serving good ones.
+                    tracing::warn!(%error, "dropping connection");
+                }
+                active_now.fetch_sub(1, Ordering::SeqCst);
+            });
+
+        if let Err(error) = spawned {
+            tracing::error!(%error, "could not spawn a connection thread");
+            active.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -207,10 +245,10 @@ mod tests {
         let loop_shutdown = shutdown.clone();
         let (finished_tx, finished_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
-            let context = Context {
+            let context = Arc::new(Context {
                 mode: crate::Mode::Console,
                 store: Store::open_in_memory().unwrap(),
-            };
+            });
             let outcome = serve(&listener, &context, &loop_shutdown);
             let _ = finished_tx.send(());
             outcome

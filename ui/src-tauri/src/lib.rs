@@ -10,6 +10,7 @@
 
 use kam_core::audit::Record;
 use kam_ipc::{Request, Response, SystemStatus};
+use kam_storage::{Scan, Volume};
 
 /// Turn a response into the value a command promised, or a message for the UI.
 ///
@@ -39,6 +40,28 @@ fn recent_audit(limit: u32) -> Result<Vec<Record>, String> {
     }
 }
 
+#[tauri::command]
+fn list_volumes() -> Result<Vec<Volume>, String> {
+    match kam_ipc::client::call(&Request::ListVolumes).map_err(|error| error.to_string())? {
+        Response::Volumes { volumes } => Ok(volumes),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Measure a directory tree.
+///
+/// Takes about a minute on a full system drive, and the agent serves each
+/// connection on its own thread, so the shell stays responsive while this runs.
+#[tauri::command]
+fn scan_path(path: String) -> Result<Scan, String> {
+    match kam_ipc::client::call(&Request::ScanPath { path }).map_err(|error| error.to_string())? {
+        Response::Scan(scan) => Ok(*scan),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Version of the protocol this build speaks, so the UI can say plainly when it
 /// and the agent disagree rather than silently mis-rendering.
 #[tauri::command]
@@ -53,6 +76,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             agent_status,
             recent_audit,
+            list_volumes,
+            scan_path,
             protocol_version
         ])
         .run(tauri::generate_context!())

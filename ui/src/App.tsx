@@ -1,88 +1,71 @@
 import { useCallback, useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
+import { api, reason } from "./lib/api";
+import type { AuditRecord, SystemStatus, Volume } from "./lib/types";
+import Overview from "./views/Overview";
+import Storage from "./views/Storage";
+import Activity from "./views/Activity";
+import Planned from "./views/Planned";
+import "./styles.css";
 
-type SystemStatus = {
-  protocol_version: number;
-  agent_version: string;
-  running_as_service: boolean;
-  hostname: string;
-};
+type Section = "overview" | "storage" | "scanner" | "firewall" | "activity";
 
-type Effect = "observed" | "changed" | "refused";
-
-type AuditRecord = {
-  id: number;
-  at: string;
-  module: string;
-  action: string;
-  effect: Effect;
-  detail: string;
-  undo_token: string | null;
-};
-
-const EFFECT_LABEL: Record<Effect, string> = {
-  observed: "observed",
-  changed: "changed",
-  refused: "refused",
-};
+const NAV: { key: Section; label: string; hint: string }[] = [
+  { key: "overview", label: "Overview", hint: "Drives and recent events" },
+  { key: "storage", label: "Storage", hint: "Where the space went" },
+  { key: "scanner", label: "Scanner", hint: "Phase 3" },
+  { key: "firewall", label: "Firewall", hint: "Phase 4" },
+  { key: "activity", label: "Activity", hint: "The audit log" },
+];
 
 function Mark() {
   return (
     <svg viewBox="0 0 256 256" className="mark" aria-hidden="true">
-      <circle cx="128" cy="128" r="128" fill="#0A0D14" />
-      <g fill="none" stroke="#4A7CFF" strokeWidth="7" strokeLinecap="round">
+      <circle cx="128" cy="128" r="128" fill="#0a0d14" />
+      <g fill="none" stroke="#4a7cff" strokeWidth="8" strokeLinecap="round">
         <path d="M21.6 146.8 A108 108 0 1 1 234.4 146.8" />
         <path d="M34.5 182 A108 108 0 0 0 221.5 182" />
       </g>
       <path
         d="M128 45 L180 135 L76 135 Z"
         fill="none"
-        stroke="#4A7CFF"
-        strokeWidth="7"
+        stroke="#4a7cff"
+        strokeWidth="8"
         strokeLinejoin="round"
       />
-      <path d="M102 90 L154 90 L128 135 Z" fill="#3A63D8" />
+      <path d="M102 90 L154 90 L128 135 Z" fill="#3a63d8" />
     </svg>
   );
 }
 
-/** Renders the ISO 8601 timestamp the agent stored, in local time. */
-function when(iso: string): string {
-  const parsed = new Date(iso);
-  if (Number.isNaN(parsed.getTime())) return iso;
-  return parsed.toLocaleString(undefined, {
-    dateStyle: "medium",
-    timeStyle: "medium",
-  });
-}
-
 export default function App() {
+  const [section, setSection] = useState<Section>("overview");
   const [status, setStatus] = useState<SystemStatus | null>(null);
+  const [volumes, setVolumes] = useState<Volume[]>([]);
   const [entries, setEntries] = useState<AuditRecord[]>([]);
   const [shellProtocol, setShellProtocol] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [storageRoot, setStorageRoot] = useState<string | null>(null);
 
+  /** Poll the cheap calls. The scan is deliberately not part of this. */
   const refresh = useCallback(async () => {
-    setLoading(true);
     try {
-      const next = await invoke<SystemStatus>("agent_status");
+      const next = await api.status();
       setStatus(next);
       setError(null);
-      // Only worth asking for history once we know the agent is answering.
-      setEntries(await invoke<AuditRecord[]>("recent_audit", { limit: 100 }));
+      const [audit, drives] = await Promise.all([
+        api.recentAudit(200),
+        api.volumes(),
+      ]);
+      setEntries(audit);
+      setVolumes(drives);
     } catch (cause) {
       setStatus(null);
-      setEntries([]);
-      setError(String(cause));
-    } finally {
-      setLoading(false);
+      setError(reason(cause));
     }
   }, []);
 
   useEffect(() => {
-    invoke<number>("protocol_version").then(setShellProtocol).catch(() => {});
+    api.protocolVersion().then(setShellProtocol).catch(() => {});
     void refresh();
     const timer = setInterval(() => void refresh(), 5000);
     return () => clearInterval(timer);
@@ -92,106 +75,120 @@ export default function App() {
   const mismatched =
     connected && shellProtocol !== null && shellProtocol !== status.protocol_version;
 
+  function openStorage(root: string) {
+    setStorageRoot(root);
+    setSection("storage");
+  }
+
   return (
-    <main className="app">
-      <header className="header">
-        <Mark />
-        <div className="titles">
-          <h1>KAM Security</h1>
-          <p className="subtitle">Agent console</p>
+    <div className="shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <Mark />
+          <div>
+            <span className="brand-name">KAM Security</span>
+            <span className="brand-sub">
+              {status ? `v${status.agent_version}` : "offline"}
+            </span>
+          </div>
         </div>
-        <span className={connected ? "pill pill-ok" : "pill pill-down"}>
-          {connected ? "agent connected" : "agent unreachable"}
-        </span>
-      </header>
 
-      {mismatched && (
-        <div className="notice notice-warn">
-          This shell speaks protocol {shellProtocol} but the agent speaks{" "}
-          {status.protocol_version}. They were built from different versions —
-          update both rather than trusting what is shown below.
+        <nav className="nav">
+          {NAV.map((item) => (
+            <button
+              key={item.key}
+              className={"nav-item" + (section === item.key ? " active" : "")}
+              onClick={() => setSection(item.key)}
+            >
+              <span className="nav-label">{item.label}</span>
+              <span className="nav-hint">{item.hint}</span>
+            </button>
+          ))}
+        </nav>
+
+        <div className="sidebar-foot">
+          <span className={connected ? "dot dot-ok" : "dot dot-down"} />
+          <div>
+            <span className="foot-title">
+              {connected ? "Agent connected" : "Agent unreachable"}
+            </span>
+            <span className="foot-sub">
+              {connected
+                ? status.running_as_service
+                  ? "Windows service · LocalSystem"
+                  : "Console process"
+                : "Not listening"}
+            </span>
+          </div>
         </div>
-      )}
+      </aside>
 
-      {error && (
-        <section className="panel">
-          <h2>Cannot reach the agent</h2>
-          <p className="muted">
-            Nothing is listening on the agent pipe, or it refused this program.
-            The agent only serves clients installed in its own directory.
-          </p>
-          <pre className="error">{error}</pre>
-          <p className="muted">Start it in a terminal with:</p>
-          <pre className="command">cargo run -p kam-agent -- --console</pre>
-        </section>
-      )}
-
-      {status && (
-        <section className="panel">
-          <h2>Agent</h2>
-          <dl className="facts">
-            <div>
-              <dt>Running as</dt>
-              <dd>
-                {status.running_as_service
-                  ? "Windows service (LocalSystem)"
-                  : "console process"}
-              </dd>
-            </div>
-            <div>
-              <dt>Version</dt>
-              <dd>{status.agent_version}</dd>
-            </div>
-            <div>
-              <dt>Protocol</dt>
-              <dd>{status.protocol_version}</dd>
-            </div>
-            <div>
-              <dt>Host</dt>
-              <dd>{status.hostname}</dd>
-            </div>
-          </dl>
-        </section>
-      )}
-
-      <section className="panel">
-        <div className="panel-head">
-          <h2>Activity</h2>
-          <button onClick={() => void refresh()} disabled={loading}>
-            {loading ? "Refreshing…" : "Refresh"}
-          </button>
-        </div>
-        <p className="muted">
-          Every privileged action the agent takes, and every one it refuses. The
-          log is append-only — the database rejects updates and deletes.
-        </p>
-
-        {entries.length === 0 ? (
-          <p className="empty">
-            {connected ? "Nothing recorded yet." : "Unavailable while disconnected."}
-          </p>
-        ) : (
-          <ul className="entries">
-            {entries.map((entry) => (
-              <li key={entry.id} className="entry">
-                <span className={`badge badge-${entry.effect}`}>
-                  {EFFECT_LABEL[entry.effect]}
-                </span>
-                <div className="entry-body">
-                  <div className="entry-title">
-                    <span className="module">{entry.module}</span>
-                    <span className="action">{entry.action}</span>
-                  </div>
-                  <div className="detail">{entry.detail}</div>
-                </div>
-                <time className="at" dateTime={entry.at}>
-                  {when(entry.at)}
-                </time>
-              </li>
-            ))}
-          </ul>
+      <main className="content">
+        {mismatched && (
+          <div className="notice notice-warn">
+            This shell speaks protocol {shellProtocol}, the agent speaks{" "}
+            {status.protocol_version}. They were built from different versions —
+            update both rather than trusting what is shown.
+          </div>
         )}
-      </section>
-    </main>
+
+        {!connected && error && (
+          <div className="notice notice-down">
+            <strong>Cannot reach the agent.</strong> Nothing is listening on its
+            pipe, or it refused this program — it only serves clients installed
+            in its own directory.
+            <pre className="error">{error}</pre>
+            <code>cargo run -p kam-agent -- --console</code>
+          </div>
+        )}
+
+        {section === "overview" && (
+          <Overview
+            status={status}
+            volumes={volumes}
+            entries={entries}
+            onOpenStorage={openStorage}
+          />
+        )}
+
+        {section === "storage" && (
+          <Storage
+            volumes={volumes}
+            initialRoot={storageRoot}
+            onScanned={() => void refresh()}
+          />
+        )}
+
+        {section === "activity" && <Activity entries={entries} />}
+
+        {section === "scanner" && (
+          <Planned
+            title="Scanner"
+            phase="Phase 3"
+            lede="Threat detection, built on Defender rather than competing with it."
+            points={[
+              "Drive Microsoft Defender through WMI — scans, threat history, exclusions — and give it the interface it never shipped with.",
+              "Judge executables by provenance: who signed it, when it arrived, which process wrote it, where it was downloaded from, and whether it survives a reboot.",
+              "Run YARA rules against what Defender tolerates: bundled adware, scareware optimisers, browser hijackers, stalkerware.",
+              "Look up individual files on VirusTotal, with your own API key.",
+            ]}
+          />
+        )}
+
+        {section === "firewall" && (
+          <Planned
+            title="Firewall"
+            phase="Phase 4"
+            lede="A usable interface over Windows Defender Firewall, which already works."
+            points={[
+              "Read, group and explain the existing rules, including ones other software added without telling you.",
+              "Show live connections joined to process, signer, and destination — what is this program talking to.",
+              "Turn any observed connection into a scoped outbound rule in one click.",
+              "Watch connections as they open via ETW. Prompting before connect would need a kernel driver, which this project will not ship.",
+            ]}
+          />
+        )}
+      </main>
+    </div>
   );
 }

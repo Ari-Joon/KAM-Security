@@ -92,10 +92,10 @@ fn run(mode: Mode) -> kam_core::Result<()> {
     // Console runs have no control manager to signal them, so the flag exists
     // only to satisfy the shared accept loop; the process is stopped directly.
     let shutdown = Shutdown::new();
-    let context = Context {
+    let context = Arc::new(Context {
         mode,
         store: server::open_store(false)?,
-    };
+    });
     let listener = PipeListener::new();
     tracing::info!(pipe = kam_ipc::PIPE_NAME, "listening");
     server::serve(&listener, &context, &shutdown)

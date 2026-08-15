@@ -152,10 +152,10 @@ fn run_service() -> Result<()> {
 }
 
 fn serve_until_stopped(shutdown: &Shutdown) -> Result<()> {
-    let context = Context {
+    let context = Arc::new(Context {
         mode: Mode::Service,
         store: server::open_store(true)?,
-    };
+    });
     let listener = PipeListener::new();
     tracing::info!(pipe = kam_ipc::PIPE_NAME, "listening");
     server::serve(&listener, &context, shutdown)

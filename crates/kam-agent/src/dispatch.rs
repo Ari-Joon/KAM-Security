@@ -1,10 +1,13 @@
 //! Maps an incoming [`Request`] onto the module that serves it.
 //!
 //! Keeping dispatch in one file means the audit rule can be checked by reading
-//! one file. That rule is narrower than "log everything": the log records what
-//! the agent *does to the system*, and what it *refuses* to do. Reads — status
-//! polls, history reloads — are not recorded, because the shell issues them
-//! continuously and auditing them would bury every entry that matters.
+//! one file. That rule is narrower than "log everything":
+//!
+//! - Anything that **changes the system**, or is **refused**, is recorded.
+//! - Anything the user **asked for deliberately** is recorded, even when it only
+//!   reads — a full-drive scan belongs in the history of what happened.
+//! - **Background chatter is not**: status polls and history reloads happen every
+//!   few seconds on their own, and recording them would bury everything else.
 
 use kam_core::audit::{Effect, Entry};
 use kam_core::Store;
@@ -82,6 +85,81 @@ pub fn handle(request: Request, context: &Context) -> Response {
                 }
             }
         }
+
+        Request::ListVolumes => match kam_storage::list_volumes() {
+            Ok(volumes) => Response::Volumes { volumes },
+            Err(error) => {
+                tracing::error!(%error, "could not enumerate volumes");
+                Response::Error {
+                    message: "the drives on this machine could not be listed".to_owned(),
+                }
+            }
+        },
+
+        Request::ScanPath { path } => scan_path(&path, context),
+    }
+}
+
+fn scan_path(path: &str, context: &Context) -> Response {
+    let target = std::path::Path::new(path);
+
+    // A relative path would be resolved against the agent's working directory,
+    // which is meaningless to the caller and, running as SYSTEM, is not
+    // somewhere a user asked to look.
+    if !target.is_absolute() {
+        context.audit(
+            "storage",
+            "scan",
+            Effect::Refused,
+            format!("refused to scan a relative path: {path}"),
+        );
+        return Response::Error {
+            message: "give an absolute path to scan".to_owned(),
+        };
+    }
+
+    match kam_storage::scan(target) {
+        Ok(scan) => {
+            // Audited: a scan is something the user asked for, so it belongs in
+            // the record of what happened, even though it changes nothing.
+            context.audit(
+                "storage",
+                "scan",
+                Effect::Observed,
+                format!(
+                    "scanned {} — {} in {} files, {} unreadable, {} ms",
+                    scan.root,
+                    human_bytes(scan.total_bytes),
+                    scan.file_count,
+                    scan.unreadable,
+                    scan.elapsed_ms
+                ),
+            );
+            Response::Scan(Box::new(scan))
+        }
+        Err(error) => {
+            tracing::error!(%error, path, "scan failed");
+            Response::Error {
+                message: format!("{path} could not be scanned"),
+            }
+        }
+    }
+}
+
+/// Sizes appear in audit entries a person reads, so they are written the way a
+/// person would say them rather than as a raw byte count.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -121,6 +199,49 @@ mod tests {
         let _ = handle(Request::GetRecentAudit { limit: 10 }, &context);
 
         assert!(context.store.recent_audit(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_relative_scan_path_is_refused_and_recorded() {
+        let context = context(Mode::Service);
+        let response = handle(
+            Request::ScanPath {
+                path: "..\\somewhere".to_owned(),
+            },
+            &context,
+        );
+
+        assert!(matches!(response, Response::Error { .. }));
+        let records = context.store.recent_audit(10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].effect, Effect::Refused);
+        assert_eq!(records[0].module, "storage");
+    }
+
+    #[test]
+    fn a_scan_is_audited_because_the_user_asked_for_it() {
+        let context = context(Mode::Console);
+        let directory = std::env::temp_dir();
+        let response = handle(
+            Request::ScanPath {
+                path: directory.display().to_string(),
+            },
+            &context,
+        );
+
+        assert!(matches!(response, Response::Scan(_)));
+        let records = context.store.recent_audit(10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action, "scan");
+        assert_eq!(records[0].effect, Effect::Observed);
+    }
+
+    #[test]
+    fn byte_counts_are_written_the_way_a_person_says_them() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(1024 * 1024 * 3 / 2), "1.5 MB");
+        assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 GB");
     }
 
     #[test]

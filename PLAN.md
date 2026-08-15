@@ -111,10 +111,31 @@ fallback that does not block the phase.
 
 The differentiating module. Four features, in build order:
 
-**(a) Instant full-disk map.**
-Read the NTFS Master File Table directly via `DeviceIoControl` +
-`FSCTL_ENUM_USN_DATA` instead of walking directories. Full-volume file inventory in
-~2 seconds vs. minutes. Renders as a zoomable treemap.
+**(a) Full-disk map.** *Partly built — see the correction below.*
+
+The original plan said `FSCTL_ENUM_USN_DATA` would give a whole-volume map in
+about two seconds. That was wrong in one decisive respect, found while building
+it: **that call returns names, parent references and attributes, but no sizes.**
+A treemap without sizes is not a treemap.
+
+Getting sizes from the master file table means locating `$MFT` on the raw
+volume and parsing record headers, attribute lists and non-resident data runs by
+hand. That is real work, and it needs elevation.
+
+So the shipped version is a parallel directory walk: no special privileges, same
+tree, seconds instead of milliseconds. Measured on the development machine:
+
+| | |
+|---|---|
+| Volume | 1.0 TB used, 1,703,920 files, 302,169 directories |
+| Walk | 58 seconds |
+| Accuracy | 1011 GB measured against 1036 GB reported by Windows — 97.6%, the gap being 266 unreadable directories and filesystem metadata |
+
+The master-file-table reader remains the goal and is the single biggest
+performance win available; it replaces the traversal underneath `kam_storage::scan`
+without changing anything above it. Until then the UI is built to survive a
+long scan: the agent serves each connection on its own thread, so the shell
+stays live while a scan runs.
 
 **(b) True application footprint.**
 Control Panel's size column is `EstimatedSize` — a value the installer self-reports.
@@ -225,10 +246,10 @@ The privilege split, end to end, with one trivial feature proving the whole path
 **Done when:** UI button → SYSTEM service → real Win32 call → result on screen, with the
 call recorded in the audit log.
 
-### Phase 2 — Storage Intelligence
-MFT reader → treemap → footprint attribution → orphan detection → provenance and
-duplicates → organisation proposals with undo. Ships the flagship features and stresses
-the architecture harder than any other module.
+### Phase 2 — Storage Intelligence *(in progress)*
+Volume enumeration → parallel scan → treemap ✅, then footprint attribution →
+orphan detection → provenance and duplicates → organisation proposals with undo.
+The master-file-table reader slots in underneath the scanner at any point.
 
 ### Phase 3 — Scanner
 Defender orchestration first (immediate value), then the provenance engine (the

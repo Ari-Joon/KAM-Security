@@ -19,6 +19,12 @@
 //! Volumes that are not NTFS, or that are locked by BitLocker, fall back to
 //! directory walking.
 
+pub mod scan;
+pub mod volumes;
+
+pub use scan::{scan, Scan};
+pub use volumes::{list as list_volumes, Volume};
+
 /// Whether a file may be included in a move proposal.
 ///
 /// This is a hard fence, not a heuristic: moving an executable or anything an

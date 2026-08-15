@@ -1963,6 +1963,7 @@ dependencies = [
  "kam-quarantine",
  "kam-scanner",
  "kam-storage",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -1993,6 +1994,7 @@ name = "kam-ipc"
 version = "0.1.0"
 dependencies = [
  "kam-core",
+ "kam-storage",
  "serde",
  "serde_json",
  "windows 0.62.2",
@@ -2022,6 +2024,7 @@ version = "0.1.0"
 dependencies = [
  "kam-core",
  "kam-ipc",
+ "kam-storage",
  "serde",
  "serde_json",
  "tauri",
@@ -2036,6 +2039,7 @@ dependencies = [
  "kam-core",
  "serde",
  "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]
