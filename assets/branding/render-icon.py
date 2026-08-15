@@ -13,7 +13,22 @@ actually lives, "KAM" is three grey smudges.
 """
 
 from pathlib import Path
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
+
+WORDMARK = "KAM"
+WORDMARK_COLOUR = (156, 190, 255, 255)
+# Matches kam-mark.svg: 34px type on a 256 viewBox, tracked out by 7.
+WORDMARK_SIZE = 34
+WORDMARK_TRACKING = 7
+WORDMARK_BASELINE = 193
+
+# In preference order. Segoe UI Semibold is what the app's own UI uses.
+FONT_CANDIDATES = [
+    r"C:\Windows\Fonts\seguisb.ttf",
+    r"C:\Windows\Fonts\segoeuib.ttf",
+    r"C:\Windows\Fonts\segoeui.ttf",
+    r"C:\Windows\Fonts\arialbd.ttf",
+]
 
 # Authored at 256; drawn at 1024 and supersampled 4x on top of that.
 VIEWBOX = 256
@@ -28,6 +43,34 @@ FILL = (58, 99, 216, 255)
 
 def scale(value):
     return value * S
+
+
+def load_font(pixels):
+    for candidate in FONT_CANDIDATES:
+        if Path(candidate).exists():
+            return ImageFont.truetype(candidate, pixels)
+    raise SystemExit(
+        "no suitable font found; edit FONT_CANDIDATES for this machine"
+    )
+
+
+def draw_wordmark(draw):
+    """Draw KAM letter by letter, so the tracking matches the SVG.
+
+    Pillow has no letter-spacing, and the SVG tracks the wordmark out by 7 units
+    — without it the three letters bunch under the triangle and read as a blob.
+    """
+    font = load_font(int(scale(WORDMARK_SIZE)))
+    tracking = scale(WORDMARK_TRACKING)
+
+    widths = [draw.textlength(letter, font=font) for letter in WORDMARK]
+    total = sum(widths) + tracking * (len(WORDMARK) - 1)
+
+    x = scale(128) - total / 2
+    baseline = scale(WORDMARK_BASELINE)
+    for letter, width in zip(WORDMARK, widths):
+        draw.text((x, baseline), letter, font=font, fill=WORDMARK_COLOUR, anchor="ls")
+        x += width + tracking
 
 
 def main():
@@ -57,6 +100,8 @@ def main():
 
     inner = [(scale(102), scale(90)), (scale(154), scale(90)), (scale(128), scale(135))]
     draw.polygon(inner, fill=FILL)
+
+    draw_wordmark(draw)
 
     image = image.resize((OUT, OUT), Image.LANCZOS)
     destination = Path(__file__).parent / "kam-icon.png"
