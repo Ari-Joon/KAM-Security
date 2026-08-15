@@ -9,30 +9,43 @@ use kam_ipc::pipe::{PipeListener, PipeStream};
 use kam_ipc::{Request, Response};
 
 use crate::dispatch::{self, Context};
+use crate::service::Shutdown;
 
-/// Serve connections until the process is asked to stop.
+/// Serve connections until `shutdown` is signalled.
 ///
 /// One connection is handled to completion before the next is accepted. The
 /// work is IO-bound against the local system and the only client is the shell,
 /// so concurrency here would add failure modes without buying anything.
-pub fn serve(listener: &PipeListener, context: &Context) -> Result<()> {
+pub fn serve(listener: &PipeListener, context: &Context, shutdown: &Shutdown) -> Result<()> {
     let trusted_directory = trusted_directory()?;
     tracing::info!(directory = %trusted_directory.display(), "accepting clients from");
 
-    loop {
+    while !shutdown.is_signalled() {
         let mut stream = match listener.accept() {
             Ok(stream) => stream,
             Err(error) => {
+                if shutdown.is_signalled() {
+                    break;
+                }
                 tracing::error!(%error, "could not accept a connection");
                 continue;
             }
         };
+
+        // The connection that woke us may be the shutdown poke rather than a
+        // real client, so the flag is checked before the stream is touched.
+        if shutdown.is_signalled() {
+            break;
+        }
 
         if let Err(error) = handle_connection(&mut stream, context, &trusted_directory) {
             // A bad peer must not be able to stop the agent serving good ones.
             tracing::warn!(%error, "dropping connection");
         }
     }
+
+    tracing::info!("accept loop stopped");
+    Ok(())
 }
 
 fn handle_connection(
@@ -154,7 +167,7 @@ pub fn record(store: &Store, entry: Entry) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -177,6 +190,42 @@ mod tests {
         let missing = PathBuf::from(r"C:\this\path\does\not\exist\client.exe");
         let exe = std::env::current_exe().unwrap();
         assert!(!is_trusted_client(&missing, exe.parent().unwrap()));
+    }
+
+    #[test]
+    fn signalling_shutdown_stops_a_loop_parked_in_accept() {
+        // The subtlest part of the service lifecycle: accept() blocks inside
+        // ConnectNamedPipe, which no flag can interrupt on its own. This asserts
+        // that signal() actually unparks it, and that the poke connection is not
+        // mistaken for a client and served.
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let name = format!("kam-test-shutdown-{}", std::process::id());
+        let shutdown = crate::service::Shutdown::for_pipe(&name);
+        let listener = PipeListener::with_name(name);
+
+        let loop_shutdown = shutdown.clone();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let context = Context {
+                mode: crate::Mode::Console,
+                store: Store::open_in_memory().unwrap(),
+            };
+            let outcome = serve(&listener, &context, &loop_shutdown);
+            let _ = finished_tx.send(());
+            outcome
+        });
+
+        // Give the loop time to reach the blocking accept before stopping it.
+        thread::sleep(Duration::from_millis(200));
+        shutdown.signal();
+
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the accept loop did not stop when signalled");
+        worker.join().unwrap().unwrap();
     }
 
     #[test]

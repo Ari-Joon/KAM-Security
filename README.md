@@ -64,11 +64,11 @@ See [PLAN.md](PLAN.md) for the full design and phase breakdown.
 
 ## Status
 
-**Phase 1 — skeleton.** The privilege split works end to end: an unprivileged
-client connects over an access-controlled named pipe, the agent identifies the
-caller, refuses anything not installed alongside it, serves the request, and
-records the outcome in an append-only audit log. Service hosting and the Tauri
-shell are the remaining pieces.
+**Phase 1 — skeleton.** The privilege split works end to end. The agent installs
+and runs as a LocalSystem Windows service; an unprivileged client connects over
+an access-controlled named pipe; the agent identifies the caller, refuses
+anything not installed alongside it, serves the request, and records both
+outcomes in an append-only audit log. The Tauri shell is the remaining piece.
 
 | Phase | Scope | State |
 |---|---|---|

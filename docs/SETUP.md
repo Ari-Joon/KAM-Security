@@ -105,6 +105,52 @@ Read the audit log at any time:
 python -c "import sqlite3;print(*sqlite3.connect('target/debug/kam-dev-state/kam.db').execute('select id,at,module,action,effect,detail from audit'),sep=chr(10))"
 ```
 
+## 8. Running as a real service
+
+Day-to-day development should use `--console`. Install the service only when
+you need to verify behaviour that depends on actually running as LocalSystem —
+file permissions, `%ProgramData%` paths, or the pipe DACL doing real work.
+
+All four commands need an **elevated** terminal.
+
+```bash
+cargo build && target\debug\kam-agent.exe --install
+```
+
+```bash
+sc start KamSecurityAgent
+```
+
+The service registers as `KamSecurityAgent`, starts on demand rather than at
+boot, and runs as LocalSystem. Its `ImagePath` carries an explicit `--service`
+so the registry states plainly how the process expects to be running.
+
+While it is running, `--probe` from the build directory still works — that is
+the whole point of the split, an unprivileged client driving a SYSTEM process
+across an access-controlled pipe:
+
+```bash
+target\debug\kam-agent.exe --probe
+```
+
+Stop and remove it:
+
+```bash
+sc stop KamSecurityAgent && target\debug\kam-agent.exe --uninstall
+```
+
+In service mode there is no console, so state and logs go to `%ProgramData%`
+instead of the build directory:
+
+| | Console | Service |
+|---|---|---|
+| Store | `target\debug\kam-dev-state\kam.db` | `%ProgramData%\KAM Security\kam.db` |
+| Log | stdout | `%ProgramData%\KAM Security\logs\agent.log` |
+
+`--uninstall` removes the service but deliberately leaves `%ProgramData%\KAM
+Security` alone — the audit log outliving the binary is the point of an audit
+log. Delete that directory by hand if you want a clean slate.
+
 ## Notes
 
 - Some Phase 2 and 3 work needs an elevated shell — reading the MFT requires

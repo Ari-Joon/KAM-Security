@@ -1,44 +1,65 @@
 //! The privileged half of KAM Security.
 //!
-//! Normally hosted by the Windows service control manager as SYSTEM. Pass
-//! `--console` to run it as a foreground process instead, which is how it is
-//! developed and debugged: same pipe, same dispatch, same trust check, but
-//! attachable to a debugger and restartable without reinstalling the service.
+//! Under the service control manager it runs as LocalSystem, which is what
+//! makes the pipe's DACL and the caller check load-bearing rather than
+//! decorative. `--console` runs the identical pipe, dispatch and trust check as
+//! a foreground process, so development never has to reinstall a service or
+//! debug something running as SYSTEM.
 //!
-//! `--probe` connects to a running agent and prints its status. Because the
-//! probe is this same executable it sits in the trusted directory, so ordinary
-//! development exercises the caller check rather than bypassing it.
+//! `--probe` is the client. It is this same executable, so it sits in the
+//! trusted directory and passes the check the shell will later have to pass —
+//! ordinary development exercises that path instead of bypassing it.
 
 mod dispatch;
 mod server;
+mod service;
 
+use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use dispatch::Context;
 use kam_ipc::pipe::PipeListener;
+use service::Shutdown;
 
 /// How the agent was started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Foreground process, for development.
     Console,
-    /// Hosted by the service control manager.
+    /// Hosted by the service control manager as LocalSystem.
     Service,
-    /// Client mode: talk to a running agent and exit.
+    /// Client: talk to a running agent and exit.
     Probe,
+    /// Register the service. Requires elevation.
+    Install,
+    /// Stop and remove the service. Requires elevation.
+    Uninstall,
 }
+
+const USAGE: &str = "\
+usage: kam-agent <mode>
+
+  --console     run in the foreground for development
+  --service     run under the service control manager (set by --install)
+  --probe       ask a running agent for its status and exit
+  --install     register the service; requires elevation
+  --uninstall   stop and remove the service; requires elevation";
 
 fn main() -> ExitCode {
     let mode = match parse_mode() {
         Ok(mode) => mode,
         Err(message) => {
-            eprintln!("{message}");
-            eprintln!("usage: kam-agent [--console | --probe]");
+            eprintln!("{message}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
     };
 
-    init_tracing(mode);
+    if let Err(error) = init_tracing(mode) {
+        eprintln!("could not start logging: {error}");
+        return ExitCode::FAILURE;
+    }
 
     match run(mode) {
         Ok(()) => ExitCode::SUCCESS,
@@ -50,8 +71,11 @@ fn main() -> ExitCode {
 }
 
 fn run(mode: Mode) -> kam_core::Result<()> {
-    if mode == Mode::Probe {
-        return server::probe();
+    match mode {
+        Mode::Probe => return server::probe(),
+        Mode::Install => return service::install(),
+        Mode::Uninstall => return service::uninstall(),
+        Mode::Console | Mode::Service => {}
     }
 
     tracing::info!(
@@ -61,38 +85,118 @@ fn run(mode: Mode) -> kam_core::Result<()> {
     );
 
     if mode == Mode::Service {
-        // Phase 1, remaining: register with the service control manager and
-        // hand it a service_main that calls serve() below.
-        eprintln!("service hosting is not implemented yet; run with --console");
-        return Err(kam_core::Error::NotImplemented("service hosting"));
+        // Blocks until the control manager stops us.
+        return service::run_dispatcher();
     }
 
+    // Console runs have no control manager to signal them, so the flag exists
+    // only to satisfy the shared accept loop; the process is stopped directly.
+    let shutdown = Shutdown::new();
     let context = Context {
         mode,
-        store: server::open_store(mode == Mode::Service)?,
+        store: server::open_store(false)?,
     };
     let listener = PipeListener::new();
     tracing::info!(pipe = kam_ipc::PIPE_NAME, "listening");
-    server::serve(&listener, &context)
+    server::serve(&listener, &context, &shutdown)
 }
 
 fn parse_mode() -> Result<Mode, String> {
-    let mut mode = Mode::Service;
+    let mut mode = None;
     for argument in std::env::args().skip(1) {
-        match argument.as_str() {
-            "--console" => mode = Mode::Console,
-            "--probe" => mode = Mode::Probe,
+        let parsed = match argument.as_str() {
+            "--console" => Mode::Console,
+            "--service" => Mode::Service,
+            "--probe" => Mode::Probe,
+            "--install" => Mode::Install,
+            "--uninstall" => Mode::Uninstall,
             other => return Err(format!("unrecognised argument: {other}")),
+        };
+        if mode.is_some_and(|existing| existing != parsed) {
+            return Err("give exactly one mode".to_owned());
         }
+        mode = Some(parsed);
     }
-    Ok(mode)
+    // Deliberately not defaulting to --service. A service whose ImagePath says
+    // what it is beats one that relies on the absence of arguments, and running
+    // the binary by hand should explain itself rather than start a server.
+    mode.ok_or_else(|| "no mode given".to_owned())
 }
 
-fn init_tracing(mode: Mode) {
+/// A log file shared by every tracing writer, guarded so concurrent writes do
+/// not interleave mid-line.
+#[derive(Clone)]
+struct LogFile(Arc<Mutex<std::fs::File>>);
+
+impl Write for LogFile {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        // A poisoned lock means another thread panicked while logging. Dropping
+        // the line is better than panicking inside the logger and taking the
+        // service down over a diagnostic.
+        match self.0.lock() {
+            Ok(mut file) => file.write(buffer),
+            Err(_) => Ok(buffer.len()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self.0.lock() {
+            Ok(mut file) => file.flush(),
+            Err(_) => Ok(()),
+        }
+    }
+}
+
+fn init_tracing(mode: Mode) -> kam_core::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_env("KAM_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(mode != Mode::Service)
-        .init();
+
+    if mode == Mode::Service {
+        // There is no console under the service control manager, so anything
+        // written to stdout is lost. Everything goes to a file next to the
+        // store instead.
+        let path = log_path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let writer = LogFile(Arc::new(Mutex::new(file)));
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(true)
+            .init();
+    }
+    Ok(())
+}
+
+fn log_path() -> kam_core::Result<PathBuf> {
+    let store = server::store_path(true)?;
+    let directory = store
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| kam_core::Error::Privileged("the store has no directory".to_owned()))?;
+    Ok(directory.join("logs").join("agent.log"))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_service_log_sits_beside_the_service_store() {
+        let log = log_path().unwrap();
+        let store = server::store_path(true).unwrap();
+        assert_eq!(log.parent().and_then(|p| p.parent()), store.parent());
+        assert!(log.ends_with("logs/agent.log") || log.ends_with(r"logs\agent.log"));
+    }
 }
