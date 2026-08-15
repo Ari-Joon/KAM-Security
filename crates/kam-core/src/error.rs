@@ -19,6 +19,15 @@ pub enum Error {
     #[error("privileged operation failed: {0}")]
     Privileged(String),
 
+    /// A peer sent something that does not fit the wire format: a bad length
+    /// prefix, a truncated frame, or a payload that will not deserialise. The
+    /// agent closes the connection rather than trying to interpret it.
+    #[error("protocol error: {0}")]
+    Protocol(String),
+
+    #[error("database error: {0}")]
+    Database(String),
+
     #[error("not implemented yet: {0}")]
     NotImplemented(&'static str),
 }

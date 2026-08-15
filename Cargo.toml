@@ -24,11 +24,11 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Added at the phase that first needs them. Versions here are starting points
-# only -- pin whatever `cargo add` resolves when the phase begins.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Added at the phase that first needs them.
 # windows = "0.58"
 # windows-service = "0.7"
-# rusqlite = { version = "0.32", features = ["bundled"] }
 # blake3 = "1"
 
 [workspace.lints.rust]

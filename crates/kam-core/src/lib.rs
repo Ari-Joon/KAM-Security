@@ -5,8 +5,10 @@
 //! linked by both the agent and (indirectly) the shell, so it stays inert.
 
 pub mod audit;
+pub mod db;
 pub mod error;
 
+pub use db::Store;
 pub use error::{Error, Result};
 
 /// Product name as shown in the UI, service registration, and log output.

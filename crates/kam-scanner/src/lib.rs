@@ -32,9 +32,13 @@ pub struct Provenance {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignatureState {
     /// Authenticode signature present and chaining to a trusted root.
-    Valid { signer: String },
+    Valid {
+        signer: String,
+    },
     /// Signature present but expired, revoked, or failing to chain.
-    Invalid { reason: String },
+    Invalid {
+        reason: String,
+    },
     Unsigned,
 }
 

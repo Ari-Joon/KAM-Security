@@ -30,6 +30,41 @@ pub struct Entry {
     pub undo_token: Option<String>,
 }
 
+impl Effect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::Changed => "changed",
+            Self::Refused => "refused",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "observed" => Some(Self::Observed),
+            "changed" => Some(Self::Changed),
+            "refused" => Some(Self::Refused),
+            _ => None,
+        }
+    }
+}
+
+/// One entry as read back out of the log.
+///
+/// Distinct from [`Entry`] because a stored row's strings are owned, whereas a
+/// call site writing an entry names its module and action as literals.
+#[derive(Debug, Clone, Serialize)]
+pub struct Record {
+    pub id: i64,
+    /// ISO 8601, UTC, to the millisecond.
+    pub at: String,
+    pub module: String,
+    pub action: String,
+    pub effect: Effect,
+    pub detail: String,
+    pub undo_token: Option<String>,
+}
+
 pub trait AuditLog: Send + Sync {
     fn record(&self, entry: Entry) -> crate::Result<()>;
 }

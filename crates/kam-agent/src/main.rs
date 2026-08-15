@@ -31,7 +31,11 @@ fn main() -> ExitCode {
     };
 
     init_tracing(mode);
-    tracing::info!(?mode, version = env!("CARGO_PKG_VERSION"), "kam-agent starting");
+    tracing::info!(
+        ?mode,
+        version = env!("CARGO_PKG_VERSION"),
+        "kam-agent starting"
+    );
 
     match mode {
         Mode::Console => run_console(),

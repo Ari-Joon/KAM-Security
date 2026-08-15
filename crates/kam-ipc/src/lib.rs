@@ -7,6 +7,8 @@
 //! Keeping the surface small and explicitly enumerated is the point: the agent
 //! runs as SYSTEM, so every variant added here is new attack surface.
 
+pub mod frame;
+
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
@@ -32,7 +34,9 @@ pub enum Request {
 pub enum Response {
     SystemStatus(SystemStatus),
     /// The agent declined or failed. `message` is safe to show to the user.
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
