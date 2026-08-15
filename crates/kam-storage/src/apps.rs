@@ -162,7 +162,7 @@ fn installed() -> Vec<Installed> {
 /// Vendors are wildly inconsistent between the registry and the folder they
 /// create — "Path of Exile 2" against `PathOfExile2`, "Mozilla Firefox"
 /// against `Mozilla\Firefox`.
-fn normalise(text: &str) -> String {
+pub(crate) fn normalise(text: &str) -> String {
     text.chars()
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
@@ -273,7 +273,7 @@ fn push_unique(locations: &mut Vec<Location>, candidate: Location) {
 }
 
 /// Where per-user and machine-wide application data lives on this machine.
-fn data_roots() -> Vec<(LocationKind, String)> {
+pub(crate) fn data_roots() -> Vec<(LocationKind, String)> {
     let mut roots = Vec::new();
     if let Some(value) = std::env::var_os("ProgramData") {
         roots.push((
@@ -408,6 +408,35 @@ pub fn footprints(index: &VolumeIndex) -> Result<Vec<AppFootprint>> {
 
     results.sort_by_key(|app| std::cmp::Reverse(app.actual_bytes));
     Ok(results)
+}
+
+/// Everything one read of the table can answer at once.
+///
+/// Footprints and orphans are two views of the same question — which
+/// directories belong to what — so they are produced together rather than
+/// costing a read of the volume each.
+#[derive(Debug)]
+pub struct StorageReport {
+    pub apps: Vec<AppFootprint>,
+    pub summary: FootprintSummary,
+    pub orphans: Vec<crate::orphans::Orphan>,
+    pub orphan_summary: crate::orphans::OrphanSummary,
+}
+
+/// Read the volume's table, then measure applications and find leftovers.
+pub fn survey(drive_letter: char, now_unix: u64) -> Result<StorageReport> {
+    let snapshot = crate::mft::read(drive_letter)?;
+    let index = VolumeIndex::build(snapshot);
+    let apps = footprints(&index)?;
+    let summary = summarise(&apps);
+    let orphans = crate::orphans::find(&index, &apps, now_unix);
+    let orphan_summary = crate::orphans::summarise(&orphans);
+    Ok(StorageReport {
+        apps,
+        summary,
+        orphans,
+        orphan_summary,
+    })
 }
 
 /// Read the volume's table and measure every installed application against it.
@@ -561,10 +590,33 @@ mod tests {
     #[test]
     #[ignore = "reads the whole master file table and needs elevation"]
     fn measure_installed_applications() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
         let snapshot = crate::mft::read('C').unwrap();
         let index = VolumeIndex::build(snapshot);
         let apps = footprints(&index).unwrap();
         let summary = summarise(&apps);
+
+        let orphans = crate::orphans::find(&index, &apps, now);
+        let orphan_summary = crate::orphans::summarise(&orphans);
+        println!(
+            "\nLEFTOVERS: {} directories holding {:.1} GB, of which {:.1} GB is high confidence",
+            orphan_summary.found,
+            orphan_summary.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+            orphan_summary.confident_bytes as f64 / 1024.0 / 1024.0 / 1024.0
+        );
+        for orphan in orphans.iter().take(12) {
+            println!(
+                "  {:>8.2} GB  {:?}  {}  ({})",
+                orphan.bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+                orphan.confidence,
+                orphan.path,
+                orphan.reasons.join("; ")
+            );
+        }
+        println!();
 
         let gb = |bytes: u64| bytes as f64 / 1024.0 / 1024.0 / 1024.0;
         println!(

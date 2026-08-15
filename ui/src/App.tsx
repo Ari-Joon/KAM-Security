@@ -7,9 +7,11 @@ import Storage from "./views/Storage";
 import Activity from "./views/Activity";
 import Planned from "./views/Planned";
 import Applications from "./views/Applications";
+import Cleanup from "./views/Cleanup";
 import {
   ActivityIcon,
   ApplicationsIcon,
+  CleanupIcon,
   FirewallIcon,
   OverviewIcon,
   ScannerIcon,
@@ -21,6 +23,7 @@ type Section =
   | "overview"
   | "storage"
   | "applications"
+  | "cleanup"
   | "scanner"
   | "firewall"
   | "activity";
@@ -40,6 +43,7 @@ const NAV: {
     hint: "Real size vs claimed",
     Icon: ApplicationsIcon,
   },
+  { key: "cleanup", label: "Cleanup", hint: "Leftovers and quarantine", Icon: CleanupIcon },
   { key: "scanner", label: "Scanner", hint: "Phase 3", Icon: ScannerIcon },
   { key: "firewall", label: "Firewall", hint: "Phase 4", Icon: FirewallIcon },
   { key: "activity", label: "Activity", hint: "The audit log", Icon: ActivityIcon },
@@ -192,6 +196,10 @@ export default function App() {
 
         {section === "applications" && (
           <Applications volumes={volumes} onMeasured={() => void refresh()} />
+        )}
+
+        {section === "cleanup" && (
+          <Cleanup volumes={volumes} onChanged={() => void refresh()} />
         )}
 
         {section === "activity" && <Activity entries={entries} />}

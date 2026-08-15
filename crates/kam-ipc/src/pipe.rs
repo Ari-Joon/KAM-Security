@@ -14,8 +14,10 @@
 //!    it. Being *allowed* to open the pipe is not the same as being trusted to
 //!    drive it.
 //!
-//! One pipe instance is created per connection rather than reusing a single
-//! instance, so a client cannot occupy the listener and starve the next caller.
+//! The listener keeps [`MAX_PIPE_INSTANCES`] instances available. One is not
+//! enough once connections are served concurrently: `CreateNamedPipeW` refuses
+//! with `ERROR_PIPE_BUSY` while an existing instance is connected, so the accept
+//! loop would spin on that error for as long as any request was in flight.
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
@@ -43,7 +45,7 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use crate::PIPE_NAME;
+use crate::{MAX_PIPE_INSTANCES, PIPE_NAME};
 
 /// Security descriptor applied to the pipe, in SDDL.
 ///
@@ -250,9 +252,10 @@ impl PipeListener {
                 PCWSTR(path.as_ptr()),
                 PIPE_ACCESS_DUPLEX,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                // One instance per connection: a client that hangs cannot hold
-                // the listener and starve the next caller.
-                1,
+                // Several instances, because connections are served on their
+                // own threads: with one, creating the next instance fails with
+                // ERROR_PIPE_BUSY for as long as a single request is in flight.
+                MAX_PIPE_INSTANCES,
                 PIPE_BUFFER_BYTES,
                 PIPE_BUFFER_BYTES,
                 PIPE_DEFAULT_TIMEOUT_MS,

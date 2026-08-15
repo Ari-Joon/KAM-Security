@@ -75,6 +75,23 @@ export function ApplicationsIcon() {
   );
 }
 
+/**
+ * A container with a lid, and an arrow going in.
+ *
+ * Deliberately not a bin: nothing here is thrown away, and an icon that says
+ * "delete" would misdescribe the one screen in the application where being
+ * misunderstood costs somebody their data.
+ */
+export function CleanupIcon() {
+  return (
+    <Frame>
+      <path d="M4.2 8.4 h15.6 v10.2 a1.6 1.6 0 0 1 -1.6 1.6 h-12.4 a1.6 1.6 0 0 1 -1.6 -1.6 Z" />
+      <path d="M12 3.4 v3.4" />
+      <path d="M9.6 5.4 L12 3.2 L14.4 5.4" />
+    </Frame>
+  );
+}
+
 /** Aegis sweep — a radar arc and its blip, so: scanning. */
 export function ScannerIcon() {
   return (

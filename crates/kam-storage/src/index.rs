@@ -227,12 +227,14 @@ mod tests {
             name: name.to_owned(),
             is_directory: true,
             bytes: 0,
+            modified: 0,
         };
         let file = |name: &str, parent: u32, bytes: u64| MftEntry {
             parent,
             name: name.to_owned(),
             is_directory: false,
             bytes,
+            modified: 0,
         };
         entries.insert(5, directory(".", 5));
         entries.insert(6, directory("Windows", 5));

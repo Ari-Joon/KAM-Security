@@ -22,12 +22,14 @@
 pub mod apps;
 pub mod index;
 pub mod mft;
+pub mod orphans;
 pub mod registry;
 pub mod scan;
 pub mod volumes;
 
 pub use apps::{AppFootprint, FootprintSummary};
 pub use index::VolumeIndex;
+pub use orphans::{Confidence, Orphan, OrphanSummary};
 pub use scan::{scan, Scan, ScanMethod};
 pub use volumes::{list as list_volumes, Volume};
 

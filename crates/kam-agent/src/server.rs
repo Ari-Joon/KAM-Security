@@ -18,7 +18,7 @@ use crate::service::Shutdown;
 /// Only trusted clients get this far, so the cap is not the security boundary —
 /// it is a guard against a buggy client opening connections in a loop and
 /// spawning threads inside a SYSTEM process until something gives way.
-const MAX_CONCURRENT_CONNECTIONS: usize = 16;
+const MAX_CONCURRENT_CONNECTIONS: usize = kam_ipc::MAX_PIPE_INSTANCES as usize;
 
 /// Serve connections until `shutdown` is signalled.
 ///
@@ -39,7 +39,11 @@ pub fn serve(listener: &PipeListener, context: &Arc<Context>, shutdown: &Shutdow
                 if shutdown.is_signalled() {
                     break;
                 }
+                // Backing off matters: an error here repeats immediately, and
+                // without a pause the loop burns a core and writes thousands of
+                // identical lines a second into the log.
                 tracing::error!(%error, "could not accept a connection");
+                std::thread::sleep(std::time::Duration::from_millis(200));
                 continue;
             }
         };
@@ -186,6 +190,18 @@ pub fn store_path(running_as_service: bool) -> Result<PathBuf> {
     Ok(base.join("kam.db"))
 }
 
+/// The quarantine store sits beside the audit database, so an item and the
+/// record of why it was taken live or die together.
+pub fn open_quarantine(running_as_service: bool) -> Result<kam_quarantine::Store> {
+    let path = store_path(running_as_service)?
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| Error::Privileged("the store has no directory".to_owned()))?
+        .join("quarantine");
+    tracing::info!(path = %path.display(), "opening the quarantine store");
+    kam_quarantine::Store::open(&path)
+}
+
 pub fn open_store(running_as_service: bool) -> Result<Store> {
     let path = store_path(running_as_service)?;
     tracing::info!(path = %path.display(), "opening the store");
@@ -245,9 +261,12 @@ mod tests {
         let loop_shutdown = shutdown.clone();
         let (finished_tx, finished_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
+            let quarantine_root =
+                std::env::temp_dir().join(format!("kam-serve-test-{}", std::process::id()));
             let context = Arc::new(Context {
                 mode: crate::Mode::Console,
                 store: Store::open_in_memory().unwrap(),
+                quarantine: kam_quarantine::Store::open(&quarantine_root).unwrap(),
             });
             let outcome = serve(&listener, &context, &loop_shutdown);
             let _ = finished_tx.send(());

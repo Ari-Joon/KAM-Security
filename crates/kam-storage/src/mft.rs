@@ -55,6 +55,7 @@ use windows::Win32::Storage::FileSystem::{
 /// Record 5 is always the root directory.
 const ROOT_RECORD: u64 = 5;
 
+const ATTR_STANDARD_INFORMATION: u32 = 0x10;
 const ATTR_FILE_NAME: u32 = 0x30;
 const ATTR_DATA: u32 = 0x80;
 const ATTR_END: u32 = 0xFFFF_FFFF;
@@ -78,6 +79,9 @@ pub struct MftEntry {
     pub is_directory: bool,
     /// Unnamed `$DATA` size. Zero for directories.
     pub bytes: u64,
+    /// Last write, as a Windows FILETIME: 100-nanosecond ticks since 1601.
+    /// Zero when `$STANDARD_INFORMATION` was missing or unreadable.
+    pub modified: u64,
 }
 
 /// Everything the table yielded, indexed by record number.
@@ -353,6 +357,8 @@ struct RawRecord {
     name: Option<(u8, String, u32)>,
     /// Unnamed `$DATA` size, taken only from the fragment that starts at VCN 0.
     data: Option<u64>,
+    /// Last write from `$STANDARD_INFORMATION`.
+    modified: u64,
 }
 
 /// Pull the name, parent and size out of one MFT record.
@@ -381,6 +387,7 @@ fn parse_record(record: &[u8]) -> Option<RawRecord> {
 
     let mut best_name: Option<(u8, String, u32)> = None;
     let mut data_size: Option<u64> = None;
+    let mut modified = 0_u64;
 
     while cursor + 8 <= limit {
         let attribute_type = read_u32(record, cursor)?;
@@ -394,6 +401,13 @@ fn parse_record(record: &[u8]) -> Option<RawRecord> {
         let non_resident = *record.get(cursor + 0x08)? != 0;
 
         match attribute_type {
+            ATTR_STANDARD_INFORMATION if !non_resident => {
+                // Creation, modification, MFT-change and access times, in that
+                // order. The modification time is the one a person means by
+                // "last touched", and drives the orphan confidence scoring.
+                let value_offset = read_u16(record, cursor + 0x14)? as usize;
+                modified = read_u64(record, cursor + value_offset + 0x08).unwrap_or(0);
+            }
             ATTR_FILE_NAME if !non_resident => {
                 let value_offset = read_u16(record, cursor + 0x14)? as usize;
                 let value = cursor + value_offset;
@@ -454,6 +468,7 @@ fn parse_record(record: &[u8]) -> Option<RawRecord> {
         base,
         name: best_name,
         data: data_size,
+        modified,
     })
 }
 
@@ -542,6 +557,7 @@ pub fn read(drive_letter: char) -> Result<MftSnapshot> {
                                                 } else {
                                                     raw.data.unwrap_or(0)
                                                 },
+                                                modified: raw.modified,
                                             },
                                         );
                                     }

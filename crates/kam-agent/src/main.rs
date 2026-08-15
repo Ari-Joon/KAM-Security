@@ -95,6 +95,7 @@ fn run(mode: Mode) -> kam_core::Result<()> {
     let context = Arc::new(Context {
         mode,
         store: server::open_store(false)?,
+        quarantine: server::open_quarantine(false)?,
     });
     let listener = PipeListener::new();
     tracing::info!(pipe = kam_ipc::PIPE_NAME, "listening");

@@ -891,6 +891,169 @@ select {
   font-size: 11px;
 }
 
+/* ---------- cleanup ---------- */
+
+.orphans {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+.orphan {
+  border-top: 1px solid var(--border);
+}
+
+.orphan:first-child {
+  border-top: none;
+}
+
+.orphan-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.orphan-toggle {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) 150px 84px;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 9px 8px;
+  color: var(--text);
+}
+
+.orphan-toggle:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.orphan-name {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.orphan-size {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  font-size: 12.5px;
+}
+
+.conf {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  text-align: center;
+}
+
+/* High confidence is the safe one to act on, so it is the calm colour. Low
+   confidence gets the warning, because acting on it is the risky choice. */
+.conf-high {
+  color: var(--ok);
+  background: rgba(61, 214, 140, 0.1);
+  border-color: rgba(61, 214, 140, 0.3);
+}
+
+.conf-medium {
+  color: var(--text-2);
+  background: var(--surface-3);
+  border-color: var(--border-strong);
+}
+
+.conf-low {
+  color: var(--warn);
+  background: rgba(240, 180, 41, 0.1);
+  border-color: rgba(240, 180, 41, 0.3);
+}
+
+.orphan-action {
+  flex: none;
+  font-size: 12px;
+  padding: 5px 12px;
+}
+
+.orphan-detail {
+  padding: 0 8px 12px 34px;
+}
+
+.orphan-path {
+  display: block;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--accent-soft);
+  overflow-wrap: anywhere;
+}
+
+.orphan-reasons {
+  margin: 6px 0 0;
+  padding-left: 16px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.held {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+
+.held:first-child {
+  border-top: none;
+}
+
+.held-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.held-path,
+.held-reason {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.held-path {
+  font-size: 12.5px;
+}
+
+.held-reason {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.held-size {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+.notice-ok {
+  color: var(--ok);
+  background: rgba(61, 214, 140, 0.08);
+  border: 1px solid rgba(61, 214, 140, 0.3);
+  margin-top: 12px;
+}
+
+.notice code {
+  background: rgba(0, 0, 0, 0.35);
+  padding: 1px 5px;
+  margin: 0 1px;
+  display: inline;
+}
+
 /* ---------- notices ---------- */
 
 .notice {

@@ -12,7 +12,8 @@ pub mod frame;
 pub mod pipe;
 
 use kam_core::audit::Record;
-use kam_storage::{AppFootprint, FootprintSummary, Scan, Volume};
+use kam_quarantine::Manifest;
+use kam_storage::{AppFootprint, FootprintSummary, Orphan, OrphanSummary, Scan, Volume};
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
@@ -21,6 +22,15 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
+
+/// Pipe instances the server keeps available.
+///
+/// This is not a nicety. `CreateNamedPipeW` refuses with `ERROR_PIPE_BUSY` once
+/// this many instances exist, so a value of one means the accept loop cannot
+/// create the next instance while a connection is still being served — it spins
+/// on the error instead. The agent's own concurrency cap is kept in step with
+/// it, so the limit is enforced deliberately rather than by a Win32 refusal.
+pub const MAX_PIPE_INSTANCES: u32 = 16;
 
 /// Maximum accepted frame size. Guards against a malformed length prefix
 /// causing an enormous allocation in the SYSTEM process.
@@ -46,9 +56,17 @@ pub enum Request {
     /// Measure everything beneath `path`. Seconds on a full drive, so callers
     /// should expect this one to take a while.
     ScanPath { path: String },
-    /// What every installed application really occupies on `drive`. Needs the
-    /// master file table, so the agent must be privileged.
+    /// What every installed application really occupies on `drive`, and which
+    /// directories nothing installed accounts for. Needs the master file table,
+    /// so the agent must be privileged.
     ListApplications { drive: String },
+    /// Move a leftover directory into quarantine. The agent re-checks the path
+    /// against its own fence before touching anything.
+    QuarantinePath { path: String, reason: String },
+    /// Everything currently held in quarantine.
+    ListQuarantine,
+    /// Put a quarantined item back where it came from.
+    RestoreQuarantined { id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +85,12 @@ pub enum Response {
     Applications {
         apps: Vec<AppFootprint>,
         summary: FootprintSummary,
+        orphans: Vec<Orphan>,
+        orphan_summary: OrphanSummary,
+    },
+    Quarantined(Manifest),
+    QuarantineList {
+        items: Vec<Manifest>,
     },
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {

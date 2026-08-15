@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ApplicationReport,
+  Manifest,
   AuditRecord,
   Scan,
   SystemStatus,
@@ -21,6 +22,10 @@ export const api = {
   scan: (path: string) => invoke<Scan>("scan_path", { path }),
   applications: (drive: string) =>
     invoke<ApplicationReport>("list_applications", { drive }),
+  quarantine: (path: string, reason: string) =>
+    invoke<Manifest>("quarantine_path", { path, reason }),
+  quarantineList: () => invoke<Manifest[]>("list_quarantine"),
+  restore: (id: string) => invoke<Manifest>("restore_quarantined", { id }),
   protocolVersion: () => invoke<number>("protocol_version"),
 };
 

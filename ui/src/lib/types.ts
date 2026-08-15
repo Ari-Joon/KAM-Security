@@ -72,6 +72,8 @@ export type FootprintSummary = {
 export type ApplicationReport = {
   apps: AppFootprint[];
   summary: FootprintSummary;
+  orphans: Orphan[];
+  orphan_summary: OrphanSummary;
 };
 
 export type ScanMethod = "master_file_table" | "directory_walk";
@@ -87,4 +89,32 @@ export type Scan = {
   elapsed_ms: number;
   tree: TreeNode;
   largest_files: FileEntry[];
+};
+
+export type Confidence = "low" | "medium" | "high";
+
+export type Orphan = {
+  path: string;
+  name: string;
+  bytes: number;
+  kind: LocationKind;
+  confidence: Confidence;
+  days_since_modified: number | null;
+  reasons: string[];
+};
+
+export type OrphanSummary = {
+  found: number;
+  total_bytes: number;
+  confident_bytes: number;
+};
+
+export type Manifest = {
+  id: string;
+  original_path: string;
+  kind: "file" | "directory";
+  bytes: number;
+  quarantined_at: number;
+  reason: string;
+  restored: boolean;
 };

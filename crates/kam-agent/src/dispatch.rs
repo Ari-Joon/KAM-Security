@@ -21,6 +21,7 @@ use crate::Mode;
 pub struct Context {
     pub mode: Mode,
     pub store: Store,
+    pub quarantine: kam_quarantine::Store,
 }
 
 impl Context {
@@ -39,6 +40,27 @@ impl Context {
                 effect,
                 detail,
                 undo_token: None,
+            },
+        );
+    }
+
+    /// As [`Self::audit`], but recording how to undo what just happened.
+    pub fn audit_with_token(
+        &self,
+        module: &'static str,
+        action: &'static str,
+        effect: Effect,
+        detail: String,
+        undo_token: Option<String>,
+    ) {
+        server::record(
+            &self.store,
+            Entry {
+                module,
+                action,
+                effect,
+                detail,
+                undo_token,
             },
         );
     }
@@ -105,30 +127,128 @@ pub fn handle(request: Request, context: &Context) -> Response {
                 };
             };
 
-            match kam_storage::apps::measure(letter.to_ascii_uppercase()) {
-                Ok((apps, summary)) => {
+            match kam_storage::apps::survey(letter.to_ascii_uppercase(), now_seconds()) {
+                Ok(report) => {
                     context.audit(
                         "storage",
-                        "measure_applications",
+                        "survey",
                         Effect::Observed,
                         format!(
-                            "measured {} applications on {letter}: — {} against the {} Control Panel reports",
-                            summary.applications,
-                            human_bytes(summary.measured_bytes),
-                            human_bytes(summary.reported_bytes)
+                            "surveyed {letter}: — {} applications using {}, {} leftover directories holding {}",
+                            report.summary.applications,
+                            human_bytes(report.summary.measured_bytes),
+                            report.orphan_summary.found,
+                            human_bytes(report.orphan_summary.total_bytes)
                         ),
                     );
-                    Response::Applications { apps, summary }
+                    Response::Applications {
+                        apps: report.apps,
+                        summary: report.summary,
+                        orphans: report.orphans,
+                        orphan_summary: report.orphan_summary,
+                    }
                 }
                 Err(error) => {
-                    tracing::info!(%error, "could not measure applications");
+                    tracing::info!(%error, "could not survey storage");
                     Response::Error {
                         message: format!(
-                            "application sizes need the master file table, which the agent \
-                             could not read: {error}"
+                            "application sizes need the master file table, which the agent                              could not read: {error}"
                         ),
                     }
                 }
+            }
+        }
+
+        Request::QuarantinePath { path, reason } => quarantine_path(&path, &reason, context),
+
+        Request::ListQuarantine => match context.quarantine.list() {
+            Ok(items) => Response::QuarantineList { items },
+            Err(error) => {
+                tracing::error!(%error, "could not list quarantine");
+                Response::Error {
+                    message: "the quarantine store could not be read".to_owned(),
+                }
+            }
+        },
+
+        Request::RestoreQuarantined { id } => match context.quarantine.restore(&id) {
+            Ok(manifest) => {
+                context.audit_with_token(
+                    "quarantine",
+                    "restore",
+                    Effect::Changed,
+                    format!("restored {} to {}", manifest.id, manifest.original_path),
+                    Some(manifest.id.clone()),
+                );
+                Response::Quarantined(manifest)
+            }
+            Err(error) => {
+                context.audit(
+                    "quarantine",
+                    "restore",
+                    Effect::Refused,
+                    format!("could not restore {id}: {error}"),
+                );
+                Response::Error {
+                    message: error.to_string(),
+                }
+            }
+        },
+    }
+}
+
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Move a leftover directory out of the way.
+///
+/// The path arrives as a string from a client. The agent runs as LocalSystem,
+/// so it is re-checked against the fence here rather than trusted because the
+/// UI only offered safe ones -- a different client need not be so polite.
+fn quarantine_path(path: &str, reason: &str, context: &Context) -> Response {
+    if let Err(refusal) = kam_storage::orphans::check_quarantinable(path) {
+        context.audit(
+            "quarantine",
+            "take",
+            Effect::Refused,
+            format!("refused to quarantine {path}: {refusal}"),
+        );
+        return Response::Error { message: refusal };
+    }
+
+    let target = std::path::Path::new(path);
+    let bytes = kam_storage::scan::walk_scan(target)
+        .map(|scan| scan.total_bytes)
+        .unwrap_or(0);
+
+    match context.quarantine.take(target, bytes, reason) {
+        Ok(manifest) => {
+            context.audit_with_token(
+                "quarantine",
+                "take",
+                Effect::Changed,
+                format!(
+                    "quarantined {} ({}) -- {reason}",
+                    manifest.original_path,
+                    human_bytes(manifest.bytes)
+                ),
+                Some(manifest.id.clone()),
+            );
+            Response::Quarantined(manifest)
+        }
+        Err(error) => {
+            context.audit(
+                "quarantine",
+                "take",
+                Effect::Refused,
+                format!("could not quarantine {path}: {error}"),
+            );
+            Response::Error {
+                message: error.to_string(),
             }
         }
     }
@@ -207,9 +327,20 @@ mod tests {
     use super::*;
 
     fn context(mode: Mode) -> Context {
+        // A scratch quarantine store per test, so nothing here can reach the
+        // real one under %ProgramData%.
+        let quarantine_root = std::env::temp_dir().join(format!(
+            "kam-dispatch-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
         Context {
             mode,
             store: Store::open_in_memory().unwrap(),
+            quarantine: kam_quarantine::Store::open(&quarantine_root).unwrap(),
         }
     }
 

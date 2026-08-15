@@ -10,7 +10,8 @@
 
 use kam_core::audit::Record;
 use kam_ipc::{Request, Response, SystemStatus};
-use kam_storage::{AppFootprint, FootprintSummary, Scan, Volume};
+use kam_quarantine::Manifest;
+use kam_storage::{AppFootprint, FootprintSummary, Orphan, OrphanSummary, Scan, Volume};
 
 /// Turn a response into the value a command promised, or a message for the UI.
 ///
@@ -71,17 +72,64 @@ fn list_applications(drive: String) -> Result<ApplicationReport, String> {
     match kam_ipc::client::call(&Request::ListApplications { drive })
         .map_err(|error| error.to_string())?
     {
-        Response::Applications { apps, summary } => Ok(ApplicationReport { apps, summary }),
+        Response::Applications {
+            apps,
+            summary,
+            orphans,
+            orphan_summary,
+        } => Ok(ApplicationReport {
+            apps,
+            summary,
+            orphans,
+            orphan_summary,
+        }),
         Response::Error { message } => Err(message),
         other => Err(unexpected(&other)),
     }
 }
 
-/// Paired so the frontend gets both halves from one call.
+/// Everything one read of the master file table produced, in one reply.
 #[derive(serde::Serialize)]
 struct ApplicationReport {
     apps: Vec<AppFootprint>,
     summary: FootprintSummary,
+    orphans: Vec<Orphan>,
+    orphan_summary: OrphanSummary,
+}
+
+/// Move a leftover directory into quarantine.
+///
+/// The agent re-checks the path against its own fence, so this is a request
+/// rather than an instruction.
+#[tauri::command]
+fn quarantine_path(path: String, reason: String) -> Result<Manifest, String> {
+    match kam_ipc::client::call(&Request::QuarantinePath { path, reason })
+        .map_err(|error| error.to_string())?
+    {
+        Response::Quarantined(manifest) => Ok(manifest),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+#[tauri::command]
+fn list_quarantine() -> Result<Vec<Manifest>, String> {
+    match kam_ipc::client::call(&Request::ListQuarantine).map_err(|error| error.to_string())? {
+        Response::QuarantineList { items } => Ok(items),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+#[tauri::command]
+fn restore_quarantined(id: String) -> Result<Manifest, String> {
+    match kam_ipc::client::call(&Request::RestoreQuarantined { id })
+        .map_err(|error| error.to_string())?
+    {
+        Response::Quarantined(manifest) => Ok(manifest),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
 }
 
 /// Version of the protocol this build speaks, so the UI can say plainly when it
@@ -101,6 +149,9 @@ pub fn run() {
             list_volumes,
             scan_path,
             list_applications,
+            quarantine_path,
+            list_quarantine,
+            restore_quarantined,
             protocol_version
         ])
         .run(tauri::generate_context!())
