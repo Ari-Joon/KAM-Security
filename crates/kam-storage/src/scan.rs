@@ -1,27 +1,37 @@
-//! Directory scanning: where the space actually went.
+//! Measuring where the space went, by either of two routes.
 //!
-//! # Why this is not the master-file-table reader
+//! [`scan`] picks between them. A whole NTFS volume is read from the master
+//! file table by [`crate::mft`]; anything else — a subdirectory, a non-NTFS
+//! volume, or a volume the process lacks the rights to open raw — is walked
+//! directory by directory. Both produce the same [`Scan`], so nothing above
+//! here has to care which ran.
 //!
-//! PLAN.md promised a whole-volume map in about two seconds by reading the NTFS
-//! master file table. That still stands, but with a correction found while
-//! building it: `FSCTL_ENUM_USN_DATA`, the documented enumeration path, returns
-//! names, parents and attributes — and no sizes. A treemap without sizes is not
-//! a treemap. Getting sizes that way means locating `$MFT` on the raw volume and
-//! parsing record headers, attribute lists and non-resident data runs by hand,
-//! which is a substantial piece of work and needs elevation.
+//! Measured on a 1 TB system drive with 1.4 million files:
 //!
-//! So this is the honest intermediate: a parallel directory walk that needs no
-//! special privileges and produces the same tree, in seconds rather than
-//! milliseconds. The master-file-table reader replaces the traversal underneath
-//! without changing anything above it.
+//! | | Master file table | Directory walk |
+//! |---|---|---|
+//! | Cold cache | 2.4 s | 57.8 s |
+//! | Warm cache | 2.4 s | 15.2 s |
+//! | Measured against the 1036.3 GB Windows reports | 99.6% | 97.6% |
+//! | Needs elevation | yes | no |
 //!
-//! # Correctness notes
+//! The walk benefits enormously from a warm filesystem cache and the table
+//! barely notices one, because it is a single sequential read either way. The
+//! fair comparison is the warm figure — still six times slower, and the cold
+//! figure is what a user actually meets on the first scan after a reboot.
+//!
+//! The walk is slower *and* less accurate: it cannot open every directory, and
+//! it counts a hard-linked file once per link, which on a Windows volume means
+//! counting much of `WinSxS` several times over.
+//!
+//! # Correctness notes for the walk
 //!
 //! Reparse points are skipped. Windows is full of junctions that point back up
 //! the tree — `C:\Documents and Settings` to `C:\Users`, `Application Data` to
 //! itself — and following them both double-counts and loops forever.
 
 use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -51,9 +61,25 @@ pub struct Node {
     pub is_aggregate: bool,
 }
 
+/// How a scan got its numbers. Shown in the UI, because a two-second answer and
+/// a one-minute answer are different enough that the user should know which
+/// they are looking at — and why, when the fast path was unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanMethod {
+    /// Read straight out of the NTFS master file table.
+    MasterFileTable,
+    /// Walked directory by directory. Slower, but needs no privileges.
+    DirectoryWalk,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scan {
     pub root: String,
+    pub method: ScanMethod,
+    /// Why the fast path was not used, when it was not.
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
     pub total_bytes: u64,
     pub file_count: u64,
     pub directory_count: u64,
@@ -87,8 +113,54 @@ const LARGEST_FILES_KEPT: usize = 25;
 /// this the per-thread overhead outweighs the win.
 const PARALLEL_DEPTH: usize = 2;
 
-/// Walk `root` and measure everything beneath it.
+/// Measure everything beneath `root`, by the fastest route available.
+///
+/// A whole NTFS volume is read from the master file table. Anything else — a
+/// subdirectory, a non-NTFS volume, or a volume we lack the rights to open
+/// raw — is walked. The two produce the same shape, so callers do not branch.
 pub fn scan(root: &Path) -> Result<Scan> {
+    if let Some(letter) = volume_letter(root) {
+        let started = Instant::now();
+        match crate::mft::read(letter) {
+            Ok(snapshot) => {
+                tracing::info!(
+                    drive = %letter,
+                    records = snapshot.entries.len(),
+                    "read the master file table"
+                );
+                return Ok(from_master_file_table(
+                    snapshot,
+                    root,
+                    started.elapsed().as_millis() as u64,
+                ));
+            }
+            Err(error) => {
+                // Not fatal: falling back is the designed behaviour for an
+                // unprivileged agent, and the reason travels to the UI so the
+                // slow answer is explained rather than mysterious.
+                tracing::info!(%error, "master file table unavailable; walking instead");
+                let mut scan = walk_scan(root)?;
+                scan.fallback_reason = Some(error.to_string());
+                return Ok(scan);
+            }
+        }
+    }
+    walk_scan(root)
+}
+
+/// `C:\` yes; `C:\Users` no. Only a whole volume can come from its table.
+fn volume_letter(path: &Path) -> Option<char> {
+    let text = path.to_str()?;
+    let bytes = text.as_bytes();
+    let looks_like_root = matches!(text.len(), 2 | 3)
+        && bytes.get(1) == Some(&b':')
+        && bytes.first().is_some_and(|c| c.is_ascii_alphabetic())
+        && bytes.get(2).is_none_or(|c| *c == b'\\' || *c == b'/');
+    looks_like_root.then(|| bytes[0].to_ascii_uppercase() as char)
+}
+
+/// Walk `root` and measure everything beneath it.
+pub fn walk_scan(root: &Path) -> Result<Scan> {
     let started = Instant::now();
     let counters = Counters::default();
 
@@ -115,6 +187,8 @@ pub fn scan(root: &Path) -> Result<Scan> {
 
     Ok(Scan {
         root: root.display().to_string(),
+        method: ScanMethod::DirectoryWalk,
+        fallback_reason: None,
         total_bytes: counters.bytes.load(Ordering::Relaxed),
         file_count: counters.files.load(Ordering::Relaxed),
         directory_count: counters.directories.load(Ordering::Relaxed),
@@ -123,6 +197,221 @@ pub fn scan(root: &Path) -> Result<Scan> {
         tree,
         largest_files: largest,
     })
+}
+
+/// Turn a table snapshot into the same tree a directory walk produces.
+///
+/// Done in two passes. The first totals every directory bottom-up, because a
+/// folder's size is only known once its children are. The second builds the
+/// transmittable tree from the top, keeping directories only — files are
+/// already counted in their parent's total.
+fn from_master_file_table(snapshot: crate::mft::MftSnapshot, root: &Path, elapsed_ms: u64) -> Scan {
+    let entries = &snapshot.entries;
+
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::with_capacity(entries.len() / 4);
+    let mut file_count = 0_u64;
+    let mut directory_count = 0_u64;
+    let mut total_bytes = 0_u64;
+
+    for (index, entry) in entries {
+        if entry.is_directory {
+            directory_count += 1;
+        } else {
+            file_count += 1;
+            total_bytes += entry.bytes;
+        }
+        // The root is its own parent; recording that edge would make the tree
+        // contain itself.
+        if *index != snapshot.root {
+            children.entry(entry.parent).or_default().push(*index);
+        }
+    }
+
+    // Bottom-up totals, iteratively. A recursive walk would risk the stack on a
+    // pathological tree, and a corrupted parent reference could make one.
+    let mut totals: HashMap<u32, u64> = HashMap::with_capacity(directory_count as usize + 1);
+    let mut direct_files: HashMap<u32, u64> = HashMap::with_capacity(directory_count as usize + 1);
+    let mut visited: HashSet<u32> = HashSet::with_capacity(entries.len());
+    let mut stack: Vec<(u32, bool)> = vec![(snapshot.root, false)];
+    visited.insert(snapshot.root);
+
+    while let Some((index, expanded)) = stack.pop() {
+        if expanded {
+            let mut sum = 0_u64;
+            let mut files_here = 0_u64;
+            if let Some(list) = children.get(&index) {
+                for child in list {
+                    match entries.get(child) {
+                        Some(entry) if entry.is_directory => {
+                            sum += totals.get(child).copied().unwrap_or(0);
+                        }
+                        Some(entry) => {
+                            sum += entry.bytes;
+                            files_here += 1;
+                        }
+                        None => {}
+                    }
+                }
+            }
+            totals.insert(index, sum);
+            direct_files.insert(index, files_here);
+            continue;
+        }
+
+        stack.push((index, true));
+        if let Some(list) = children.get(&index) {
+            for child in list {
+                let is_directory = entries.get(child).is_some_and(|e| e.is_directory);
+                // Only directories need expanding, and only once: a cycle from
+                // a bad parent reference would otherwise never terminate.
+                if is_directory && visited.insert(*child) {
+                    stack.push((*child, false));
+                }
+            }
+        }
+    }
+
+    let root_label = root.display().to_string();
+    let tree = build_branch(
+        snapshot.root,
+        &root_label,
+        &root_label,
+        entries,
+        &children,
+        &totals,
+        &direct_files,
+        0,
+    );
+
+    let mut largest = largest_files(entries, &children, snapshot.root, &root_label);
+    largest.sort_by_key(|entry| Reverse(entry.bytes));
+    largest.truncate(LARGEST_FILES_KEPT);
+
+    Scan {
+        root: root_label,
+        method: ScanMethod::MasterFileTable,
+        fallback_reason: None,
+        total_bytes,
+        file_count,
+        directory_count,
+        unreadable: snapshot.skipped,
+        elapsed_ms,
+        tree: prune(tree, 0, DEFAULT_MAX_DEPTH, DEFAULT_MAX_CHILDREN),
+        largest_files: largest,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_branch(
+    index: u32,
+    name: &str,
+    path: &str,
+    entries: &HashMap<u32, crate::mft::MftEntry>,
+    children: &HashMap<u32, Vec<u32>>,
+    totals: &HashMap<u32, u64>,
+    direct_files: &HashMap<u32, u64>,
+    depth: usize,
+) -> Node {
+    let mut node = Node {
+        name: name.to_owned(),
+        path: path.to_owned(),
+        bytes: totals.get(&index).copied().unwrap_or(0),
+        files: direct_files.get(&index).copied().unwrap_or(0),
+        children: Vec::new(),
+        is_aggregate: false,
+    };
+
+    // One level deeper than the tree is pruned to, so pruning has a tail to
+    // fold rather than silently losing it.
+    if depth > DEFAULT_MAX_DEPTH {
+        return node;
+    }
+
+    if let Some(list) = children.get(&index) {
+        for child in list {
+            let Some(entry) = entries.get(child) else {
+                continue;
+            };
+            if !entry.is_directory {
+                continue;
+            }
+            let child_path = join(path, &entry.name);
+            node.children.push(build_branch(
+                *child,
+                &entry.name,
+                &child_path,
+                entries,
+                children,
+                totals,
+                direct_files,
+                depth + 1,
+            ));
+        }
+    }
+
+    node
+}
+
+/// Find the biggest files and reconstruct paths for just those.
+///
+/// Building a path for all 1.7 million entries would cost more than the read
+/// did; only the handful that get displayed are worth resolving.
+fn largest_files(
+    entries: &HashMap<u32, crate::mft::MftEntry>,
+    children: &HashMap<u32, Vec<u32>>,
+    root: u32,
+    root_label: &str,
+) -> Vec<FileEntry> {
+    let mut candidates: Vec<(u32, u64)> = entries
+        .iter()
+        .filter(|(_, entry)| !entry.is_directory && entry.bytes >= 64 * 1024 * 1024)
+        .map(|(index, entry)| (*index, entry.bytes))
+        .collect();
+    candidates.sort_by_key(|(_, bytes)| Reverse(*bytes));
+    candidates.truncate(LARGEST_FILES_KEPT);
+
+    let _ = children;
+    candidates
+        .into_iter()
+        .filter_map(|(index, bytes)| {
+            let path = resolve_path(index, entries, root, root_label)?;
+            Some(FileEntry { path, bytes })
+        })
+        .collect()
+}
+
+/// Walk parent references up to the root, assembling a path.
+fn resolve_path(
+    index: u32,
+    entries: &HashMap<u32, crate::mft::MftEntry>,
+    root: u32,
+    root_label: &str,
+) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut current = index;
+    // Bounded so a cycle in the parent chain cannot hang the caller.
+    for _ in 0..64 {
+        if current == root {
+            let mut path = root_label.trim_end_matches(['\\', '/']).to_owned();
+            for part in parts.iter().rev() {
+                path.push('\\');
+                path.push_str(part);
+            }
+            return Some(path);
+        }
+        let entry = entries.get(&current)?;
+        parts.push(&entry.name);
+        current = entry.parent;
+    }
+    None
+}
+
+fn join(parent: &str, name: &str) -> String {
+    if parent.ends_with('\\') || parent.ends_with('/') {
+        format!("{parent}{name}")
+    } else {
+        format!("{parent}\\{name}")
+    }
 }
 
 /// Files big enough to be worth naming individually, carried up the tree.
@@ -381,6 +670,14 @@ mod tests {
     fn measure_the_system_drive() {
         let scan = scan(Path::new("C:\\")).unwrap();
         println!(
+            "method: {:?}{}",
+            scan.method,
+            scan.fallback_reason
+                .as_deref()
+                .map(|reason| format!("  (fell back: {reason})"))
+                .unwrap_or_default()
+        );
+        println!(
             "C:\\  {:.1} GB  {} files  {} dirs  {} unreadable  {} ms",
             scan.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
             scan.file_count,
@@ -388,6 +685,11 @@ mod tests {
             scan.unreadable,
             scan.elapsed_ms
         );
+        println!("largest: {:?}", scan.largest_files.first());
+        if scan.method == ScanMethod::MasterFileTable {
+            let snapshot = crate::mft::read('C').unwrap();
+            println!("stats: {:?}", snapshot.stats);
+        }
         for child in scan.tree.children.iter().take(8) {
             println!(
                 "   {:>8.1} GB  {}",

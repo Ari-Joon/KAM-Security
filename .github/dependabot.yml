@@ -1,0 +1,28 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # The windows-* crates move together; separate PRs for each would be
+      # noise and would not build in isolation anyway.
+      windows:
+        patterns: ["windows", "windows-*"]
+
+  - package-ecosystem: npm
+    directory: "/ui"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      tauri:
+        patterns: ["@tauri-apps/*"]
+      react:
+        patterns: ["react", "react-dom", "@types/react", "@types/react-dom"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly

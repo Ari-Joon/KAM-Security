@@ -1,0 +1,60 @@
+name: Bug report
+description: Something behaves differently than it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not report security vulnerabilities here — use the Security
+        tab to open a private advisory instead. See SECURITY.md.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: And what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start the agent with ...
+        2. Open Storage and scan ...
+        3. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: agent-mode
+    attributes:
+      label: How was the agent running?
+      description: This changes what it is allowed to do, so it matters.
+      options:
+        - Windows service (LocalSystem)
+        - Console, elevated
+        - Console, ordinary user
+        - Not running / unsure
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: "Windows 11 24H2 (build 26100)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Agent output
+      description: >
+        Console mode prints to the terminal. As a service it writes to
+        %ProgramData%\KAM Security\logs\agent.log. Re-run with KAM_LOG=debug for
+        more. Remove anything you would rather not publish — paths can be
+        personal.
+      render: text

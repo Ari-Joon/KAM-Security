@@ -295,6 +295,13 @@ h2 {
   font-variant-numeric: tabular-nums;
 }
 
+/* For values that are words rather than numbers, which need the room. */
+.stat-value.small {
+  font-size: 13.5px;
+  font-weight: 500;
+  padding-top: 4px;
+}
+
 /* ---------- controls ---------- */
 
 button {

@@ -1,6 +1,6 @@
 [licenses]
-# The project ships as a permissive open-source release, so no copyleft
-# dependency may enter the tree. This is the rule that keeps libclamav
+# The project ships as a permissive open-source release, so no *strong*
+# copyleft dependency may enter the tree. This is the rule that keeps libclamav
 # (GPL-2.0) out -- see PLAN.md, "Licensing constraints".
 allow = [
     "MIT",
@@ -12,6 +12,11 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
+    # MPL-2.0 is file-level copyleft and, unlike the GPL, explicitly permits
+    # distributing a larger work under different terms. Linking it does not
+    # make this project MPL. It arrives through Tauri's stylesheet parsing
+    # (cssparser, cssparser-macros, dtoa-short) and via option-ext.
+    "MPL-2.0",
 ]
 confidence-threshold = 0.9
 
@@ -25,6 +30,35 @@ reason = "use rustls or the Windows platform TLS stack instead"
 
 [advisories]
 yanked = "deny"
+
+# Every entry here is justified. An unexplained ignore is how a real advisory
+# gets waved through six months later.
+ignore = [
+    # GTK3 and its ecosystem are unmaintained. They reach the lockfile through
+    # Tauri's Linux backend and are never compiled: this project targets
+    # Windows only, where Tauri uses WebView2. They disappear when Tauri
+    # completes its GTK4 migration; there is nothing to upgrade to meanwhile.
+    { id = "RUSTSEC-2024-0411", reason = "gtk — Linux-only Tauri dependency, not built on Windows" },
+    { id = "RUSTSEC-2024-0412", reason = "gtk-sys — Linux-only Tauri dependency, not built on Windows" },
+    { id = "RUSTSEC-2024-0413", reason = "gtk3-macros — Linux-only Tauri dependency, not built on Windows" },
+    { id = "RUSTSEC-2024-0414", reason = "glib — Linux-only Tauri dependency, not built on Windows" },
+    { id = "RUSTSEC-2024-0415", reason = "gdk — Linux-only Tauri dependency, not built on Windows" },
+    { id = "RUSTSEC-2024-0416", reason = "gdk-sys — Linux-only Tauri dependency, not built on Windows" },
+    { id = "RUSTSEC-2024-0417", reason = "atk — Linux-only Tauri dependency, not built on Windows" },
+    { id = "RUSTSEC-2024-0418", reason = "atk-sys — Linux-only Tauri dependency, not built on Windows" },
+    { id = "RUSTSEC-2024-0419", reason = "gdkwayland-sys — Linux-only Tauri dependency, not built on Windows" },
+    { id = "RUSTSEC-2024-0420", reason = "gdkx11-sys — Linux-only Tauri dependency, not built on Windows" },
+
+    # Unmaintained transitive crates with no published successor. None is a
+    # vulnerability; all arrive through Tauri and none is reachable from code
+    # this project writes.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error, unmaintained, transitive through Tauri" },
+    { id = "RUSTSEC-2025-0075", reason = "unmaintained transitive dependency of Tauri; no safe upgrade published" },
+    { id = "RUSTSEC-2025-0080", reason = "unmaintained transitive dependency of Tauri; no safe upgrade published" },
+    { id = "RUSTSEC-2025-0081", reason = "unmaintained transitive dependency of Tauri; no safe upgrade published" },
+    { id = "RUSTSEC-2025-0098", reason = "unmaintained transitive dependency of Tauri; no safe upgrade published" },
+    { id = "RUSTSEC-2025-0100", reason = "unmaintained transitive dependency of Tauri; no safe upgrade published" },
+]
 
 [sources]
 unknown-registry = "deny"

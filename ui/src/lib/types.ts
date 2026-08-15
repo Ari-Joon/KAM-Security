@@ -43,8 +43,12 @@ export type FileEntry = {
   bytes: number;
 };
 
+export type ScanMethod = "master_file_table" | "directory_walk";
+
 export type Scan = {
   root: string;
+  method: ScanMethod;
+  fallback_reason: string | null;
   total_bytes: number;
   file_count: number;
   directory_count: number;

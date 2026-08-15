@@ -10,16 +10,20 @@ members = ["crates/*", "ui/src-tauri"]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
-authors = ["KAM Security"]
+authors = ["KAM Security contributors"]
+license = "Apache-2.0"
 repository = "https://github.com/OWNER/kam-security"
 
 [workspace.dependencies]
-kam-core = { path = "crates/kam-core" }
-kam-ipc = { path = "crates/kam-ipc" }
-kam-scanner = { path = "crates/kam-scanner" }
-kam-firewall = { path = "crates/kam-firewall" }
-kam-storage = { path = "crates/kam-storage" }
-kam-quarantine = { path = "crates/kam-quarantine" }
+# Versions alongside the paths so these are not wildcard dependencies. Nothing
+# here is published to crates.io, but a wildcard is a real hazard in general and
+# `cargo deny` is right to reject it rather than special-case us.
+kam-core = { path = "crates/kam-core", version = "0.1.0" }
+kam-ipc = { path = "crates/kam-ipc", version = "0.1.0" }
+kam-scanner = { path = "crates/kam-scanner", version = "0.1.0" }
+kam-firewall = { path = "crates/kam-firewall", version = "0.1.0" }
+kam-storage = { path = "crates/kam-storage", version = "0.1.0" }
+kam-quarantine = { path = "crates/kam-quarantine", version = "0.1.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

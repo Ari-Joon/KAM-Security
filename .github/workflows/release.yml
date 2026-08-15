@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build the frontend
+        working-directory: ui
+        run: npm ci --ignore-scripts && npm approve-scripts esbuild && npm run build
+
+      - name: Build the agent
+        run: cargo build --release -p kam-agent
+
+      - name: Build the shell
+        working-directory: ui
+        run: npm run tauri build -- --no-bundle
+
+      - name: Stage the release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/kam-agent.exe dist/
+          Copy-Item target/release/kam-shell.exe dist/
+          Copy-Item README.md, LICENSE, SECURITY.md dist/
+          # The two binaries must sit in one directory: the agent only serves
+          # clients installed alongside it.
+          Compress-Archive -Path dist/* -DestinationPath kam-security-windows-x64.zip
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-FileHash kam-security-windows-x64.zip -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  kam-security-windows-x64.zip" } |
+            Out-File -FilePath SHA256SUMS.txt -Encoding ascii
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kam-security-windows-x64
+          path: |
+            kam-security-windows-x64.zip
+            SHA256SUMS.txt
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            kam-security-windows-x64.zip
+            SHA256SUMS.txt
+          body: |
+            ## Install
+
+            Unzip anywhere. **Keep both executables in the same folder** — the
+            agent only serves clients installed alongside it, so separating them
+            stops the shell working.
+
+            Run `kam-shell.exe`. For the fast disk scan, install the agent as a
+            service from an administrator terminal:
+
+            ```
+            kam-agent.exe --install
+            sc start KamSecurityAgent
+            ```
+
+            ## These binaries are not signed
+
+            SmartScreen will warn on first run, and some antivirus products may
+            flag them. That is expected for an unsigned tool that enumerates
+            every file on disk and runs an elevated service. Verify the checksum
+            against `SHA256SUMS.txt`, and build from source if you would rather
+            not trust a download.

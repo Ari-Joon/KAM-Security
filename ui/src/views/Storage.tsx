@@ -100,11 +100,29 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
 
         {error && <pre className="error">{error}</pre>}
 
+        {scan && scan.method === "directory_walk" && scan.fallback_reason && (
+          <div className="notice notice-warn">
+            <strong>Read the slow way.</strong> The master file table gives the
+            same answer in about two seconds and counts hard links correctly,
+            but it needs administrative rights. Run the agent as a service, or
+            elevated, to use it.
+            <pre className="error">{scan.fallback_reason}</pre>
+          </div>
+        )}
+
         {scan && (
           <div className="stat-row tight">
             <div className="stat">
               <span className="stat-label">Measured</span>
               <span className="stat-value">{fmt.bytes(scan.total_bytes)}</span>
+            </div>
+            <div className="stat">
+              <span className="stat-label">Method</span>
+              <span className="stat-value small">
+                {scan.method === "master_file_table"
+                  ? "Master file table"
+                  : "Directory walk"}
+              </span>
             </div>
             <div className="stat">
               <span className="stat-label">Files</span>

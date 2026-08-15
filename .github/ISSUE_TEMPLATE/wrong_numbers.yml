@@ -1,0 +1,51 @@
+name: Sizes look wrong
+description: A scan reports a total that does not match what Windows says
+labels: ["bug", "storage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Disagreements are expected up to a point, and knowing which direction
+        the error runs in usually identifies the cause immediately.
+
+        Some differences are deliberate: the master file table counts a
+        hard-linked file once, while Explorer counts it once per link, so
+        `C:\Windows\WinSxS` legitimately reads smaller here.
+
+  - type: dropdown
+    id: method
+    attributes:
+      label: Which method did the scan use?
+      description: Shown in the Method tile after a scan.
+      options:
+        - Master file table
+        - Directory walk
+    validations:
+      required: true
+
+  - type: input
+    id: reported
+    attributes:
+      label: What KAM reported
+      placeholder: "1032.5 GB"
+    validations:
+      required: true
+
+  - type: input
+    id: expected
+    attributes:
+      label: What Windows reports
+      description: >
+        From `Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"`, or the
+        drive's Properties dialog.
+      placeholder: "1036.3 GB used"
+    validations:
+      required: true
+
+  - type: textarea
+    id: volume
+    attributes:
+      label: Volume details
+      description: Filesystem, size, and anything unusual — ReFS, BitLocker, dedup, compression, a mounted VHD.
+    validations:
+      required: true

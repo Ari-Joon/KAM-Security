@@ -111,31 +111,35 @@ fallback that does not block the phase.
 
 The differentiating module. Four features, in build order:
 
-**(a) Full-disk map.** *Partly built — see the correction below.*
+**(a) Full-disk map.** ✅ **Built.**
 
 The original plan said `FSCTL_ENUM_USN_DATA` would give a whole-volume map in
-about two seconds. That was wrong in one decisive respect, found while building
-it: **that call returns names, parent references and attributes, but no sizes.**
-A treemap without sizes is not a treemap.
+about two seconds. One correction, found while building it: **that call returns
+names, parent references and attributes, but no sizes.** A treemap without sizes
+is not a treemap, so the shipped reader locates `$MFT` on the raw volume and
+parses it directly.
 
-Getting sizes from the master file table means locating `$MFT` on the raw
-volume and parsing record headers, attribute lists and non-resident data runs by
-hand. That is real work, and it needs elevation.
+Measured on the development machine, a 1 TB volume with 1.4 million files:
 
-So the shipped version is a parallel directory walk: no special privileges, same
-tree, seconds instead of milliseconds. Measured on the development machine:
+| | Master file table | Directory walk |
+|---|---|---|
+| First scan after a reboot | 2.4 s | 57.8 s |
+| Repeat scan, warm cache | 2.4 s | 15.2 s |
+| Against the 1036.3 GB Windows reports | 99.6% | 97.6% |
+| Needs elevation | yes | no |
 
-| | |
-|---|---|
-| Volume | 1.0 TB used, 1,703,920 files, 302,169 directories |
-| Walk | 58 seconds |
-| Accuracy | 1011 GB measured against 1036 GB reported by Windows — 97.6%, the gap being 266 unreadable directories and filesystem metadata |
+Two traps cost 270 GB before the numbers were checked against Windows rather
+than eyeballed:
 
-The master-file-table reader remains the goal and is the single biggest
-performance win available; it replaces the traversal underneath `kam_storage::scan`
-without changing anything above it. Until then the UI is built to survive a
-long scan: the agent serves each connection on its own thread, so the shell
-stays live while a scan runs.
+1. Fragmented files spill their attributes into **extension records**, leaving
+   the base record with no `$DATA` at all. A 138 GB game archive read as zero.
+2. Where several `$DATA` attributes exist, only the fragment starting at
+   **virtual cluster 0** carries the real length. The others hold zero.
+
+The walk remains as the fallback for subdirectories, non-NTFS volumes, and an
+agent without administrative rights. It is slower *and* less accurate — it
+cannot open every directory, and it counts a hard-linked file once per link,
+which on a Windows volume means counting much of `WinSxS` repeatedly.
 
 **(b) True application footprint.**
 Control Panel's size column is `EstimatedSize` — a value the installer self-reports.

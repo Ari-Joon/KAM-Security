@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/OWNER/kam-security/security/advisories/new
+    about: Report privately. Never in a public issue — the agent runs as LocalSystem.
+  - name: Antivirus flagged the binary
+    url: https://github.com/OWNER/kam-security/blob/main/README.md#a-note-on-antivirus-warnings
+    about: Expected, and explained in the README. Report false positives to your vendor.

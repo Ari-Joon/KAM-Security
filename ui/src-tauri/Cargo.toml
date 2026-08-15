@@ -4,6 +4,7 @@ description = "KAM Security desktop shell"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [lib]
 # The `_lib` suffix keeps the library name distinct from the binary name, which
