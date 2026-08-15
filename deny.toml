@@ -1,0 +1,31 @@
+[licenses]
+# The project ships as a permissive open-source release, so no copyleft
+# dependency may enter the tree. This is the rule that keeps libclamav
+# (GPL-2.0) out -- see PLAN.md, "Licensing constraints".
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[[bans.deny]]
+name = "openssl-sys"
+reason = "use rustls or the Windows platform TLS stack instead"
+
+[advisories]
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

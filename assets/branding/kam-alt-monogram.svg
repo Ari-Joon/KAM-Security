@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="kamMonogramTitle">
+  <title id="kamMonogramTitle">KAM Security — sentinel monogram</title>
+  <path d="M128 30 L210 64 L210 128 C210 176 174 208 128 224 C82 208 46 176 46 128 L46 64 Z" fill="#0A0D14"/>
+  <g stroke="#9CBEFF" stroke-width="18" stroke-linecap="round" fill="none">
+    <path d="M100 82 L100 172"/>
+    <path d="M107 130 L158 82"/>
+    <path d="M107 130 L158 172"/>
+  </g>
+  <path d="M128 30 L210 64 L210 128 C210 176 174 208 128 224 C82 208 46 176 46 128 L46 64 Z" fill="none" stroke="#4A7CFF" stroke-width="6" stroke-linejoin="round"/>
+</svg>

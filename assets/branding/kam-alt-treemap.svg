@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="kamTreemapTitle">
+  <title id="kamTreemapTitle">KAM Security — treemap shield</title>
+  <defs>
+    <clipPath id="treemapShield">
+      <path d="M128 28 L214 62 L214 128 C214 178 176 210 128 226 C80 210 42 178 42 128 L42 62 Z"/>
+    </clipPath>
+  </defs>
+  <path d="M128 28 L214 62 L214 128 C214 178 176 210 128 226 C80 210 42 178 42 128 L42 62 Z" fill="#0A0D14"/>
+  <g clip-path="url(#treemapShield)" stroke="#2E4372" stroke-width="2">
+    <rect x="46" y="42" width="70" height="64" fill="#16203A"/>
+    <rect x="120" y="42" width="90" height="30" fill="#16203A"/>
+    <rect x="120" y="76" width="42" height="30" fill="#16203A"/>
+    <rect x="166" y="76" width="44" height="30" fill="#16203A"/>
+    <rect x="46" y="110" width="46" height="46" fill="#16203A"/>
+    <rect x="96" y="110" width="114" height="46" fill="#4A7CFF" stroke="#9CBEFF"/>
+    <rect x="46" y="160" width="70" height="60" fill="#16203A"/>
+    <rect x="120" y="160" width="90" height="60" fill="#16203A"/>
+  </g>
+  <path d="M128 28 L214 62 L214 128 C214 178 176 210 128 226 C80 210 42 178 42 128 L42 62 Z" fill="none" stroke="#4A7CFF" stroke-width="6" stroke-linejoin="round"/>
+</svg>

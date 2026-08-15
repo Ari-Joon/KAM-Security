@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="kamStrataTitle">
+  <title id="kamStrataTitle">KAM Security — strata</title>
+  <rect x="0" y="0" width="256" height="256" rx="58" fill="#0A0D14"/>
+  <g fill="none" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M54 82 L128 124 L202 82" stroke="#4A7CFF"/>
+    <path d="M73 120 L128 151 L183 120" stroke="#6C93FF"/>
+    <path d="M92 158 L128 178 L164 158" stroke="#9CBEFF"/>
+  </g>
+  <circle cx="128" cy="60" r="8" fill="#4A7CFF"/>
+</svg>

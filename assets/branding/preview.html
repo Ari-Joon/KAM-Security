@@ -1,0 +1,97 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>KAM Security — logo options</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; padding: 40px; font: 400 15px/1.6 "Segoe UI", Inter, system-ui, sans-serif;
+         background: #f6f7f9; color: #14161a; }
+  @media (prefers-color-scheme: dark) { body { background: #101216; color: #e8eaee; } }
+  h1 { font-size: 22px; font-weight: 500; margin: 0 0 4px; }
+  p.sub { margin: 0 0 32px; opacity: .65; }
+  .grid { display: grid; gap: 20px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+  .card { border: 1px solid rgba(128,140,160,.28); border-radius: 12px; padding: 20px; }
+  .stage { display: flex; align-items: center; justify-content: center; padding: 8px 0 18px; }
+  .stage svg { width: 148px; height: 148px; }
+  .name { font-weight: 500; }
+  .note { font-size: 13px; opacity: .65; margin-top: 4px; }
+  .sizes { display: flex; align-items: center; gap: 14px; margin-top: 16px;
+           padding-top: 14px; border-top: 1px solid rgba(128,140,160,.24); }
+  .sizes svg { display: block; }
+  .s48 { width: 48px; height: 48px; } .s32 { width: 32px; height: 32px; }
+  .s16 { width: 16px; height: 16px; }
+  .sizes span { font-size: 12px; opacity: .5; margin-left: auto; }
+</style>
+<h1>KAM Security — logo options</h1>
+<p class="sub">Bottom row of each card shows the mark at 48, 32 and 16 px — taskbar, tray and favicon sizes.</p>
+<div class="grid" id="grid"></div>
+<script>
+const marks = [
+  ["kam-mark", "Your mark, with KAM",
+   "Original geometry kept exactly: broken ring, subdivided triangle. Wordmark set inside the lower arc.",
+   `<circle cx="128" cy="128" r="128" fill="#0A0D14"/>
+    <g fill="none" stroke="#4A7CFF" stroke-width="5" stroke-linecap="round">
+      <path d="M21.6 146.8 A108 108 0 1 1 234.4 146.8"/>
+      <path d="M34.5 182 A108 108 0 0 0 221.5 182"/></g>
+    <path d="M128 45 L180 135 L76 135 Z" fill="none" stroke="#4A7CFF" stroke-width="5" stroke-linejoin="round"/>
+    <path d="M102 90 L154 90 L128 135 Z" fill="#3A63D8"/>
+    <text x="130" y="193" text-anchor="middle" font-family="Segoe UI, Inter, sans-serif" font-size="34" font-weight="500" letter-spacing="7" fill="#9CBEFF">KAM</text>`],
+
+  ["kam-alt-aegis", "Aegis sweep",
+   "Shield with a radar sweep and a detected blip. Reads as active scanning.",
+   `<defs><clipPath id="c1"><path d="M128 28 L214 62 L214 128 C214 178 176 210 128 226 C80 210 42 178 42 128 L42 62 Z"/></clipPath></defs>
+    <path d="M128 28 L214 62 L214 128 C214 178 176 210 128 226 C80 210 42 178 42 128 L42 62 Z" fill="#0A0D14"/>
+    <g clip-path="url(#c1)">
+      <g fill="none" stroke="#2E4372" stroke-width="3">
+        <circle cx="128" cy="132" r="30"/><circle cx="128" cy="132" r="56"/><circle cx="128" cy="132" r="82"/></g>
+      <path d="M128 132 L195.7 107.4 A72 72 0 0 0 152.6 64.3 Z" fill="#4A7CFF" opacity="0.28"/>
+      <path d="M128 132 L152.6 64.3" stroke="#4A7CFF" stroke-width="3" fill="none"/></g>
+    <circle cx="128" cy="132" r="5" fill="#4A7CFF"/>
+    <circle cx="174" cy="98" r="7" fill="#9CBEFF"/>
+    <path d="M128 28 L214 62 L214 128 C214 178 176 210 128 226 C80 210 42 178 42 128 L42 62 Z" fill="none" stroke="#4A7CFF" stroke-width="6" stroke-linejoin="round"/>`],
+
+  ["kam-alt-strata", "Strata",
+   "Three layers for the three pillars — scanner, firewall, storage. Also reads as disk platters and a downward shield.",
+   `<rect x="0" y="0" width="256" height="256" rx="58" fill="#0A0D14"/>
+    <g fill="none" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M54 82 L128 124 L202 82" stroke="#4A7CFF"/>
+      <path d="M73 120 L128 151 L183 120" stroke="#6C93FF"/>
+      <path d="M92 158 L128 178 L164 158" stroke="#9CBEFF"/></g>
+    <circle cx="128" cy="60" r="8" fill="#4A7CFF"/>`],
+
+  ["kam-alt-treemap", "Treemap shield",
+   "The disk map rendered inside the shield, one block surfaced. Says security and storage in a single mark.",
+   `<defs><clipPath id="c2"><path d="M128 28 L214 62 L214 128 C214 178 176 210 128 226 C80 210 42 178 42 128 L42 62 Z"/></clipPath></defs>
+    <path d="M128 28 L214 62 L214 128 C214 178 176 210 128 226 C80 210 42 178 42 128 L42 62 Z" fill="#0A0D14"/>
+    <g clip-path="url(#c2)" stroke="#2E4372" stroke-width="2">
+      <rect x="46" y="42" width="70" height="64" fill="#16203A"/>
+      <rect x="120" y="42" width="90" height="30" fill="#16203A"/>
+      <rect x="120" y="76" width="42" height="30" fill="#16203A"/>
+      <rect x="166" y="76" width="44" height="30" fill="#16203A"/>
+      <rect x="46" y="110" width="46" height="46" fill="#16203A"/>
+      <rect x="96" y="110" width="114" height="46" fill="#4A7CFF" stroke="#9CBEFF"/>
+      <rect x="46" y="160" width="70" height="60" fill="#16203A"/>
+      <rect x="120" y="160" width="90" height="60" fill="#16203A"/></g>
+    <path d="M128 28 L214 62 L214 128 C214 178 176 210 128 226 C80 210 42 178 42 128 L42 62 Z" fill="none" stroke="#4A7CFF" stroke-width="6" stroke-linejoin="round"/>`],
+
+  ["kam-alt-monogram", "Sentinel monogram",
+   "Just the K in a shield. Survives 16 px better than anything else here.",
+   `<path d="M128 30 L210 64 L210 128 C210 176 174 208 128 224 C82 208 46 176 46 128 L46 64 Z" fill="#0A0D14"/>
+    <g stroke="#9CBEFF" stroke-width="18" stroke-linecap="round" fill="none">
+      <path d="M100 82 L100 172"/><path d="M107 130 L158 82"/><path d="M107 130 L158 172"/></g>
+    <path d="M128 30 L210 64 L210 128 C210 176 174 208 128 224 C82 208 46 176 46 128 L46 64 Z" fill="none" stroke="#4A7CFF" stroke-width="6" stroke-linejoin="round"/>`]
+];
+
+const svg = (body, cls) =>
+  `<svg viewBox="0 0 256 256" class="${cls}" xmlns="http://www.w3.org/2000/svg">${body}</svg>`;
+
+document.getElementById("grid").innerHTML = marks.map(([file, name, note, body]) => `
+  <div class="card">
+    <div class="stage">${svg(body, "")}</div>
+    <div class="name">${name}</div>
+    <div class="note">${note}</div>
+    <div class="sizes">
+      ${svg(body, "s48")}${svg(body, "s32")}${svg(body, "s16")}
+      <span>${file}.svg</span>
+    </div>
+  </div>`).join("");
+</script>

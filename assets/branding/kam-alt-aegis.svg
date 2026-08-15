@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="kamAegisTitle">
+  <title id="kamAegisTitle">KAM Security — aegis sweep</title>
+  <defs>
+    <clipPath id="aegisShield">
+      <path d="M128 28 L214 62 L214 128 C214 178 176 210 128 226 C80 210 42 178 42 128 L42 62 Z"/>
+    </clipPath>
+  </defs>
+  <path d="M128 28 L214 62 L214 128 C214 178 176 210 128 226 C80 210 42 178 42 128 L42 62 Z" fill="#0A0D14"/>
+  <g clip-path="url(#aegisShield)">
+    <g fill="none" stroke="#2E4372" stroke-width="3">
+      <circle cx="128" cy="132" r="30"/>
+      <circle cx="128" cy="132" r="56"/>
+      <circle cx="128" cy="132" r="82"/>
+    </g>
+    <path d="M128 132 L195.7 107.4 A72 72 0 0 0 152.6 64.3 Z" fill="#4A7CFF" opacity="0.28"/>
+    <path d="M128 132 L152.6 64.3" stroke="#4A7CFF" stroke-width="3" fill="none"/>
+  </g>
+  <circle cx="128" cy="132" r="5" fill="#4A7CFF"/>
+  <circle cx="174" cy="98" r="7" fill="#9CBEFF"/>
+  <path d="M128 28 L214 62 L214 128 C214 178 176 210 128 226 C80 210 42 178 42 128 L42 62 Z" fill="none" stroke="#4A7CFF" stroke-width="6" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,13 @@
+[package]
+name = "kam-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kam-core = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
