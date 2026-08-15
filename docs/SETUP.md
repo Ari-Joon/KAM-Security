@@ -79,6 +79,32 @@ Log level is controlled by `KAM_LOG`, using `tracing-subscriber` filter syntax:
 set KAM_LOG=debug && cargo run -p kam-agent -- --console
 ```
 
+## 7. Talk to a running agent
+
+With the agent serving in one terminal, `--probe` connects over the named pipe,
+asks for status, and prints the reply:
+
+```bash
+cargo run -p kam-agent -- --probe
+```
+
+The probe is the same executable as the agent, so it sits in the agent's own
+directory and passes the caller check that the shell will later have to pass.
+Everyday development therefore exercises that check rather than bypassing it.
+
+To see the check reject something, copy the binary elsewhere and run it from
+there — the agent answers with an authorisation error and records the refusal:
+
+```bash
+cp target/debug/kam-agent.exe "$TEMP/kam-agent.exe" && "$TEMP/kam-agent.exe" --probe
+```
+
+Read the audit log at any time:
+
+```bash
+python -c "import sqlite3;print(*sqlite3.connect('target/debug/kam-dev-state/kam.db').execute('select id,at,module,action,effect,detail from audit'),sep=chr(10))"
+```
+
 ## Notes
 
 - Some Phase 2 and 3 work needs an elevated shell — reading the MFT requires

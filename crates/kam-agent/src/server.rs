@@ -1,0 +1,189 @@
+//! The accept loop, and the policy deciding who is allowed to drive the agent.
+
+use std::path::{Path, PathBuf};
+
+use kam_core::audit::{AuditLog, Effect, Entry};
+use kam_core::{Error, Result, Store};
+use kam_ipc::frame::{read_frame, write_frame};
+use kam_ipc::pipe::{PipeListener, PipeStream};
+use kam_ipc::{Request, Response};
+
+use crate::dispatch::{self, Context};
+
+/// Serve connections until the process is asked to stop.
+///
+/// One connection is handled to completion before the next is accepted. The
+/// work is IO-bound against the local system and the only client is the shell,
+/// so concurrency here would add failure modes without buying anything.
+pub fn serve(listener: &PipeListener, context: &Context) -> Result<()> {
+    let trusted_directory = trusted_directory()?;
+    tracing::info!(directory = %trusted_directory.display(), "accepting clients from");
+
+    loop {
+        let mut stream = match listener.accept() {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::error!(%error, "could not accept a connection");
+                continue;
+            }
+        };
+
+        if let Err(error) = handle_connection(&mut stream, context, &trusted_directory) {
+            // A bad peer must not be able to stop the agent serving good ones.
+            tracing::warn!(%error, "dropping connection");
+        }
+    }
+}
+
+fn handle_connection(
+    stream: &mut PipeStream,
+    context: &Context,
+    trusted_directory: &Path,
+) -> Result<()> {
+    let image_path = stream.client_image_path()?;
+
+    if !is_trusted_client(&image_path, trusted_directory) {
+        // Refusals are recorded. Being able to open the pipe is not the same as
+        // being trusted to drive it, and an attempt to cross that line is
+        // exactly the kind of thing the audit log exists to preserve.
+        context.audit(
+            "agent",
+            "reject_client",
+            Effect::Refused,
+            format!(
+                "{} is not installed alongside the agent",
+                image_path.display()
+            ),
+        );
+        tracing::warn!(client = %image_path.display(), "refused an untrusted client");
+
+        write_frame(
+            stream,
+            &Response::Error {
+                message: "this program is not authorised to control the agent".to_owned(),
+            },
+        )?;
+        return Ok(());
+    }
+
+    let request: Request = read_frame(stream)?;
+    tracing::debug!(client = %image_path.display(), ?request, "serving request");
+    let response = dispatch::handle(request, context);
+    write_frame(stream, &response)
+}
+
+/// Directory the agent will accept clients from: its own.
+///
+/// The shell is installed next to the agent, so "same directory" is a check an
+/// attacker cannot satisfy without already having write access to a privileged
+/// install location -- at which point the pipe is not the weak point.
+///
+/// Authenticode verification of the client belongs here too, once releases are
+/// signed. Until then this is the honest boundary, and it is stated as such.
+fn trusted_directory() -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    exe.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| Error::Privileged("the agent has no parent directory".to_owned()))
+}
+
+fn is_trusted_client(image_path: &Path, trusted_directory: &Path) -> bool {
+    // Canonicalise both sides so `..`, short names, and symlinks cannot be used
+    // to present an untrusted binary as though it sat in the trusted directory.
+    let Ok(client_directory) = image_path
+        .parent()
+        .ok_or(())
+        .and_then(|parent| parent.canonicalize().map_err(|_| ()))
+    else {
+        return false;
+    };
+    let Ok(trusted) = trusted_directory.canonicalize() else {
+        return false;
+    };
+    client_directory == trusted
+}
+
+/// Connect to a running agent, ask for status, and print the reply.
+///
+/// A development aid, and the reason the trust check is exercised on every run:
+/// the probe is this same executable, so it sits in the trusted directory and
+/// passes the check the shell will later have to pass.
+pub fn probe() -> Result<()> {
+    let mut stream = kam_ipc::pipe::connect(kam_ipc::PIPE_NAME)?;
+    write_frame(&mut stream, &Request::GetSystemStatus)?;
+    let response: Response = read_frame(&mut stream)?;
+    let rendered = serde_json::to_string_pretty(&response)
+        .map_err(|error| Error::Protocol(format!("could not render the response: {error}")))?;
+    println!("{rendered}");
+    Ok(())
+}
+
+/// Where the agent keeps its store, which differs by how it was started.
+pub fn store_path(running_as_service: bool) -> Result<PathBuf> {
+    let base = if running_as_service {
+        PathBuf::from(std::env::var_os("ProgramData").ok_or_else(|| {
+            Error::Privileged("ProgramData is not set in the environment".to_owned())
+        })?)
+        .join("KAM Security")
+    } else {
+        // Development runs keep their state beside the build output rather than
+        // touching the machine-wide location the service uses.
+        std::env::current_exe()?
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| Error::Privileged("the agent has no parent directory".to_owned()))?
+            .join("kam-dev-state")
+    };
+    Ok(base.join("kam.db"))
+}
+
+pub fn open_store(running_as_service: bool) -> Result<Store> {
+    let path = store_path(running_as_service)?;
+    tracing::info!(path = %path.display(), "opening the store");
+    Store::open(&path)
+}
+
+/// Record an entry, logging rather than failing if the store rejects it.
+///
+/// A failed audit write must not silently swallow the fact that it failed, but
+/// it also must not take down the agent mid-request.
+pub fn record(store: &Store, entry: Entry) {
+    if let Err(error) = store.record(entry) {
+        tracing::error!(%error, "could not write an audit entry");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_client_in_the_trusted_directory_is_accepted() {
+        let exe = std::env::current_exe().unwrap();
+        let directory = exe.parent().unwrap();
+        assert!(is_trusted_client(&exe, directory));
+    }
+
+    #[test]
+    fn a_client_elsewhere_is_refused() {
+        let exe = std::env::current_exe().unwrap();
+        let elsewhere = std::env::temp_dir();
+        assert!(!is_trusted_client(&exe, &elsewhere));
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_canonicalised_is_refused() {
+        let missing = PathBuf::from(r"C:\this\path\does\not\exist\client.exe");
+        let exe = std::env::current_exe().unwrap();
+        assert!(!is_trusted_client(&missing, exe.parent().unwrap()));
+    }
+
+    #[test]
+    fn the_service_and_development_stores_are_different_files() {
+        let service = store_path(true).unwrap();
+        let development = store_path(false).unwrap();
+        assert_ne!(service, development);
+        assert!(development.to_string_lossy().contains("kam-dev-state"));
+    }
+}

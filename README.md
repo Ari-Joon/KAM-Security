@@ -64,13 +64,16 @@ See [PLAN.md](PLAN.md) for the full design and phase breakdown.
 
 ## Status
 
-**Phase 0 — foundations.** Workspace scaffolding and CI are in place. Nothing is
-functional yet.
+**Phase 1 — skeleton.** The privilege split works end to end: an unprivileged
+client connects over an access-controlled named pipe, the agent identifies the
+caller, refuses anything not installed alongside it, serves the request, and
+records the outcome in an append-only audit log. Service hosting and the Tauri
+shell are the remaining pieces.
 
 | Phase | Scope | State |
 |---|---|---|
-| 0 | Workspace, CI, tooling | In progress |
-| 1 | Agent, IPC, audit log, shell skeleton | Not started |
+| 0 | Workspace, CI, tooling | Done |
+| 1 | Agent, IPC, audit log, shell skeleton | In progress |
 | 2 | Storage intelligence | Not started |
 | 3 | Scanner | Not started |
 | 4 | Firewall | Not started |

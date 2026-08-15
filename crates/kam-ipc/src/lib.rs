@@ -8,6 +8,7 @@
 //! runs as SYSTEM, so every variant added here is new attack surface.
 
 pub mod frame;
+pub mod pipe;
 
 use serde::{Deserialize, Serialize};
 

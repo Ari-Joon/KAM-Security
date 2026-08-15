@@ -26,8 +26,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 # Added at the phase that first needs them.
-# windows = "0.58"
 # windows-service = "0.7"
 # blake3 = "1"
 
