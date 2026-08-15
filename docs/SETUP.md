@@ -105,7 +105,43 @@ Read the audit log at any time:
 python -c "import sqlite3;print(*sqlite3.connect('target/debug/kam-dev-state/kam.db').execute('select id,at,module,action,effect,detail from audit'),sep=chr(10))"
 ```
 
-## 8. Running as a real service
+## 8. The shell
+
+The desktop app lives in `ui/`. Install its dependencies once:
+
+```bash
+cd ui && npm install
+```
+
+npm blocks package install scripts by default. Vite needs esbuild's, so approve
+that one:
+
+```bash
+cd ui && npm approve-scripts esbuild
+```
+
+Run the agent in one terminal and the shell in another:
+
+```bash
+cd ui && npm run tauri dev
+```
+
+**Use `npm run tauri dev`, not the built binary.** In a debug build Tauri loads
+`devUrl` (the Vite dev server on port 1420) rather than the bundled frontend, so
+`target\debug\kam-shell.exe` launched on its own shows an empty window and its
+`invoke` calls never reach Rust. Only release builds embed the frontend.
+
+The shell is a member of the cargo workspace, which is not incidental: it makes
+`kam-shell.exe` build into the same `target\debug` directory as `kam-agent.exe`,
+so it satisfies the agent's "installed alongside me" check during development
+exactly as it will after installation.
+
+The frontend is a web view and cannot open a named pipe, so every call goes
+through a `#[tauri::command]` in `ui/src-tauri/src/lib.rs`. That keeps what the
+UI can ask for enumerated in one place, mirroring `dispatch.rs` on the agent
+side.
+
+## 9. Running as a real service
 
 Day-to-day development should use `--console`. Install the service only when
 you need to verify behaviour that depends on actually running as LocalSystem —

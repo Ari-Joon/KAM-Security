@@ -4,10 +4,14 @@
 //! log. Phase 1 backs this with SQLite; the trait exists now so callers are
 //! written against it from the first line of feature code.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Whether an entry describes something that changed the system.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+///
+/// Serialised in the same lower-case spelling used in the database column, so
+/// the value the UI receives and the value stored on disk read identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Effect {
     /// Read-only: a scan, an enumeration, a status query.
     Observed,
@@ -53,7 +57,7 @@ impl Effect {
 ///
 /// Distinct from [`Entry`] because a stored row's strings are owned, whereas a
 /// call site writing an entry names its module and action as literals.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     pub id: i64,
     /// ISO 8601, UTC, to the millisecond.

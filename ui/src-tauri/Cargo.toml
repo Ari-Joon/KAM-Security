@@ -1,0 +1,30 @@
+[package]
+name = "kam-shell"
+description = "KAM Security desktop shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+# The `_lib` suffix keeps the library name distinct from the binary name, which
+# would otherwise collide on Windows.
+name = "kam_shell_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "kam-shell"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+kam-core = { workspace = true }
+kam-ipc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+
+[lints]
+workspace = true

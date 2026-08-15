@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+# The shell is a workspace member so that it builds into the same target
+# directory as the agent. The agent only serves clients installed alongside it,
+# so co-located build output is what lets `cargo run` exercise that check
+# instead of tripping over it.
+members = ["crates/*", "ui/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

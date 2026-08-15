@@ -122,9 +122,7 @@ fn is_trusted_client(image_path: &Path, trusted_directory: &Path) -> bool {
 /// the probe is this same executable, so it sits in the trusted directory and
 /// passes the check the shell will later have to pass.
 pub fn probe() -> Result<()> {
-    let mut stream = kam_ipc::pipe::connect(kam_ipc::PIPE_NAME)?;
-    write_frame(&mut stream, &Request::GetSystemStatus)?;
-    let response: Response = read_frame(&mut stream)?;
+    let response = kam_ipc::client::call(&Request::GetSystemStatus)?;
     let rendered = serde_json::to_string_pretty(&response)
         .map_err(|error| Error::Protocol(format!("could not render the response: {error}")))?;
     println!("{rendered}");

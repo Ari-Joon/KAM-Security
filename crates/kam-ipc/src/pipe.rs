@@ -364,7 +364,7 @@ mod tests {
         let response: Response = read_frame(&mut client).unwrap();
         match response {
             Response::SystemStatus(status) => assert_eq!(status.hostname, "test-host"),
-            Response::Error { message } => panic!("unexpected error response: {message}"),
+            other => panic!("unexpected response: {other:?}"),
         }
 
         server.join().unwrap();
