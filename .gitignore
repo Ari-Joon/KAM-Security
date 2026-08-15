@@ -1,4 +1,7 @@
 /target
+# Staged release output. Built artefacts belong on the releases page, not in
+# the history -- an 8 MB binary per commit is permanent.
+/dist
 **/*.rs.bk
 *.pdb
 
