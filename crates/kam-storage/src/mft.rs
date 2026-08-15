@@ -82,6 +82,12 @@ pub struct MftEntry {
     /// Last write, as a Windows FILETIME: 100-nanosecond ticks since 1601.
     /// Zero when `$STANDARD_INFORMATION` was missing or unreadable.
     pub modified: u64,
+    /// When the file was created here. For a download this is when it arrived.
+    pub created: u64,
+    /// Last read. Windows disables access-time updates by default, so this is
+    /// often equal to `created` and cannot be trusted without checking whether
+    /// the machine tracks it -- see [`crate::provenance::last_access_tracked`].
+    pub accessed: u64,
 }
 
 /// Everything the table yielded, indexed by record number.
@@ -357,8 +363,10 @@ struct RawRecord {
     name: Option<(u8, String, u32)>,
     /// Unnamed `$DATA` size, taken only from the fragment that starts at VCN 0.
     data: Option<u64>,
-    /// Last write from `$STANDARD_INFORMATION`.
+    /// Timestamps from `$STANDARD_INFORMATION`.
     modified: u64,
+    created: u64,
+    accessed: u64,
 }
 
 /// Pull the name, parent and size out of one MFT record.
@@ -388,6 +396,8 @@ fn parse_record(record: &[u8]) -> Option<RawRecord> {
     let mut best_name: Option<(u8, String, u32)> = None;
     let mut data_size: Option<u64> = None;
     let mut modified = 0_u64;
+    let mut created = 0_u64;
+    let mut accessed = 0_u64;
 
     while cursor + 8 <= limit {
         let attribute_type = read_u32(record, cursor)?;
@@ -402,11 +412,14 @@ fn parse_record(record: &[u8]) -> Option<RawRecord> {
 
         match attribute_type {
             ATTR_STANDARD_INFORMATION if !non_resident => {
-                // Creation, modification, MFT-change and access times, in that
-                // order. The modification time is the one a person means by
-                // "last touched", and drives the orphan confidence scoring.
+                // Creation, modification, MFT-change and access, at +0x00,
+                // +0x08, +0x10 and +0x18. Modification is what a person means
+                // by "last touched"; creation is when a download arrived.
                 let value_offset = read_u16(record, cursor + 0x14)? as usize;
-                modified = read_u64(record, cursor + value_offset + 0x08).unwrap_or(0);
+                let value = cursor + value_offset;
+                created = read_u64(record, value).unwrap_or(0);
+                modified = read_u64(record, value + 0x08).unwrap_or(0);
+                accessed = read_u64(record, value + 0x18).unwrap_or(0);
             }
             ATTR_FILE_NAME if !non_resident => {
                 let value_offset = read_u16(record, cursor + 0x14)? as usize;
@@ -469,6 +482,8 @@ fn parse_record(record: &[u8]) -> Option<RawRecord> {
         name: best_name,
         data: data_size,
         modified,
+        created,
+        accessed,
     })
 }
 
@@ -558,6 +573,8 @@ pub fn read(drive_letter: char) -> Result<MftSnapshot> {
                                                     raw.data.unwrap_or(0)
                                                 },
                                                 modified: raw.modified,
+                                                created: raw.created,
+                                                accessed: raw.accessed,
                                             },
                                         );
                                     }

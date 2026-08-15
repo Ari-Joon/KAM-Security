@@ -243,7 +243,11 @@ mod tests {
     fn signalling_is_visible_through_a_clone() {
         // The control handler holds a clone while the accept loop reads the
         // original, so the two must observe the same flag.
-        let shutdown = Shutdown::new();
+        //
+        // Named rather than Shutdown::new(): signalling opens a connection to
+        // the pipe, and the default name is the production one -- running the
+        // tests would poke a live service on the same machine.
+        let shutdown = Shutdown::for_pipe(&format!("kam-test-clone-{}", std::process::id()));
         let handler_copy = shutdown.clone();
         handler_copy.signal();
         assert!(shutdown.is_signalled());

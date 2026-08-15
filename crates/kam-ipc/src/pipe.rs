@@ -23,19 +23,18 @@ use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use kam_core::{Error, Result};
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
-};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
-    OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES,
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
@@ -52,13 +51,30 @@ use crate::{MAX_PIPE_INSTANCES, PIPE_NAME};
 /// - `D:P` -- a protected DACL: inherited entries are not applied.
 /// - `(A;;GA;;;SY)` -- Local System, full control. The agent itself.
 /// - `(A;;GA;;;BA)` -- Builtin Administrators, full control.
-/// - `(A;;GRGW;;;IU)` -- Interactive Users, read and write only. This is the
-///   desktop user running the shell. Deliberately not `GA`: the shell has no
-///   reason to change the pipe's own security.
+/// - `(A;;0x120183;;;IU)` -- Interactive Users: read data, write data, read and
+///   write attributes, read control, synchronise. Nothing else.
+///
+/// That mask is spelled out rather than written `GRGW` for one specific reason.
+/// Generic write on a pipe expands to include `FILE_APPEND_DATA`, and on a
+/// named pipe that bit *is* `FILE_CREATE_PIPE_INSTANCE`. Granting it lets any
+/// process running as the desktop user create another instance of this pipe,
+/// accept the shell's connections, and answer them — impersonating a SYSTEM
+/// service to the user's own interface. It cannot gain privilege that way, but
+/// it can report a clean machine on a dirty one, which for this application is
+/// the worse failure.
 ///
 /// Network, Anonymous, and every service account other than SYSTEM are absent,
 /// and absence in a DACL is denial.
-const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x120183;;;IU)";
+
+/// Exactly what a client needs, and nothing more: read data, write data, read
+/// and write attributes, read control, synchronise.
+///
+/// It must be spelled out for the same reason the descriptor is. Asking for
+/// `GENERIC_WRITE` expands to include `FILE_APPEND_DATA`, which the pipe's DACL
+/// deliberately withholds, so a blanket request is refused outright — the
+/// tightened descriptor and the client's access mask have to agree.
+const CLIENT_ACCESS: u32 = 0x0012_0183;
 
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 /// Milliseconds a client will wait in `WaitNamedPipe` if all instances are busy.
@@ -227,18 +243,23 @@ impl Drop for OwnedHandle {
 #[derive(Debug)]
 pub struct PipeListener {
     name: String,
+    /// Cleared once the first instance has been created, so only that one asks
+    /// for `FILE_FLAG_FIRST_PIPE_INSTANCE` -- later instances must not, or they
+    /// would be refused for colliding with the name this listener owns.
+    claim_name: AtomicBool,
 }
 
 impl PipeListener {
     pub fn new() -> Self {
-        Self {
-            name: PIPE_NAME.to_owned(),
-        }
+        Self::with_name(PIPE_NAME)
     }
 
     /// Listener on a non-default pipe name, for tests running concurrently.
     pub fn with_name(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            claim_name: AtomicBool::new(true),
+        }
     }
 
     /// Block until a client connects, then hand back the connected instance.
@@ -247,10 +268,21 @@ impl PipeListener {
         let attributes = security.attributes();
         let path = full_pipe_path(&self.name);
 
+        // Only the first instance claims the name. The flag makes Windows
+        // refuse the call outright if the pipe already exists, which is what
+        // stops another process getting in first and impersonating the agent --
+        // and tells us immediately if one already has.
+        let first = self.claim_name.swap(false, AtomicOrdering::SeqCst);
+        let open_mode = if first {
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
+        } else {
+            PIPE_ACCESS_DUPLEX
+        };
+
         let handle = unsafe {
             CreateNamedPipeW(
                 PCWSTR(path.as_ptr()),
-                PIPE_ACCESS_DUPLEX,
+                open_mode,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 // Several instances, because connections are served on their
                 // own threads: with one, creating the next instance fails with
@@ -264,10 +296,14 @@ impl PipeListener {
         };
 
         if handle.is_invalid() {
-            return Err(win32(
-                windows::core::Error::from_thread(),
-                "could not create the agent pipe",
-            ));
+            let error = windows::core::Error::from_thread();
+            if first {
+                return Err(Error::Refused(format!(
+                    "the agent pipe already exists, so something else is already \
+                     serving it — refusing to share the name: {error}"
+                )));
+            }
+            return Err(win32(error, "could not create the agent pipe"));
         }
 
         let stream = PipeStream {
@@ -299,7 +335,7 @@ pub fn connect(name: &str) -> Result<PipeStream> {
     let handle = unsafe {
         CreateFileW(
             PCWSTR(path.as_ptr()),
-            (GENERIC_READ | GENERIC_WRITE).0,
+            CLIENT_ACCESS,
             FILE_SHARE_MODE(0),
             None,
             OPEN_EXISTING,
@@ -415,5 +451,51 @@ mod tests {
     fn the_sddl_parses_into_a_usable_descriptor() {
         let descriptor = SecurityDescriptor::from_sddl(PIPE_SDDL).unwrap();
         assert!(!descriptor.0 .0.is_null());
+    }
+
+    #[test]
+    fn the_interactive_user_is_not_granted_pipe_instance_creation() {
+        // Generic write on a pipe includes FILE_APPEND_DATA, which for a named
+        // pipe is FILE_CREATE_PIPE_INSTANCE. Granting it would let any process
+        // running as the desktop user stand up another instance of this pipe
+        // and answer the shell in the agent's place.
+        assert!(
+            !PIPE_SDDL.contains("GW"),
+            "the descriptor grants generic write: {PIPE_SDDL}"
+        );
+        assert!(PIPE_SDDL.contains("0x120183"), "expected an explicit mask");
+        // FILE_APPEND_DATA / FILE_CREATE_PIPE_INSTANCE is 0x0004.
+        assert_eq!(0x0012_0183 & 0x0000_0004, 0, "instance creation is granted");
+    }
+
+    #[test]
+    fn a_second_listener_cannot_steal_a_name_already_being_served() {
+        // The impersonation guard, exercised for real: while one listener holds
+        // the name, a second must be refused rather than allowed to accept
+        // connections meant for the first.
+        let name = unique_name("exclusive");
+        let holder = PipeListener::with_name(name.clone());
+
+        let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = std::sync::Arc::clone(&ready);
+        let served = thread::spawn(move || {
+            signal.store(true, std::sync::atomic::Ordering::SeqCst);
+            holder.accept()
+        });
+
+        while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        thread::sleep(std::time::Duration::from_millis(200));
+
+        let impostor = PipeListener::with_name(name.clone());
+        assert!(
+            impostor.accept().is_err(),
+            "a second listener claimed a pipe already being served"
+        );
+
+        // Let the holder finish so no thread is left parked.
+        drop(connect(&name));
+        let _ = served.join();
     }
 }

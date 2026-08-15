@@ -133,6 +133,29 @@ impl VolumeIndex {
         Some(current)
     }
 
+    /// Rebuild the full path of a record by walking parent references.
+    ///
+    /// Bounded: a corrupted parent chain could otherwise loop forever, and this
+    /// runs inside a privileged process.
+    pub fn path_of(&self, index: u32, root_label: &str) -> Option<String> {
+        let mut parts: Vec<&str> = Vec::new();
+        let mut current = index;
+        for _ in 0..64 {
+            if current == self.snapshot.root {
+                let mut path = root_label.trim_end_matches(['\\', '/']).to_owned();
+                for part in parts.iter().rev() {
+                    path.push('\\');
+                    path.push_str(part);
+                }
+                return Some(path);
+            }
+            let entry = self.entry(current)?;
+            parts.push(&entry.name);
+            current = entry.parent;
+        }
+        None
+    }
+
     /// Total bytes beneath a path, or the file's own size.
     pub fn size_of(&self, path: &str) -> Option<u64> {
         let index = self.resolve(path)?;
@@ -228,6 +251,8 @@ mod tests {
             is_directory: true,
             bytes: 0,
             modified: 0,
+            created: 0,
+            accessed: 0,
         };
         let file = |name: &str, parent: u32, bytes: u64| MftEntry {
             parent,
@@ -235,6 +260,8 @@ mod tests {
             is_directory: false,
             bytes,
             modified: 0,
+            created: 0,
+            accessed: 0,
         };
         entries.insert(5, directory(".", 5));
         entries.insert(6, directory("Windows", 5));
