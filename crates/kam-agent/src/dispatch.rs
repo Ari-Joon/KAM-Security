@@ -97,6 +97,40 @@ pub fn handle(request: Request, context: &Context) -> Response {
         },
 
         Request::ScanPath { path } => scan_path(&path, context),
+
+        Request::ListApplications { drive } => {
+            let Some(letter) = drive.chars().next().filter(|c| c.is_ascii_alphabetic()) else {
+                return Response::Error {
+                    message: "give a drive letter, such as C:".to_owned(),
+                };
+            };
+
+            match kam_storage::apps::measure(letter.to_ascii_uppercase()) {
+                Ok((apps, summary)) => {
+                    context.audit(
+                        "storage",
+                        "measure_applications",
+                        Effect::Observed,
+                        format!(
+                            "measured {} applications on {letter}: — {} against the {} Control Panel reports",
+                            summary.applications,
+                            human_bytes(summary.measured_bytes),
+                            human_bytes(summary.reported_bytes)
+                        ),
+                    );
+                    Response::Applications { apps, summary }
+                }
+                Err(error) => {
+                    tracing::info!(%error, "could not measure applications");
+                    Response::Error {
+                        message: format!(
+                            "application sizes need the master file table, which the agent \
+                             could not read: {error}"
+                        ),
+                    }
+                }
+            }
+        }
     }
 }
 

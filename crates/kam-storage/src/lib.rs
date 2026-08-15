@@ -19,10 +19,15 @@
 //! Volumes that are not NTFS, or that are locked by BitLocker, fall back to
 //! directory walking.
 
+pub mod apps;
+pub mod index;
 pub mod mft;
+pub mod registry;
 pub mod scan;
 pub mod volumes;
 
+pub use apps::{AppFootprint, FootprintSummary};
+pub use index::VolumeIndex;
 pub use scan::{scan, Scan, ScanMethod};
 pub use volumes::{list as list_volumes, Volume};
 

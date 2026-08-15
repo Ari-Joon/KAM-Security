@@ -10,7 +10,7 @@
 
 use kam_core::audit::Record;
 use kam_ipc::{Request, Response, SystemStatus};
-use kam_storage::{Scan, Volume};
+use kam_storage::{AppFootprint, FootprintSummary, Scan, Volume};
 
 /// Turn a response into the value a command promised, or a message for the UI.
 ///
@@ -62,6 +62,28 @@ fn scan_path(path: String) -> Result<Scan, String> {
     }
 }
 
+/// What every installed application really occupies.
+///
+/// Needs a privileged agent, and takes a couple of seconds — it reads the whole
+/// master file table to answer.
+#[tauri::command]
+fn list_applications(drive: String) -> Result<ApplicationReport, String> {
+    match kam_ipc::client::call(&Request::ListApplications { drive })
+        .map_err(|error| error.to_string())?
+    {
+        Response::Applications { apps, summary } => Ok(ApplicationReport { apps, summary }),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Paired so the frontend gets both halves from one call.
+#[derive(serde::Serialize)]
+struct ApplicationReport {
+    apps: Vec<AppFootprint>,
+    summary: FootprintSummary,
+}
+
 /// Version of the protocol this build speaks, so the UI can say plainly when it
 /// and the agent disagree rather than silently mis-rendering.
 #[tauri::command]
@@ -78,6 +100,7 @@ pub fn run() {
             recent_audit,
             list_volumes,
             scan_path,
+            list_applications,
             protocol_version
         ])
         .run(tauri::generate_context!())

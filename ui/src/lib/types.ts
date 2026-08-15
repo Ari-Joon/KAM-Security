@@ -43,6 +43,37 @@ export type FileEntry = {
   bytes: number;
 };
 
+export type LocationKind = "install" | "program_data" | "local_data" | "roaming_data";
+
+export type AppLocation = {
+  path: string;
+  bytes: number;
+  kind: LocationKind;
+  shared_with: number;
+};
+
+export type AppFootprint = {
+  name: string;
+  publisher: string;
+  version: string;
+  reported_bytes: number | null;
+  actual_bytes: number;
+  shared_bytes: number;
+  locations: AppLocation[];
+};
+
+export type FootprintSummary = {
+  applications: number;
+  measured_bytes: number;
+  reported_bytes: number;
+  without_reported_size: number;
+};
+
+export type ApplicationReport = {
+  apps: AppFootprint[];
+  summary: FootprintSummary;
+};
+
 export type ScanMethod = "master_file_table" | "directory_walk";
 
 export type Scan = {

@@ -107,8 +107,8 @@ select {
 
 .nav-item {
   display: flex;
-  flex-direction: column;
-  gap: 1px;
+  align-items: center;
+  gap: 10px;
   text-align: left;
   padding: 8px 10px;
   border: 1px solid transparent;
@@ -116,6 +116,26 @@ select {
   background: transparent;
   color: var(--text-2);
   cursor: pointer;
+}
+
+.section-icon {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  /* Slightly dimmer than the label so the word leads and the mark supports. */
+  opacity: 0.72;
+}
+
+.nav-item.active .section-icon {
+  opacity: 1;
+  color: var(--accent);
+}
+
+.nav-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
 }
 
 .nav-item:hover {
@@ -720,6 +740,155 @@ select {
   font-size: 11.5px;
   white-space: nowrap;
   padding-top: 2px;
+}
+
+/* ---------- applications ---------- */
+
+.app-header,
+.app-head {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) 110px 110px 56px;
+  align-items: center;
+  gap: 10px;
+}
+
+.app-header {
+  margin-top: 14px;
+  padding: 0 8px 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.app-header .right {
+  text-align: right;
+}
+
+.app-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.app-row {
+  border-bottom: 1px solid var(--border);
+}
+
+.app-head {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 9px 8px;
+  color: var(--text);
+}
+
+.app-head:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.app-caret {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.app-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.app-publisher {
+  color: var(--text-3);
+  font-size: 11.5px;
+  margin-left: 8px;
+}
+
+.app-reported,
+.app-actual {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-size: 12.5px;
+}
+
+.app-reported {
+  color: var(--text-2);
+}
+
+.app-actual {
+  font-weight: 600;
+}
+
+.app-none {
+  color: var(--text-3);
+  font-style: italic;
+  font-size: 11.5px;
+}
+
+.app-ratio {
+  text-align: right;
+}
+
+/* Only shown past 1.5x, where the gap between claim and reality is the point. */
+.ratio-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 11px;
+  color: var(--warn);
+  background: rgba(240, 180, 41, 0.1);
+  border: 1px solid rgba(240, 180, 41, 0.3);
+  font-variant-numeric: tabular-nums;
+}
+
+.app-locations {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 2px 8px 0 34px;
+}
+
+.app-location {
+  display: grid;
+  grid-template-columns: 86px minmax(0, 1fr) 76px;
+  gap: 10px;
+  align-items: baseline;
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+.app-location.shared {
+  opacity: 0.55;
+}
+
+.loc-kind {
+  color: var(--text-3);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.loc-path {
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.loc-size {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.loc-shared {
+  grid-column: 2 / -1;
+  color: var(--warn);
+  font-size: 11px;
 }
 
 /* ---------- notices ---------- */

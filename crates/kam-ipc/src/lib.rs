@@ -12,7 +12,7 @@ pub mod frame;
 pub mod pipe;
 
 use kam_core::audit::Record;
-use kam_storage::{Scan, Volume};
+use kam_storage::{AppFootprint, FootprintSummary, Scan, Volume};
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
@@ -46,6 +46,9 @@ pub enum Request {
     /// Measure everything beneath `path`. Seconds on a full drive, so callers
     /// should expect this one to take a while.
     ScanPath { path: String },
+    /// What every installed application really occupies on `drive`. Needs the
+    /// master file table, so the agent must be privileged.
+    ListApplications { drive: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +64,10 @@ pub enum Response {
     /// Boxed because a scan result dwarfs every other variant, and an enum is
     /// as large as its largest member wherever it is passed.
     Scan(Box<Scan>),
+    Applications {
+        apps: Vec<AppFootprint>,
+        summary: FootprintSummary,
+    },
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {
         message: String,

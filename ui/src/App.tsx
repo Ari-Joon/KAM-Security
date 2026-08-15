@@ -1,20 +1,48 @@
 import { useCallback, useEffect, useState } from "react";
+import type { ReactElement } from "react";
 import { api, reason } from "./lib/api";
 import type { AuditRecord, SystemStatus, Volume } from "./lib/types";
 import Overview from "./views/Overview";
 import Storage from "./views/Storage";
 import Activity from "./views/Activity";
 import Planned from "./views/Planned";
+import Applications from "./views/Applications";
+import {
+  ActivityIcon,
+  ApplicationsIcon,
+  FirewallIcon,
+  OverviewIcon,
+  ScannerIcon,
+  StorageIcon,
+} from "./components/SectionIcons";
 import "./styles.css";
 
-type Section = "overview" | "storage" | "scanner" | "firewall" | "activity";
+type Section =
+  | "overview"
+  | "storage"
+  | "applications"
+  | "scanner"
+  | "firewall"
+  | "activity";
 
-const NAV: { key: Section; label: string; hint: string }[] = [
-  { key: "overview", label: "Overview", hint: "Drives and recent events" },
-  { key: "storage", label: "Storage", hint: "Where the space went" },
-  { key: "scanner", label: "Scanner", hint: "Phase 3" },
-  { key: "firewall", label: "Firewall", hint: "Phase 4" },
-  { key: "activity", label: "Activity", hint: "The audit log" },
+/** Each section carries the alternate mark that belongs to it. */
+const NAV: {
+  key: Section;
+  label: string;
+  hint: string;
+  Icon: () => ReactElement;
+}[] = [
+  { key: "overview", label: "Overview", hint: "Drives and recent events", Icon: OverviewIcon },
+  { key: "storage", label: "Storage", hint: "Where the space went", Icon: StorageIcon },
+  {
+    key: "applications",
+    label: "Applications",
+    hint: "Real size vs claimed",
+    Icon: ApplicationsIcon,
+  },
+  { key: "scanner", label: "Scanner", hint: "Phase 3", Icon: ScannerIcon },
+  { key: "firewall", label: "Firewall", hint: "Phase 4", Icon: FirewallIcon },
+  { key: "activity", label: "Activity", hint: "The audit log", Icon: ActivityIcon },
 ];
 
 function Mark() {
@@ -100,8 +128,11 @@ export default function App() {
               className={"nav-item" + (section === item.key ? " active" : "")}
               onClick={() => setSection(item.key)}
             >
-              <span className="nav-label">{item.label}</span>
-              <span className="nav-hint">{item.hint}</span>
+              <item.Icon />
+              <span className="nav-text">
+                <span className="nav-label">{item.label}</span>
+                <span className="nav-hint">{item.hint}</span>
+              </span>
             </button>
           ))}
         </nav>
@@ -157,6 +188,10 @@ export default function App() {
             initialRoot={storageRoot}
             onScanned={() => void refresh()}
           />
+        )}
+
+        {section === "applications" && (
+          <Applications volumes={volumes} onMeasured={() => void refresh()} />
         )}
 
         {section === "activity" && <Activity entries={entries} />}

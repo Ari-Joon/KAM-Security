@@ -1,5 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AuditRecord, Scan, SystemStatus, Volume } from "./types";
+import type {
+  ApplicationReport,
+  AuditRecord,
+  Scan,
+  SystemStatus,
+  Volume,
+} from "./types";
 
 /**
  * Typed wrappers over the Tauri commands.
@@ -13,6 +19,8 @@ export const api = {
   recentAudit: (limit: number) => invoke<AuditRecord[]>("recent_audit", { limit }),
   volumes: () => invoke<Volume[]>("list_volumes"),
   scan: (path: string) => invoke<Scan>("scan_path", { path }),
+  applications: (drive: string) =>
+    invoke<ApplicationReport>("list_applications", { drive }),
   protocolVersion: () => invoke<number>("protocol_version"),
 };
 
