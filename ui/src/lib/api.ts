@@ -1,10 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ApplicationReport,
+  DefenderReport,
   DuplicateReport,
   Manifest,
   MoveRecord,
   OrganiseReport,
+  Threat,
   AuditRecord,
   Scan,
   SystemStatus,
@@ -27,6 +29,8 @@ export const api = {
     invoke<ApplicationReport>("list_applications", { drive }),
   duplicates: (drive: string) =>
     invoke<DuplicateReport>("find_duplicates", { drive }),
+  defenderStatus: () => invoke<DefenderReport>("defender_status"),
+  defenderThreats: () => invoke<Threat[]>("defender_threats"),
   organise: (drive: string) =>
     invoke<OrganiseReport>("find_organise_proposals", { drive }),
   applyMove: (from: string, to: string) =>

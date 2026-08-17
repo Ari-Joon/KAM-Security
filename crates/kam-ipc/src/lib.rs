@@ -13,6 +13,7 @@ pub mod pipe;
 
 use kam_core::audit::Record;
 use kam_quarantine::{Manifest, MoveRecord};
+use kam_scanner::{DefenderStatus, Threat};
 use kam_storage::{
     AppFootprint, Download, DownloadSummary, DuplicateGroup, DuplicateSummary, FootprintSummary,
     OrganiseSummary, Orphan, OrphanSummary, Proposal, Scan, Volume,
@@ -83,6 +84,10 @@ pub enum Request {
     UndoMove { id: String },
     /// Every move recorded, newest first.
     ListMoves,
+    /// What Microsoft Defender is doing, read from Defender.
+    GetDefenderStatus,
+    /// Everything Defender has detected and still has a record of.
+    GetDefenderThreats,
     /// Record that the shell launched an application's own uninstaller.
     ///
     /// The agent does not run it -- an uninstaller needs the user's desktop,
@@ -121,6 +126,15 @@ pub enum Response {
         summary: OrganiseSummary,
     },
     Moved(MoveRecord),
+    Defender {
+        status: DefenderStatus,
+        /// Phrased for a person, produced by the agent so the interface cannot
+        /// invent a concern the data does not support.
+        concerns: Vec<String>,
+    },
+    DefenderThreats {
+        threats: Vec<Threat>,
+    },
     Moves {
         records: Vec<MoveRecord>,
     },

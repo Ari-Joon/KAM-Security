@@ -8,6 +8,7 @@ import Activity from "./views/Activity";
 import Planned from "./views/Planned";
 import Applications from "./views/Applications";
 import Cleanup from "./views/Cleanup";
+import Scanner from "./views/Scanner";
 import {
   ActivityIcon,
   ApplicationsIcon,
@@ -44,7 +45,7 @@ const NAV: {
     Icon: ApplicationsIcon,
   },
   { key: "cleanup", label: "Cleanup", hint: "Leftovers and quarantine", Icon: CleanupIcon },
-  { key: "scanner", label: "Scanner", hint: "Phase 3", Icon: ScannerIcon },
+  { key: "scanner", label: "Scanner", hint: "Defender status", Icon: ScannerIcon },
   { key: "firewall", label: "Firewall", hint: "Phase 4", Icon: FirewallIcon },
   { key: "activity", label: "Activity", hint: "The audit log", Icon: ActivityIcon },
 ];
@@ -204,19 +205,7 @@ export default function App() {
 
         {section === "activity" && <Activity entries={entries} />}
 
-        {section === "scanner" && (
-          <Planned
-            title="Scanner"
-            phase="Phase 3"
-            lede="Threat detection, built on Defender rather than competing with it."
-            points={[
-              "Drive Microsoft Defender through WMI — scans, threat history, exclusions — and give it the interface it never shipped with.",
-              "Judge executables by provenance: who signed it, when it arrived, which process wrote it, where it was downloaded from, and whether it survives a reboot.",
-              "Run YARA rules against what Defender tolerates: bundled adware, scareware optimisers, browser hijackers, stalkerware.",
-              "Look up individual files on VirusTotal, with your own API key.",
-            ]}
-          />
-        )}
+        {section === "scanner" && <Scanner />}
 
         {section === "firewall" && (
           <Planned

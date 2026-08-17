@@ -2036,6 +2036,7 @@ version = "0.1.0"
 dependencies = [
  "kam-core",
  "kam-quarantine",
+ "kam-scanner",
  "kam-storage",
  "serde",
  "serde_json",
@@ -2059,6 +2060,7 @@ dependencies = [
  "kam-core",
  "serde",
  "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -2068,6 +2070,7 @@ dependencies = [
  "kam-core",
  "kam-ipc",
  "kam-quarantine",
+ "kam-scanner",
  "kam-storage",
  "serde",
  "serde_json",

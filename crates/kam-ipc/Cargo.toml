@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 kam-core = { workspace = true }
 kam-quarantine = { workspace = true }
+kam-scanner = { workspace = true }
 kam-storage = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

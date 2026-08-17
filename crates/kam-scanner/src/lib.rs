@@ -11,6 +11,11 @@
 //!    binary by its history rather than by matching a signature.
 //! 4. **VirusTotal** -- on demand, single file, user-supplied API key.
 
+pub mod defender;
+pub mod wmi;
+
+pub use defender::{DefenderStatus, Threat};
+
 /// Everything layer 3 knows about one executable on disk.
 ///
 /// No single field is a verdict. An unsigned binary that arrived in AppData via

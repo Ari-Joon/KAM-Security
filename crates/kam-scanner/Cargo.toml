@@ -9,6 +9,7 @@ license.workspace = true
 kam-core = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
+windows = { workspace = true }
 
 [lints]
 workspace = true

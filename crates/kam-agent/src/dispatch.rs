@@ -250,6 +250,29 @@ pub fn handle(request: Request, context: &Context) -> Response {
             }
         },
 
+        Request::GetDefenderStatus => match kam_scanner::defender::status() {
+            Ok(status) => {
+                let concerns = status.concerns();
+                Response::Defender { status, concerns }
+            }
+            Err(error) => {
+                tracing::info!(%error, "could not read Defender status");
+                Response::Error {
+                    message: format!("Defender did not answer: {error}"),
+                }
+            }
+        },
+
+        Request::GetDefenderThreats => match kam_scanner::defender::threats() {
+            Ok(threats) => Response::DefenderThreats { threats },
+            Err(error) => {
+                tracing::info!(%error, "could not read Defender threat history");
+                Response::Error {
+                    message: format!("Defender's threat history could not be read: {error}"),
+                }
+            }
+        },
+
         Request::NoteUninstallLaunched { name, command } => {
             // Effect::Changed, not Observed: the machine is about to change.
             // The wording says "launched" rather than "uninstalled" because

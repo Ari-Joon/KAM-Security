@@ -23,6 +23,7 @@ tauri-build = { version = "2", features = [] }
 kam-core = { workspace = true }
 kam-ipc = { workspace = true }
 kam-quarantine = { workspace = true }
+kam-scanner = { workspace = true }
 kam-storage = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

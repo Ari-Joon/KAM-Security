@@ -200,3 +200,33 @@ export type Manifest = {
   reason: string;
   restored: boolean;
 };
+
+export type DefenderStatus = {
+  healthy: boolean | null;
+  antivirus_enabled: boolean | null;
+  realtime_protection: boolean | null;
+  behaviour_monitoring: boolean | null;
+  cloud_protection: boolean | null;
+  tamper_protection: boolean | null;
+  antivirus_signature_version: string | null;
+  engine_version: string | null;
+  signature_age_days: number | null;
+  last_quick_scan_age_days: number | null;
+  last_full_scan_age_days: number | null;
+  computer_state: number | null;
+};
+
+export type DefenderReport = {
+  status: DefenderStatus;
+  concerns: string[];
+};
+
+export type Threat = {
+  name: string;
+  severity: number | null;
+  category: number | null;
+  action: number | null;
+  status: number | null;
+  resources: string[];
+  detected_at: string | null;
+};

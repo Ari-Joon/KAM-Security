@@ -13,6 +13,7 @@ mod uninstall;
 use kam_core::audit::Record;
 use kam_ipc::{Request, Response, SystemStatus};
 use kam_quarantine::{Manifest, MoveRecord};
+use kam_scanner::{DefenderStatus, Threat};
 use kam_storage::{
     AppFootprint, Download, DownloadSummary, DuplicateGroup, DuplicateSummary, FootprintSummary,
     OrganiseSummary, Orphan, OrphanSummary, Proposal, Scan, Volume,
@@ -243,6 +244,30 @@ fn list_moves() -> Result<Vec<MoveRecord>, String> {
     }
 }
 
+#[tauri::command]
+fn defender_status() -> Result<DefenderReport, String> {
+    match kam_ipc::client::call(&Request::GetDefenderStatus).map_err(|e| e.to_string())? {
+        Response::Defender { status, concerns } => Ok(DefenderReport { status, concerns }),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DefenderReport {
+    status: DefenderStatus,
+    concerns: Vec<String>,
+}
+
+#[tauri::command]
+fn defender_threats() -> Result<Vec<Threat>, String> {
+    match kam_ipc::client::call(&Request::GetDefenderThreats).map_err(|e| e.to_string())? {
+        Response::DefenderThreats { threats } => Ok(threats),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Run an application's own uninstaller.
 ///
 /// The command comes back from the agent, having been read out of the
@@ -285,6 +310,8 @@ pub fn run() {
             scan_path,
             list_applications,
             find_duplicates,
+            defender_status,
+            defender_threats,
             find_organise_proposals,
             apply_move,
             undo_move,

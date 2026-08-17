@@ -1169,6 +1169,105 @@ select {
   font-size: 12px;
 }
 
+.settings {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+.setting {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 0;
+  border-top: 1px solid var(--border);
+}
+
+.setting:first-child {
+  border-top: none;
+}
+
+.setting-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--text-3);
+}
+
+.setting-on .setting-dot {
+  background: var(--ok);
+}
+
+.setting-off .setting-dot {
+  background: var(--danger);
+}
+
+/* Not reported is grey, never red: inventing a scary state from a value
+   Defender simply did not publish would be the worst kind of wrong. */
+.setting-unknown .setting-dot {
+  background: var(--text-3);
+}
+
+.setting-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.setting-label,
+.setting-explain {
+  display: block;
+}
+
+.setting-label {
+  font-size: 13px;
+}
+
+.setting-explain {
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-top: 1px;
+}
+
+.setting-state {
+  flex: none;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.setting-off .setting-state {
+  color: var(--danger);
+}
+
+.concerns {
+  margin: 8px 0 0;
+  padding-left: 20px;
+}
+
+.concerns li {
+  padding: 2px 0;
+}
+
+.severity-5,
+.severity-4 {
+  color: var(--danger);
+  background: rgba(244, 112, 122, 0.11);
+  border-color: rgba(244, 112, 122, 0.34);
+}
+
+.severity-2 {
+  color: var(--warn);
+  background: rgba(240, 180, 41, 0.1);
+  border-color: rgba(240, 180, 41, 0.3);
+}
+
+.severity-1,
+.severity-0 {
+  color: var(--text-2);
+  background: var(--surface-3);
+  border-color: var(--border-strong);
+}
+
 .proposals {
   list-style: none;
   margin: 12px 0 0;
