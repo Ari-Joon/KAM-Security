@@ -296,3 +296,36 @@ export type ProvenanceReport = {
   unreadable: string[];
   swept: string[];
 };
+
+/**
+ * YARA rule matching, which runs in the shell rather than the agent.
+ *
+ * `confidence` is the rule author's own claim, carried through from the rule's
+ * metadata. `informational` is a statement of fact about the file and implies
+ * no wrongdoing; the interface must not render it as an alarm.
+ */
+export type RuleConfidence = "informational" | "notable" | "strong";
+
+export type RuleMatch = {
+  rule: string;
+  category: string;
+  confidence: RuleConfidence;
+  explains: string;
+  bundled: boolean;
+  evidence: string[];
+};
+
+export type FileMatches = {
+  path: string;
+  matches: RuleMatch[];
+};
+
+export type RuleReport = {
+  matches: FileMatches[];
+  files_scanned: number;
+  skipped: string[];
+  rules_loaded: number;
+  user_rules_directory: string;
+  user_rules_loaded: number;
+  problems: string[];
+};

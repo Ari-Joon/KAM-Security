@@ -9,7 +9,8 @@ members = ["crates/*", "ui/src-tauri"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+# Raised from 1.82 by yara-x, which the scanner uses for rule matching.
+rust-version = "1.91"
 authors = ["KAM Security contributors"]
 license = "Apache-2.0"
 repository = "https://github.com/OWNER/kam-security"
@@ -24,6 +25,7 @@ kam-scanner = { path = "crates/kam-scanner", version = "0.1.0" }
 kam-firewall = { path = "crates/kam-firewall", version = "0.1.0" }
 kam-storage = { path = "crates/kam-storage", version = "0.1.0" }
 kam-quarantine = { path = "crates/kam-quarantine", version = "0.1.0" }
+kam-rules = { path = "crates/kam-rules", version = "0.1.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -58,6 +60,25 @@ windows = { version = "0.62", features = [
 ] }
 
 blake3 = "1"
+
+# A pure-Rust YARA. The C libyara would drag a build toolchain into every
+# checkout; this needs none. Default features pull in parsers for Mach-O, ELF,
+# DEX, LNK, ZIP and VirusTotal's own metadata, none of which a Windows-only tool
+# has any use for, so the set below is narrowed to what the bundled rules
+# actually reference.
+#
+# Reached only by `kam-rules`, which only the unprivileged shell links. It
+# carries wasmtime's JIT, and that does not belong in a LocalSystem service --
+# see the note in deny.toml.
+yara-x = { version = "1.19", default-features = false, features = [
+    "pe-module",
+    "hash-module",
+    "math-module",
+    "string-module",
+    "constant-folding",
+    "exact-atoms",
+    "fast-regexp",
+] }
 
 # Added at the phase that first needs them.
 # windows-service = "0.7"

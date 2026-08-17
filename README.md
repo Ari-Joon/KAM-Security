@@ -125,7 +125,7 @@ finished software.
 | 0 | Workspace, CI, tooling | Done |
 | 1 | Agent, IPC, audit log, shell | Done |
 | 2 | Storage intelligence | Done |
-| 3 | Scanner | Defender status and provenance done; YARA and VirusTotal not started |
+| 3 | Scanner | Defender status, provenance and YARA rules done; VirusTotal not started |
 | 4 | Firewall | Not started |
 | 5 | Installer, scheduler, polish | Not started |
 
@@ -141,6 +141,21 @@ both embedded signatures and the system catalogues, arrival times, download
 origin, and every place a program anchors itself to survive a reboot (Run keys
 in both hives and both registry views, services, scheduled tasks and the Startup
 folders). Sources it could not read are reported rather than silently omitted.
+
+It also matches YARA rules against those same executables — aimed not at malware,
+which Defender handles, but at the grey band Defender deliberately tolerates:
+bundled adware installers, scareware optimisers, browser hijackers, miners, and
+the fetch-and-run patterns that only exist as text. Rules carry their own
+plain-English explanation, and you can drop your own `.yar` files into
+`%ProgramData%\KAM Security\rules` to have them matched alongside.
+
+The rule engine runs in the **unprivileged shell**, not in the LocalSystem
+agent. `yara-x` compiles rules to WebAssembly and executes them through a JIT,
+which does not belong inside the most privileged process in a security product.
+That split works because privilege is needed to *find* the interesting
+executables — services, scheduled tasks, both registry hives — but not to read
+them. The agent finds; the shell matches. A test in the agent fails the build if
+the rule engine ever creeps back across that line.
 
 ## Running it
 

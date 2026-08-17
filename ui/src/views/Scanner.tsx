@@ -5,6 +5,7 @@ import type {
   DefenderReport,
   Location,
   ProvenanceReport,
+  RuleReport,
   Signature,
   Threat,
 } from "../lib/types";
@@ -295,23 +296,66 @@ function signatureLabel(signature: Signature): string {
  */
 function Provenance() {
   const [report, setReport] = useState<ProvenanceReport | null>(null);
+  const [rules, setRules] = useState<RuleReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  const [stage, setStage] = useState<string>("");
   const [showAll, setShowAll] = useState(false);
 
   const run = useCallback(async () => {
     setRunning(true);
     setError(null);
+    setRules(null);
     try {
-      setReport(await api.provenance());
+      // The agent finds the candidates, which needs privilege. The rules then
+      // run here in the shell, which does not — see `kam-rules` for why that
+      // split is deliberate rather than incidental.
+      setStage("Looking for programs that start themselves…");
+      const survey = await api.provenance();
+      setReport(survey);
+
+      setStage("Matching rules…");
+      try {
+        setRules(await api.scanRules(survey.findings.map((f) => f.path)));
+      } catch (cause) {
+        // The rule pass is an addition, not a prerequisite. Losing it should
+        // not throw away a provenance report that already succeeded.
+        setRules({
+          matches: [],
+          files_scanned: 0,
+          skipped: [],
+          rules_loaded: 0,
+          user_rules_directory: "",
+          user_rules_loaded: 0,
+          problems: [`The rule scan did not run: ${reason(cause)}`],
+        });
+      }
     } catch (cause) {
       setError(reason(cause));
     } finally {
+      setStage("");
       setRunning(false);
     }
   }, []);
 
-  const flagged = report?.findings.filter((f) => f.attention !== "ordinary") ?? [];
+  const matchesFor = useCallback(
+    (path: string) =>
+      rules?.matches.find(
+        (entry) => entry.path.toLowerCase() === path.toLowerCase(),
+      )?.matches ?? [],
+    [rules],
+  );
+
+  // A rule match promotes a file into the list even when its provenance was
+  // unremarkable: "this is a miner" is a stronger statement than anything the
+  // provenance signals produce, and burying it under an "ordinary" badge
+  // because the file happened to be signed would be perverse.
+  const flagged =
+    report?.findings.filter(
+      (f) =>
+        f.attention !== "ordinary" ||
+        matchesFor(f.path).some((m) => m.confidence !== "informational"),
+    ) ?? [];
   const shown = showAll ? (report?.findings ?? []) : flagged;
 
   return (
@@ -322,6 +366,8 @@ function Provenance() {
           {running ? "Examining…" : report ? "Run again" : "Examine"}
         </button>
       </div>
+
+      {running && stage && <p className="empty">{stage}</p>}
 
       <p className="lede panel-lede">
         Every program that starts itself, and everything that arrived from
@@ -352,7 +398,29 @@ function Provenance() {
                 {flagged.length === 1 ? "is" : "are"} worth reading.
               </>
             )}
+            {rules && rules.rules_loaded > 0 && (
+              <>
+                {" "}
+                Matched <strong>{rules.rules_loaded}</strong> rules against{" "}
+                {rules.files_scanned} of them
+                {rules.user_rules_loaded > 0 && (
+                  <>, including {rules.user_rules_loaded} of your own</>
+                )}
+                .
+              </>
+            )}
           </div>
+
+          {rules && rules.problems.length > 0 && (
+            <div className="notice notice-warn">
+              <strong>Rules:</strong>
+              <ul className="concerns">
+                {rules.problems.map((problem) => (
+                  <li key={problem}>{problem}</li>
+                ))}
+              </ul>
+            </div>
+          )}
 
           {report.unreadable.length > 0 && (
             <div className="notice notice-warn">
@@ -392,6 +460,17 @@ function Provenance() {
                   >
                     {finding.path}
                   </button>
+
+                  {matchesFor(finding.path).map((hit) => (
+                    <div key={hit.rule} className={`rule-hit rule-${hit.confidence}`}>
+                      <div className="rule-hit-head">
+                        <span className="rule-category">{hit.category}</span>
+                        {!hit.bundled && <span className="rule-source">your rule</span>}
+                        <span className="rule-name">{hit.rule}</span>
+                      </div>
+                      <p className="rule-explains">{hit.explains}</p>
+                    </div>
+                  ))}
 
                   <ul className="finding-reasons">
                     {finding.reasons.map((why) => (
@@ -455,6 +534,19 @@ function Provenance() {
             <p className="footnote">
               Folders swept for downloaded programs: {report.swept.join(", ")}.
               Programs that start themselves were found wherever they registered.
+              {rules && rules.user_rules_directory && (
+                <>
+                  {" "}
+                  Drop your own <code>.yar</code> files in{" "}
+                  <button
+                    className="inline-path"
+                    onClick={() => void api.reveal(rules.user_rules_directory)}
+                  >
+                    {rules.user_rules_directory}
+                  </button>{" "}
+                  to have them matched too.
+                </>
+              )}
             </p>
           )}
         </>

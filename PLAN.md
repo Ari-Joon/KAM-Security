@@ -283,6 +283,27 @@ a file whose *embedded* signature is broken is never rescued by a catalogue
 entry, since that would let a tampered binary pass on the strength of a record
 for the version it no longer is.
 
+The YARA layer is built, and where it runs changed. The plan assumed it would
+sit in the agent with everything else. `yara-x` is the only pure-Rust YARA and
+it embeds wasmtime, whose 43.x line carries an advisory with no fix released for
+it; no version pairing or feature flag avoids this. Putting a JIT with a known
+unpatchable bug inside a LocalSystem service, in a product whose argument is
+that it is trustworthy, was the wrong trade. It runs in the unprivileged shell
+instead, which works because reading these files needs no privilege even though
+finding them does. A test in the agent fails the build if the rule engine ever
+crosses back.
+
+Rule quality was the other thing measurement changed. The first draft flagged
+Git three times: its installer carries the strings "randomx" and "ethash"
+somewhere in a compressed payload, and `git-lfs.exe` contains both
+"Invoke-Expression" and "DownloadFile" for entirely ordinary reasons. Short
+markers now corroborate rather than establish, and fetch-and-run text only
+counts inside a file Windows would actually execute. Identifying a program by
+strings it merely *mentions* was the same mistake in another form — Safe Exam
+Browser was called remote-access software because it carries a list of
+remote-access tools in order to block them — so that rule reads the PE version
+resource instead, which is where a file states what it is.
+
 ### Phase 4 — Firewall
 Rule management → connection table → one-click block → ETW watcher.
 

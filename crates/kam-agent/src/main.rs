@@ -193,6 +193,50 @@ fn log_path() -> kam_core::Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// The rule engine must never reach this binary.
+    ///
+    /// `kam-rules` carries a WebAssembly JIT, and the entire argument for
+    /// shipping it is that it runs in the unprivileged shell rather than here,
+    /// where this process is LocalSystem. That argument is a property of the
+    /// dependency graph, and dependency graphs drift: adding `kam-rules` to
+    /// `kam-scanner` for something that seemed convenient would quietly undo
+    /// it, with nothing to show that anything had changed.
+    ///
+    /// So it is asserted rather than trusted. This walks the manifests of the
+    /// crates in this workspace that the agent links, and fails if any of them
+    /// depends on the rule engine.
+    #[test]
+    fn the_rule_engine_never_reaches_the_privileged_agent() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates directory");
+
+        // Everything the agent links, directly or through those.
+        let linked = [
+            "kam-agent",
+            "kam-core",
+            "kam-ipc",
+            "kam-scanner",
+            "kam-storage",
+            "kam-quarantine",
+            "kam-firewall",
+        ];
+
+        for name in linked {
+            let manifest = crates.join(name).join("Cargo.toml");
+            let Ok(text) = std::fs::read_to_string(&manifest) else {
+                continue;
+            };
+            assert!(
+                !text.contains("kam-rules"),
+                "{name} depends on kam-rules, which would put a WebAssembly JIT \
+                 inside the LocalSystem service. If this is deliberate, the \
+                 reasoning in kam-rules and deny.toml no longer holds and both \
+                 must be revisited."
+            );
+        }
+    }
+
     #[test]
     fn the_service_log_sits_beside_the_service_store() {
         let log = log_path().unwrap();

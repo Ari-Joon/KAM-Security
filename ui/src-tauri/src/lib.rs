@@ -283,6 +283,29 @@ fn survey_provenance() -> Result<ProvenanceReport, String> {
     }
 }
 
+/// Match the bundled YARA rules against files the agent identified.
+///
+/// This is the one examination that happens in the shell rather than the agent,
+/// and that is deliberate: the rule engine carries a WebAssembly JIT, which has
+/// no business inside a LocalSystem service. It works here because privilege is
+/// needed to *find* these files, not to read them — see `kam-rules`.
+///
+/// The paths come from a provenance survey the agent produced moments earlier.
+/// Nothing is trusted about them beyond what this process could already do for
+/// itself: it reads files as the signed-in user, which is exactly the authority
+/// the shell already has.
+#[tauri::command]
+async fn scan_rules(paths: Vec<String>) -> Result<kam_rules::RuleReport, String> {
+    // Compiling rules and reading several hundred files takes seconds, so it
+    // runs off the interface thread rather than freezing the window.
+    tauri::async_runtime::spawn_blocking(move || {
+        let engine = kam_rules::Engine::load().map_err(|error| error.to_string())?;
+        Ok(engine.scan(&paths))
+    })
+    .await
+    .map_err(|error| format!("the rule scan did not finish: {error}"))?
+}
+
 /// Run an application's own uninstaller.
 ///
 /// The command comes back from the agent, having been read out of the
@@ -328,6 +351,7 @@ pub fn run() {
             defender_status,
             defender_threats,
             survey_provenance,
+            scan_rules,
             find_organise_proposals,
             apply_move,
             undo_move,

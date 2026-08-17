@@ -58,6 +58,49 @@ ignore = [
     { id = "RUSTSEC-2025-0081", reason = "unmaintained transitive dependency of Tauri; no safe upgrade published" },
     { id = "RUSTSEC-2025-0098", reason = "unmaintained transitive dependency of Tauri; no safe upgrade published" },
     { id = "RUSTSEC-2025-0100", reason = "unmaintained transitive dependency of Tauri; no safe upgrade published" },
+
+    # The three below all arrive through yara-x, which powers the rule matching
+    # in `kam-rules`. They are the reason that crate exists separately, and the
+    # reason it is linked only by the unprivileged shell.
+    #
+    # yara-x compiles rules to WebAssembly and runs them through wasmtime. That
+    # brings a JIT compiler, and wasmtime 43.x has a published advisory with no
+    # fixed release in its line -- the fixes landed in 24.0.12, 36.0.13, 46.0.2
+    # and 47.0.3, and yara-x 1.19 (the latest) pins 43.x. There is no version
+    # pairing and no feature flag that avoids it.
+    #
+    # This is accepted rather than ignored, on three grounds, and it should be
+    # revisited the moment yara-x moves to a fixed wasmtime:
+    #
+    #   1. It is nowhere near LocalSystem. Every other component that examines
+    #      the machine runs inside the agent; this one deliberately does not.
+    #      `kam-rules` is linked only by the shell, which holds exactly the
+    #      user's own rights, so a compromise there gains an attacker nothing
+    #      they did not already have.
+    #   2. The WebAssembly executed is compiled by yara-x from rule text, not
+    #      supplied by an attacker. The files being scanned are *data* to that
+    #      WebAssembly, never code. Reaching this bug means controlling the
+    #      rules, and the only rules loaded are the ones shipped here plus any
+    #      the user has deliberately placed in their own rules directory.
+    #   3. The advisory concerns type indices being confused *between engines*.
+    #      One engine is built per run.
+    #
+    # If any of those three stops being true, this entry must go and the
+    # feature must go with it.
+    { id = "RUSTSEC-2026-0222", reason = "wasmtime, via yara-x — no fixed release in the 43.x line; confined to the unprivileged shell, runs only rules we or the user supply" },
+
+    # `rsa` reaches the tree through yara-x's PE module, which uses it to parse
+    # Authenticode signatures. The Marvin attack recovers a *private* key from
+    # timing observed over a network. Nothing here performs a private-key
+    # operation, and nothing here is network-reachable: the only RSA work is
+    # reading a public key out of a file already sitting on the disk. No patch
+    # exists, so there is nothing to upgrade to regardless.
+    { id = "RUSTSEC-2023-0071", reason = "rsa, via yara-x PE parsing — timing sidechannel on private-key operations; this code performs none, and no fix is published" },
+
+    # Not a vulnerability. The bincode maintainers stopped work for reasons
+    # that had nothing to do with the code, and consider the last release
+    # complete.
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained by maintainer choice, not defect; transitive through yara-x" },
 ]
 
 [sources]
