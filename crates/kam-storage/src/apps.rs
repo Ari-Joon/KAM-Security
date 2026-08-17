@@ -70,6 +70,13 @@ pub struct AppFootprint {
     /// number is visible, never added to `actual_bytes`.
     pub shared_bytes: u64,
     pub locations: Vec<Location>,
+    /// Exactly what Windows would run to remove this, verbatim from the
+    /// uninstall key. `None` when the entry has none, which is common for
+    /// store apps and things installed by a package manager.
+    ///
+    /// Shown to the user before it runs. It is a command line out of the
+    /// registry, and the only honest way to present that is literally.
+    pub uninstall_command: Option<String>,
 }
 
 impl AppFootprint {
@@ -92,6 +99,7 @@ struct Installed {
     version: String,
     install_location: Option<String>,
     estimated_kilobytes: Option<u32>,
+    uninstall_command: Option<String>,
 }
 
 /// Read every uninstall key across both registry views and both hives.
@@ -149,6 +157,11 @@ fn installed() -> Vec<Installed> {
                 version: entry.string("DisplayVersion").unwrap_or_default(),
                 install_location: entry.string("InstallLocation"),
                 estimated_kilobytes: entry.dword("EstimatedSize"),
+                // The quiet form where an installer offers one: same program,
+                // same arguments, minus the wizard.
+                uninstall_command: entry
+                    .string("QuietUninstallString")
+                    .or_else(|| entry.string("UninstallString")),
                 name,
             });
         }
@@ -180,6 +193,8 @@ fn with_steam_games(mut apps: Vec<Installed>, steam: &[crate::steam::SteamApp]) 
             publisher: "Steam".to_owned(),
             version: String::new(),
             install_location: Some(game.path.clone()),
+            // Steam owns the install, so removal goes through Steam.
+            uninstall_command: Some(format!("steam://uninstall/{}", game.app_id)),
             // Steam records a SizeOnDisk, but it is the same kind of claim as
             // EstimatedSize: written by the installer about itself. Left absent
             // so the measured figure stands on its own.
@@ -484,6 +499,7 @@ pub fn footprints(index: &VolumeIndex, drive_root: &str) -> Result<Vec<AppFootpr
                 actual_bytes,
                 shared_bytes,
                 locations,
+                uninstall_command: app.uninstall_command,
             }
         })
         .collect();
@@ -618,15 +634,18 @@ mod tests {
             version: String::new(),
             install_location: None,
             estimated_kilobytes: None,
+            uninstall_command: None,
         }];
         let steam = vec![
             crate::steam::SteamApp {
                 name: "Warframe".to_owned(),
                 path: r"C:\Steam\steamapps\common\Warframe".to_owned(),
+                app_id: "230410".to_owned(),
             },
             crate::steam::SteamApp {
                 name: "Deep Rock Galactic".to_owned(),
                 path: r"C:\Steam\steamapps\common\Deep Rock Galactic".to_owned(),
+                app_id: "548430".to_owned(),
             },
         ];
 
@@ -644,6 +663,11 @@ mod tests {
             .unwrap();
         assert_eq!(added.publisher, "Steam");
         assert!(added.install_location.is_some());
+        assert_eq!(
+            added.uninstall_command.as_deref(),
+            Some("steam://uninstall/548430"),
+            "a Steam title is removed through Steam"
+        );
     }
 
     #[test]
@@ -720,6 +744,7 @@ mod tests {
             actual_bytes: 4096,
             shared_bytes: 0,
             locations: Vec::new(),
+            uninstall_command: None,
         };
         assert!(app.understatement().is_none());
 

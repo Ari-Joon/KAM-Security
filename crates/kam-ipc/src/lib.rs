@@ -69,6 +69,12 @@ pub enum Request {
     ListQuarantine,
     /// Put a quarantined item back where it came from.
     RestoreQuarantined { id: String },
+    /// Record that the shell launched an application's own uninstaller.
+    ///
+    /// The agent does not run it -- an uninstaller needs the user's desktop,
+    /// which a service does not have -- but the audit log is the record of what
+    /// happened on this machine, and this belongs in it.
+    NoteUninstallLaunched { name: String, command: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +99,8 @@ pub enum Response {
         download_summary: DownloadSummary,
     },
     Quarantined(Manifest),
+    /// Nothing to return beyond "recorded".
+    Acknowledged,
     QuarantineList {
         items: Vec<Manifest>,
     },

@@ -31,6 +31,10 @@ pub struct SteamApp {
     pub name: String,
     /// Full path to the install directory.
     pub path: String,
+    /// Steam's own identifier, taken from the manifest filename. Removing a
+    /// Steam title means asking Steam, not running an uninstaller it does not
+    /// have.
+    pub app_id: String,
 }
 
 /// Pull the quoted key and value out of a line, when it has both.
@@ -123,10 +127,17 @@ pub fn installed_games() -> Vec<SteamApp> {
                 continue;
             };
 
+            // appmanifest_730.acf -> 730
+            let app_id = name
+                .trim_start_matches("appmanifest_")
+                .trim_end_matches(".acf")
+                .to_owned();
+
             let path = steamapps.join("common").join(&directory);
             games.push(SteamApp {
                 name: title,
                 path: path.display().to_string(),
+                app_id,
             });
         }
     }
@@ -150,6 +161,16 @@ mod tests {
 	"SizeOnDisk"		"38654705664"
 }
 "#;
+
+    #[test]
+    fn the_app_id_comes_from_the_manifest_filename() {
+        let name = "appmanifest_730.acf";
+        assert_eq!(
+            name.trim_start_matches("appmanifest_")
+                .trim_end_matches(".acf"),
+            "730"
+        );
+    }
 
     #[test]
     fn a_manifest_yields_the_name_and_directory() {

@@ -163,6 +163,19 @@ pub fn handle(request: Request, context: &Context) -> Response {
             }
         }
 
+        Request::NoteUninstallLaunched { name, command } => {
+            // Effect::Changed, not Observed: the machine is about to change.
+            // The wording says "launched" rather than "uninstalled" because
+            // whether the user goes through with it is not knowable from here.
+            context.audit(
+                "applications",
+                "launch_uninstaller",
+                Effect::Changed,
+                format!("launched the uninstaller for {name}: {command}"),
+            );
+            Response::Acknowledged
+        }
+
         Request::QuarantinePath { path, reason } => quarantine_path(&path, &reason, context),
 
         Request::ListQuarantine => match context.quarantine.list() {

@@ -8,6 +8,8 @@
 //! Nothing in this process is privileged. It runs as the desktop user and gets
 //! served only because it is installed alongside the agent.
 
+mod uninstall;
+
 use kam_core::audit::Record;
 use kam_ipc::{Request, Response, SystemStatus};
 use kam_quarantine::Manifest;
@@ -173,6 +175,30 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Run an application's own uninstaller.
+///
+/// The command comes back from the agent, having been read out of the
+/// uninstall key, and is shown to the user before this is called. It runs here
+/// rather than in the agent because an uninstaller needs a desktop to put its
+/// window on, and a LocalSystem service does not have one.
+///
+/// The audit entry is written first. If the launch then fails the log says an
+/// uninstaller was started when it was not, which is a smaller lie than the
+/// reverse -- an application removed with no record of who removed it.
+#[tauri::command]
+fn run_uninstaller(name: String, command: String) -> Result<(), String> {
+    let noted = kam_ipc::client::call(&Request::NoteUninstallLaunched {
+        name,
+        command: command.clone(),
+    });
+    if let Err(error) = noted {
+        // Not fatal. Refusing to uninstall because the log is unreachable
+        // would be the audit trail holding the machine hostage.
+        eprintln!("could not record the uninstall in the audit log: {error}");
+    }
+    uninstall::run(&command)
+}
+
 /// Version of the protocol this build speaks, so the UI can say plainly when it
 /// and the agent disagree rather than silently mis-rendering.
 #[tauri::command]
@@ -194,6 +220,7 @@ pub fn run() {
             list_quarantine,
             restore_quarantined,
             reveal_in_explorer,
+            run_uninstaller,
             protocol_version
         ])
         .run(tauri::generate_context!())

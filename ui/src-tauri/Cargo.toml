@@ -27,6 +27,7 @@ kam-storage = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { version = "2", features = [] }
+windows = { workspace = true }
 tauri-plugin-opener = "2"
 
 [lints]

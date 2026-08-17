@@ -15,9 +15,11 @@ const KIND_LABEL: Record<string, string> = {
 function Row({
   app,
   onReveal,
+  onUninstall,
 }: {
   app: AppFootprint;
   onReveal: (path: string) => void;
+  onUninstall: (app: AppFootprint) => void;
 }) {
   const [open, setOpen] = useState(false);
   // Zero measured bytes and zero directories found are different claims. The
@@ -58,7 +60,25 @@ function Row({
       </button>
 
       {open && (
-        <ul className="app-locations">
+        <>
+          <div className="app-actions">
+            {app.uninstall_command ? (
+              <>
+                <button onClick={() => onUninstall(app)}>Uninstall…</button>
+                <span className="muted">
+                  Runs this application's own uninstaller. Nothing here removes
+                  files itself.
+                </span>
+              </>
+            ) : (
+              <span className="muted">
+                This application publishes no uninstall command, so there is
+                nothing to run. Store apps and package-manager installs are
+                usually removed through whatever installed them.
+              </span>
+            )}
+          </div>
+          <ul className="app-locations">
           {notFound && (
             <li className="app-location-empty">
               No directories for this application were found on this drive. It
@@ -88,9 +108,56 @@ function Row({
               )}
             </li>
           ))}
-        </ul>
+          </ul>
+        </>
       )}
     </li>
+  );
+}
+
+/**
+ * Confirmation before an uninstaller runs.
+ *
+ * It shows the command verbatim. That string came out of the registry, written
+ * by whoever built the installer, and the user is about to run it as
+ * themselves — paraphrasing it would be hiding the only thing worth checking.
+ */
+function ConfirmUninstall({
+  app,
+  onCancel,
+  onConfirm,
+}: {
+  app: AppFootprint;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="modal-ground" onClick={onCancel}>
+      <div className="modal" onClick={(event) => event.stopPropagation()}>
+        <h2>Uninstall {app.name}?</h2>
+        <p className="muted">
+          This hands over to the application's own uninstaller — KAM Security
+          does not delete anything itself, and cannot undo what that uninstaller
+          does. It may ask for administrator rights, and it may leave data
+          behind, which Cleanup can find afterwards.
+        </p>
+        <p className="modal-label">The command that will run</p>
+        <pre className="command">{app.uninstall_command}</pre>
+        {app.actual_bytes > 0 && (
+          <p className="muted">
+            {fmt.bytes(app.actual_bytes)} measured across{" "}
+            {app.locations.length} location
+            {app.locations.length === 1 ? "" : "s"}.
+          </p>
+        )}
+        <div className="modal-actions">
+          <button onClick={onCancel}>Cancel</button>
+          <button className="primary" onClick={onConfirm}>
+            Run the uninstaller
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -99,6 +166,24 @@ export default function Applications({ volumes, onMeasured }: Props) {
   const [report, setReport] = useState<ApplicationReport | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<AppFootprint | null>(null);
+
+  async function uninstall(app: AppFootprint) {
+    setConfirming(null);
+    setError(null);
+    try {
+      await api.uninstall(app.name, app.uninstall_command ?? "");
+      setNote(
+        `Started the uninstaller for ${app.name}. When it has finished, ` +
+          `measure again to see what was actually reclaimed.`,
+      );
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
+      onMeasured();
+    }
+  }
 
   async function reveal(path: string) {
     try {
@@ -161,6 +246,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
         </div>
 
         {error && <pre className="error">{error}</pre>}
+        {note && <div className="notice notice-ok">{note}</div>}
 
         {summary && (
           <div className="stat-row tight">
@@ -211,10 +297,19 @@ export default function Applications({ volumes, onMeasured }: Props) {
                 key={`${app.name}-${app.version}`}
                 app={app}
                 onReveal={(path) => void reveal(path)}
+                onUninstall={setConfirming}
               />
             ))}
           </ul>
         </section>
+      )}
+
+      {confirming && (
+        <ConfirmUninstall
+          app={confirming}
+          onCancel={() => setConfirming(null)}
+          onConfirm={() => void uninstall(confirming)}
+        />
       )}
 
       {!report && !running && !error && (
