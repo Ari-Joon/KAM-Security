@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ApplicationReport,
+  DuplicateReport,
   Manifest,
   AuditRecord,
   Scan,
@@ -22,6 +23,8 @@ export const api = {
   scan: (path: string) => invoke<Scan>("scan_path", { path }),
   applications: (drive: string) =>
     invoke<ApplicationReport>("list_applications", { drive }),
+  duplicates: (drive: string) =>
+    invoke<DuplicateReport>("find_duplicates", { drive }),
   quarantine: (path: string, reason: string) =>
     invoke<Manifest>("quarantine_path", { path, reason }),
   quarantineList: () => invoke<Manifest[]>("list_quarantine"),

@@ -6,6 +6,8 @@ import type {
   Confidence,
   Download,
   DownloadSummary,
+  DuplicateGroup,
+  DuplicateSummary,
   Manifest,
   Orphan,
   OrphanSummary,
@@ -69,6 +71,9 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const [summary, setSummary] = useState<OrphanSummary | null>(null);
   const [downloads, setDownloads] = useState<Download[] | null>(null);
   const [downloadSummary, setDownloadSummary] = useState<DownloadSummary | null>(null);
+  const [duplicates, setDuplicates] = useState<DuplicateGroup[] | null>(null);
+  const [duplicateSummary, setDuplicateSummary] = useState<DuplicateSummary | null>(null);
+  const [findingDuplicates, setFindingDuplicates] = useState(false);
   const [held, setHeld] = useState<Manifest[]>([]);
   const [running, setRunning] = useState(false);
   const [busyPath, setBusyPath] = useState<string | null>(null);
@@ -103,6 +108,22 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       setDownloads(null);
     } finally {
       setRunning(false);
+      onChanged();
+    }
+  }
+
+  async function findDuplicates() {
+    setFindingDuplicates(true);
+    setError(null);
+    try {
+      const report = await api.duplicates(drive);
+      setDuplicates(report.groups);
+      setDuplicateSummary(report.summary);
+    } catch (cause) {
+      setError(reason(cause));
+      setDuplicates(null);
+    } finally {
+      setFindingDuplicates(false);
       onChanged();
     }
   }
@@ -182,6 +203,13 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             come from the internet, with the site they came from and when they
             arrived. Nothing here is a suggestion to delete; it is a list of
             things you may have forgotten you kept.
+          </li>
+          <li>
+            <strong>Duplicates</strong> are files that are byte-for-byte
+            identical. Finding them reads file contents rather than the
+            filesystem's index, so it has its own button. Copies inside an
+            application's own folder are usually there on purpose — this only
+            reports them.
           </li>
           <li>
             <strong>Quarantine</strong> is where anything you act on goes. Items
@@ -313,6 +341,78 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           )}
         </section>
       )}
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Identical copies</h2>
+          <button onClick={() => void findDuplicates()} disabled={findingDuplicates}>
+            {findingDuplicates ? "Comparing…" : "Find duplicates"}
+          </button>
+        </div>
+        <p className="muted">
+          Compared by size, then by their first 64 KB, then in full — so
+          "duplicate" means every byte, not a guess. Nothing here is removed for
+          you; several copies of a file are often deliberate.
+        </p>
+
+        {duplicateSummary && (
+          <div className="stat-row tight">
+            <div className="stat">
+              <span className="stat-label">Sets</span>
+              <span className="stat-value">{fmt.count(duplicateSummary.groups)}</span>
+            </div>
+            <div className="stat">
+              <span className="stat-label">Wasted</span>
+              <span className="stat-value">
+                {fmt.bytes(duplicateSummary.wasted_bytes)}
+              </span>
+            </div>
+            <div className="stat">
+              <span className="stat-label">Read in full</span>
+              <span className="stat-value">
+                {fmt.count(duplicateSummary.fully_hashed)}
+              </span>
+            </div>
+            <div className="stat">
+              <span className="stat-label">Took</span>
+              <span className="stat-value">
+                {fmt.duration(duplicateSummary.elapsed_ms)}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {duplicates && duplicates.length === 0 && (
+          <p className="empty">No identical files over 8 MB.</p>
+        )}
+
+        {duplicates && duplicates.length > 0 && (
+          <ul className="dupes">
+            {duplicates.slice(0, 25).map((group) => (
+              <li key={group.paths[0]} className="dupe">
+                <div className="dupe-head">
+                  <span className="dupe-count">
+                    {group.paths.length} copies of {fmt.bytes(group.bytes)}
+                  </span>
+                  <span className="dupe-waste">
+                    {fmt.bytes(group.wasted_bytes)} wasted
+                  </span>
+                </div>
+                <ul className="files">
+                  {group.paths.map((path) => (
+                    <FileRow
+                      key={path}
+                      path={path}
+                      bytes={group.bytes}
+                      onReveal={(target) => void reveal(target)}
+                    />
+                  ))}
+                </ul>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       <section className="panel">
         <div className="panel-head">

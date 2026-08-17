@@ -20,6 +20,7 @@
 //! directory walking.
 
 pub mod apps;
+pub mod duplicates;
 pub mod index;
 pub mod mft;
 pub mod orphans;
@@ -30,6 +31,7 @@ pub mod steam;
 pub mod volumes;
 
 pub use apps::{AppFootprint, FootprintSummary};
+pub use duplicates::{DuplicateGroup, DuplicateSummary};
 pub use index::VolumeIndex;
 pub use orphans::{Confidence, Orphan, OrphanSummary};
 pub use provenance::{Download, DownloadSummary};

@@ -778,6 +778,34 @@ mod tests {
 
         let gb = |bytes: u64| bytes as f64 / 1024.0 / 1024.0 / 1024.0;
 
+        let (dupes, dsum) = crate::duplicates::find(&index, "C:");
+        println!(
+            "
+DUPLICATES: {} sets wasting {:.1} GB | {} files sized, {} heads read, {} read whole | {} ms{}",
+            dsum.groups,
+            gb(dsum.wasted_bytes),
+            dsum.examined,
+            dsum.head_hashed,
+            dsum.fully_hashed,
+            dsum.elapsed_ms,
+            if dsum.truncated {
+                " (hit the read ceiling)"
+            } else {
+                ""
+            }
+        );
+        for group in dupes.iter().take(8) {
+            println!(
+                "  {:>7.2} GB wasted, {} copies of {:.2} GB:",
+                gb(group.wasted_bytes),
+                group.paths.len(),
+                gb(group.bytes)
+            );
+            for path in group.paths.iter().take(3) {
+                println!("       {path}");
+            }
+        }
+
         let (downloads, download_summary) = crate::provenance::find(&index, "C:", now);
         println!(
             "\nDOWNLOADS: {} of {} large files carry a download record, {:.1} GB (last-access tracked: {})",

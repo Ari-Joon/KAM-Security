@@ -49,9 +49,10 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+blake3 = "1"
+
 # Added at the phase that first needs them.
 # windows-service = "0.7"
-# blake3 = "1"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -96,6 +96,27 @@ export type DownloadSummary = {
   examined: number;
 };
 
+export type DuplicateGroup = {
+  bytes: number;
+  wasted_bytes: number;
+  paths: string[];
+};
+
+export type DuplicateSummary = {
+  groups: number;
+  wasted_bytes: number;
+  examined: number;
+  head_hashed: number;
+  fully_hashed: number;
+  elapsed_ms: number;
+  truncated: boolean;
+};
+
+export type DuplicateReport = {
+  groups: DuplicateGroup[];
+  summary: DuplicateSummary;
+};
+
 export type ApplicationReport = {
   apps: AppFootprint[];
   summary: FootprintSummary;

@@ -1169,6 +1169,43 @@ select {
   font-size: 12px;
 }
 
+.dupes {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+}
+
+.dupe {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  background: var(--surface-2);
+}
+
+.dupe-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.dupe-count {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.dupe-waste {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--warn);
+  font-variant-numeric: tabular-nums;
+}
+
+.dupe .files {
+  margin-top: 6px;
+}
+
 .held {
   display: flex;
   align-items: center;

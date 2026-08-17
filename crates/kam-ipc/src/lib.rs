@@ -14,7 +14,8 @@ pub mod pipe;
 use kam_core::audit::Record;
 use kam_quarantine::Manifest;
 use kam_storage::{
-    AppFootprint, Download, DownloadSummary, FootprintSummary, Orphan, OrphanSummary, Scan, Volume,
+    AppFootprint, Download, DownloadSummary, DuplicateGroup, DuplicateSummary, FootprintSummary,
+    Orphan, OrphanSummary, Scan, Volume,
 };
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +70,11 @@ pub enum Request {
     ListQuarantine,
     /// Put a quarantined item back where it came from.
     RestoreQuarantined { id: String },
+    /// Find byte-for-byte duplicate files on `drive`.
+    ///
+    /// Separate from the survey because it reads file contents rather than the
+    /// master file table, and takes tens of seconds rather than three.
+    FindDuplicates { drive: String },
     /// Record that the shell launched an application's own uninstaller.
     ///
     /// The agent does not run it -- an uninstaller needs the user's desktop,
@@ -97,6 +103,10 @@ pub enum Response {
         orphan_summary: OrphanSummary,
         downloads: Vec<Download>,
         download_summary: DownloadSummary,
+    },
+    Duplicates {
+        groups: Vec<DuplicateGroup>,
+        summary: DuplicateSummary,
     },
     Quarantined(Manifest),
     /// Nothing to return beyond "recorded".

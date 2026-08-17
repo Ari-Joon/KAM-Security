@@ -14,7 +14,8 @@ use kam_core::audit::Record;
 use kam_ipc::{Request, Response, SystemStatus};
 use kam_quarantine::Manifest;
 use kam_storage::{
-    AppFootprint, Download, DownloadSummary, FootprintSummary, Orphan, OrphanSummary, Scan, Volume,
+    AppFootprint, Download, DownloadSummary, DuplicateGroup, DuplicateSummary, FootprintSummary,
+    Orphan, OrphanSummary, Scan, Volume,
 };
 
 /// Turn a response into the value a command promised, or a message for the UI.
@@ -105,6 +106,27 @@ struct ApplicationReport {
     orphan_summary: OrphanSummary,
     downloads: Vec<Download>,
     download_summary: DownloadSummary,
+}
+
+/// Byte-for-byte duplicate files.
+///
+/// Its own command rather than part of the survey: this one reads file
+/// contents, so it takes tens of seconds where everything else takes three.
+#[tauri::command]
+fn find_duplicates(drive: String) -> Result<DuplicateReport, String> {
+    match kam_ipc::client::call(&Request::FindDuplicates { drive })
+        .map_err(|error| error.to_string())?
+    {
+        Response::Duplicates { groups, summary } => Ok(DuplicateReport { groups, summary }),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DuplicateReport {
+    groups: Vec<DuplicateGroup>,
+    summary: DuplicateSummary,
 }
 
 /// Move a leftover directory into quarantine.
@@ -216,6 +238,7 @@ pub fn run() {
             list_volumes,
             scan_path,
             list_applications,
+            find_duplicates,
             quarantine_path,
             list_quarantine,
             restore_quarantined,

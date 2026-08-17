@@ -163,6 +163,40 @@ pub fn handle(request: Request, context: &Context) -> Response {
             }
         }
 
+        Request::FindDuplicates { drive } => {
+            let Some(letter) = drive.chars().next().filter(|c| c.is_ascii_alphabetic()) else {
+                return Response::Error {
+                    message: "give a drive letter, such as C:".to_owned(),
+                };
+            };
+
+            match kam_storage::duplicates::survey(letter.to_ascii_uppercase()) {
+                Ok((groups, summary)) => {
+                    context.audit(
+                        "storage",
+                        "find_duplicates",
+                        Effect::Observed,
+                        format!(
+                            "found {} duplicate sets on {letter}: wasting {}, reading {} files in full",
+                            summary.groups,
+                            human_bytes(summary.wasted_bytes),
+                            summary.fully_hashed
+                        ),
+                    );
+                    Response::Duplicates { groups, summary }
+                }
+                Err(error) => {
+                    tracing::info!(%error, "could not look for duplicates");
+                    Response::Error {
+                        message: format!(
+                            "duplicate detection needs the master file table, which the \
+                             agent could not read: {error}"
+                        ),
+                    }
+                }
+            }
+        }
+
         Request::NoteUninstallLaunched { name, command } => {
             // Effect::Changed, not Observed: the machine is about to change.
             // The wording says "launched" rather than "uninstalled" because
