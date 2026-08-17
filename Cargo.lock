@@ -2687,6 +2687,7 @@ dependencies = [
  "kam-rules",
  "kam-scanner",
  "kam-storage",
+ "kam-virustotal",
  "serde",
  "serde_json",
  "tauri",
@@ -2702,6 +2703,18 @@ dependencies = [
  "blake3",
  "kam-core",
  "serde",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "kam-virustotal"
+version = "0.1.0"
+dependencies = [
+ "kam-core",
+ "serde",
+ "serde_json",
+ "sha2",
  "tracing",
  "windows 0.62.2",
 ]

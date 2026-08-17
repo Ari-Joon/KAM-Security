@@ -13,6 +13,7 @@ import type {
   Volume,
   ProvenanceReport,
   RuleReport,
+  Verdict,
 } from "./types";
 
 /**
@@ -35,6 +36,9 @@ export const api = {
   defenderThreats: () => invoke<Threat[]>("defender_threats"),
   provenance: () => invoke<ProvenanceReport>("survey_provenance"),
   scanRules: (paths: string[]) => invoke<RuleReport>("scan_rules", { paths }),
+  virustotalKeyPresent: () => invoke<boolean>("virustotal_key_present"),
+  setVirustotalKey: (key: string) => invoke<boolean>("set_virustotal_key", { key }),
+  virustotalLookup: (path: string) => invoke<Verdict>("virustotal_lookup", { path }),
   organise: (drive: string) =>
     invoke<OrganiseReport>("find_organise_proposals", { drive }),
   applyMove: (from: string, to: string) =>

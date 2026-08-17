@@ -304,6 +304,25 @@ Browser was called remote-access software because it carries a list of
 remote-access tools in order to block them — so that rule reads the PE version
 resource instead, which is where a file states what it is.
 
+VirusTotal lookups follow the same placement as the rules and for a related
+reason: outbound network requests and a stored credential have no business in a
+LocalSystem service either. The agent guard test covers both crates now.
+
+Two decisions there are worth recording. Hash lookups only, never uploads —
+uploading someone's file publishes its contents irrevocably to anyone with a
+VirusTotal account, and there is deliberately no code in the crate that could
+do it. And WinHTTP rather than a bundled HTTP and TLS stack: it is one GET
+against one host, the operating system already validates certificates against
+the machine's trust store and honours the system proxy, and a bundled root list
+would silently override an administrator who had distrusted a certificate
+authority.
+
+The hardest part was not the transport but the wording. "6 of 70 engines
+flagged this" is the number people read as a verdict, and it is not one — low
+single-digit counts are overwhelmingly false positives. The interpretation
+lives in Rust with tests on the sentences it produces, so the interface cannot
+recompute a scarier reading from the same numbers.
+
 ### Phase 4 — Firewall
 Rule management → connection table → one-click block → ETW watcher.
 

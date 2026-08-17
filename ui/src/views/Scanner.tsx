@@ -7,6 +7,7 @@ import type {
   ProvenanceReport,
   RuleReport,
   Signature,
+  Verdict,
   Threat,
 } from "../lib/types";
 
@@ -256,6 +257,153 @@ export default function Scanner() {
   );
 }
 
+/**
+ * A VirusTotal lookup for one file, on request.
+ *
+ * Deliberately per-file and never automatic. It reaches a third party, and
+ * although only a hash crosses the network, telling an external service which
+ * files sit on someone's machine is their decision to make each time — not a
+ * background behaviour they have to discover.
+ */
+function VirusTotal({ path, hasKey }: { path: string; hasKey: boolean }) {
+  const [verdict, setVerdict] = useState<Verdict | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [looking, setLooking] = useState(false);
+
+  if (!hasKey) return null;
+
+  const look = async () => {
+    setLooking(true);
+    setError(null);
+    try {
+      setVerdict(await api.virustotalLookup(path));
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
+      setLooking(false);
+    }
+  };
+
+  return (
+    <div className="vt">
+      {!verdict && !error && (
+        <button className="link-button" onClick={() => void look()} disabled={looking}>
+          {looking ? "Asking VirusTotal…" : "Ask VirusTotal about this file"}
+        </button>
+      )}
+
+      {error && (
+        <p className="vt-error">
+          {error}{" "}
+          <button className="link-button" onClick={() => void look()}>
+            Try again
+          </button>
+        </p>
+      )}
+
+      {verdict && (
+        <div className={`vt-result vt-${verdict.standing}`}>
+          <div className="vt-head">
+            <span className="vt-score">
+              {verdict.engines > 0
+                ? `${verdict.malicious + verdict.suspicious} of ${verdict.engines}`
+                : "no record"}
+            </span>
+            <span className="vt-standing">
+              {verdict.standing === "clean"
+                ? "nothing flagged it"
+                : verdict.standing === "not_known"
+                  ? "not known to VirusTotal"
+                  : verdict.standing === "isolated"
+                    ? "a few engines flagged it"
+                    : "many engines flagged it"}
+            </span>
+          </div>
+
+          {/* The agent's sentence, not one computed here from the counts. */}
+          <p className="vt-summary">{verdict.summary}</p>
+
+          {verdict.detections.length > 0 && (
+            <ul className="vt-detections">
+              {verdict.detections.map((d) => (
+                <li key={d.engine}>
+                  <span className="vt-engine">{d.engine}</span>
+                  <span className="vt-verdict">{d.verdict}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <div className="vt-facts">
+            {verdict.common_name && <span>usually called {verdict.common_name}</span>}
+            {verdict.first_seen && <span>first seen {verdict.first_seen}</span>}
+            {verdict.last_analysed && <span>last analysed {verdict.last_analysed}</span>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Storing the user's own VirusTotal key. */
+function VirusTotalKey({ hasKey, onChange }: { hasKey: boolean; onChange: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const save = async (key: string) => {
+    setError(null);
+    try {
+      await api.setVirustotalKey(key);
+      setValue("");
+      setEditing(false);
+      onChange();
+    } catch (cause) {
+      setError(reason(cause));
+    }
+  };
+
+  return (
+    <div className="vt-key">
+      {hasKey ? (
+        <p className="footnote">
+          A VirusTotal key is stored, encrypted under your Windows account.{" "}
+          <button className="link-button" onClick={() => void save("")}>
+            Remove it
+          </button>
+        </p>
+      ) : editing ? (
+        <div className="vt-key-form">
+          <input
+            type="password"
+            className="vt-key-input"
+            placeholder="Paste your VirusTotal API key"
+            value={value}
+            onChange={(event) => setValue(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void save(value);
+            }}
+          />
+          <button onClick={() => void save(value)}>Save</button>
+          <button className="link-button" onClick={() => setEditing(false)}>
+            Cancel
+          </button>
+          {error && <p className="vt-error">{error}</p>}
+        </div>
+      ) : (
+        <p className="footnote">
+          With a free VirusTotal API key you can ask about individual files.
+          Only the file's <strong>hash</strong> is sent — never the file itself.
+          The key is stored encrypted under your Windows account.{" "}
+          <button className="link-button" onClick={() => setEditing(true)}>
+            Add a key
+          </button>
+        </p>
+      )}
+    </div>
+  );
+}
+
 const ANCHOR_LABELS: Record<Anchor, string> = {
   run_key: "a sign-in entry",
   run_once_key: "a run-once entry",
@@ -301,6 +449,15 @@ function Provenance() {
   const [running, setRunning] = useState(false);
   const [stage, setStage] = useState<string>("");
   const [showAll, setShowAll] = useState(false);
+  const [hasKey, setHasKey] = useState(false);
+
+  const refreshKey = useCallback(() => {
+    void api.virustotalKeyPresent().then(setHasKey).catch(() => setHasKey(false));
+  }, []);
+
+  useEffect(() => {
+    refreshKey();
+  }, [refreshKey]);
 
   const run = useCallback(async () => {
     setRunning(true);
@@ -507,6 +664,8 @@ function Provenance() {
                     )}
                   </dl>
 
+                  <VirusTotal path={finding.path} hasKey={hasKey} />
+
                   {finding.persistence.length > 0 && (
                     <ul className="finding-anchors">
                       {finding.persistence.map((entry, index) => (
@@ -529,6 +688,8 @@ function Provenance() {
                 : `Show all ${report.findings.length} examined`}
             </button>
           )}
+
+          <VirusTotalKey hasKey={hasKey} onChange={refreshKey} />
 
           {report.swept.length > 0 && (
             <p className="footnote">

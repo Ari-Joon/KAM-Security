@@ -24,6 +24,7 @@ kam-ipc = { path = "crates/kam-ipc", version = "0.1.0" }
 kam-scanner = { path = "crates/kam-scanner", version = "0.1.0" }
 kam-firewall = { path = "crates/kam-firewall", version = "0.1.0" }
 kam-storage = { path = "crates/kam-storage", version = "0.1.0" }
+kam-virustotal = { path = "crates/kam-virustotal", version = "0.1.0" }
 kam-quarantine = { path = "crates/kam-quarantine", version = "0.1.0" }
 kam-rules = { path = "crates/kam-rules", version = "0.1.0" }
 
@@ -38,6 +39,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Networking_WinHttp",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
@@ -60,6 +62,9 @@ windows = { version = "0.62", features = [
 ] }
 
 blake3 = "1"
+
+# VirusTotal indexes files by SHA-256, so blake3 cannot serve here.
+sha2 = "0.10"
 
 # A pure-Rust YARA. The C libyara would drag a build toolchain into every
 # checkout; this needs none. Default features pull in parsers for Mach-O, ELF,

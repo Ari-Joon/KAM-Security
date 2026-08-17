@@ -193,23 +193,25 @@ fn log_path() -> kam_core::Result<PathBuf> {
 mod tests {
     use super::*;
 
-    /// The rule engine must never reach this binary.
+    /// Neither the rule engine nor the VirusTotal client may reach this
+    /// binary.
     ///
-    /// `kam-rules` carries a WebAssembly JIT, and the entire argument for
-    /// shipping it is that it runs in the unprivileged shell rather than here,
-    /// where this process is LocalSystem. That argument is a property of the
-    /// dependency graph, and dependency graphs drift: adding `kam-rules` to
-    /// `kam-scanner` for something that seemed convenient would quietly undo
-    /// it, with nothing to show that anything had changed.
+    /// `kam-rules` carries a WebAssembly JIT. `kam-virustotal` makes outbound
+    /// network requests and holds a credential. The argument for shipping
+    /// either is that it runs in the unprivileged shell rather than here,
+    /// where this process is LocalSystem: a JIT with a known unpatchable bug,
+    /// and a socket to the public internet, are the last two things that
+    /// belong in the most privileged process in a security product.
     ///
-    /// So it is asserted rather than trusted. This walks the manifests of the
-    /// crates in this workspace that the agent links, and fails if any of them
-    /// depends on the rule engine.
+    /// That argument is a property of the dependency graph, and dependency
+    /// graphs drift. Adding either to `kam-scanner` for something that seemed
+    /// convenient would quietly undo it, with nothing to show that anything
+    /// had changed — so it is asserted rather than trusted.
     #[test]
     fn the_rule_engine_never_reaches_the_privileged_agent() {
-        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("crates directory");
+        let Some(crates) = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent() else {
+            panic!("the agent crate should sit inside a crates directory");
+        };
 
         // Everything the agent links, directly or through those.
         let linked = [

@@ -125,7 +125,7 @@ finished software.
 | 0 | Workspace, CI, tooling | Done |
 | 1 | Agent, IPC, audit log, shell | Done |
 | 2 | Storage intelligence | Done |
-| 3 | Scanner | Defender status, provenance and YARA rules done; VirusTotal not started |
+| 3 | Scanner | Defender status, provenance, YARA rules and VirusTotal done; scan progress not started |
 | 4 | Firewall | Not started |
 | 5 | Installer, scheduler, polish | Not started |
 
@@ -156,6 +156,19 @@ That split works because privilege is needed to *find* the interesting
 executables — services, scheduled tasks, both registry hives — but not to read
 them. The agent finds; the shell matches. A test in the agent fails the build if
 the rule engine ever creeps back across that line.
+
+With a free VirusTotal API key you can also ask about an individual file. Only
+the file's SHA-256 is sent; the file itself is never uploaded, and there is no
+code in the project that could upload it. Every lookup is one deliberate click
+on one file — nothing runs in bulk or in the background, because telling a third
+party which files sit on your machine is a decision to make each time rather
+than a behaviour to discover. The key is yours, stored encrypted under your
+Windows account with DPAPI, and none ships with the product.
+
+Results are reported as "N of M engines", never as a bare count. A handful of
+detections against a large majority is the everyday signature of a false
+positive, and the interface says so in as many words rather than colouring it
+red.
 
 ## Running it
 

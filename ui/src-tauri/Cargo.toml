@@ -26,6 +26,7 @@ kam-quarantine = { workspace = true }
 kam-rules = { workspace = true }
 kam-scanner = { workspace = true }
 kam-storage = { workspace = true }
+kam-virustotal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { version = "2", features = [] }

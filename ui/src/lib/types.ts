@@ -329,3 +329,36 @@ export type RuleReport = {
   user_rules_loaded: number;
   problems: string[];
 };
+
+/**
+ * A VirusTotal lookup.
+ *
+ * `summary` is written by the agent-side code and is the sentence to show. The
+ * interface must not compute its own reading of the counts: a handful of
+ * detections out of seventy is the ordinary signature of a false positive, and
+ * rendering "3 threats found!" from those numbers would be the exact dishonesty
+ * this product exists to avoid.
+ */
+export type Standing = "clean" | "not_known" | "isolated" | "substantial";
+
+export type Detection = {
+  engine: string;
+  verdict: string;
+};
+
+export type Verdict = {
+  sha256: string;
+  standing: Standing;
+  malicious: number;
+  suspicious: number;
+  harmless: number;
+  undetected: number;
+  engines: number;
+  detections: Detection[];
+  reputation: number | null;
+  first_seen: string | null;
+  last_analysed: string | null;
+  common_name: string | null;
+  permalink: string;
+  summary: string;
+};

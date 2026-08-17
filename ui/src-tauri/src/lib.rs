@@ -306,6 +306,44 @@ async fn scan_rules(paths: Vec<String>) -> Result<kam_rules::RuleReport, String>
     .map_err(|error| format!("the rule scan did not finish: {error}"))?
 }
 
+/// Whether a VirusTotal key has been stored, without revealing it.
+///
+/// The key is never sent back to the interface. There is no command that
+/// returns it, and there should not be: the interface only ever needs to know
+/// whether to show the box.
+#[tauri::command]
+fn virustotal_key_present() -> bool {
+    kam_virustotal::key::is_present()
+}
+
+/// Store, replace, or (with an empty string) forget the VirusTotal key.
+#[tauri::command]
+fn set_virustotal_key(key: String) -> Result<bool, String> {
+    kam_virustotal::key::store(&key).map_err(|error| error.to_string())?;
+    Ok(kam_virustotal::key::is_present())
+}
+
+/// Ask VirusTotal about one file.
+///
+/// One file, on an explicit request. Never in bulk and never automatically:
+/// this reaches a third party, and a free key allows four lookups a minute in
+/// any case.
+///
+/// What crosses the network is the file's SHA-256 and nothing else. The file
+/// is not uploaded — there is no code in `kam-virustotal` that could upload it
+/// — because publishing someone's file to a third party is irreversible and is
+/// not a thing to do on their behalf.
+#[tauri::command]
+async fn virustotal_lookup(path: String) -> Result<kam_virustotal::Verdict, String> {
+    // Hashing reads the whole file and the request waits on the network, so
+    // neither belongs on the interface thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        kam_virustotal::look_up_file(&path).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("the lookup did not finish: {error}"))?
+}
+
 /// Run an application's own uninstaller.
 ///
 /// The command comes back from the agent, having been read out of the
@@ -352,6 +390,9 @@ pub fn run() {
             defender_threats,
             survey_provenance,
             scan_rules,
+            virustotal_key_present,
+            set_virustotal_key,
+            virustotal_lookup,
             find_organise_proposals,
             apply_move,
             undo_move,
