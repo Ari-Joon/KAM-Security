@@ -65,6 +65,22 @@ impl Manifest {
     }
 }
 
+/// One file moved from where it was to where it now is.
+///
+/// Quarantine takes something out of use; this puts it somewhere better. Both
+/// are renames within a volume and both must be undoable, so they share a store
+/// and differ only in where the destination is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveRecord {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub bytes: u64,
+    pub moved_at: u64,
+    #[serde(default)]
+    pub undone: bool,
+}
+
 #[derive(Debug)]
 pub struct Store {
     root: PathBuf,
@@ -245,6 +261,134 @@ impl Store {
         Ok(items)
     }
 
+    fn moves_directory(&self) -> PathBuf {
+        self.root.join("moves")
+    }
+
+    /// Move a file, recording how to put it back.
+    ///
+    /// Refuses to overwrite: if something already sits at the destination, the
+    /// move is abandoned rather than resolved by guessing which the user wanted.
+    pub fn move_file(&self, from: &Path, to: &Path, bytes: u64) -> Result<MoveRecord> {
+        let metadata = fs::symlink_metadata(from).map_err(|error| {
+            Error::Refused(format!("{} cannot be read: {error}", from.display()))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(Error::Refused(format!(
+                "{} is a link; moving it would move the link and not the file",
+                from.display()
+            )));
+        }
+        if !metadata.is_file() {
+            return Err(Error::Refused(format!("{} is not a file", from.display())));
+        }
+        if to.exists() {
+            return Err(Error::Refused(format!(
+                "{} already exists; moving would overwrite it",
+                to.display()
+            )));
+        }
+        if volume_of(from) != volume_of(to) {
+            return Err(Error::Refused(
+                "moving between drives would copy rather than rename, which this does not do"
+                    .to_owned(),
+            ));
+        }
+
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let directory = self.moves_directory();
+        fs::create_dir_all(&directory)?;
+
+        let record = MoveRecord {
+            id: self.allocate_id(),
+            from: from.display().to_string(),
+            to: to.display().to_string(),
+            bytes,
+            moved_at: now_seconds(),
+            undone: false,
+        };
+        // Written first, for the same reason quarantine writes its manifest
+        // first: a record with no move is recoverable, a move with no record is
+        // a file that silently changed place.
+        self.write_move(&record)?;
+
+        fs::rename(from, to).map_err(|error| {
+            let _ = fs::remove_file(directory.join(format!("{}.json", record.id)));
+            Error::Refused(format!(
+                "{} could not be moved to {}: {error}",
+                from.display(),
+                to.display()
+            ))
+        })?;
+
+        Ok(record)
+    }
+
+    /// Put a moved file back where it was.
+    pub fn undo_move(&self, id: &str) -> Result<MoveRecord> {
+        let mut record = self.move_record(id)?;
+        if record.undone {
+            return Err(Error::Refused(format!("{id} has already been undone")));
+        }
+
+        let from = PathBuf::from(&record.from);
+        let to = PathBuf::from(&record.to);
+        if from.exists() {
+            return Err(Error::Refused(format!(
+                "{} exists again; putting the file back would overwrite it",
+                from.display()
+            )));
+        }
+        if let Some(parent) = from.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::rename(&to, &from).map_err(|error| {
+            Error::Refused(format!("{} could not be put back: {error}", to.display()))
+        })?;
+
+        record.undone = true;
+        self.write_move(&record)?;
+        Ok(record)
+    }
+
+    pub fn move_record(&self, id: &str) -> Result<MoveRecord> {
+        let path = self.moves_directory().join(format!("{id}.json"));
+        let text = fs::read_to_string(&path)
+            .map_err(|error| Error::Refused(format!("no recorded move {id}: {error}")))?;
+        serde_json::from_str(&text)
+            .map_err(|error| Error::Refused(format!("{id} has an unreadable record: {error}")))
+    }
+
+    /// Every move recorded, newest first.
+    pub fn moves(&self) -> Result<Vec<MoveRecord>> {
+        let mut records = Vec::new();
+        let Ok(entries) = fs::read_dir(self.moves_directory()) else {
+            return Ok(records);
+        };
+        for entry in entries.flatten() {
+            if let Ok(text) = fs::read_to_string(entry.path()) {
+                if let Ok(record) = serde_json::from_str::<MoveRecord>(&text) {
+                    records.push(record);
+                }
+            }
+        }
+        records.sort_by_key(|record| std::cmp::Reverse(record.moved_at));
+        Ok(records)
+    }
+
+    fn write_move(&self, record: &MoveRecord) -> Result<()> {
+        let directory = self.moves_directory();
+        fs::create_dir_all(&directory)?;
+        let text = serde_json::to_string_pretty(record)
+            .map_err(|error| Error::Refused(format!("could not write a move record: {error}")))?;
+        fs::write(directory.join(format!("{}.json", record.id)), text)?;
+        Ok(())
+    }
+
     fn write_manifest(&self, manifest: &Manifest) -> Result<()> {
         let path = self.item_directory(&manifest.id).join(MANIFEST);
         let text = serde_json::to_string_pretty(manifest)
@@ -420,6 +564,71 @@ mod tests {
         let outcome = store.take(&link, 0, "test");
         assert!(matches!(outcome, Err(Error::Refused(_))));
         assert!(link.exists(), "the link should be untouched");
+    }
+
+    #[test]
+    fn a_move_relocates_the_file_and_can_be_undone() {
+        let scratch = Scratch::new("move");
+        let store = scratch.store();
+        let from = scratch.join("Downloads");
+        let to = scratch.join("Documents/Invoices");
+        fs::create_dir_all(&from).unwrap();
+        let source = from.join("bill.pdf");
+        fs::write(&source, b"invoice").unwrap();
+
+        let record = store.move_file(&source, &to.join("bill.pdf"), 7).unwrap();
+        assert!(!source.exists(), "the original should be gone");
+        assert!(to.join("bill.pdf").exists(), "and the destination present");
+
+        store.undo_move(&record.id).unwrap();
+        assert!(source.exists(), "and back again");
+        assert!(!to.join("bill.pdf").exists());
+        assert!(store.move_record(&record.id).unwrap().undone);
+    }
+
+    #[test]
+    fn a_move_refuses_to_overwrite_the_destination() {
+        let scratch = Scratch::new("clobber");
+        let store = scratch.store();
+        let source = scratch.join("a.pdf");
+        let target = scratch.join("b.pdf");
+        fs::write(&source, b"new").unwrap();
+        fs::write(&target, b"existing").unwrap();
+
+        assert!(store.move_file(&source, &target, 3).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"existing");
+        assert!(source.exists(), "and the source is left alone");
+    }
+
+    #[test]
+    fn undoing_over_something_that_came_back_is_refused() {
+        let scratch = Scratch::new("undo-clobber");
+        let store = scratch.store();
+        let source = scratch.join("a.pdf");
+        let target = scratch.join("sub/a.pdf");
+        fs::write(&source, b"one").unwrap();
+
+        let record = store.move_file(&source, &target, 3).unwrap();
+        fs::write(&source, b"a different file with the same name").unwrap();
+
+        assert!(store.undo_move(&record.id).is_err());
+        assert_eq!(
+            fs::read(&source).unwrap(),
+            b"a different file with the same name"
+        );
+    }
+
+    #[test]
+    fn undoing_twice_is_refused() {
+        let scratch = Scratch::new("undo-twice");
+        let store = scratch.store();
+        let source = scratch.join("a.pdf");
+        fs::write(&source, b"x").unwrap();
+        let record = store
+            .move_file(&source, &scratch.join("sub/a.pdf"), 1)
+            .unwrap();
+        store.undo_move(&record.id).unwrap();
+        assert!(store.undo_move(&record.id).is_err());
     }
 
     #[test]

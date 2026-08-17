@@ -8,6 +8,9 @@ import type {
   DownloadSummary,
   DuplicateGroup,
   DuplicateSummary,
+  MoveRecord,
+  OrganiseSummary,
+  Proposal,
   Manifest,
   Orphan,
   OrphanSummary,
@@ -74,6 +77,10 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const [duplicates, setDuplicates] = useState<DuplicateGroup[] | null>(null);
   const [duplicateSummary, setDuplicateSummary] = useState<DuplicateSummary | null>(null);
   const [findingDuplicates, setFindingDuplicates] = useState(false);
+  const [proposals, setProposals] = useState<Proposal[] | null>(null);
+  const [organiseSummary, setOrganiseSummary] = useState<OrganiseSummary | null>(null);
+  const [organising, setOrganising] = useState(false);
+  const [moves, setMoves] = useState<MoveRecord[]>([]);
   const [held, setHeld] = useState<Manifest[]>([]);
   const [running, setRunning] = useState(false);
   const [busyPath, setBusyPath] = useState<string | null>(null);
@@ -90,6 +97,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
 
   useEffect(() => {
     void loadQuarantine();
+    void loadMoves();
   }, []);
 
   async function find() {
@@ -108,6 +116,58 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       setDownloads(null);
     } finally {
       setRunning(false);
+      onChanged();
+    }
+  }
+
+  async function loadMoves() {
+    try {
+      setMoves(await api.moves());
+    } catch {
+      // Secondary to everything else on the page.
+    }
+  }
+
+  async function findProposals() {
+    setOrganising(true);
+    setError(null);
+    try {
+      const report = await api.organise(drive);
+      setProposals(report.proposals);
+      setOrganiseSummary(report.summary);
+    } catch (cause) {
+      setError(reason(cause));
+      setProposals(null);
+    } finally {
+      setOrganising(false);
+    }
+  }
+
+  async function applyMove(proposal: Proposal) {
+    setError(null);
+    try {
+      await api.applyMove(proposal.from, proposal.to);
+      setNote(`Moved ${proposal.name}. It can be put back from the list below.`);
+      setProposals((current) =>
+        current ? current.filter((item) => item.from !== proposal.from) : current,
+      );
+      await loadMoves();
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
+      onChanged();
+    }
+  }
+
+  async function undoMove(id: string) {
+    setError(null);
+    try {
+      const record = await api.undoMove(id);
+      setNote(`Put ${record.from} back.`);
+      await loadMoves();
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
       onChanged();
     }
   }
@@ -210,6 +270,12 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             filesystem's index, so it has its own button. Copies inside an
             application's own folder are usually there on purpose — this only
             reports them.
+          </li>
+          <li>
+            <strong>Loose files</strong> are downloads sitting in{" "}
+            <code>Downloads</code> or on the Desktop that match a folder you
+            already keep that kind of file in. Only documents, images, audio,
+            video and archives — never anything that runs.
           </li>
           <li>
             <strong>Quarantine</strong> is where anything you act on goes. Items
@@ -341,6 +407,79 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           )}
         </section>
       )}
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Loose files with a home</h2>
+          <button onClick={() => void findProposals()} disabled={organising}>
+            {organising ? "Looking…" : "Find loose files"}
+          </button>
+        </div>
+        <p className="muted">
+          A destination has to be a folder you already keep that kind of file
+          in — this never invents one. Executables are excluded on purpose: a
+          downloaded installer may be pointed at by a shortcut or a scheduled
+          task, and none of that is visible from here.
+        </p>
+
+        {organiseSummary && (
+          <p className="muted">
+            {fmt.count(organiseSummary.proposals)} of{" "}
+            {fmt.count(organiseSummary.examined)} loose files have an obvious
+            home.
+          </p>
+        )}
+
+        {proposals && proposals.length === 0 && (
+          <p className="empty">Nothing loose that matches a folder you already use.</p>
+        )}
+
+        {proposals && proposals.length > 0 && (
+          <ul className="proposals">
+            {proposals.map((proposal) => (
+              <li key={proposal.from} className="proposal">
+                <div className="proposal-body">
+                  <span className="proposal-name">{proposal.name}</span>
+                  <span className="proposal-move">
+                    → {proposal.to.slice(0, proposal.to.lastIndexOf("\\"))}
+                  </span>
+                  <span className="proposal-reason">
+                    {proposal.reason}
+                    {proposal.destination_syncs && (
+                      <span className="proposal-sync">
+                        {" "}
+                        · that folder syncs to the cloud, so moving it there
+                        will upload it
+                      </span>
+                    )}
+                  </span>
+                </div>
+                <span className="proposal-size">{fmt.bytes(proposal.bytes)}</span>
+                <button onClick={() => void applyMove(proposal)}>Move</button>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        {moves.filter((move) => !move.undone).length > 0 && (
+          <>
+            <p className="modal-label">Moved by KAM Security</p>
+            <ul className="files">
+              {moves
+                .filter((move) => !move.undone)
+                .map((move) => (
+                  <li key={move.id} className="held">
+                    <div className="held-body">
+                      <span className="held-path">{move.to}</span>
+                      <span className="held-reason">was {move.from}</span>
+                    </div>
+                    <button onClick={() => void undoMove(move.id)}>Put back</button>
+                  </li>
+                ))}
+            </ul>
+          </>
+        )}
+      </section>
 
       <section className="panel">
         <div className="panel-head">

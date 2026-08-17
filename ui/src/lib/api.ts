@@ -3,6 +3,8 @@ import type {
   ApplicationReport,
   DuplicateReport,
   Manifest,
+  MoveRecord,
+  OrganiseReport,
   AuditRecord,
   Scan,
   SystemStatus,
@@ -25,6 +27,12 @@ export const api = {
     invoke<ApplicationReport>("list_applications", { drive }),
   duplicates: (drive: string) =>
     invoke<DuplicateReport>("find_duplicates", { drive }),
+  organise: (drive: string) =>
+    invoke<OrganiseReport>("find_organise_proposals", { drive }),
+  applyMove: (from: string, to: string) =>
+    invoke<MoveRecord>("apply_move", { from, to }),
+  undoMove: (id: string) => invoke<MoveRecord>("undo_move", { id }),
+  moves: () => invoke<MoveRecord[]>("list_moves"),
   quarantine: (path: string, reason: string) =>
     invoke<Manifest>("quarantine_path", { path, reason }),
   quarantineList: () => invoke<Manifest[]>("list_quarantine"),

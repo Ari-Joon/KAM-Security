@@ -121,9 +121,11 @@ finished software.
 | 4 | Firewall | Not started |
 | 5 | Installer, scheduler, polish | Not started |
 
-Still to come in phase 2: true application footprint across every location an
-app touches, orphan detection for software uninstalled long ago, and download
-provenance from the `Zone.Identifier` stream and the USN journal.
+Phase 2 covers: the master file table reader, a zoomable treemap, true
+application footprint across every location an app touches, uninstalling from
+within the app, orphan detection for software uninstalled long ago, download
+provenance from the `Zone.Identifier` stream, byte-for-byte duplicate detection,
+and proposals for filing loose downloads into folders you already keep.
 
 ## Running it
 

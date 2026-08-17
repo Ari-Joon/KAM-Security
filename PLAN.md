@@ -250,10 +250,17 @@ The privilege split, end to end, with one trivial feature proving the whole path
 **Done when:** UI button → SYSTEM service → real Win32 call → result on screen, with the
 call recorded in the audit log.
 
-### Phase 2 — Storage Intelligence *(in progress)*
-Volume enumeration → parallel scan → treemap ✅, then footprint attribution →
-orphan detection → provenance and duplicates → organisation proposals with undo.
-The master-file-table reader slots in underneath the scanner at any point.
+### Phase 2 — Storage Intelligence ✅ **Complete**
+Master file table reader, treemap, application footprints, orphan detection,
+download provenance, duplicate detection, and organisation proposals — each with
+its reasoning shown and, where it acts, an undo.
+
+One rule in this plan turned out to contradict itself. It listed "installers" as
+safe to move and "executables" as never movable; installers are executables. It
+is resolved toward caution in `kam_storage::organise`: nothing that runs is ever
+proposed for moving, even though downloaded installers are the most common
+clutter there is. Being wrong about a PDF confuses someone; being wrong about an
+executable silently breaks something.
 
 ### Phase 3 — Scanner
 Defender orchestration first (immediate value), then the provenance engine (the

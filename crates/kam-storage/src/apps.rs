@@ -778,6 +778,22 @@ mod tests {
 
         let gb = |bytes: u64| bytes as f64 / 1024.0 / 1024.0 / 1024.0;
 
+        let profile = std::env::var("USERPROFILE").unwrap();
+        let (proposals, osum) = crate::organise::find(&index, profile.trim_end_matches('\\'));
+        println!(
+            "
+ORGANISE: {} proposals from {} loose files, {:.1} GB",
+            osum.proposals,
+            osum.examined,
+            gb(osum.bytes)
+        );
+        for proposal in proposals.iter().take(12) {
+            println!(
+                "  {:?}  {}\n       -> {}\n       because {}",
+                proposal.strength, proposal.name, proposal.to, proposal.reason
+            );
+        }
+
         let (dupes, dsum) = crate::duplicates::find(&index, "C:");
         println!(
             "

@@ -197,6 +197,59 @@ pub fn handle(request: Request, context: &Context) -> Response {
             }
         }
 
+        Request::FindOrganiseProposals { drive } => {
+            let Some(letter) = drive.chars().next().filter(|c| c.is_ascii_alphabetic()) else {
+                return Response::Error {
+                    message: "give a drive letter, such as C:".to_owned(),
+                };
+            };
+            match kam_storage::organise::survey(letter.to_ascii_uppercase()) {
+                Ok((proposals, summary)) => Response::Organise { proposals, summary },
+                Err(error) => {
+                    tracing::info!(%error, "could not look for loose files");
+                    Response::Error {
+                        message: format!("loose files could not be looked for: {error}"),
+                    }
+                }
+            }
+        }
+
+        Request::ApplyMove { from, to } => apply_move(&from, &to, context),
+
+        Request::UndoMove { id } => match context.quarantine.undo_move(&id) {
+            Ok(record) => {
+                context.audit_with_token(
+                    "storage",
+                    "undo_move",
+                    Effect::Changed,
+                    format!("put {} back", record.from),
+                    Some(record.id.clone()),
+                );
+                Response::Moved(record)
+            }
+            Err(error) => {
+                context.audit(
+                    "storage",
+                    "undo_move",
+                    Effect::Refused,
+                    format!("could not undo {id}: {error}"),
+                );
+                Response::Error {
+                    message: error.to_string(),
+                }
+            }
+        },
+
+        Request::ListMoves => match context.quarantine.moves() {
+            Ok(records) => Response::Moves { records },
+            Err(error) => {
+                tracing::error!(%error, "could not list moves");
+                Response::Error {
+                    message: "the move journal could not be read".to_owned(),
+                }
+            }
+        },
+
         Request::NoteUninstallLaunched { name, command } => {
             // Effect::Changed, not Observed: the machine is about to change.
             // The wording says "launched" rather than "uninstalled" because
@@ -346,6 +399,55 @@ fn scan_path(path: &str, context: &Context) -> Response {
             tracing::error!(%error, path, "scan failed");
             Response::Error {
                 message: format!("{path} could not be scanned"),
+            }
+        }
+    }
+}
+
+/// Carry out one organisation proposal.
+///
+/// The fence is re-derived here rather than trusted. The proposal came from
+/// this agent, but the paths come back as strings from a client, and a client
+/// is not obliged to send back what it was given.
+fn apply_move(from: &str, to: &str, context: &Context) -> Response {
+    if let Err(refusal) = kam_storage::organise::check_movable(from, to) {
+        context.audit(
+            "storage",
+            "move_file",
+            Effect::Refused,
+            format!("refused to move {from}: {refusal}"),
+        );
+        return Response::Error { message: refusal };
+    }
+
+    let source = std::path::Path::new(from);
+    let bytes = std::fs::metadata(source)
+        .map(|data| data.len())
+        .unwrap_or(0);
+
+    match context
+        .quarantine
+        .move_file(source, std::path::Path::new(to), bytes)
+    {
+        Ok(record) => {
+            context.audit_with_token(
+                "storage",
+                "move_file",
+                Effect::Changed,
+                format!("moved {from} to {to} ({})", human_bytes(record.bytes)),
+                Some(record.id.clone()),
+            );
+            Response::Moved(record)
+        }
+        Err(error) => {
+            context.audit(
+                "storage",
+                "move_file",
+                Effect::Refused,
+                format!("could not move {from}: {error}"),
+            );
+            Response::Error {
+                message: error.to_string(),
             }
         }
     }

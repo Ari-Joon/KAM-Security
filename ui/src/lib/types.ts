@@ -117,6 +117,38 @@ export type DuplicateReport = {
   summary: DuplicateSummary;
 };
 
+export type Strength = "reasonable" | "strong";
+
+export type Proposal = {
+  from: string;
+  to: string;
+  name: string;
+  bytes: number;
+  strength: Strength;
+  reason: string;
+  destination_syncs: boolean;
+};
+
+export type OrganiseSummary = {
+  proposals: number;
+  bytes: number;
+  examined: number;
+};
+
+export type OrganiseReport = {
+  proposals: Proposal[];
+  summary: OrganiseSummary;
+};
+
+export type MoveRecord = {
+  id: string;
+  from: string;
+  to: string;
+  bytes: number;
+  moved_at: number;
+  undone: boolean;
+};
+
 export type ApplicationReport = {
   apps: AppFootprint[];
   summary: FootprintSummary;

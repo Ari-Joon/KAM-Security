@@ -12,10 +12,10 @@ mod uninstall;
 
 use kam_core::audit::Record;
 use kam_ipc::{Request, Response, SystemStatus};
-use kam_quarantine::Manifest;
+use kam_quarantine::{Manifest, MoveRecord};
 use kam_storage::{
     AppFootprint, Download, DownloadSummary, DuplicateGroup, DuplicateSummary, FootprintSummary,
-    Orphan, OrphanSummary, Scan, Volume,
+    OrganiseSummary, Orphan, OrphanSummary, Proposal, Scan, Volume,
 };
 
 /// Turn a response into the value a command promised, or a message for the UI.
@@ -197,6 +197,52 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn find_organise_proposals(drive: String) -> Result<OrganiseReport, String> {
+    match kam_ipc::client::call(&Request::FindOrganiseProposals { drive })
+        .map_err(|error| error.to_string())?
+    {
+        Response::Organise { proposals, summary } => Ok(OrganiseReport { proposals, summary }),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct OrganiseReport {
+    proposals: Vec<Proposal>,
+    summary: OrganiseSummary,
+}
+
+#[tauri::command]
+fn apply_move(from: String, to: String) -> Result<MoveRecord, String> {
+    match kam_ipc::client::call(&Request::ApplyMove { from, to })
+        .map_err(|error| error.to_string())?
+    {
+        Response::Moved(record) => Ok(record),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+#[tauri::command]
+fn undo_move(id: String) -> Result<MoveRecord, String> {
+    match kam_ipc::client::call(&Request::UndoMove { id }).map_err(|error| error.to_string())? {
+        Response::Moved(record) => Ok(record),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+#[tauri::command]
+fn list_moves() -> Result<Vec<MoveRecord>, String> {
+    match kam_ipc::client::call(&Request::ListMoves).map_err(|error| error.to_string())? {
+        Response::Moves { records } => Ok(records),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Run an application's own uninstaller.
 ///
 /// The command comes back from the agent, having been read out of the
@@ -239,6 +285,10 @@ pub fn run() {
             scan_path,
             list_applications,
             find_duplicates,
+            find_organise_proposals,
+            apply_move,
+            undo_move,
+            list_moves,
             quarantine_path,
             list_quarantine,
             restore_quarantined,

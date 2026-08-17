@@ -12,10 +12,10 @@ pub mod frame;
 pub mod pipe;
 
 use kam_core::audit::Record;
-use kam_quarantine::Manifest;
+use kam_quarantine::{Manifest, MoveRecord};
 use kam_storage::{
     AppFootprint, Download, DownloadSummary, DuplicateGroup, DuplicateSummary, FootprintSummary,
-    Orphan, OrphanSummary, Scan, Volume,
+    OrganiseSummary, Orphan, OrphanSummary, Proposal, Scan, Volume,
 };
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +75,14 @@ pub enum Request {
     /// Separate from the survey because it reads file contents rather than the
     /// master file table, and takes tens of seconds rather than three.
     FindDuplicates { drive: String },
+    /// Loose files that belong in a folder the user already keeps.
+    FindOrganiseProposals { drive: String },
+    /// Carry out one proposal. The agent re-checks the fence before moving.
+    ApplyMove { from: String, to: String },
+    /// Put a moved file back.
+    UndoMove { id: String },
+    /// Every move recorded, newest first.
+    ListMoves,
     /// Record that the shell launched an application's own uninstaller.
     ///
     /// The agent does not run it -- an uninstaller needs the user's desktop,
@@ -107,6 +115,14 @@ pub enum Response {
     Duplicates {
         groups: Vec<DuplicateGroup>,
         summary: DuplicateSummary,
+    },
+    Organise {
+        proposals: Vec<Proposal>,
+        summary: OrganiseSummary,
+    },
+    Moved(MoveRecord),
+    Moves {
+        records: Vec<MoveRecord>,
     },
     Quarantined(Manifest),
     /// Nothing to return beyond "recorded".
