@@ -14,6 +14,7 @@ use kam_core::audit::Record;
 use kam_ipc::{Request, Response, SystemStatus};
 use kam_quarantine::{Manifest, MoveRecord};
 use kam_scanner::provenance::Report as ProvenanceReport;
+use tauri::Emitter;
 use kam_scanner::{DefenderStatus, Threat};
 use kam_storage::{
     AppFootprint, Download, DownloadSummary, DuplicateGroup, DuplicateSummary, FootprintSummary,
@@ -114,15 +115,27 @@ struct ApplicationReport {
 ///
 /// Its own command rather than part of the survey: this one reads file
 /// contents, so it takes tens of seconds where everything else takes three.
+/// That is also why it streams its progress.
 #[tauri::command]
-fn find_duplicates(drive: String) -> Result<DuplicateReport, String> {
-    match kam_ipc::client::call(&Request::FindDuplicates { drive })
-        .map_err(|error| error.to_string())?
-    {
-        Response::Duplicates { groups, summary } => Ok(DuplicateReport { groups, summary }),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn find_duplicates(
+    app: tauri::AppHandle,
+    drive: String,
+    job: String,
+) -> Result<Option<DuplicateReport>, String> {
+    stream_job(
+        app,
+        job.clone(),
+        Request::FindDuplicates { drive, job },
+        |response| match response {
+            Response::Duplicates { groups, summary } => {
+                Ok(Some(DuplicateReport { groups, summary }))
+            }
+            Response::Stopped => Ok(None),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        },
+    )
+    .await
 }
 
 #[derive(serde::Serialize)]
@@ -275,9 +288,53 @@ fn defender_threats() -> Result<Vec<Threat>, String> {
 /// means, and there is deliberately no counterpart command that acts on the
 /// result.
 #[tauri::command]
-fn survey_provenance() -> Result<ProvenanceReport, String> {
-    match kam_ipc::client::call(&Request::SurveyProvenance).map_err(|e| e.to_string())? {
-        Response::Provenance(report) => Ok(report),
+async fn survey_provenance(
+    app: tauri::AppHandle,
+    job: String,
+) -> Result<Option<ProvenanceReport>, String> {
+    stream_job(app, job.clone(), Request::SurveyProvenance { job }, |response| {
+        match response {
+            Response::Provenance(report) => Ok(Some(report)),
+            // Stopping is not a failure, so it comes back as an absent result
+            // rather than an error the interface would have to render in red.
+            Response::Stopped => Ok(None),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
+}
+
+/// Run a request that reports progress, forwarding each update to the window.
+///
+/// Progress arrives on the pipe as frames and leaves as Tauri events named
+/// `job://<id>`, so several jobs can run without their updates being confused
+/// for one another.
+async fn stream_job<T: Send + 'static>(
+    app: tauri::AppHandle,
+    job: String,
+    request: Request,
+    finish: impl FnOnce(Response) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let channel = format!("job://{job}");
+    tauri::async_runtime::spawn_blocking(move || {
+        let response = kam_ipc::client::call_streaming(&request, |progress| {
+            // An interface that has navigated away is not an error worth
+            // failing the job over.
+            let _ = app.emit(&channel, progress);
+        })
+        .map_err(|error| error.to_string())?;
+        finish(response)
+    })
+    .await
+    .map_err(|error| format!("the job did not finish: {error}"))?
+}
+
+/// Ask a running job to stop.
+#[tauri::command]
+fn cancel_job(job: String) -> Result<(), String> {
+    match kam_ipc::client::call(&Request::CancelJob { job }).map_err(|e| e.to_string())? {
+        Response::Acknowledged => Ok(()),
         Response::Error { message } => Err(message),
         other => Err(unexpected(&other)),
     }
@@ -389,6 +446,7 @@ pub fn run() {
             defender_status,
             defender_threats,
             survey_provenance,
+            cancel_job,
             scan_rules,
             virustotal_key_present,
             set_virustotal_key,

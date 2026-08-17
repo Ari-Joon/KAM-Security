@@ -2,13 +2,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 use kam_core::audit::{AuditLog, Effect, Entry};
-use kam_core::{Error, Result, Store};
+use kam_core::{Error, Progress, Reporter, Result, Store};
 use kam_ipc::frame::{read_frame, write_frame};
 use kam_ipc::pipe::{PipeListener, PipeStream};
-use kam_ipc::{Request, Response};
+use kam_ipc::{Reply, Request, Response};
 
 use crate::dispatch::{self, Context};
 use crate::service::Shutdown;
@@ -58,9 +58,9 @@ pub fn serve(listener: &PipeListener, context: &Arc<Context>, shutdown: &Shutdow
             tracing::warn!("connection limit reached; turning a client away");
             let _ = write_frame(
                 &mut stream,
-                &Response::Error {
+                &Reply::Done(Response::Error {
                     message: "the agent is busy; try again shortly".to_owned(),
-                },
+                }),
             );
             continue;
         }
@@ -92,7 +92,7 @@ pub fn serve(listener: &PipeListener, context: &Arc<Context>, shutdown: &Shutdow
 
 fn handle_connection(
     stream: &mut PipeStream,
-    context: &Context,
+    context: &Arc<Context>,
     trusted_directory: &Path,
 ) -> Result<()> {
     let image_path = stream.client_image_path()?;
@@ -114,17 +114,73 @@ fn handle_connection(
 
         write_frame(
             stream,
-            &Response::Error {
+            &Reply::Done(Response::Error {
                 message: "this program is not authorised to control the agent".to_owned(),
-            },
+            }),
         )?;
         return Ok(());
     }
 
     let request: Request = read_frame(stream)?;
     tracing::debug!(client = %image_path.display(), ?request, "serving request");
-    let response = dispatch::handle(request, context);
-    write_frame(stream, &response)
+    let response = run_request(stream, request, context);
+    write_frame(stream, &Reply::Done(response))
+}
+
+/// Run one request, streaming its progress down the same connection.
+///
+/// The work happens on its own thread and reports through a channel, which
+/// this thread drains onto the pipe. It has to be that way round: the reporter
+/// is shared with scoped worker threads and so must be `Send + Sync`, while a
+/// pipe handle is neither — and a job that wrote to the pipe directly from
+/// four hashing threads would interleave frames into nonsense.
+///
+/// The channel closes when the last clone of the reporter is dropped, which
+/// happens when the job returns. So draining until the channel is empty *is*
+/// waiting for the job to finish, and there is no separate signal to get wrong.
+fn run_request(stream: &mut PipeStream, request: Request, context: &Arc<Context>) -> Response {
+    let (sender, receiver) = mpsc::channel::<Progress>();
+    let reporter = Reporter::new(move |progress| {
+        // A failed send means the reader has gone: the client hung up. The job
+        // itself is unaffected and will be stopped by the usual path.
+        let _ = sender.send(progress);
+    });
+
+    let context = Arc::clone(context);
+    let worker = std::thread::Builder::new()
+        .name("kam-job".to_owned())
+        .spawn(move || dispatch::handle(request, &context, &reporter));
+
+    let worker = match worker {
+        Ok(worker) => worker,
+        Err(error) => {
+            tracing::error!(%error, "could not spawn a worker thread");
+            return Response::Error {
+                message: "the agent could not start the job".to_owned(),
+            };
+        }
+    };
+
+    for progress in receiver {
+        if write_frame(stream, &Reply::Progress(progress)).is_err() {
+            // The client is gone. Stop writing, but let the job finish and be
+            // joined rather than leaving a thread running inside a SYSTEM
+            // process with nobody waiting on it.
+            tracing::debug!("client stopped reading progress");
+            break;
+        }
+    }
+
+    match worker.join() {
+        Ok(response) => response,
+        Err(_) => {
+            // A panicked job must not take the agent down with it.
+            tracing::error!("a job panicked");
+            Response::Error {
+                message: "the job failed unexpectedly; see the agent log".to_owned(),
+            }
+        }
+    }
 }
 
 /// Directory the agent will accept clients from: its own.
@@ -266,6 +322,7 @@ mod tests {
             let context = Arc::new(Context {
                 mode: crate::Mode::Console,
                 store: Store::open_in_memory().unwrap(),
+                jobs: Default::default(),
                 quarantine: kam_quarantine::Store::open(&quarantine_root).unwrap(),
             });
             let outcome = serve(&listener, &context, &loop_shutdown);
@@ -281,6 +338,77 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the accept loop did not stop when signalled");
         worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_long_job_streams_progress_over_a_real_pipe() {
+        // End to end, through the actual transport: a job's progress must
+        // arrive as frames *before* its result, and the result must still
+        // arrive intact afterwards.
+        //
+        // This is the test that would have caught the tagging collision that
+        // made every reply undeserialisable, and it is here because progress
+        // that silently never arrives looks exactly like a job with nothing to
+        // say.
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let name = format!("kam-test-progress-{}", std::process::id());
+        let shutdown = crate::service::Shutdown::for_pipe(&name);
+        let listener = PipeListener::with_name(name.clone());
+
+        let loop_shutdown = shutdown.clone();
+        let server = thread::spawn(move || {
+            let quarantine_root =
+                std::env::temp_dir().join(format!("kam-progress-test-{}", std::process::id()));
+            let context = Arc::new(Context {
+                mode: crate::Mode::Console,
+                store: Store::open_in_memory().unwrap(),
+                jobs: Default::default(),
+                quarantine: kam_quarantine::Store::open(&quarantine_root).unwrap(),
+            });
+            let _ = serve(&listener, &context, &loop_shutdown);
+        });
+
+        thread::sleep(Duration::from_millis(200));
+
+        let (tx, rx) = mpsc::channel();
+        let response = kam_ipc::client::call_streaming_on(
+            &name,
+            &Request::SurveyProvenance {
+                job: "test-job".to_owned(),
+            },
+            move |progress| {
+                let _ = tx.send(progress);
+            },
+        );
+
+        shutdown.signal();
+        let _ = server.join();
+
+        let response = response.expect("the streamed call should succeed");
+        assert!(
+            matches!(response, Response::Provenance(_)),
+            "unexpected result: {response:?}"
+        );
+
+        let seen: Vec<_> = rx.into_iter().collect();
+        assert!(
+            !seen.is_empty(),
+            "no progress arrived; the job reported nothing at all"
+        );
+
+        // The stages are named, and at least one of them counts towards a
+        // total. Without that the interface has nothing to draw a bar from.
+        let stages: std::collections::BTreeSet<&str> =
+            seen.iter().map(|p| p.stage.as_str()).collect();
+        assert!(stages.len() > 1, "expected several stages, got {stages:?}");
+        assert!(
+            seen.iter().any(|p| p.total.is_some() && p.done > 0),
+            "no stage reported measurable progress"
+        );
+        println!("{} updates across stages {stages:?}", seen.len());
     }
 
     #[test]

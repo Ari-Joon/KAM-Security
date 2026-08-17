@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, reason } from "../lib/api";
+import ProgressBar from "../components/ProgressBar";
+import { runJob, stopJob, type Progress } from "../lib/jobs";
 import type {
   Anchor,
   DefenderReport,
@@ -447,7 +449,9 @@ function Provenance() {
   const [rules, setRules] = useState<RuleReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
-  const [stage, setStage] = useState<string>("");
+  const [progress, setProgress] = useState<Progress | null>(null);
+  const [job, setJob] = useState<string | null>(null);
+  const [stopped, setStopped] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [hasKey, setHasKey] = useState(false);
 
@@ -463,15 +467,34 @@ function Provenance() {
     setRunning(true);
     setError(null);
     setRules(null);
+    setStopped(false);
+    setProgress(null);
     try {
-      // The agent finds the candidates, which needs privilege. The rules then
-      // run here in the shell, which does not — see `kam-rules` for why that
-      // split is deliberate rather than incidental.
-      setStage("Looking for programs that start themselves…");
-      const survey = await api.provenance();
+      // The agent finds the candidates, which needs privilege, and streams what
+      // it is doing as it goes. The rules then run here in the shell, which
+      // does not — see `kam-rules` for why that split is deliberate.
+      const { job, result: survey } = await runJob(
+        (job) => {
+          setJob(job);
+          return api.provenance(job);
+        },
+        setProgress,
+      );
+      void job;
+
+      if (survey === null) {
+        // Stopped, which is not a failure.
+        setStopped(true);
+        return;
+      }
       setReport(survey);
 
-      setStage("Matching rules…");
+      setProgress({
+        stage: "Matching rules",
+        done: 0,
+        total: survey.findings.length,
+        detail: null,
+      });
       try {
         setRules(await api.scanRules(survey.findings.map((f) => f.path)));
       } catch (cause) {
@@ -490,7 +513,8 @@ function Provenance() {
     } catch (cause) {
       setError(reason(cause));
     } finally {
-      setStage("");
+      setProgress(null);
+      setJob(null);
       setRunning(false);
     }
   }, []);
@@ -524,7 +548,18 @@ function Provenance() {
         </button>
       </div>
 
-      {running && stage && <p className="empty">{stage}</p>}
+      {running && progress && (
+        <ProgressBar
+          progress={progress}
+          onStop={job ? () => void stopJob(job) : undefined}
+        />
+      )}
+
+      {stopped && (
+        <p className="empty">
+          Stopped. Nothing was changed — this only ever reads.
+        </p>
+      )}
 
       <p className="lede panel-lede">
         Every program that starts itself, and everything that arrived from

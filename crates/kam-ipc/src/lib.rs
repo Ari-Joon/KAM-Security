@@ -12,6 +12,7 @@ pub mod frame;
 pub mod pipe;
 
 use kam_core::audit::Record;
+use kam_core::Progress;
 use kam_quarantine::{Manifest, MoveRecord};
 use kam_scanner::provenance::Report as ProvenanceReport;
 use kam_scanner::{DefenderStatus, Threat};
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -47,6 +48,31 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// for history rather than opening the database. Capping the answer keeps a
 /// careless caller from requesting the entire log in a single frame.
 pub const MAX_AUDIT_ROWS: u32 = 500;
+
+/// What the agent writes back.
+///
+/// A request used to be answered by exactly one frame. Long jobs may now send
+/// any number of [`Reply::Progress`] frames first, and every exchange ends with
+/// exactly one [`Reply::Done`] — so a client reads frames until it sees one,
+/// and a client that does not care about progress can discard the rest.
+///
+/// Wrapping rather than adding a `Response::Progress` variant keeps the two
+/// kinds of message distinguishable at the type level: a progress frame can
+/// never be mistaken for a result, and forgetting to handle one is a
+/// compile error rather than a hang.
+///
+/// Tagged *adjacently* — `{"kind": "done", "body": {…}}` — rather than
+/// internally. An internal tag flattens the wrapped value into the same JSON
+/// object, and `Response` carries its own `kind` field, so the two collided and
+/// every reply failed to deserialise. Adjacent tagging nests the payload
+/// instead, which cannot collide with anything the inner type does now or
+/// later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "body", rename_all = "snake_case")]
+pub enum Reply {
+    Progress(Progress),
+    Done(Response),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -76,7 +102,7 @@ pub enum Request {
     ///
     /// Separate from the survey because it reads file contents rather than the
     /// master file table, and takes tens of seconds rather than three.
-    FindDuplicates { drive: String },
+    FindDuplicates { drive: String, job: String },
     /// Loose files that belong in a folder the user already keeps.
     FindOrganiseProposals { drive: String },
     /// Carry out one proposal. The agent re-checks the fence before moving.
@@ -85,12 +111,22 @@ pub enum Request {
     UndoMove { id: String },
     /// Every move recorded, newest first.
     ListMoves,
+    /// Ask a running job to stop. Answered on its own connection, because the
+    /// one carrying the job is busy streaming its progress.
+    ///
+    /// Unknown ids are acknowledged rather than refused: by the time a person
+    /// presses the button the job may already have finished, and that is not
+    /// something to show them an error about.
+    CancelJob { job: String },
     /// What Microsoft Defender is doing, read from Defender.
     GetDefenderStatus,
     /// Everything Defender has detected and still has a record of.
     GetDefenderThreats,
     /// Judge every executable that starts itself or arrived from outside.
-    SurveyProvenance,
+    ///
+    /// `job` names this run so it can be stopped; it is chosen by the caller
+    /// and only has to be unique among jobs in flight.
+    SurveyProvenance { job: String },
     /// Record that the shell launched an application's own uninstaller.
     ///
     /// The agent does not run it -- an uninstaller needs the user's desktop,
@@ -139,6 +175,9 @@ pub enum Response {
         threats: Vec<Threat>,
     },
     Provenance(ProvenanceReport),
+    /// The job stopped because it was asked to. Not an error, and the
+    /// interface should not present it as one.
+    Stopped,
     Moves {
         records: Vec<MoveRecord>,
     },

@@ -125,7 +125,7 @@ finished software.
 | 0 | Workspace, CI, tooling | Done |
 | 1 | Agent, IPC, audit log, shell | Done |
 | 2 | Storage intelligence | Done |
-| 3 | Scanner | Defender status, provenance, YARA rules and VirusTotal done; scan progress not started |
+| 3 | Scanner | Done |
 | 4 | Firewall | Not started |
 | 5 | Installer, scheduler, polish | Not started |
 
@@ -164,6 +164,12 @@ on one file — nothing runs in bulk or in the background, because telling a thi
 party which files sit on your machine is a decision to make each time rather
 than a behaviour to discover. The key is yours, stored encrypted under your
 Windows account with DPAPI, and none ships with the product.
+
+Long jobs — the provenance survey and duplicate detection — report what they
+are doing as they do it, and can be stopped. A scan behind a disabled button is
+indistinguishable from one that has hung, and people reasonably assume the
+second. The agent streams named stages and counts down the same pipe that
+carries the result, and a second connection carries the request to stop.
 
 Results are reported as "N of M engines", never as a bare count. A handful of
 detections against a large majority is the everyday signature of a false

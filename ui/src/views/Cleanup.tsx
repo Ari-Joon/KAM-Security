@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, reason } from "../lib/api";
+import ProgressBar from "../components/ProgressBar";
+import { runJob, stopJob, type Progress } from "../lib/jobs";
 import * as fmt from "../lib/format";
 import FileRow from "../components/FileRow";
 import type {
@@ -77,6 +79,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const [duplicates, setDuplicates] = useState<DuplicateGroup[] | null>(null);
   const [duplicateSummary, setDuplicateSummary] = useState<DuplicateSummary | null>(null);
   const [findingDuplicates, setFindingDuplicates] = useState(false);
+  const [duplicateProgress, setDuplicateProgress] = useState<Progress | null>(null);
+  const [duplicateJob, setDuplicateJob] = useState<string | null>(null);
   const [proposals, setProposals] = useState<Proposal[] | null>(null);
   const [organiseSummary, setOrganiseSummary] = useState<OrganiseSummary | null>(null);
   const [organising, setOrganising] = useState(false);
@@ -175,14 +179,33 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   async function findDuplicates() {
     setFindingDuplicates(true);
     setError(null);
+    setDuplicateProgress(null);
     try {
-      const report = await api.duplicates(drive);
-      setDuplicates(report.groups);
-      setDuplicateSummary(report.summary);
+      // The longest job in the product: it reads file contents rather than
+      // the file table, so it is the one that most needs to say what it is
+      // doing and to be stoppable.
+      const { result } = await runJob(
+        (job) => {
+          setDuplicateJob(job);
+          return api.duplicates(drive, job);
+        },
+        setDuplicateProgress,
+      );
+
+      if (result === null) {
+        // Stopped, not failed.
+        setDuplicates(null);
+        setDuplicateSummary(null);
+        return;
+      }
+      setDuplicates(result.groups);
+      setDuplicateSummary(result.summary);
     } catch (cause) {
       setError(reason(cause));
       setDuplicates(null);
     } finally {
+      setDuplicateProgress(null);
+      setDuplicateJob(null);
       setFindingDuplicates(false);
       onChanged();
     }
@@ -493,6 +516,13 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           "duplicate" means every byte, not a guess. Nothing here is removed for
           you; several copies of a file are often deliberate.
         </p>
+
+        {findingDuplicates && duplicateProgress && (
+          <ProgressBar
+            progress={duplicateProgress}
+            onStop={duplicateJob ? () => void stopJob(duplicateJob) : undefined}
+          />
+        )}
 
         {duplicateSummary && (
           <div className="stat-row tight">

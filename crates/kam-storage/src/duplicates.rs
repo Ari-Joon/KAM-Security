@@ -46,6 +46,7 @@ use std::io::Read;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
+use kam_core::{Cancelled, Reporter};
 use serde::{Deserialize, Serialize};
 
 use crate::index::VolumeIndex;
@@ -199,7 +200,11 @@ fn resolve_group(
 }
 
 /// Find duplicate files on an indexed volume.
-pub fn find(index: &VolumeIndex, drive_root: &str) -> (Vec<DuplicateGroup>, DuplicateSummary) {
+pub fn find(
+    index: &VolumeIndex,
+    drive_root: &str,
+    reporter: &Reporter,
+) -> Result<(Vec<DuplicateGroup>, DuplicateSummary), Cancelled> {
     let started = Instant::now();
 
     // Pass one: identical length, straight from the table. No disk access.
@@ -211,6 +216,12 @@ pub fn find(index: &VolumeIndex, drive_root: &str) -> (Vec<DuplicateGroup>, Dupl
         .collect();
     let examined = by_size.len();
     let size_groups = keep_collisions(by_size);
+    reporter.check()?;
+
+    // Only the second pass is worth a bar. The first is a scan of a table
+    // already in memory and is over before anything could be drawn; the
+    // second reads file contents off the disk, and is where the time goes.
+    reporter.stage("Comparing files of equal size", Some(size_groups.len() as u64));
 
     let counters = Counters::default();
     let threads = std::thread::available_parallelism()
@@ -223,11 +234,17 @@ pub fn find(index: &VolumeIndex, drive_root: &str) -> (Vec<DuplicateGroup>, Dupl
             .chunks(chunk)
             .map(|slice| {
                 let counters = &counters;
+                let reporter = reporter.clone();
                 scope.spawn(move || {
-                    slice
-                        .iter()
-                        .flat_map(|records| resolve_group(records, index, drive_root, counters))
-                        .collect::<Vec<_>>()
+                    let mut found = Vec::new();
+                    for records in slice {
+                        if reporter.is_cancelled() {
+                            break;
+                        }
+                        found.extend(resolve_group(records, index, drive_root, counters));
+                        reporter.advance(1);
+                    }
+                    found
                 })
             })
             .collect();
@@ -239,6 +256,7 @@ pub fn find(index: &VolumeIndex, drive_root: &str) -> (Vec<DuplicateGroup>, Dupl
             .collect()
     });
 
+    reporter.check()?;
     groups.sort_by_key(|group| std::cmp::Reverse(group.wasted_bytes));
 
     let summary = DuplicateSummary {
@@ -250,14 +268,19 @@ pub fn find(index: &VolumeIndex, drive_root: &str) -> (Vec<DuplicateGroup>, Dupl
         elapsed_ms: started.elapsed().as_millis() as u64,
         truncated: counters.truncated.load(Ordering::Relaxed) > 0,
     };
-    (groups, summary)
+    Ok((groups, summary))
 }
 
 /// Read the volume's table, then look for duplicates on it.
-pub fn survey(drive_letter: char) -> kam_core::Result<(Vec<DuplicateGroup>, DuplicateSummary)> {
+pub fn survey(
+    drive_letter: char,
+    reporter: &Reporter,
+) -> kam_core::Result<(Vec<DuplicateGroup>, DuplicateSummary)> {
+    reporter.stage("Reading the file table", None);
     let snapshot = crate::mft::read(drive_letter)?;
     let index = VolumeIndex::build(snapshot);
-    Ok(find(&index, &format!("{drive_letter}:")))
+    find(&index, &format!("{drive_letter}:"), reporter)
+        .map_err(|_| kam_core::Error::Refused("stopped at your request".to_owned()))
 }
 
 #[cfg(test)]

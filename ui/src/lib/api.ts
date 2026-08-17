@@ -30,11 +30,13 @@ export const api = {
   scan: (path: string) => invoke<Scan>("scan_path", { path }),
   applications: (drive: string) =>
     invoke<ApplicationReport>("list_applications", { drive }),
-  duplicates: (drive: string) =>
-    invoke<DuplicateReport>("find_duplicates", { drive }),
+  duplicates: (drive: string, job: string) =>
+    invoke<DuplicateReport | null>("find_duplicates", { drive, job }),
   defenderStatus: () => invoke<DefenderReport>("defender_status"),
   defenderThreats: () => invoke<Threat[]>("defender_threats"),
-  provenance: () => invoke<ProvenanceReport>("survey_provenance"),
+  provenance: (job: string) =>
+    invoke<ProvenanceReport | null>("survey_provenance", { job }),
+  cancelJob: (job: string) => invoke<void>("cancel_job", { job }),
   scanRules: (paths: string[]) => invoke<RuleReport>("scan_rules", { paths }),
   virustotalKeyPresent: () => invoke<boolean>("virustotal_key_present"),
   setVirustotalKey: (key: string) => invoke<boolean>("set_virustotal_key", { key }),

@@ -590,6 +590,7 @@ pub fn summarise(apps: &[AppFootprint]) -> FootprintSummary {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use kam_core::Reporter;
 
     #[test]
     fn normalising_ignores_case_spacing_and_punctuation() {
@@ -794,7 +795,7 @@ ORGANISE: {} proposals from {} loose files, {:.1} GB",
             );
         }
 
-        let (dupes, dsum) = crate::duplicates::find(&index, "C:");
+        let (dupes, dsum) = crate::duplicates::find(&index, "C:", &Reporter::silent()).unwrap();
         println!(
             "
 DUPLICATES: {} sets wasting {:.1} GB | {} files sized, {} heads read, {} read whole | {} ms{}",

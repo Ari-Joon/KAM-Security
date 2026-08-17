@@ -35,6 +35,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use kam_core::{Cancelled, Reporter};
 use kam_storage::provenance::{origin_of, Origin};
 use serde::{Deserialize, Serialize};
 
@@ -458,13 +459,18 @@ fn walk(folder: &Path, depth: usize, found: &mut Vec<PathBuf>) {
 
 /// Examine everything on this machine that starts itself, plus executables
 /// that arrived from outside and are sitting where downloads land.
-pub fn survey() -> Report {
+pub fn survey(reporter: &Reporter) -> Result<Report, Cancelled> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs())
         .unwrap_or_default();
 
+    // Three stages, and they are named rather than numbered because the
+    // useful thing to know while waiting is what is being done, not how far
+    // through an opaque sequence it is.
+    reporter.stage("Reading what starts itself", None);
     let persistence = persistence::survey();
+    reporter.check()?;
 
     // One file, many anchors: svchost hosts dozens of services, and an updater
     // typically holds on two or three ways. Grouping first means each binary is
@@ -482,12 +488,15 @@ pub fn survey() -> Report {
 
     // Loose executables in the download folders, minus anything already
     // accounted for above.
+    reporter.stage("Sweeping the download folders", None);
     let folders = sweep_folders();
     let mut loose: Vec<(PathBuf, Sweep)> = Vec::new();
     for (folder, policy) in &folders {
         let mut found = Vec::new();
         walk(folder, 0, &mut found);
+        reporter.advance(found.len() as u64);
         loose.extend(found.into_iter().map(|path| (path, *policy)));
+        reporter.check()?;
     }
 
     let mut candidates: Vec<(PathBuf, Vec<Entry>)> = anchored.into_values().collect();
@@ -508,6 +517,12 @@ pub fn survey() -> Report {
         }
     }
 
+    reporter.check()?;
+
+    // The only stage with a total worth showing: the candidate list is known
+    // before the expensive part starts, and this is where the seconds go.
+    reporter.stage("Examining programs", Some(candidates.len() as u64));
+
     // Signature verification is the slow part — each call may open a catalogue
     // and walk a certificate chain — and it is entirely independent per file.
     let threads = std::thread::available_parallelism()
@@ -519,11 +534,26 @@ pub fn survey() -> Report {
         let handles: Vec<_> = candidates
             .chunks(chunk)
             .map(|batch| {
+                let reporter = reporter.clone();
                 scope.spawn(move || {
-                    batch
-                        .iter()
-                        .filter_map(|(path, anchors)| examine(path, anchors, now))
-                        .collect::<Vec<_>>()
+                    let mut found = Vec::new();
+                    for (path, anchors) in batch {
+                        // Checked per file rather than per batch: with the work
+                        // split across cores a batch is a quarter of the job,
+                        // and stopping should feel immediate.
+                        if reporter.is_cancelled() {
+                            break;
+                        }
+                        let name = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if let Some(finding) = examine(path, anchors, now) {
+                            found.push(finding);
+                        }
+                        reporter.advance_with(&name);
+                    }
+                    found
                 })
             })
             .collect();
@@ -544,7 +574,9 @@ pub fn survey() -> Report {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
 
-    Report {
+    reporter.check()?;
+
+    Ok(Report {
         examined: findings.len(),
         swept_files,
         findings,
@@ -553,7 +585,7 @@ pub fn survey() -> Report {
             .iter()
             .map(|(folder, _)| folder.display().to_string())
             .collect(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -708,7 +740,7 @@ mod tests {
     #[test]
     fn this_machine_produces_a_readable_report() {
         let started = std::time::Instant::now();
-        let report = survey();
+        let report = survey(&Reporter::silent()).unwrap();
         let elapsed = started.elapsed();
 
         println!(

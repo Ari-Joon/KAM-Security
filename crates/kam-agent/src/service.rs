@@ -155,6 +155,7 @@ fn serve_until_stopped(shutdown: &Shutdown) -> Result<()> {
     let context = Arc::new(Context {
         mode: Mode::Service,
         store: server::open_store(true)?,
+        jobs: Default::default(),
         quarantine: server::open_quarantine(true)?,
     });
     let listener = PipeListener::new();

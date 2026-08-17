@@ -9,8 +9,12 @@
 //! - **Background chatter is not**: status polls and history reloads happen every
 //!   few seconds on their own, and recording them would bury everything else.
 
+use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+
 use kam_core::audit::{Effect, Entry};
-use kam_core::Store;
+use kam_core::{Reporter, Store};
 use kam_ipc::{Request, Response, SystemStatus};
 
 use crate::server;
@@ -22,6 +26,42 @@ pub struct Context {
     pub mode: Mode,
     pub store: Store,
     pub quarantine: kam_quarantine::Store,
+    /// Stop signals for jobs currently running, by the id their caller chose.
+    ///
+    /// A job streams its progress down the connection that started it, so that
+    /// connection cannot also carry a request to stop. The token is left here
+    /// instead, and a second connection sets it.
+    pub jobs: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+impl Context {
+    /// Remember a job's stop signal for as long as it runs.
+    pub fn register_job(&self, job: &str, token: Arc<AtomicBool>) {
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.insert(job.to_owned(), token);
+        }
+    }
+
+    /// Forget a job that has finished, however it finished.
+    pub fn finish_job(&self, job: &str) {
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.remove(job);
+        }
+    }
+
+    /// Ask a running job to stop. False when there is no such job.
+    pub fn stop_job(&self, job: &str) -> bool {
+        let Ok(jobs) = self.jobs.lock() else {
+            return false;
+        };
+        match jobs.get(job) {
+            Some(token) => {
+                token.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 impl Context {
@@ -70,7 +110,7 @@ impl Context {
     }
 }
 
-pub fn handle(request: Request, context: &Context) -> Response {
+pub fn handle(request: Request, context: &Context, reporter: &Reporter) -> Response {
     match request {
         Request::GetSystemStatus => {
             let status = SystemStatus {
@@ -163,14 +203,23 @@ pub fn handle(request: Request, context: &Context) -> Response {
             }
         }
 
-        Request::FindDuplicates { drive } => {
+        Request::FindDuplicates { drive, job } => {
             let Some(letter) = drive.chars().next().filter(|c| c.is_ascii_alphabetic()) else {
                 return Response::Error {
                     message: "give a drive letter, such as C:".to_owned(),
                 };
             };
 
-            match kam_storage::duplicates::survey(letter.to_ascii_uppercase()) {
+            context.register_job(&job, reporter.cancel_token());
+            let outcome = kam_storage::duplicates::survey(letter.to_ascii_uppercase(), reporter);
+            context.finish_job(&job);
+
+            if reporter.is_cancelled() {
+                tracing::info!(%job, "duplicate scan stopped");
+                return Response::Stopped;
+            }
+
+            match outcome {
                 Ok((groups, summary)) => {
                     context.audit(
                         "storage",
@@ -263,15 +312,35 @@ pub fn handle(request: Request, context: &Context) -> Response {
             }
         },
 
-        Request::SurveyProvenance => {
-            let report = kam_scanner::provenance::survey();
-            tracing::info!(
-                judged = report.examined,
-                swept = report.swept_files,
-                flagged = report.worth_reading().count(),
-                "provenance survey"
-            );
-            Response::Provenance(report)
+        Request::CancelJob { job } => {
+            // An unknown id is acknowledged rather than refused. By the time
+            // someone presses the button the job may already have finished,
+            // and an error about that would be noise.
+            let stopped = context.stop_job(&job);
+            tracing::info!(%job, stopped, "stop requested");
+            Response::Acknowledged
+        }
+
+        Request::SurveyProvenance { job } => {
+            context.register_job(&job, reporter.cancel_token());
+            let outcome = kam_scanner::provenance::survey(reporter);
+            context.finish_job(&job);
+
+            match outcome {
+                Ok(report) => {
+                    tracing::info!(
+                        judged = report.examined,
+                        swept = report.swept_files,
+                        flagged = report.worth_reading().count(),
+                        "provenance survey"
+                    );
+                    Response::Provenance(report)
+                }
+                Err(_) => {
+                    tracing::info!(%job, "provenance survey stopped");
+                    Response::Stopped
+                }
+            }
         }
 
         Request::GetDefenderThreats => match kam_scanner::defender::threats() {
@@ -527,6 +596,7 @@ mod tests {
         Context {
             mode,
             store: Store::open_in_memory().unwrap(),
+            jobs: Default::default(),
             quarantine: kam_quarantine::Store::open(&quarantine_root).unwrap(),
         }
     }
@@ -534,7 +604,7 @@ mod tests {
     #[test]
     fn status_reports_the_current_protocol_version() {
         let context = context(Mode::Console);
-        let Response::SystemStatus(status) = handle(Request::GetSystemStatus, &context) else {
+        let Response::SystemStatus(status) = handle(Request::GetSystemStatus, &context, &Reporter::silent()) else {
             panic!("expected a status response");
         };
         assert_eq!(status.protocol_version, kam_ipc::PROTOCOL_VERSION);
@@ -547,8 +617,8 @@ mod tests {
         // were audited the log would fill with entries about being looked at,
         // and the entries that matter would be unfindable.
         let context = context(Mode::Service);
-        let _ = handle(Request::GetSystemStatus, &context);
-        let _ = handle(Request::GetRecentAudit { limit: 10 }, &context);
+        let _ = handle(Request::GetSystemStatus, &context, &Reporter::silent());
+        let _ = handle(Request::GetRecentAudit { limit: 10 }, &context, &Reporter::silent());
 
         assert!(context.store.recent_audit(10).unwrap().is_empty());
     }
@@ -561,6 +631,7 @@ mod tests {
                 path: "..\\somewhere".to_owned(),
             },
             &context,
+            &Reporter::silent(),
         );
 
         assert!(matches!(response, Response::Error { .. }));
@@ -579,6 +650,7 @@ mod tests {
                 path: directory.display().to_string(),
             },
             &context,
+            &Reporter::silent(),
         );
 
         assert!(matches!(response, Response::Scan(_)));
@@ -599,7 +671,7 @@ mod tests {
     #[test]
     fn an_oversized_audit_request_is_clamped_rather_than_refused() {
         let context = context(Mode::Console);
-        let response = handle(Request::GetRecentAudit { limit: u32::MAX }, &context);
+        let response = handle(Request::GetRecentAudit { limit: u32::MAX }, &context, &Reporter::silent());
         assert!(matches!(response, Response::RecentAudit { .. }));
     }
 }

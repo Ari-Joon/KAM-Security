@@ -323,6 +323,26 @@ single-digit counts are overwhelmingly false positives. The interpretation
 lives in Rust with tests on the sentences it produces, so the interface cannot
 recompute a scarier reading from the same numbers.
 
+Progress streaming completes the phase, and took a protocol change. A reply is
+now a stream: zero or more progress frames, then exactly one result. Wrapping
+them in a `Reply` enum rather than adding a `Response::Progress` variant keeps
+the two kinds distinguishable at the type level, so a progress frame can never
+be mistaken for a result.
+
+Two things there were worth getting right. The wrapper is tagged *adjacently*
+rather than internally, because `Response` already carries a `kind` field and an
+internal tag flattened both into the same object — every reply failed to
+deserialise, and the end-to-end test is what caught it. And the work runs on its
+own thread reporting through a channel that the connection thread drains onto
+the pipe: the reporter is shared with scoped worker threads and so must be
+`Send + Sync`, while a pipe handle is neither, and four hashing threads writing
+frames directly would interleave them into nonsense.
+
+Stopping needed a second connection. The one carrying a job is busy streaming
+it, so the agent keeps the job's stop flag in a registry keyed by an id the
+caller chose, and a later `CancelJob` sets it. Stopping returns
+`Response::Stopped` rather than an error, because nothing went wrong.
+
 ### Phase 4 — Firewall
 Rule management → connection table → one-click block → ETW watcher.
 
