@@ -34,6 +34,16 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
     return () => clearInterval(timer);
   }, [running]);
 
+  /// Opening Explorer can fail if the item has since gone; say so rather than
+  /// letting the click do nothing.
+  async function reveal(path: string) {
+    try {
+      await api.reveal(path);
+    } catch (cause) {
+      setError(reason(cause));
+    }
+  }
+
   async function run() {
     setRunning(true);
     setError(null);
@@ -54,6 +64,13 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
   }
 
   const current = trail.length > 0 ? trail[trail.length - 1] : null;
+
+  // The scanned drive, so the header can say "1.0 TB of 1.8 TB" rather than
+  // leaving the measured figure without anything to compare against.
+  const volume = useMemo(
+    () => volumes.find((item) => item.root.toUpperCase() === target.toUpperCase()),
+    [volumes, target],
+  );
 
   const rows = useMemo(() => {
     if (!current) return [];
@@ -116,6 +133,27 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
               <span className="stat-label">Measured</span>
               <span className="stat-value">{fmt.bytes(scan.total_bytes)}</span>
             </div>
+            {volume && (
+              <div className="stat stat-wide">
+                <span className="stat-label">Drive</span>
+                <span className="stat-value">
+                  {fmt.bytes(volume.total_bytes - volume.free_bytes)}
+                  <span className="stat-of"> of {fmt.bytes(volume.total_bytes)}</span>
+                </span>
+                <span className="usage-track">
+                  <span
+                    className="usage-fill usage-accent"
+                    style={{
+                      width: `${fmt.percent(
+                        volume.total_bytes - volume.free_bytes,
+                        volume.total_bytes,
+                      )}%`,
+                    }}
+                  />
+                </span>
+                <span className="stat-sub">{fmt.bytes(volume.free_bytes)} free</span>
+              </div>
+            )}
             <div className="stat">
               <span className="stat-label">Method</span>
               <span className="stat-value small">
@@ -176,9 +214,13 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
               <ul className="bars">
                 {rows.slice(0, 10).map((row) => (
                   <li key={row.path} className="bar-row">
-                    <span className="bar-name" title={row.path}>
+                    <button
+                      className="bar-name link"
+                      title={`Show ${row.path} in Explorer`}
+                      onClick={() => void reveal(row.path)}
+                    >
                       {row.name}
-                    </span>
+                    </button>
                     <span className="bar-track">
                       <span
                         className="bar-fill"
@@ -199,9 +241,13 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
               <ul className="files">
                 {scan.largest_files.slice(0, 10).map((file) => (
                   <li key={file.path} className="file-row">
-                    <span className="file-path" title={file.path}>
+                    <button
+                      className="file-path link"
+                      title={`Show ${file.path} in Explorer`}
+                      onClick={() => void reveal(file.path)}
+                    >
                       {file.path}
-                    </span>
+                    </button>
                     <span className="file-size">{fmt.bytes(file.bytes)}</span>
                   </li>
                 ))}

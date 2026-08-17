@@ -170,22 +170,59 @@ pub(crate) fn normalise(text: &str) -> String {
 }
 
 /// Directories that plausibly belong to this application, and their sizes.
-fn locate(app: &Installed, index: &VolumeIndex, roots: &[(LocationKind, String)]) -> Vec<Location> {
+fn locate(
+    app: &Installed,
+    index: &VolumeIndex,
+    roots: &[(LocationKind, String)],
+    steam: &[crate::steam::SteamApp],
+    drive_root: &str,
+) -> Vec<Location> {
     let mut locations = Vec::new();
+
+    // Steam first, because it is a lookup rather than a guess. Its uninstall
+    // entries often have no InstallLocation and its folder names rarely match
+    // the store name, so without this a games machine measures as nearly empty.
+    let wanted = normalise(&app.name);
+    for game in steam {
+        if normalise(&game.name) != wanted {
+            continue;
+        }
+        let Some(record) = index.resolve(&game.path) else {
+            continue;
+        };
+        // Steam stores its root lower-cased with forward slashes. The table
+        // holds the real on-disk names, so the path is rebuilt from there and
+        // displayed the way Explorer would show it.
+        let path = index
+            .path_of(record, drive_root)
+            .unwrap_or_else(|| game.path.clone());
+        push_unique(
+            &mut locations,
+            Location {
+                path,
+                bytes: index.total_of(record),
+                kind: LocationKind::Install,
+                shared_with: 0,
+            },
+        );
+    }
 
     if let Some(path) = &app.install_location {
         let trimmed = path.trim_end_matches(['\\', '/']);
         if let Some(bytes) = index.size_of(trimmed) {
-            locations.push(Location {
-                path: trimmed.to_owned(),
-                bytes,
-                kind: LocationKind::Install,
-                shared_with: 0,
-            });
+            push_unique(
+                &mut locations,
+                Location {
+                    path: trimmed.to_owned(),
+                    bytes,
+                    kind: LocationKind::Install,
+                    shared_with: 0,
+                },
+            );
         }
     }
 
-    let wanted_name = normalise(&app.name);
+    let wanted_name = wanted;
     let wanted_publisher = normalise(&app.publisher);
     if wanted_name.is_empty() {
         return locations;
@@ -261,11 +298,25 @@ fn names_match(folder: &str, wanted: &str) -> bool {
     folder.contains(wanted) || wanted.contains(folder)
 }
 
+/// One spelling of a path, for comparison only.
+///
+/// The same directory arrives written several ways: the registry gives
+/// `C:\Program Files (x86)\Steam\...`, Steam's own config gives
+/// `c:/program files (x86)/steam/...`, and either may carry a trailing
+/// separator. Comparing them literally counts one folder twice, which is how a
+/// 66 GB game briefly became a 133 GB one.
+pub(crate) fn canonical(path: &str) -> String {
+    path.replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
 /// Guard against listing a directory twice when several rules find it.
 fn push_unique(locations: &mut Vec<Location>, candidate: Location) {
+    let wanted = canonical(&candidate.path);
     if locations
         .iter()
-        .any(|existing| existing.path.eq_ignore_ascii_case(&candidate.path))
+        .any(|existing| canonical(&existing.path) == wanted)
     {
         return;
     }
@@ -305,7 +356,7 @@ pub(crate) fn data_roots() -> Vec<(LocationKind, String)> {
 fn drop_ancestors(locations: &mut Vec<Location>) {
     let paths: Vec<String> = locations
         .iter()
-        .map(|location| location.path.to_lowercase())
+        .map(|location| canonical(&location.path))
         .collect();
 
     let mut keep = vec![true; locations.len()];
@@ -348,13 +399,14 @@ fn drop_ancestors(locations: &mut Vec<Location>) {
 /// of every total. It is still listed, with a count, because "45 GB in a folder
 /// six NVIDIA packages share" is a useful thing to be told — it is just not a
 /// fact about any one of them.
-pub fn footprints(index: &VolumeIndex) -> Result<Vec<AppFootprint>> {
+pub fn footprints(index: &VolumeIndex, drive_root: &str) -> Result<Vec<AppFootprint>> {
     let roots = data_roots();
+    let steam = crate::steam::installed_games();
 
     let candidates: Vec<(Installed, Vec<Location>)> = installed()
         .into_iter()
         .map(|app| {
-            let mut locations = locate(&app, index, &roots);
+            let mut locations = locate(&app, index, &roots, &steam, drive_root);
             drop_ancestors(&mut locations);
             (app, locations)
         })
@@ -363,7 +415,7 @@ pub fn footprints(index: &VolumeIndex) -> Result<Vec<AppFootprint>> {
     let mut claims: HashMap<String, usize> = HashMap::new();
     for (_, locations) in &candidates {
         for location in locations {
-            *claims.entry(location.path.to_lowercase()).or_default() += 1;
+            *claims.entry(canonical(&location.path)).or_default() += 1;
         }
     }
 
@@ -373,10 +425,7 @@ pub fn footprints(index: &VolumeIndex) -> Result<Vec<AppFootprint>> {
             let locations: Vec<Location> = locations
                 .into_iter()
                 .map(|mut location| {
-                    let claimed = claims
-                        .get(&location.path.to_lowercase())
-                        .copied()
-                        .unwrap_or(1);
+                    let claimed = claims.get(&canonical(&location.path)).copied().unwrap_or(1);
                     location.shared_with = claimed.saturating_sub(1);
                     location
                 })
@@ -427,7 +476,8 @@ pub struct StorageReport {
 pub fn survey(drive_letter: char, now_unix: u64) -> Result<StorageReport> {
     let snapshot = crate::mft::read(drive_letter)?;
     let index = VolumeIndex::build(snapshot);
-    let apps = footprints(&index)?;
+    let root = format!("{drive_letter}:");
+    let apps = footprints(&index, &root)?;
     let summary = summarise(&apps);
     let orphans = crate::orphans::find(&index, &apps, now_unix);
     let orphan_summary = crate::orphans::summarise(&orphans);
@@ -448,7 +498,7 @@ pub fn survey(drive_letter: char, now_unix: u64) -> Result<StorageReport> {
 pub fn measure(drive_letter: char) -> Result<(Vec<AppFootprint>, FootprintSummary)> {
     let snapshot = crate::mft::read(drive_letter)?;
     let index = VolumeIndex::build(snapshot);
-    let apps = footprints(&index)?;
+    let apps = footprints(&index, &format!("{drive_letter}:"))?;
     let summary = summarise(&apps);
     Ok((apps, summary))
 }
@@ -518,6 +568,32 @@ mod tests {
             kind: LocationKind::ProgramData,
             shared_with: 0,
         }
+    }
+
+    #[test]
+    fn the_same_directory_spelled_differently_is_one_directory() {
+        // The registry, Steam's config and a trailing separator all name the
+        // same folder differently. Treating them as three cost a 66 GB game an
+        // extra 66 GB before this existed.
+        let steam_style = r"c:/program files (x86)/steam/steamapps/common/Warframe";
+        let registry_style = r"C:\Program Files (x86)\Steam\steamapps\common\Warframe";
+        let trailing = r"C:\Program Files (x86)\Steam\steamapps\common\Warframe";
+        assert_eq!(canonical(steam_style), canonical(registry_style));
+        assert_eq!(canonical(registry_style), canonical(trailing));
+
+        let mut locations = Vec::new();
+        push_unique(&mut locations, location(steam_style, 50));
+        push_unique(&mut locations, location(registry_style, 50));
+        push_unique(&mut locations, location(trailing, 50));
+        assert_eq!(locations.len(), 1, "one folder counted more than once");
+    }
+
+    #[test]
+    fn different_directories_are_still_different() {
+        assert_ne!(
+            canonical(r"C:\Games\Warframe"),
+            canonical(r"C:\Games\Warframe2")
+        );
     }
 
     #[test]
@@ -596,7 +672,7 @@ mod tests {
             .unwrap_or(0);
         let snapshot = crate::mft::read('C').unwrap();
         let index = VolumeIndex::build(snapshot);
-        let apps = footprints(&index).unwrap();
+        let apps = footprints(&index, "C:").unwrap();
         let summary = summarise(&apps);
 
         let orphans = crate::orphans::find(&index, &apps, now);

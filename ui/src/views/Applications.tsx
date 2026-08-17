@@ -12,8 +12,18 @@ const KIND_LABEL: Record<string, string> = {
   roaming_data: "Roaming",
 };
 
-function Row({ app }: { app: AppFootprint }) {
+function Row({
+  app,
+  onReveal,
+}: {
+  app: AppFootprint;
+  onReveal: (path: string) => void;
+}) {
   const [open, setOpen] = useState(false);
+  // Zero measured bytes and zero directories found are different claims. The
+  // first says an application uses no space; the second says we could not find
+  // it -- usually because it lives on another drive.
+  const notFound = app.locations.length === 0;
   const ratio = app.reported_bytes && app.reported_bytes > 0
     ? app.actual_bytes / app.reported_bytes
     : null;
@@ -33,7 +43,13 @@ function Row({ app }: { app: AppFootprint }) {
             fmt.bytes(app.reported_bytes)
           )}
         </span>
-        <span className="app-actual">{fmt.bytes(app.actual_bytes)}</span>
+        <span className="app-actual">
+          {notFound ? (
+            <span className="app-none">not found here</span>
+          ) : (
+            fmt.bytes(app.actual_bytes)
+          )}
+        </span>
         <span className="app-ratio">
           {ratio !== null && ratio >= 1.5 && (
             <span className="ratio-badge">{ratio.toFixed(1)}×</span>
@@ -43,9 +59,11 @@ function Row({ app }: { app: AppFootprint }) {
 
       {open && (
         <ul className="app-locations">
-          {app.locations.length === 0 && (
-            <li className="app-location muted">
-              No directories found on this drive. It may be installed elsewhere.
+          {notFound && (
+            <li className="app-location-empty">
+              No directories for this application were found on this drive. It
+              is most likely installed on another one — measure that drive to
+              see it.
             </li>
           )}
           {app.locations.map((location) => (
@@ -54,9 +72,13 @@ function Row({ app }: { app: AppFootprint }) {
               className={"app-location" + (location.shared_with > 0 ? " shared" : "")}
             >
               <span className="loc-kind">{KIND_LABEL[location.kind] ?? location.kind}</span>
-              <span className="loc-path" title={location.path}>
+              <button
+                className="loc-path link"
+                title={`Show ${location.path} in Explorer`}
+                onClick={() => onReveal(location.path)}
+              >
                 {location.path}
-              </span>
+              </button>
               <span className="loc-size">{fmt.bytes(location.bytes)}</span>
               {location.shared_with > 0 && (
                 <span className="loc-shared">
@@ -77,6 +99,14 @@ export default function Applications({ volumes, onMeasured }: Props) {
   const [report, setReport] = useState<ApplicationReport | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  async function reveal(path: string) {
+    try {
+      await api.reveal(path);
+    } catch (cause) {
+      setError(reason(cause));
+    }
+  }
 
   async function run() {
     setRunning(true);
@@ -177,7 +207,11 @@ export default function Applications({ volumes, onMeasured }: Props) {
           </div>
           <ul className="app-list">
             {report.apps.map((app) => (
-              <Row key={`${app.name}-${app.version}`} app={app} />
+              <Row
+                key={`${app.name}-${app.version}`}
+                app={app}
+                onReveal={(path) => void reveal(path)}
+              />
             ))}
           </ul>
         </section>

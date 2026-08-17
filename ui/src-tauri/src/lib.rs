@@ -132,6 +132,39 @@ fn restore_quarantined(id: String) -> Result<Manifest, String> {
     }
 }
 
+/// Open Explorer with a file or folder selected.
+///
+/// Deliberately done here rather than through the agent. The agent runs as
+/// LocalSystem, and a window it launched would be an Explorer running as SYSTEM
+/// on the user's desktop -- a privilege boundary crossed for a convenience.
+/// The shell already runs as the user, which is who should be looking at their
+/// own files.
+#[tauri::command]
+fn reveal_in_explorer(path: String) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    let target = std::path::Path::new(&path);
+    if !target.is_absolute() {
+        return Err("only an absolute path can be revealed".to_owned());
+    }
+    // A quote in the path would end the argument early and let the rest be read
+    // as further switches to explorer.
+    if path.contains('"') {
+        return Err("that path cannot be opened safely".to_owned());
+    }
+    if !target.exists() {
+        return Err(format!("{path} is no longer there"));
+    }
+
+    // explorer.exe parses its own command line rather than using argv, so the
+    // argument is passed raw with the quoting it expects.
+    std::process::Command::new("explorer.exe")
+        .raw_arg(format!("/select,\"{path}\""))
+        .spawn()
+        .map_err(|error| format!("could not open Explorer: {error}"))?;
+    Ok(())
+}
+
 /// Version of the protocol this build speaks, so the UI can say plainly when it
 /// and the agent disagree rather than silently mis-rendering.
 #[tauri::command]
@@ -152,6 +185,7 @@ pub fn run() {
             quarantine_path,
             list_quarantine,
             restore_quarantined,
+            reveal_in_explorer,
             protocol_version
         ])
         .run(tauri::generate_context!())

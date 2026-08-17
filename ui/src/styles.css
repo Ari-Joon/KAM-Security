@@ -269,7 +269,12 @@ h2 {
 
 .split {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  /* minmax(0, 1fr) rather than 1fr. A bare 1fr is minmax(auto, 1fr), and the
+     auto minimum is the content's own width -- one long unbroken file path
+     then forces its column past half, overflows the page sideways, and
+     squeezes the other column until its first grid track collapses to zero.
+     That is exactly what happened to the folder names here. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 16px;
 }
 
@@ -313,6 +318,51 @@ h2 {
   font-size: 18px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
+}
+
+/* Spans two tracks so the capacity bar has room to mean anything. */
+.stat-wide {
+  grid-column: span 2;
+}
+
+.stat-of {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-3);
+}
+
+.stat-sub {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.stat-wide .usage-track {
+  display: block;
+  margin-top: 7px;
+}
+
+/* A path or folder name that opens Explorer. Styled as text, not a button:
+   it sits in a data table and a row of buttons would read as a toolbar. */
+button.link {
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+button.link:hover:not(:disabled) {
+  color: var(--accent-soft);
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 /* For values that are words rather than numbers, which need the room. */
@@ -638,6 +688,10 @@ select {
 }
 
 .file-path {
+  /* A flex item will not shrink below its content unless told it may. Without
+     this the ellipsis never engages and the path pushes the layout wide. */
+  flex: 1;
+  min-width: 0;
   font-size: 12px;
   color: var(--text-2);
   direction: rtl;
@@ -885,6 +939,13 @@ select {
   font-variant-numeric: tabular-nums;
 }
 
+.app-location-empty {
+  grid-column: 1 / -1;
+  color: var(--text-3);
+  font-size: 12px;
+  padding: 4px 0;
+}
+
 .loc-shared {
   grid-column: 2 / -1;
   color: var(--warn);
@@ -1014,6 +1075,14 @@ select {
 
 .held-body {
   flex: 1;
+  min-width: 0;
+}
+
+.loc-path,
+.orphan-path,
+.bar-name,
+.app-name,
+.held-path {
   min-width: 0;
 }
 

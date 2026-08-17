@@ -26,6 +26,7 @@ export const api = {
     invoke<Manifest>("quarantine_path", { path, reason }),
   quarantineList: () => invoke<Manifest[]>("list_quarantine"),
   restore: (id: string) => invoke<Manifest>("restore_quarantined", { id }),
+  reveal: (path: string) => invoke<void>("reveal_in_explorer", { path }),
   protocolVersion: () => invoke<number>("protocol_version"),
 };
 

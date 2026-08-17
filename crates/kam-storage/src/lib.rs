@@ -25,6 +25,7 @@ pub mod mft;
 pub mod orphans;
 pub mod registry;
 pub mod scan;
+pub mod steam;
 pub mod volumes;
 
 pub use apps::{AppFootprint, FootprintSummary};
