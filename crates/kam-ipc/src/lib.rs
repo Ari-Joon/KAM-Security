@@ -13,6 +13,7 @@ pub mod pipe;
 
 use kam_core::audit::Record;
 use kam_quarantine::{Manifest, MoveRecord};
+use kam_scanner::provenance::Report as ProvenanceReport;
 use kam_scanner::{DefenderStatus, Threat};
 use kam_storage::{
     AppFootprint, Download, DownloadSummary, DuplicateGroup, DuplicateSummary, FootprintSummary,
@@ -88,6 +89,8 @@ pub enum Request {
     GetDefenderStatus,
     /// Everything Defender has detected and still has a record of.
     GetDefenderThreats,
+    /// Judge every executable that starts itself or arrived from outside.
+    SurveyProvenance,
     /// Record that the shell launched an application's own uninstaller.
     ///
     /// The agent does not run it -- an uninstaller needs the user's desktop,
@@ -135,6 +138,7 @@ pub enum Response {
     DefenderThreats {
         threats: Vec<Threat>,
     },
+    Provenance(ProvenanceReport),
     Moves {
         records: Vec<MoveRecord>,
     },

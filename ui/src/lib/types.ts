@@ -230,3 +230,69 @@ export type Threat = {
   resources: string[];
   detected_at: string | null;
 };
+
+/**
+ * The provenance engine's view of one executable.
+ *
+ * Every field is evidence rather than judgement, and `reasons` is the reasoning
+ * written out — the interface never re-derives why something was ranked where
+ * it was, it shows what the agent said.
+ */
+export type Signature =
+  | { state: "valid"; signer: string; catalogue: string | null }
+  | { state: "invalid"; signer: string | null; reason: string }
+  | { state: "unsigned" }
+  | { state: "unknown"; reason: string };
+
+export type Anchor =
+  | "run_key"
+  | "run_once_key"
+  | "startup_folder"
+  | "service"
+  | "scheduled_task";
+
+export type PersistenceEntry = {
+  name: string;
+  anchor: Anchor;
+  location: string;
+  command: string;
+  executable: string | null;
+  machine_wide: boolean;
+};
+
+export type Origin = {
+  zone: string | { other: number };
+  host_url: string | null;
+  referrer_url: string | null;
+};
+
+export type Attention = "ordinary" | "notable" | "unusual";
+
+export type Location =
+  | "system"
+  | "installed"
+  | "shared"
+  | "user_writable"
+  | "elsewhere";
+
+export type Finding = {
+  path: string;
+  name: string;
+  bytes: number;
+  signature: Signature;
+  origin: Origin | null;
+  origin_host: string | null;
+  arrived_days_ago: number | null;
+  persistence: PersistenceEntry[];
+  location: Location;
+  attention: Attention;
+  reasons: string[];
+};
+
+export type ProvenanceReport = {
+  findings: Finding[];
+  examined: number;
+  swept_files: number;
+  unreadable: string[];
+  swept: string[];
+};

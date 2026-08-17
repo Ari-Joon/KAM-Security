@@ -1503,3 +1503,210 @@ pre.error {
   border-radius: 50%;
   background: var(--border-strong);
 }
+
+/* --- Provenance findings ------------------------------------------------ *
+ * A finding is a small dossier rather than a table row: a name, the reasons
+ * it was ranked where it was, the facts behind them, and every place it holds
+ * on. The reasons come first because they are the point — the rank is only an
+ * ordering, and a rank shown without its reasoning reads as an accusation.
+ */
+
+.panel-lede {
+  margin: 0 0 4px;
+  max-width: 78ch;
+}
+
+.findings {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.finding {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  /* Long paths must wrap inside the card rather than widening the page. */
+  min-width: 0;
+}
+
+.finding-notable {
+  border-left-color: var(--warn);
+}
+
+.finding-unusual {
+  border-left-color: var(--danger);
+}
+
+.finding-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.finding-name {
+  font-weight: 600;
+  font-size: 14px;
+  /* Truncate the name, never the reasoning. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.badge.attention-ordinary {
+  background: var(--surface-3);
+  color: var(--text-3);
+  width: auto;
+  padding: 2px 8px;
+}
+
+.badge.attention-notable {
+  background: rgba(240, 180, 41, 0.14);
+  border-color: rgba(240, 180, 41, 0.35);
+  color: var(--warn);
+  width: auto;
+  padding: 2px 8px;
+}
+
+.badge.attention-unusual {
+  background: rgba(244, 112, 122, 0.14);
+  border-color: rgba(244, 112, 122, 0.35);
+  color: var(--danger);
+  width: auto;
+  padding: 2px 8px;
+}
+
+.finding-path {
+  display: block;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0 0 8px;
+  text-align: left;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--text-3);
+  cursor: pointer;
+  /* Break on separators so a deep path wraps instead of scrolling. */
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.finding-path:hover {
+  color: var(--accent-soft);
+  text-decoration: underline;
+}
+
+.finding-reasons {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.finding-reasons li {
+  font-size: 13px;
+  color: var(--text);
+  padding-left: 14px;
+  position: relative;
+  max-width: 78ch;
+}
+
+.finding-reasons li::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 8px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--text-3);
+}
+
+.finding-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 20px;
+  margin: 0;
+}
+
+.finding-facts > div {
+  min-width: 0;
+}
+
+.finding-facts dt {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-3);
+  margin: 0;
+}
+
+.finding-facts dd {
+  font-size: 12.5px;
+  color: var(--text-2);
+  margin: 1px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.finding-anchors {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 8px 0 0;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.finding-anchors li {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  font-size: 11.5px;
+  min-width: 0;
+}
+
+.anchor-kind {
+  flex: none;
+  color: var(--accent-soft);
+}
+
+.anchor-where {
+  color: var(--text-3);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.link-button {
+  background: none;
+  border: none;
+  padding: 10px 0 0;
+  color: var(--accent-soft);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.link-button:hover {
+  text-decoration: underline;
+}
+
+.footnote {
+  margin: 12px 0 0;
+  font-size: 11.5px;
+  color: var(--text-3);
+  max-width: 78ch;
+  overflow-wrap: anywhere;
+}

@@ -68,9 +68,62 @@ impl Zone {
     }
 
     /// Whether the file came from outside this machine.
-    fn is_external(self) -> bool {
+    pub fn is_external(self) -> bool {
         matches!(self, Self::Internet | Self::Restricted)
     }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LocalMachine => "this machine",
+            Self::Intranet => "the local network",
+            Self::Trusted => "a trusted site",
+            Self::Internet => "the internet",
+            Self::Restricted => "a restricted site",
+            Self::Other(_) => "an unrecognised zone",
+        }
+    }
+}
+
+/// Where a single file came from, as its own stream records it.
+///
+/// [`find`] answers "what large downloads are on this volume"; this answers
+/// "where did this one file come from", which is the question the scanner asks
+/// about a binary it already has reason to care about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Origin {
+    pub zone: Zone,
+    /// Kept whole because it is evidence. Download URLs routinely carry tokens
+    /// and account identifiers, so the interface shows only the host.
+    pub host_url: Option<String>,
+    pub referrer_url: Option<String>,
+}
+
+impl Origin {
+    /// Just the host, which is what is safe to put on screen.
+    pub fn host(&self) -> Option<&str> {
+        let url = self.host_url.as_deref()?;
+        let rest = url
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(url);
+        let host = rest.split(['/', '?', '#']).next()?;
+        // Strip any credentials, which have no business on screen either.
+        let host = host.rsplit('@').next()?;
+        (!host.is_empty()).then_some(host)
+    }
+}
+
+/// Read one file's recorded origin.
+///
+/// Most files have no such stream, and that is not an error: it means nothing
+/// was recorded, not that the file is local.
+pub fn origin_of(path: &str) -> Option<Origin> {
+    let (zone, host_url, referrer_url) = parse_stream(&read_stream(path)?)?;
+    Some(Origin {
+        zone,
+        host_url,
+        referrer_url,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -12,6 +12,9 @@
 //! 4. **VirusTotal** -- on demand, single file, user-supplied API key.
 
 pub mod defender;
+pub mod persistence;
+pub mod provenance;
+pub mod signature;
 pub mod wmi;
 
 pub use defender::{DefenderStatus, Threat};

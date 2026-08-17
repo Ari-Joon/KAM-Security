@@ -31,9 +31,17 @@ Defender, manages Defender Firewall, and adds two things nothing else does.
 number the installer writes about itself. It is routinely wrong and never counts
 anything outside the install directory.
 
-**Provenance-based detection.** Rather than asking "does this file match a
-signature", ask what an analyst would: who signed it, when did it arrive, which
-process wrote it, where was it downloaded from, does it survive a reboot.
+**Provenance-based judgement.** Rather than asking "does this file match a known
+threat" — Defender already does that better — ask what an analyst would: who
+signed it and does Windows still accept that signature, when did it arrive,
+where was it downloaded from, and how does it survive a reboot. None of those
+answers means anything alone. Together they sort several hundred executables
+into the two or three actually worth reading about, with the reasoning attached.
+
+It is not a detector and does not claim to be. The evidence is circumstantial by
+construction, so nothing in that layer deletes, blocks or quarantines anything —
+presenting circumstantial evidence as a verdict is the whole business model of
+the software this replaces.
 
 ## Reading a terabyte in two seconds
 
@@ -109,15 +117,15 @@ See [PLAN.md](PLAN.md) for the full design and phase breakdown.
 
 ## Status
 
-Phases 0 and 1 are complete; phase 2 is in progress. Nothing claims to be
+Phases 0 to 2 are complete and phase 3 is in progress. Nothing claims to be
 finished software.
 
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Workspace, CI, tooling | Done |
 | 1 | Agent, IPC, audit log, shell | Done |
-| 2 | Storage intelligence | Scan, MFT reader and treemap done |
-| 3 | Scanner | Not started |
+| 2 | Storage intelligence | Done |
+| 3 | Scanner | Defender status and provenance done; YARA and VirusTotal not started |
 | 4 | Firewall | Not started |
 | 5 | Installer, scheduler, polish | Not started |
 
@@ -126,6 +134,13 @@ application footprint across every location an app touches, uninstalling from
 within the app, orphan detection for software uninstalled long ago, download
 provenance from the `Zone.Identifier` stream, byte-for-byte duplicate detection,
 and proposals for filing loose downloads into folders you already keep.
+
+Phase 3 so far covers: Defender's real state read from Defender rather than from
+the Settings app, and the provenance engine — Authenticode verification against
+both embedded signatures and the system catalogues, arrival times, download
+origin, and every place a program anchors itself to survive a reboot (Run keys
+in both hives and both registry views, services, scheduled tasks and the Startup
+folders). Sources it could not read are reported rather than silently omitted.
 
 ## Running it
 

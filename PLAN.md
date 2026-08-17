@@ -266,6 +266,23 @@ executable silently breaks something.
 Defender orchestration first (immediate value), then the provenance engine (the
 differentiator), then YARA, then optional VirusTotal.
 
+Defender orchestration and the provenance engine are built. Two assumptions in
+the original plan did not survive contact with Windows.
+
+The plan wanted "which process wrote it" as a provenance signal. Nothing keeps
+that. The USN journal records what changed, not who changed it, and there is no
+retrospective way to recover the writer of a file that already exists. The
+signal was dropped rather than approximated.
+
+Verifying a signature turned out to be two questions, not one. `WinVerifyTrust`
+on the file alone reports most of Windows as unsigned, because Windows signs
+itself through catalogues — a `.cat` file elsewhere listing the binary's hash.
+Checking only embedded signatures would have buried the handful of genuinely
+unsigned binaries among several hundred false ones. Both routes are checked, and
+a file whose *embedded* signature is broken is never rescued by a catalogue
+entry, since that would let a tampered binary pass on the strength of a record
+for the version it no longer is.
+
 ### Phase 4 — Firewall
 Rule management → connection table → one-click block → ETW watcher.
 

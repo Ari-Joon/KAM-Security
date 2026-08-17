@@ -263,6 +263,17 @@ pub fn handle(request: Request, context: &Context) -> Response {
             }
         },
 
+        Request::SurveyProvenance => {
+            let report = kam_scanner::provenance::survey();
+            tracing::info!(
+                judged = report.examined,
+                swept = report.swept_files,
+                flagged = report.worth_reading().count(),
+                "provenance survey"
+            );
+            Response::Provenance(report)
+        }
+
         Request::GetDefenderThreats => match kam_scanner::defender::threats() {
             Ok(threats) => Response::DefenderThreats { threats },
             Err(error) => {

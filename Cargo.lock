@@ -2019,6 +2019,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.20",
  "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -2058,6 +2059,7 @@ name = "kam-scanner"
 version = "0.1.0"
 dependencies = [
  "kam-core",
+ "kam-storage",
  "serde",
  "tracing",
  "windows 0.62.2",

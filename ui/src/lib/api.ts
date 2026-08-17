@@ -11,6 +11,7 @@ import type {
   Scan,
   SystemStatus,
   Volume,
+  ProvenanceReport,
 } from "./types";
 
 /**
@@ -31,6 +32,7 @@ export const api = {
     invoke<DuplicateReport>("find_duplicates", { drive }),
   defenderStatus: () => invoke<DefenderReport>("defender_status"),
   defenderThreats: () => invoke<Threat[]>("defender_threats"),
+  provenance: () => invoke<ProvenanceReport>("survey_provenance"),
   organise: (drive: string) =>
     invoke<OrganiseReport>("find_organise_proposals", { drive }),
   applyMove: (from: string, to: string) =>

@@ -26,7 +26,9 @@ pub mod mft;
 pub mod organise;
 pub mod orphans;
 pub mod provenance;
-pub mod registry;
+/// Re-exported from the shared crate, where it moved once the scanner
+/// needed it too.
+pub use kam_core::registry;
 pub mod scan;
 pub mod steam;
 pub mod volumes;

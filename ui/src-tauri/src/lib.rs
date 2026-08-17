@@ -13,6 +13,7 @@ mod uninstall;
 use kam_core::audit::Record;
 use kam_ipc::{Request, Response, SystemStatus};
 use kam_quarantine::{Manifest, MoveRecord};
+use kam_scanner::provenance::Report as ProvenanceReport;
 use kam_scanner::{DefenderStatus, Threat};
 use kam_storage::{
     AppFootprint, Download, DownloadSummary, DuplicateGroup, DuplicateSummary, FootprintSummary,
@@ -268,6 +269,20 @@ fn defender_threats() -> Result<Vec<Threat>, String> {
     }
 }
 
+/// Judge every executable that starts itself or arrived from outside.
+///
+/// Read-only by construction: the agent gathers evidence and says what it
+/// means, and there is deliberately no counterpart command that acts on the
+/// result.
+#[tauri::command]
+fn survey_provenance() -> Result<ProvenanceReport, String> {
+    match kam_ipc::client::call(&Request::SurveyProvenance).map_err(|e| e.to_string())? {
+        Response::Provenance(report) => Ok(report),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Run an application's own uninstaller.
 ///
 /// The command comes back from the agent, having been read out of the
@@ -312,6 +327,7 @@ pub fn run() {
             find_duplicates,
             defender_status,
             defender_threats,
+            survey_provenance,
             find_organise_proposals,
             apply_move,
             undo_move,

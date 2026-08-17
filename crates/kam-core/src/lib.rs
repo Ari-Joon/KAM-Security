@@ -7,6 +7,7 @@
 pub mod audit;
 pub mod db;
 pub mod error;
+pub mod registry;
 
 pub use db::Store;
 pub use error::{Error, Result};

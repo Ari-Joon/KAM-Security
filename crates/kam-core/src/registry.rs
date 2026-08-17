@@ -1,7 +1,11 @@
-//! The little bit of registry reading this crate needs.
+//! The little bit of registry reading this project needs.
 //!
-//! Only enough to enumerate the uninstall keys: open, list subkeys, read string
-//! and DWORD values. Deliberately not a general registry library.
+//! Open a key, list its subkeys, read string and DWORD values. Deliberately not
+//! a general registry library.
+//!
+//! It lives in the shared crate because two modules now need it for unrelated
+//! reasons: storage reads the uninstall keys to find what is installed, and the
+//! scanner reads the Run keys to find what starts itself.
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
@@ -9,7 +13,7 @@ use std::os::windows::ffi::OsStringExt;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, KEY_READ, KEY_WOW64_32KEY,
+    RegCloseKey, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, HKEY, KEY_READ, KEY_WOW64_32KEY,
     KEY_WOW64_64KEY, REG_DWORD, REG_EXPAND_SZ, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
 };
 
@@ -92,6 +96,40 @@ impl Key {
             let mut length = buffer.len() as u32;
             let status: WIN32_ERROR = unsafe {
                 RegEnumKeyExW(
+                    self.0,
+                    index,
+                    Some(windows::core::PWSTR(buffer.as_mut_ptr())),
+                    &mut length,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            if status != ERROR_SUCCESS {
+                break;
+            }
+            names.push(from_wide(&buffer));
+            index += 1;
+        }
+        names
+    }
+
+    /// Names of every value directly under this key.
+    ///
+    /// The counterpart to `subkey_names`, and what the auto-start keys need:
+    /// there the interesting information is the values, not the subkeys.
+    pub fn value_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut index = 0_u32;
+        loop {
+            // Value names are capped at 16383 characters, but anything that
+            // long is not a name a person wrote. A generous fixed buffer keeps
+            // this a single call per value.
+            let mut buffer = [0_u16; 1024];
+            let mut length = buffer.len() as u32;
+            let status: WIN32_ERROR = unsafe {
+                RegEnumValueW(
                     self.0,
                     index,
                     Some(windows::core::PWSTR(buffer.as_mut_ptr())),
