@@ -1,7 +1,16 @@
 import { useEffect, useState } from "react";
 import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
-import type { Confidence, Manifest, Orphan, OrphanSummary, Volume } from "../lib/types";
+import FileRow from "../components/FileRow";
+import type {
+  Confidence,
+  Download,
+  DownloadSummary,
+  Manifest,
+  Orphan,
+  OrphanSummary,
+  Volume,
+} from "../lib/types";
 
 type Props = { volumes: Volume[]; onChanged: () => void };
 
@@ -58,6 +67,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const [drive, setDrive] = useState("C:\\");
   const [orphans, setOrphans] = useState<Orphan[] | null>(null);
   const [summary, setSummary] = useState<OrphanSummary | null>(null);
+  const [downloads, setDownloads] = useState<Download[] | null>(null);
+  const [downloadSummary, setDownloadSummary] = useState<DownloadSummary | null>(null);
   const [held, setHeld] = useState<Manifest[]>([]);
   const [running, setRunning] = useState(false);
   const [busyPath, setBusyPath] = useState<string | null>(null);
@@ -84,12 +95,23 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       const report = await api.applications(drive);
       setOrphans(report.orphans);
       setSummary(report.orphan_summary);
+      setDownloads(report.downloads);
+      setDownloadSummary(report.download_summary);
     } catch (cause) {
       setError(reason(cause));
       setOrphans(null);
+      setDownloads(null);
     } finally {
       setRunning(false);
       onChanged();
+    }
+  }
+
+  async function reveal(path: string) {
+    try {
+      await api.reveal(path);
+    } catch (cause) {
+      setError(reason(cause));
     }
   }
 
@@ -144,13 +166,35 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         </div>
       </div>
 
-      <div className="notice notice-warn">
-        <strong>Read this before acting.</strong> These are suggestions produced
-        from names and dates, not certainties. Quarantining moves a folder; an
-        application that was still using it will misbehave until you restore it.
-        Only <code>ProgramData</code> and the two <code>AppData</code> roots are
-        ever examined, one level deep, and never a directory Windows owns.
-      </div>
+      <section className="panel">
+        <div className="panel-head">
+          <h2>What this page does</h2>
+        </div>
+        <ol className="explain">
+          <li>
+            <strong>Leftovers</strong> are folders under <code>ProgramData</code>{" "}
+            and the two <code>AppData</code> roots that no installed application
+            accounts for — usually left behind when something was uninstalled
+            years ago. Each says why it is listed.
+          </li>
+          <li>
+            <strong>Downloads</strong> are large files Windows recorded as having
+            come from the internet, with the site they came from and when they
+            arrived. Nothing here is a suggestion to delete; it is a list of
+            things you may have forgotten you kept.
+          </li>
+          <li>
+            <strong>Quarantine</strong> is where anything you act on goes. Items
+            are <em>moved</em>, never deleted, and can be put back for 30 days.
+          </li>
+        </ol>
+        <p className="muted">
+          Only those three folders are examined, one level deep, and never a
+          directory Windows owns. These are suggestions from names and dates,
+          not certainties — an application still using a folder will misbehave
+          until you restore it.
+        </p>
+      </section>
 
       <section className="panel">
         <div className="scan-bar">
@@ -211,6 +255,58 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                   orphan={orphan}
                   busy={busyPath === orphan.path}
                   onQuarantine={(item) => void quarantine(item)}
+                />
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+
+      {downloads && (
+        <section className="panel">
+          <div className="panel-head">
+            <h2>Downloads you may have forgotten</h2>
+            {downloadSummary && (
+              <span className="muted">
+                {fmt.count(downloadSummary.found)} files ·{" "}
+                {fmt.bytes(downloadSummary.total_bytes)}
+              </span>
+            )}
+          </div>
+          <p className="muted">
+            Files over 32 MB carrying Windows' own record of having come from
+            the internet. Click one to show it in Explorer.
+            {downloadSummary && !downloadSummary.last_access_tracked && (
+              <>
+                {" "}
+                This machine does not update last-access times, so there is no
+                way to tell which of these were ever opened.
+              </>
+            )}
+          </p>
+          {downloads.length === 0 ? (
+            <p className="empty">
+              Nothing over 32 MB carries a download record.
+            </p>
+          ) : (
+            <ul className="files">
+              {downloads.slice(0, 25).map((download) => (
+                <FileRow
+                  key={download.path}
+                  path={download.path}
+                  bytes={download.bytes}
+                  onReveal={(path) => void reveal(path)}
+                  note={
+                    <>
+                      {fmt.host(download.host_url) ?? "source not recorded"}
+                      {download.days_since_arrival !== null && (
+                        <> · arrived {download.days_since_arrival} days ago</>
+                      )}
+                      {download.zone === "restricted" && (
+                        <span className="zone-restricted"> · restricted zone</span>
+                      )}
+                    </>
+                  }
                 />
               ))}
             </ul>

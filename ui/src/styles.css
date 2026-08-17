@@ -675,36 +675,69 @@ select {
   font-variant-numeric: tabular-nums;
 }
 
-.file-row {
+.filerow {
   display: flex;
-  justify-content: space-between;
+  align-items: flex-start;
   gap: 12px;
-  padding: 5px 0;
+  padding: 7px 0;
   border-top: 1px solid var(--border);
 }
 
-.file-row:first-child {
+.filerow:first-child {
   border-top: none;
 }
 
-.file-path {
-  /* A flex item will not shrink below its content unless told it may. Without
-     this the ellipsis never engages and the path pushes the layout wide. */
+.filerow-main {
   flex: 1;
   min-width: 0;
-  font-size: 12px;
-  color: var(--text-2);
-  direction: rtl;
+  display: block;
   text-align: left;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  color: inherit;
+  cursor: pointer;
 }
 
-.file-size {
-  font-size: 12px;
+.filerow-name,
+.filerow-folder,
+.filerow-note {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.filerow-name {
+  font-size: 13px;
+}
+
+.filerow-main:hover .filerow-name {
+  color: var(--accent-soft);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* The folder is the part allowed to disappear: the name above it is what
+   identifies the file, and the size to the right is what ranked it. */
+.filerow-folder {
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-top: 1px;
+}
+
+.filerow-note {
+  font-size: 11.5px;
+  color: var(--text-2);
+  margin-top: 2px;
+}
+
+.filerow-size {
   flex: none;
+  font-size: 12.5px;
   font-variant-numeric: tabular-nums;
+  padding-top: 1px;
 }
 
 /* ---------- audit entries ---------- */
@@ -953,6 +986,26 @@ select {
 }
 
 /* ---------- cleanup ---------- */
+
+.explain {
+  margin: 12px 0 0;
+  padding-left: 20px;
+  color: var(--text-2);
+  font-size: 13px;
+}
+
+.explain li {
+  padding: 4px 0;
+}
+
+.explain strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.zone-restricted {
+  color: var(--warn);
+}
 
 .orphans {
   list-style: none;

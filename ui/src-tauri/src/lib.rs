@@ -11,7 +11,9 @@
 use kam_core::audit::Record;
 use kam_ipc::{Request, Response, SystemStatus};
 use kam_quarantine::Manifest;
-use kam_storage::{AppFootprint, FootprintSummary, Orphan, OrphanSummary, Scan, Volume};
+use kam_storage::{
+    AppFootprint, Download, DownloadSummary, FootprintSummary, Orphan, OrphanSummary, Scan, Volume,
+};
 
 /// Turn a response into the value a command promised, or a message for the UI.
 ///
@@ -77,11 +79,15 @@ fn list_applications(drive: String) -> Result<ApplicationReport, String> {
             summary,
             orphans,
             orphan_summary,
+            downloads,
+            download_summary,
         } => Ok(ApplicationReport {
             apps,
             summary,
             orphans,
             orphan_summary,
+            downloads,
+            download_summary,
         }),
         Response::Error { message } => Err(message),
         other => Err(unexpected(&other)),
@@ -95,6 +101,8 @@ struct ApplicationReport {
     summary: FootprintSummary,
     orphans: Vec<Orphan>,
     orphan_summary: OrphanSummary,
+    downloads: Vec<Download>,
+    download_summary: DownloadSummary,
 }
 
 /// Move a leftover directory into quarantine.

@@ -56,3 +56,26 @@ export function relative(iso: string): string {
   if (seconds < 86400) return `${Math.floor(seconds / 3600)} h ago`;
   return `${Math.floor(seconds / 86400)} d ago`;
 }
+
+/**
+ * Split a Windows path into its folder and its final component.
+ *
+ * Showing one long path in a fixed column truncates whichever end the ellipsis
+ * lands on, and that is usually the filename — the only part anyone recognises.
+ * Displaying the two separately lets the folder be the part that gives way.
+ */
+export function splitPath(path: string): { folder: string; name: string } {
+  const cut = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
+  if (cut < 0) return { folder: "", name: path };
+  return { folder: path.slice(0, cut), name: path.slice(cut + 1) };
+}
+
+/** The host part of a URL, which is the bit worth reading at a glance. */
+export function host(url: string | null): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).host;
+  } catch {
+    return url.length > 60 ? `${url.slice(0, 60)}…` : url;
+  }
+}

@@ -134,11 +134,13 @@ pub fn handle(request: Request, context: &Context) -> Response {
                         "survey",
                         Effect::Observed,
                         format!(
-                            "surveyed {letter}: — {} applications using {}, {} leftover directories holding {}",
+                            "surveyed {letter}: — {} applications using {}, {} leftover directories holding {}, {} downloads holding {}",
                             report.summary.applications,
                             human_bytes(report.summary.measured_bytes),
                             report.orphan_summary.found,
-                            human_bytes(report.orphan_summary.total_bytes)
+                            human_bytes(report.orphan_summary.total_bytes),
+                            report.download_summary.found,
+                            human_bytes(report.download_summary.total_bytes)
                         ),
                     );
                     Response::Applications {
@@ -146,6 +148,8 @@ pub fn handle(request: Request, context: &Context) -> Response {
                         summary: report.summary,
                         orphans: report.orphans,
                         orphan_summary: report.orphan_summary,
+                        downloads: report.downloads,
+                        download_summary: report.download_summary,
                     }
                 }
                 Err(error) => {

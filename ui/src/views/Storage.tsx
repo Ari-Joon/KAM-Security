@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Treemap from "../components/Treemap";
+import FileRow from "../components/FileRow";
 import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
 import type { Scan, TreeNode, Volume } from "../lib/types";
@@ -240,16 +241,12 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
               </div>
               <ul className="files">
                 {scan.largest_files.slice(0, 10).map((file) => (
-                  <li key={file.path} className="file-row">
-                    <button
-                      className="file-path link"
-                      title={`Show ${file.path} in Explorer`}
-                      onClick={() => void reveal(file.path)}
-                    >
-                      {file.path}
-                    </button>
-                    <span className="file-size">{fmt.bytes(file.bytes)}</span>
-                  </li>
+                  <FileRow
+                    key={file.path}
+                    path={file.path}
+                    bytes={file.bytes}
+                    onReveal={(path) => void reveal(path)}
+                  />
                 ))}
                 {scan.largest_files.length === 0 && (
                   <p className="empty">Nothing above 64 MB.</p>

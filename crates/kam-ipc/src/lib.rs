@@ -13,7 +13,9 @@ pub mod pipe;
 
 use kam_core::audit::Record;
 use kam_quarantine::Manifest;
-use kam_storage::{AppFootprint, FootprintSummary, Orphan, OrphanSummary, Scan, Volume};
+use kam_storage::{
+    AppFootprint, Download, DownloadSummary, FootprintSummary, Orphan, OrphanSummary, Scan, Volume,
+};
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
@@ -87,6 +89,8 @@ pub enum Response {
         summary: FootprintSummary,
         orphans: Vec<Orphan>,
         orphan_summary: OrphanSummary,
+        downloads: Vec<Download>,
+        download_summary: DownloadSummary,
     },
     Quarantined(Manifest),
     QuarantineList {

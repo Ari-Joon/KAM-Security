@@ -157,6 +157,39 @@ fn installed() -> Vec<Installed> {
     found
 }
 
+/// Add Steam games the registry never mentioned.
+///
+/// Steam does not create an uninstall entry for every title it installs, and
+/// Control Panel therefore never lists them — which is why a 40 GB game can be
+/// entirely absent from a list of installed software. The manifests know about
+/// them regardless, so anything Steam has and the registry does not is added
+/// here, marked as coming from Steam rather than from an installer.
+///
+/// Nothing is replaced: a game with a real uninstall entry keeps it, along with
+/// whatever size that entry claims.
+fn with_steam_games(mut apps: Vec<Installed>, steam: &[crate::steam::SteamApp]) -> Vec<Installed> {
+    let known: Vec<String> = apps.iter().map(|app| normalise(&app.name)).collect();
+
+    for game in steam {
+        let wanted = normalise(&game.name);
+        if wanted.is_empty() || known.contains(&wanted) {
+            continue;
+        }
+        apps.push(Installed {
+            name: game.name.clone(),
+            publisher: "Steam".to_owned(),
+            version: String::new(),
+            install_location: Some(game.path.clone()),
+            // Steam records a SizeOnDisk, but it is the same kind of claim as
+            // EstimatedSize: written by the installer about itself. Left absent
+            // so the measured figure stands on its own.
+            estimated_kilobytes: None,
+        });
+    }
+
+    apps
+}
+
 /// Reduce a name to something comparable: lower case, letters and digits only.
 ///
 /// Vendors are wildly inconsistent between the registry and the folder they
@@ -403,7 +436,7 @@ pub fn footprints(index: &VolumeIndex, drive_root: &str) -> Result<Vec<AppFootpr
     let roots = data_roots();
     let steam = crate::steam::installed_games();
 
-    let candidates: Vec<(Installed, Vec<Location>)> = installed()
+    let candidates: Vec<(Installed, Vec<Location>)> = with_steam_games(installed(), &steam)
         .into_iter()
         .map(|app| {
             let mut locations = locate(&app, index, &roots, &steam, drive_root);
@@ -470,6 +503,8 @@ pub struct StorageReport {
     pub summary: FootprintSummary,
     pub orphans: Vec<crate::orphans::Orphan>,
     pub orphan_summary: crate::orphans::OrphanSummary,
+    pub downloads: Vec<crate::provenance::Download>,
+    pub download_summary: crate::provenance::DownloadSummary,
 }
 
 /// Read the volume's table, then measure applications and find leftovers.
@@ -481,11 +516,14 @@ pub fn survey(drive_letter: char, now_unix: u64) -> Result<StorageReport> {
     let summary = summarise(&apps);
     let orphans = crate::orphans::find(&index, &apps, now_unix);
     let orphan_summary = crate::orphans::summarise(&orphans);
+    let (downloads, download_summary) = crate::provenance::find(&index, &root, now_unix);
     Ok(StorageReport {
         apps,
         summary,
         orphans,
         orphan_summary,
+        downloads,
+        download_summary,
     })
 }
 
@@ -568,6 +606,44 @@ mod tests {
             kind: LocationKind::ProgramData,
             shared_with: 0,
         }
+    }
+
+    #[test]
+    fn steam_games_missing_from_the_registry_are_added() {
+        // Steam does not register every title, so without this a 40 GB game can
+        // be absent from the list of installed software entirely.
+        let registry = vec![Installed {
+            name: "Warframe".to_owned(),
+            publisher: "Digital Extremes".to_owned(),
+            version: String::new(),
+            install_location: None,
+            estimated_kilobytes: None,
+        }];
+        let steam = vec![
+            crate::steam::SteamApp {
+                name: "Warframe".to_owned(),
+                path: r"C:\Steam\steamapps\common\Warframe".to_owned(),
+            },
+            crate::steam::SteamApp {
+                name: "Deep Rock Galactic".to_owned(),
+                path: r"C:\Steam\steamapps\common\Deep Rock Galactic".to_owned(),
+            },
+        ];
+
+        let merged = with_steam_games(registry, &steam);
+        assert_eq!(merged.len(), 2, "the unregistered game should be added");
+
+        let existing = merged.iter().find(|app| app.name == "Warframe").unwrap();
+        assert_eq!(
+            existing.publisher, "Digital Extremes",
+            "a registered game keeps its own details"
+        );
+        let added = merged
+            .iter()
+            .find(|app| app.name == "Deep Rock Galactic")
+            .unwrap();
+        assert_eq!(added.publisher, "Steam");
+        assert!(added.install_location.is_some());
     }
 
     #[test]
@@ -674,6 +750,38 @@ mod tests {
         let index = VolumeIndex::build(snapshot);
         let apps = footprints(&index, "C:").unwrap();
         let summary = summarise(&apps);
+
+        let gb = |bytes: u64| bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+
+        let (downloads, download_summary) = crate::provenance::find(&index, "C:", now);
+        println!(
+            "\nDOWNLOADS: {} of {} large files carry a download record, {:.1} GB (last-access tracked: {})",
+            download_summary.found,
+            download_summary.examined,
+            gb(download_summary.total_bytes),
+            download_summary.last_access_tracked
+        );
+        for download in downloads.iter().take(10) {
+            println!(
+                "  {:>7.2} GB  {}  <- {}  ({} days ago)",
+                gb(download.bytes),
+                download.name,
+                // Host only: these URLs carry tokens and account identifiers.
+                download
+                    .host_url
+                    .as_deref()
+                    .and_then(|url| url.split('/').nth(2))
+                    .unwrap_or("source not recorded"),
+                download
+                    .days_since_arrival
+                    .map(|days| days.to_string())
+                    .unwrap_or_else(|| "?".to_owned())
+            );
+        }
+        println!(
+            "\nSTEAM: {} games located from manifests",
+            crate::steam::installed_games().len()
+        );
 
         let orphans = crate::orphans::find(&index, &apps, now);
         let orphan_summary = crate::orphans::summarise(&orphans);

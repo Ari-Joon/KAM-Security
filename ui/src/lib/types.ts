@@ -69,11 +69,39 @@ export type FootprintSummary = {
   without_reported_size: number;
 };
 
+export type Zone =
+  | "local_machine"
+  | "intranet"
+  | "trusted"
+  | "internet"
+  | "restricted"
+  | { other: number };
+
+export type Download = {
+  path: string;
+  name: string;
+  bytes: number;
+  zone: Zone;
+  host_url: string | null;
+  referrer_url: string | null;
+  days_since_arrival: number | null;
+  days_since_access: number | null;
+};
+
+export type DownloadSummary = {
+  found: number;
+  total_bytes: number;
+  last_access_tracked: boolean;
+  examined: number;
+};
+
 export type ApplicationReport = {
   apps: AppFootprint[];
   summary: FootprintSummary;
   orphans: Orphan[];
   orphan_summary: OrphanSummary;
+  downloads: Download[];
+  download_summary: DownloadSummary;
 };
 
 export type ScanMethod = "master_file_table" | "directory_walk";
