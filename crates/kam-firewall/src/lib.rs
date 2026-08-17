@@ -11,6 +11,9 @@
 //! callout driver; observing and then blocking delivers nearly the same value
 //! with no kernel code, and is deliberately where this module stops.
 
+pub mod connections;
+pub mod policy;
+
 /// One observed outbound connection, resolved as far as we can take it.
 #[derive(Debug, Clone)]
 pub struct Connection {

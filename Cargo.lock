@@ -2629,8 +2629,10 @@ name = "kam-firewall"
 version = "0.1.0"
 dependencies = [
  "kam-core",
+ "kam-scanner",
  "serde",
  "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -2638,6 +2640,7 @@ name = "kam-ipc"
 version = "0.1.0"
 dependencies = [
  "kam-core",
+ "kam-firewall",
  "kam-quarantine",
  "kam-scanner",
  "kam-storage",
@@ -2682,6 +2685,7 @@ name = "kam-shell"
 version = "0.1.0"
 dependencies = [
  "kam-core",
+ "kam-firewall",
  "kam-ipc",
  "kam-quarantine",
  "kam-rules",

@@ -14,6 +14,8 @@ pub mod pipe;
 use kam_core::audit::Record;
 use kam_core::Progress;
 use kam_quarantine::{Manifest, MoveRecord};
+use kam_firewall::connections::ConnectionReport;
+use kam_firewall::policy::FirewallReport;
 use kam_scanner::provenance::Report as ProvenanceReport;
 use kam_scanner::{DefenderStatus, Threat};
 use kam_storage::{
@@ -24,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -111,6 +113,14 @@ pub enum Request {
     UndoMove { id: String },
     /// Every move recorded, newest first.
     ListMoves,
+    /// Windows Defender Firewall's profile state and every rule it holds.
+    GetFirewall,
+    /// Every open socket, joined to the program that owns it.
+    GetConnections,
+    /// Stop a program reaching the network, with an outbound block rule.
+    BlockProgram { path: String },
+    /// Remove a block rule this product created. Refuses anything else.
+    UnblockProgram { rule: String },
     /// Ask a running job to stop. Answered on its own connection, because the
     /// one carrying the job is busy streaming its progress.
     ///
@@ -175,6 +185,10 @@ pub enum Response {
         threats: Vec<Threat>,
     },
     Provenance(ProvenanceReport),
+    Firewall(Box<FirewallReport>),
+    Connections(ConnectionReport),
+    /// A firewall rule was created; the name is how it is undone.
+    Blocked { rule: String },
     /// The job stopped because it was asked to. Not an error, and the
     /// interface should not present it as one.
     Stopped,

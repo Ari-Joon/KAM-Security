@@ -312,6 +312,67 @@ pub fn handle(request: Request, context: &Context, reporter: &Reporter) -> Respo
             }
         },
 
+        Request::GetFirewall => match kam_firewall::policy::survey() {
+            Ok(report) => Response::Firewall(Box::new(report)),
+            Err(error) => {
+                tracing::info!(%error, "could not read the firewall");
+                Response::Error {
+                    message: error.to_string(),
+                }
+            }
+        },
+
+        Request::GetConnections => Response::Connections(kam_firewall::connections::survey()),
+
+        Request::BlockProgram { path } => match kam_firewall::policy::block_program(&path) {
+            Ok(rule) => {
+                // The first thing in this product that changes the machine, so
+                // it is recorded with the handle that reverses it.
+                context.audit_with_token(
+                    "firewall",
+                    "block_program",
+                    Effect::Changed,
+                    format!("blocked outgoing connections from {path}"),
+                    Some(rule.clone()),
+                );
+                Response::Blocked { rule }
+            }
+            Err(error) => {
+                context.audit(
+                    "firewall",
+                    "block_program",
+                    Effect::Refused,
+                    format!("could not block {path}: {error}"),
+                );
+                Response::Error {
+                    message: error.to_string(),
+                }
+            }
+        },
+
+        Request::UnblockProgram { rule } => match kam_firewall::policy::remove_our_rule(&rule) {
+            Ok(()) => {
+                context.audit(
+                    "firewall",
+                    "unblock_program",
+                    Effect::Changed,
+                    format!("removed the block rule {rule}"),
+                );
+                Response::Acknowledged
+            }
+            Err(error) => {
+                context.audit(
+                    "firewall",
+                    "unblock_program",
+                    Effect::Refused,
+                    format!("could not remove {rule}: {error}"),
+                );
+                Response::Error {
+                    message: error.to_string(),
+                }
+            }
+        },
+
         Request::CancelJob { job } => {
             // An unknown id is acknowledged rather than refused. By the time
             // someone presses the button the job may already have finished,

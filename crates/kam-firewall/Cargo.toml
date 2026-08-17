@@ -7,8 +7,10 @@ license.workspace = true
 
 [dependencies]
 kam-core = { workspace = true }
+kam-scanner = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
+windows = { workspace = true }
 
 [lints]
 workspace = true

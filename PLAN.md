@@ -346,6 +346,27 @@ caller chose, and a later `CancelJob` sets it. Stopping returns
 ### Phase 4 — Firewall
 Rule management → connection table → one-click block → ETW watcher.
 
+The first three are built. The ETW watcher is not, and is the one item here
+where the effort is hard to justify: a snapshot of the connection table every
+few seconds shows a person reading a screen the same connections that a live
+event stream would, and an ETW session is a substantial amount of surface for
+that difference. It stays on the list, below blocking a single address rather
+than a whole program, which is worth more.
+
+This is the first phase that changes the machine, and the shape of that is
+worth recording. Every rule the product creates carries a group of its own, and
+removal only ever considers rules bearing it — so a rule Windows or an installer
+created cannot be deleted by us even by accident. A test asserts that removing
+Windows' own "Core Networking" rule is refused. Existing rules are read and
+shown but never edited, blocks are outbound only (blocking a program's incoming
+traffic is rarely what "block this" means), and the agent re-derives that the
+path names a real program rather than trusting what the interface sent.
+
+The write path is exercised by an ignored-by-default test that creates a real
+rule against `notepad.exe`, checks its properties, and removes it again. Testing
+only the refusals would have proved nothing about the path that actually
+changes someone's firewall.
+
 ### Phase 5 — Product polish
 Scheduler, notifications, first-run experience, MSI/NSIS installer, auto-update,
 documentation, screenshots. Decide on code signing here, not before.

@@ -126,7 +126,7 @@ finished software.
 | 1 | Agent, IPC, audit log, shell | Done |
 | 2 | Storage intelligence | Done |
 | 3 | Scanner | Done |
-| 4 | Firewall | Not started |
+| 4 | Firewall | Rules, connections and one-click block done; ETW watcher not started |
 | 5 | Installer, scheduler, polish | Not started |
 
 Phase 2 covers: the master file table reader, a zoomable treemap, true
@@ -171,7 +171,28 @@ indistinguishable from one that has hung, and people reasonably assume the
 second. The agent streams named stages and counts down the same pipe that
 carries the result, and a second connection carries the request to stop.
 
-Results are reported as "N of M engines", never as a bare count. A handful of
+Results are reported as "N of M engines", never as a bare count.
+
+## The firewall
+
+Windows Defender Firewall works. What it lacks is a way to see what it has been
+told to do, and what is happening now. KAM Security shows both: profile state
+and all several hundred rules, and every open socket joined to the program that
+owns it and to whoever signed that program. `netstat -b` gets closest to the
+second and tells you nothing about signing; Resource Monitor shows names without
+paths. "chrome.exe is connected to 142.250.x.x" is not useful — "an unsigned
+program in your AppData folder is connected to the internet" is.
+
+Blocking a program adds exactly one outbound rule, on every profile, tagged with
+a group of our own. That tag is what makes removal safe: this product will only
+delete rules carrying it, so a rule Windows or an installer created cannot be
+removed here even by mistake — there is a test asserting it refuses to touch
+Windows' own "Core Networking" rules. Existing rules are read and shown, never
+edited. Blocking asks first and says exactly what it will do.
+
+Everything else the plan listed for the firewall — prompting *before* a
+connection opens — is permanently out of scope. It needs a kernel driver, an EV
+certificate and Microsoft attestation signing. A handful of
 detections against a large majority is the everyday signature of a false
 positive, and the interface says so in as many words rather than colouring it
 red.

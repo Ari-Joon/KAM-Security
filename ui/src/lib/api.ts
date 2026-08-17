@@ -14,6 +14,8 @@ import type {
   ProvenanceReport,
   RuleReport,
   Verdict,
+  FirewallReport,
+  ConnectionReport,
 } from "./types";
 
 /**
@@ -37,6 +39,10 @@ export const api = {
   provenance: (job: string) =>
     invoke<ProvenanceReport | null>("survey_provenance", { job }),
   cancelJob: (job: string) => invoke<void>("cancel_job", { job }),
+  firewall: () => invoke<FirewallReport>("firewall"),
+  connections: () => invoke<ConnectionReport>("connections"),
+  blockProgram: (path: string) => invoke<string>("block_program", { path }),
+  unblockProgram: (rule: string) => invoke<void>("unblock_program", { rule }),
   scanRules: (paths: string[]) => invoke<RuleReport>("scan_rules", { paths }),
   virustotalKeyPresent: () => invoke<boolean>("virustotal_key_present"),
   setVirustotalKey: (key: string) => invoke<boolean>("set_virustotal_key", { key }),

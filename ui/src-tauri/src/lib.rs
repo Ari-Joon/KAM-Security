@@ -330,6 +330,49 @@ async fn stream_job<T: Send + 'static>(
     .map_err(|error| format!("the job did not finish: {error}"))?
 }
 
+#[tauri::command]
+fn firewall() -> Result<kam_firewall::policy::FirewallReport, String> {
+    match kam_ipc::client::call(&Request::GetFirewall).map_err(|e| e.to_string())? {
+        Response::Firewall(report) => Ok(*report),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+#[tauri::command]
+fn connections() -> Result<kam_firewall::connections::ConnectionReport, String> {
+    match kam_ipc::client::call(&Request::GetConnections).map_err(|e| e.to_string())? {
+        Response::Connections(report) => Ok(report),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Stop a program reaching the network.
+///
+/// The first command in the product that changes the machine. The agent
+/// re-derives everything that matters — that the path names a real program,
+/// and that the rule it creates is tagged as ours — rather than trusting what
+/// the interface sent. Returns the rule name, which is how it is undone.
+#[tauri::command]
+fn block_program(path: String) -> Result<String, String> {
+    match kam_ipc::client::call(&Request::BlockProgram { path }).map_err(|e| e.to_string())? {
+        Response::Blocked { rule } => Ok(rule),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Remove a block this product created. The agent refuses anything else.
+#[tauri::command]
+fn unblock_program(rule: String) -> Result<(), String> {
+    match kam_ipc::client::call(&Request::UnblockProgram { rule }).map_err(|e| e.to_string())? {
+        Response::Acknowledged => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Ask a running job to stop.
 #[tauri::command]
 fn cancel_job(job: String) -> Result<(), String> {
@@ -447,6 +490,10 @@ pub fn run() {
             defender_threats,
             survey_provenance,
             cancel_job,
+            firewall,
+            connections,
+            block_program,
+            unblock_program,
             scan_rules,
             virustotal_key_present,
             set_virustotal_key,

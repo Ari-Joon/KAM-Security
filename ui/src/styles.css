@@ -2017,3 +2017,194 @@ pre.error {
     transition: none;
   }
 }
+
+/* --- Firewall ----------------------------------------------------------- *
+ * Connections reaching the internet are marked; everything on loopback or the
+ * local network is not, because "connected to 127.0.0.1" alarms people about
+ * a program talking to itself. Rules this product added are separated from the
+ * several hundred it did not, since only ours are removable here.
+ */
+
+.chip {
+  margin-left: 8px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--accent-soft);
+  border: 1px solid var(--accent-dim);
+  border-radius: 4px;
+  padding: 1px 5px;
+  vertical-align: middle;
+}
+
+.conns,
+.fw-rules {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.conn {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 9px 12px;
+  min-width: 0;
+}
+
+.conn-external {
+  border-left-color: var(--accent);
+}
+
+.conn-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.conn-name {
+  font-weight: 600;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.conn-proto {
+  font-size: 11px;
+  color: var(--text-3);
+  flex: none;
+}
+
+.conn-block {
+  margin-left: auto;
+  flex: none;
+  padding: 0;
+}
+
+.conn-detail {
+  display: flex;
+  gap: 14px;
+  margin-top: 2px;
+  font-size: 11.5px;
+  min-width: 0;
+}
+
+.conn-peer {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.conn-signer {
+  color: var(--text-3);
+  flex: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 40%;
+}
+
+.conn-path {
+  display: block;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 3px 0 0;
+  margin: 0;
+  text-align: left;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--text-3);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.conn-path:hover {
+  color: var(--accent-soft);
+  text-decoration: underline;
+}
+
+.fw-rule {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  min-width: 0;
+}
+
+.fw-rule-ours {
+  border-color: var(--accent-dim);
+}
+
+.fw-rule-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.fw-rule-name {
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.fw-rule-head .link-button {
+  margin-left: auto;
+  flex: none;
+  padding: 0;
+}
+
+.fw-rule-off {
+  margin-left: auto;
+  flex: none;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+.fw-rule-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-3);
+  min-width: 0;
+}
+
+.fw-rule-app {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.confirm-body {
+  margin: 6px 0 10px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  max-width: 78ch;
+}
+
+.confirm-body code {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+.confirm-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}

@@ -5,9 +5,9 @@ import type { AuditRecord, SystemStatus, Volume } from "./lib/types";
 import Overview from "./views/Overview";
 import Storage from "./views/Storage";
 import Activity from "./views/Activity";
-import Planned from "./views/Planned";
 import Applications from "./views/Applications";
 import Cleanup from "./views/Cleanup";
+import Firewall from "./views/Firewall";
 import Scanner from "./views/Scanner";
 import {
   ActivityIcon,
@@ -46,7 +46,7 @@ const NAV: {
   },
   { key: "cleanup", label: "Cleanup", hint: "Leftovers and quarantine", Icon: CleanupIcon },
   { key: "scanner", label: "Scanner", hint: "Defender status", Icon: ScannerIcon },
-  { key: "firewall", label: "Firewall", hint: "Phase 4", Icon: FirewallIcon },
+  { key: "firewall", label: "Firewall", hint: "Rules and connections", Icon: FirewallIcon },
   { key: "activity", label: "Activity", hint: "The audit log", Icon: ActivityIcon },
 ];
 
@@ -207,19 +207,7 @@ export default function App() {
 
         {section === "scanner" && <Scanner />}
 
-        {section === "firewall" && (
-          <Planned
-            title="Firewall"
-            phase="Phase 4"
-            lede="A usable interface over Windows Defender Firewall, which already works."
-            points={[
-              "Read, group and explain the existing rules, including ones other software added without telling you.",
-              "Show live connections joined to process, signer, and destination — what is this program talking to.",
-              "Turn any observed connection into a scoped outbound rule in one click.",
-              "Watch connections as they open via ETW. Prompting before connect would need a kernel driver, which this project will not ship.",
-            ]}
-          />
-        )}
+        {section === "firewall" && <Firewall />}
       </main>
     </div>
   );

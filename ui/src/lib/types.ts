@@ -362,3 +362,74 @@ export type Verdict = {
   permalink: string;
   summary: string;
 };
+
+/** Windows Defender Firewall, read through its own interface. */
+export type FirewallProfile = "domain" | "private" | "public";
+export type FirewallDefault = "allow" | "block" | "unknown";
+export type RuleDirection = "in" | "out" | "unknown";
+
+export type ProfileState = {
+  profile: FirewallProfile;
+  enabled: boolean;
+  active: boolean;
+  inbound_default: FirewallDefault;
+  outbound_default: FirewallDefault;
+};
+
+export type FirewallRule = {
+  name: string;
+  description: string | null;
+  application: string | null;
+  service: string | null;
+  direction: RuleDirection;
+  action: FirewallDefault;
+  enabled: boolean;
+  grouping: string | null;
+  profiles: FirewallProfile[];
+  protocol: number | null;
+  local_ports: string | null;
+  remote_ports: string | null;
+  remote_addresses: string | null;
+  /** True when this product created it, and so may remove it. */
+  ours: boolean;
+};
+
+export type FirewallReport = {
+  profiles: ProfileState[];
+  rules: FirewallRule[];
+  concerns: string[];
+  total_rules: number;
+  enabled_rules: number;
+  blocking_rules: number;
+  our_rules: number;
+};
+
+export type ConnectionState =
+  | "listening"
+  | "established"
+  | "transient"
+  | "connectionless";
+
+export type Connection = {
+  protocol: string;
+  state: ConnectionState;
+  local_address: string;
+  local_port: number;
+  remote_address: string | null;
+  remote_port: number | null;
+  process_id: number;
+  image_path: string | null;
+  name: string | null;
+  signer: string | null;
+  /** null means the owning program could not be identified — not "unsigned". */
+  unsigned: boolean | null;
+  external: boolean;
+};
+
+export type ConnectionReport = {
+  connections: Connection[];
+  established: number;
+  listening: number;
+  external: number;
+  programs: number;
+};
