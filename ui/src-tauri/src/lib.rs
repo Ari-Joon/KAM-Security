@@ -476,8 +476,15 @@ fn protocol_version() -> u32 {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+mod tray;
+
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            tray::install(app.handle())?;
+            Ok(())
+        })
+        .on_window_event(tray::on_window_event)
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             agent_status,
@@ -509,11 +516,25 @@ pub fn run() {
             run_uninstaller,
             protocol_version
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .unwrap_or_else(|error| {
             // Nothing can be shown to the user without a window, so failing
             // loudly on stderr is the best available.
             eprintln!("could not start the KAM Security shell: {error}");
             std::process::exit(1);
+        })
+        .run(|_app, event| {
+            // Destroying the last window would normally end the program, which
+            // would take the tray icon with it. Holding the loop open is what
+            // makes "close to the notification area" mean anything.
+            //
+            // `code` distinguishes the two cases: `None` is Tauri noticing the
+            // last window went away, `Some` is somebody actually choosing Quit.
+            // Preventing both would make the program unquittable.
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                if code.is_none() {
+                    api.prevent_exit();
+                }
+            }
         });
 }

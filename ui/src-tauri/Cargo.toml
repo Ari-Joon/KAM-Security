@@ -30,7 +30,7 @@ kam-storage = { workspace = true }
 kam-virustotal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 windows = { workspace = true }
 tauri-plugin-opener = "2"
 
