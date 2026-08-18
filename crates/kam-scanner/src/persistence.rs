@@ -29,9 +29,7 @@ use std::path::{Path, PathBuf};
 
 use kam_core::registry::{self, View};
 use serde::{Deserialize, Serialize};
-use windows::core::PCWSTR;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
-use windows::Win32::UI::Shell::SHLoadIndirectString;
 
 /// Where an auto-start entry was found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,34 +176,6 @@ fn expand(text: &str) -> String {
     out
 }
 
-/// Resolve a display name that is really a pointer into a resource file.
-///
-/// Services routinely store their name as `@%SystemRoot%\system32\thing.dll,-101`,
-/// meaning "string 101 in that library, in the user's language". Showing that
-/// to a person is worse than showing the bare service key name, so an
-/// unresolvable reference falls back to the key name rather than being
-/// displayed raw.
-fn resolve_display_name(name: &str, fallback: &str) -> String {
-    if !name.starts_with('@') {
-        return name.to_owned();
-    }
-
-    let source: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut buffer = [0_u16; 512];
-    let resolved = unsafe {
-        SHLoadIndirectString(PCWSTR(source.as_ptr()), &mut buffer, None)
-    };
-
-    if resolved.is_ok() {
-        let end = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
-        let text = String::from_utf16_lossy(&buffer[..end]).trim().to_owned();
-        if !text.is_empty() {
-            return text;
-        }
-    }
-    fallback.to_owned()
-}
-
 /// The auto-start registry keys worth reading, and what each one means.
 const RUN_KEYS: &[(&str, Anchor)] = &[
     (r"Software\Microsoft\Windows\CurrentVersion\Run", Anchor::RunKey),
@@ -340,7 +310,7 @@ fn read_services(entries: &mut Vec<Entry>) {
         entries.push(Entry {
             name: service
                 .string("DisplayName")
-                .map(|display| resolve_display_name(&display, &name))
+                .map(|display| kam_core::mui::resolve(&display, &name))
                 .unwrap_or_else(|| name.clone()),
             anchor: Anchor::Service,
             location: format!(r"HKLM\SYSTEM\CurrentControlSet\Services\{name}"),
@@ -594,7 +564,7 @@ mod tests {
     fn a_resource_reference_never_reaches_the_screen() {
         // Whether or not it resolves, what comes back must be a name rather
         // than a pointer into a library.
-        let resolved = resolve_display_name(
+        let resolved = kam_core::mui::resolve(
             r"@%SystemRoot%\system32\wscsvc.dll,-200",
             "wscsvc",
         );
@@ -605,7 +575,7 @@ mod tests {
         println!("resolved to: {resolved}");
 
         // A plain name is passed through untouched.
-        assert_eq!(resolve_display_name("Print Spooler", "spooler"), "Print Spooler");
+        assert_eq!(kam_core::mui::resolve("Print Spooler", "spooler"), "Print Spooler");
     }
 
     #[test]

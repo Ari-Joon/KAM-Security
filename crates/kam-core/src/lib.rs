@@ -7,6 +7,7 @@
 pub mod audit;
 pub mod db;
 pub mod error;
+pub mod mui;
 pub mod progress;
 pub mod registry;
 

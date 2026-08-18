@@ -311,7 +311,15 @@ fn read_profiles(policy: &INetFwPolicy2) -> Vec<ProfileState> {
 /// can have properties that fail to read, and one bad rule must not take the
 /// whole list with it.
 fn read_rule(rule: &INetFwRule) -> Option<Rule> {
-    let name = unsafe { rule.Name() }.ok().and_then(text)?;
+    let raw = unsafe { rule.Name() }.ok().and_then(text)?;
+
+    // Store applications register their rules under a resource pointer rather
+    // than a name — 92 of the 671 rules on the development machine. Showing
+    // those raw means a seventh of the list reads as corruption, so they are
+    // resolved the same way service names are. A pointer that cannot be looked
+    // up keeps its own text as the fallback, which is at least stable and
+    // unique enough to identify the rule by.
+    let name = kam_core::mui::resolve(&raw, &raw);
     let grouping = unsafe { rule.Grouping() }.ok().and_then(text);
 
     Some(Rule {
@@ -707,6 +715,22 @@ mod tests {
             "the machine should be left exactly as it was found"
         );
         println!("removed cleanly; {} rules ours", restored.our_rules);
+    }
+
+    /// Diagnostic: dump every rule name so it can be diffed against
+    /// `Get-NetFirewallRule`. Ignored by default.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn dump_rule_names() {
+        let report = survey().unwrap();
+        let mut out = String::new();
+        for rule in &report.rules {
+            out.push_str(&rule.name);
+            out.push('\n');
+        }
+        let path = std::env::temp_dir().join("kam-rule-names.txt");
+        std::fs::write(&path, out).unwrap();
+        println!("wrote {} names to {}", report.rules.len(), path.display());
     }
 
     #[test]
