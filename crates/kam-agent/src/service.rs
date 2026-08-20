@@ -18,6 +18,7 @@ use kam_core::{Error, Result, SERVICE_NAME};
 use kam_ipc::pipe::PipeListener;
 use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+    ServiceAction, ServiceActionType, ServiceFailureActions, ServiceFailureResetPeriod,
     ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
@@ -163,6 +164,10 @@ fn serve_until_stopped(shutdown: &Shutdown) -> Result<()> {
     server::serve(&listener, &context, shutdown)
 }
 
+/// `ERROR_SERVICE_EXISTS`. Spelled out rather than pulling the whole `windows`
+/// crate into the agent for one integer.
+const ERROR_SERVICE_EXISTS: i32 = 1073;
+
 /// Register the agent with the service control manager. Requires elevation.
 pub fn install() -> Result<()> {
     let manager = ServiceManager::local_computer(
@@ -175,9 +180,23 @@ pub fn install() -> Result<()> {
         name: OsString::from(SERVICE_NAME),
         display_name: OsString::from(DISPLAY_NAME),
         service_type: SERVICE_TYPE,
-        // Manual until there is something worth running at boot. Auto-start is
-        // a decision to make when the scheduler exists, not before.
-        start_type: ServiceStartType::OnDemand,
+        // Automatic, and this was wrong before.
+        //
+        // The original reasoning -- "manual until there is something worth
+        // running at boot" -- was defensible while the agent only answered a
+        // window nobody had opened yet. It stopped being true the moment
+        // anything depended on the agent being there, and it failed exactly as
+        // you would predict: a reboot left the service stopped, and opening
+        // KAM Security showed "Cannot reach the agent" with a
+        // file-not-found on the pipe. Nothing was broken; nothing had started.
+        //
+        // The boot cost of fixing it is nil. The agent blocks in
+        // `ConnectNamedPipe` and does nothing until asked -- 1.4 MB of private
+        // memory and no measurable CPU -- so there is nothing to defer. Delayed
+        // auto-start was considered and rejected: it would put the same
+        // confusing error in front of anyone who opens the app within a couple
+        // of minutes of logging in.
+        start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: std::env::current_exe()?,
         // Explicit, so the ImagePath in the registry states plainly how this
@@ -189,12 +208,60 @@ pub fn install() -> Result<()> {
         account_password: None,
     };
 
-    let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG)
-        .map_err(|error| service_error(error, "could not create the service"))?;
+    // Installing over an existing registration repairs it rather than failing.
+    // A machine that already has the service is the common case when the start
+    // type or image path needs correcting, and refusing there would mean
+    // telling people to uninstall a security service to fix its configuration.
+    let service = match manager.create_service(&info, ServiceAccess::CHANGE_CONFIG) {
+        Ok(service) => service,
+        Err(windows_service::Error::Winapi(error))
+            if error.raw_os_error() == Some(ERROR_SERVICE_EXISTS) =>
+        {
+            let existing = manager
+                .open_service(
+                    SERVICE_NAME,
+                    ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG,
+                )
+                .map_err(|error| service_error(error, "could not open the existing service"))?;
+            existing
+                .change_config(&info)
+                .map_err(|error| service_error(error, "could not update the service"))?;
+            println!("updated the existing {SERVICE_NAME} registration");
+            existing
+        }
+        Err(error) => return Err(service_error(error, "could not create the service")),
+    };
+
     service
         .set_description(DESCRIPTION)
         .map_err(|error| service_error(error, "could not set the service description"))?;
+
+    // Come back on its own if it ever falls over. A security service that
+    // stays down after one crash is worse than useless: the interface reports
+    // everything as unavailable and the machine looks unprotected when the
+    // only thing wrong is a process that needs starting again.
+    let restart = |after: Duration| ServiceAction {
+        action_type: ServiceActionType::Restart,
+        delay: after,
+    };
+    if let Err(error) = service.update_failure_actions(ServiceFailureActions {
+        // Two quick attempts, then a longer one, then leave it alone: a fault
+        // that survives three restarts will not be fixed by a fourth, and a
+        // service restarting forever is its own kind of problem.
+        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
+        reboot_msg: None,
+        command: None,
+        actions: Some(vec![
+            restart(Duration::from_secs(5)),
+            restart(Duration::from_secs(15)),
+            restart(Duration::from_secs(60)),
+        ]),
+    }) {
+        // Not fatal. The service is installed and will run; it simply will not
+        // pick itself up automatically, which is worth saying rather than
+        // failing the whole install over.
+        println!("note: could not set restart-on-failure ({error})");
+    }
 
     println!("installed {SERVICE_NAME} ({DISPLAY_NAME})");
     println!("start it with:  sc start {SERVICE_NAME}");

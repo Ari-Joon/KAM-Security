@@ -89,6 +89,22 @@ try {
         Say ("  {0,-16} {1}  {2} MB" -f $name, $stamp, $mb) 'Green'
     }
 
+    # --- repair the registration --------------------------------------------
+    #
+    # The service was originally registered as manual-start, which meant a
+    # reboot left it stopped and the application reported "Cannot reach the
+    # agent". Fixed in the installer, but an existing registration keeps
+    # whatever it was created with, so it is corrected here too -- that is the
+    # one this machine actually runs.
+    $cim = Get-CimInstance Win32_Service -Filter "Name='$service'" -ErrorAction SilentlyContinue
+    if ($cim -and $cim.StartMode -ne 'Auto') {
+        Say "Start mode is $($cim.StartMode); setting it to Automatic so it survives a reboot..." 'Yellow'
+        & sc.exe config $service start= auto | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "could not set the service to start automatically (sc exit $LASTEXITCODE)" }
+        & sc.exe failure $service reset= 86400 actions= restart/5000/restart/15000/restart/60000 | Out-Null
+        Say '  set to Automatic, with restart-on-failure.' 'Green'
+    }
+
     # --- start and verify ----------------------------------------------------
     if ($svc) {
         Say 'Starting the service...'
