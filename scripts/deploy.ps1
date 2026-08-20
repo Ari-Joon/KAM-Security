@@ -30,13 +30,27 @@ if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrat
     $log = Join-Path $env:TEMP 'kam-deploy.log'
     if (Test-Path $log) { Remove-Item $log -Force }
 
+    # Every argument is quoted by hand.
+    #
+    # Start-Process joins ArgumentList with spaces and does NOT quote the
+    # parts, so this script's own path -- which lives under "KAM Security" --
+    # arrives at PowerShell split in half at the space. It then cannot find the
+    # file and exits -196608 before running a line, which is what "Deploy
+    # failed (exit -196608)" with no log meant.
+    $self = '"' + $MyInvocation.MyCommand.Path + '"'
     $child = Start-Process powershell.exe -Verb RunAs -PassThru -Wait -ArgumentList @(
         '-ExecutionPolicy', 'Bypass',
         '-NoProfile',
-        '-File', $MyInvocation.MyCommand.Path
+        '-File', $self
     )
 
-    if (Test-Path $log) { Get-Content $log }
+    if (Test-Path $log) {
+        Get-Content $log
+    } elseif ($child.ExitCode -ne 0) {
+        Write-Host 'The elevated pass wrote no log, so it failed before it began.' -ForegroundColor Red
+        Write-Host "Run it directly from an administrator terminal to see why:" -ForegroundColor Yellow
+        Write-Host "  powershell -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`"" -ForegroundColor Yellow
+    }
     if ($child.ExitCode -ne 0) {
         Write-Host "Deploy failed (exit $($child.ExitCode))." -ForegroundColor Red
     }
@@ -56,6 +70,24 @@ try {
         if (-not (Test-Path $built)) {
             throw "$name has not been built. Run: cargo build --release -p kam-agent  and  npm run tauri build -- --no-bundle"
         }
+    }
+
+    # --- close the window ----------------------------------------------------
+    #
+    # kam-shell.exe holds a write lock on itself while it runs, and deploying
+    # underneath a running window would leave an old interface talking to a new
+    # agent across a protocol that may have changed. Closing it is part of the
+    # swap, not a liberty.
+    $shells = Get-Process kam-shell -ErrorAction SilentlyContinue
+    if ($shells) {
+        Say 'Closing the KAM Security window...'
+        $shells | Stop-Process -Force
+        $waited = 0
+        while ((Get-Process kam-shell -ErrorAction SilentlyContinue) -and $waited -lt 100) {
+            Start-Sleep -Milliseconds 100
+            $waited++
+        }
+        Say '  closed.'
     }
 
     # --- stop, and confirm it actually stopped -------------------------------
@@ -78,17 +110,6 @@ try {
         Say '  stopped.'
     }
 
-    # --- copy ---------------------------------------------------------------
-    New-Item -ItemType Directory -Force -Path (Join-Path $root 'dist') | Out-Null
-    foreach ($name in $binaries) {
-        $built = Join-Path $root "target\release\$name"
-        $live = Join-Path $root "dist\$name"
-        Copy-Item $built $live -Force
-        $stamp = (Get-Item $live).LastWriteTime.ToString('HH:mm:ss')
-        $mb = [math]::Round((Get-Item $live).Length / 1MB, 1)
-        Say ("  {0,-16} {1}  {2} MB" -f $name, $stamp, $mb) 'Green'
-    }
-
     # --- repair the registration --------------------------------------------
     #
     # The service was originally registered as manual-start, which meant a
@@ -103,6 +124,17 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "could not set the service to start automatically (sc exit $LASTEXITCODE)" }
         & sc.exe failure $service reset= 86400 actions= restart/5000/restart/15000/restart/60000 | Out-Null
         Say '  set to Automatic, with restart-on-failure.' 'Green'
+    }
+
+    # --- copy ---------------------------------------------------------------
+    New-Item -ItemType Directory -Force -Path (Join-Path $root 'dist') | Out-Null
+    foreach ($name in $binaries) {
+        $built = Join-Path $root "target\release\$name"
+        $live = Join-Path $root "dist\$name"
+        Copy-Item $built $live -Force
+        $stamp = (Get-Item $live).LastWriteTime.ToString('HH:mm:ss')
+        $mb = [math]::Round((Get-Item $live).Length / 1MB, 1)
+        Say ("  {0,-16} {1}  {2} MB" -f $name, $stamp, $mb) 'Green'
     }
 
     # --- start and verify ----------------------------------------------------
