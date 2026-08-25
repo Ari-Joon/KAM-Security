@@ -38,11 +38,20 @@ if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrat
     # file and exits -196608 before running a line, which is what "Deploy
     # failed (exit -196608)" with no log meant.
     $self = '"' + $MyInvocation.MyCommand.Path + '"'
-    $child = Start-Process powershell.exe -Verb RunAs -PassThru -Wait -ArgumentList @(
-        '-ExecutionPolicy', 'Bypass',
-        '-NoProfile',
-        '-File', $self
-    )
+
+    # Declining the prompt is a choice, not a fault, and it should read like
+    # one rather than as an unhandled PowerShell exception.
+    try {
+        $child = Start-Process powershell.exe -Verb RunAs -PassThru -Wait -ArgumentList @(
+            '-ExecutionPolicy', 'Bypass',
+            '-NoProfile',
+            '-File', $self
+        ) -ErrorAction Stop
+    } catch {
+        Write-Host 'Administrator rights were not granted, so nothing was changed.' -ForegroundColor Yellow
+        Write-Host 'The service is still running whatever was deployed before.' -ForegroundColor Yellow
+        exit 2
+    }
 
     if (Test-Path $log) {
         Get-Content $log

@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -146,7 +146,20 @@ pub enum Request {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+// Adjacently tagged, not internally tagged, and the difference is not
+// cosmetic.
+//
+// With `tag = "kind"` alone, serde flattens a newtype variant's payload
+// alongside the discriminant, so `Quarantined(Manifest)` serialised as
+// `{"kind":"quarantined", ..., "kind":<ItemKind>, ...}` -- because `Manifest`
+// has its own `kind` field. The shell then refused the frame with "duplicate
+// field `kind`" and quarantine could not be used at all.
+//
+// Adding `content = "body"` nests the payload under its own key instead, so no
+// field of any wrapped struct can ever collide with the discriminant again.
+// Renaming `Manifest::kind` would have fixed the one case and left the trap
+// armed for the next struct that happens to have a field called `kind`.
+#[serde(tag = "kind", content = "body", rename_all = "snake_case")]
 pub enum Response {
     SystemStatus(SystemStatus),
     RecentAudit {
@@ -215,4 +228,114 @@ pub struct SystemStatus {
     /// than running as a foreground console process for development.
     pub running_as_service: bool,
     pub hostname: String,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// Every response has to survive the trip it is built for.
+    ///
+    /// This exists because one did not. `Response::Quarantined(Manifest)` could
+    /// be sent and never received: internal tagging flattened the manifest's
+    /// fields next to the discriminant, the manifest had its own `kind` field,
+    /// and the shell rejected the frame with "duplicate field `kind`". Nothing
+    /// caught it, because every test constructed values in memory and none of
+    /// them went through serde and back.
+    fn round_trip(response: Response) {
+        let json = serde_json::to_string(&response).expect("should serialise");
+
+        // Adjacent tagging keeps the payload in its own object, so the
+        // discriminant can appear exactly once at the top level whatever the
+        // payload contains.
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("should be JSON");
+        let object = parsed.as_object().expect("a response is an object");
+        assert!(object.contains_key("kind"), "no discriminant in {json}");
+
+        // The real assertion: it must come back. Serde rejects duplicate keys
+        // on the way in, which is precisely how the original bug surfaced.
+        serde_json::from_str::<Response>(&json)
+            .unwrap_or_else(|error| panic!("could not read it back: {error}\n{json}"));
+    }
+
+    fn manifest() -> kam_quarantine::Manifest {
+        kam_quarantine::Manifest {
+            id: "abc123".to_owned(),
+            original_path: r"C:\Users\someone\Downloads\thing.exe".to_owned(),
+            // The field that collided with the discriminant.
+            kind: kam_quarantine::ItemKind::File,
+            bytes: 4096,
+            quarantined_at: 1_700_000_000,
+            reason: "leftover from software uninstalled long ago".to_owned(),
+            restored: false,
+        }
+    }
+
+    #[test]
+    fn a_quarantine_manifest_survives_the_wire() {
+        // The exact frame that could not be delivered.
+        round_trip(Response::Quarantined(manifest()));
+    }
+
+    #[test]
+    fn a_manifests_own_kind_does_not_collide_with_the_discriminant() {
+        let json = serde_json::to_string(&Response::Quarantined(manifest())).unwrap();
+        assert_eq!(
+            json.matches("\"kind\"").count(),
+            2,
+            "expected the response discriminant and the manifest's own kind, \
+             nested rather than flattened: {json}"
+        );
+        assert!(
+            json.contains("\"body\""),
+            "the payload should be nested under its own key: {json}"
+        );
+    }
+
+    #[test]
+    fn every_simple_response_survives_the_wire() {
+        round_trip(Response::Acknowledged);
+        round_trip(Response::Stopped);
+        round_trip(Response::Error {
+            message: "something went wrong".to_owned(),
+        });
+        round_trip(Response::Blocked {
+            rule: "KAM Security: block thing.exe".to_owned(),
+        });
+        round_trip(Response::QuarantineList {
+            items: vec![manifest()],
+        });
+        round_trip(Response::Connections(Default::default()));
+        round_trip(Response::SystemStatus(SystemStatus {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: "0.1.0".to_owned(),
+            running_as_service: true,
+            hostname: "machine".to_owned(),
+        }));
+    }
+
+    #[test]
+    fn a_progress_frame_is_never_mistaken_for_a_result() {
+        // The two are distinguished at the type level so a client cannot read
+        // one as the other; this checks the wire agrees.
+        let progress = Reply::Progress(kam_core::Progress {
+            stage: "Examining programs".to_owned(),
+            done: 12,
+            total: Some(400),
+            detail: None,
+        });
+        let done = Reply::Done(Response::Acknowledged);
+
+        let progress_json = serde_json::to_string(&progress).unwrap();
+        let done_json = serde_json::to_string(&done).unwrap();
+
+        assert!(progress_json.contains("\"progress\""));
+        assert!(done_json.contains("\"done\""));
+
+        for json in [&progress_json, &done_json] {
+            serde_json::from_str::<Reply>(json)
+                .unwrap_or_else(|error| panic!("could not read {json}: {error}"));
+        }
+    }
 }
