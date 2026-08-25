@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
 import type { AppFootprint, ApplicationReport, Volume } from "../lib/types";
@@ -169,14 +169,68 @@ export default function Applications({ volumes, onMeasured }: Props) {
   const [note, setNote] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<AppFootprint | null>(null);
 
+  // Names an uninstaller was launched for and whose result has not been
+  // measured yet. A ref rather than state because the focus handler below
+  // reads it from outside React's render cycle.
+  const awaitingUninstall = useRef<string | null>(null);
+
+  const measure = useCallback(async () => {
+    setRunning(true);
+    setError(null);
+    try {
+      setReport(await api.applications(drive));
+    } catch (cause) {
+      setError(reason(cause));
+      setReport(null);
+    } finally {
+      setRunning(false);
+      onMeasured();
+    }
+  }, [drive, onMeasured]);
+
+  /**
+   * Re-measure when the window comes back after an uninstaller ran.
+   *
+   * An uninstaller is a separate program that takes as long as it takes, and
+   * the list is a snapshot from before it started, so an entry stays on screen
+   * for something that has already gone. Refreshing the instant the uninstaller
+   * is launched would be worse than useless: nothing has been removed yet.
+   *
+   * Returning to this window is the honest signal that the uninstaller is
+   * done with, and it costs nothing to watch for. Polling the registry would
+   * be guessing at a moment the person can simply tell us by coming back.
+   */
+  useEffect(() => {
+    function recheck() {
+      const name = awaitingUninstall.current;
+      if (!name || document.hidden) {
+        return;
+      }
+      awaitingUninstall.current = null;
+      setNote(`Checking whether ${name} is really gone…`);
+      void measure().then(() => {
+        setNote(`Measured again after uninstalling ${name}.`);
+      });
+    }
+
+    window.addEventListener("focus", recheck);
+    document.addEventListener("visibilitychange", recheck);
+    return () => {
+      window.removeEventListener("focus", recheck);
+      document.removeEventListener("visibilitychange", recheck);
+    };
+  }, [measure]);
+
   async function uninstall(app: AppFootprint) {
     setConfirming(null);
     setError(null);
     try {
       await api.uninstall(app.name, app.uninstall_command ?? "");
+      awaitingUninstall.current = app.name;
       setNote(
-        `Started the uninstaller for ${app.name}. When it has finished, ` +
-          `measure again to see what was actually reclaimed.`,
+        `Started the uninstaller for ${app.name}. This list still shows what ` +
+          `was there before it ran, and will measure again when you come back ` +
+          `to this window.`,
       );
     } catch (cause) {
       setError(reason(cause));
@@ -190,20 +244,6 @@ export default function Applications({ volumes, onMeasured }: Props) {
       await api.reveal(path);
     } catch (cause) {
       setError(reason(cause));
-    }
-  }
-
-  async function run() {
-    setRunning(true);
-    setError(null);
-    try {
-      setReport(await api.applications(drive));
-    } catch (cause) {
-      setError(reason(cause));
-      setReport(null);
-    } finally {
-      setRunning(false);
-      onMeasured();
     }
   }
 
@@ -236,7 +276,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
                 </option>
               ))}
           </select>
-          <button className="primary" onClick={() => void run()} disabled={running}>
+          <button className="primary" onClick={() => void measure()} disabled={running}>
             {running ? "Measuring…" : "Measure"}
           </button>
           <span className="muted">
