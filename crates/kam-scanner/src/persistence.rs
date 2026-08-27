@@ -107,7 +107,7 @@ pub fn executable_in(command: &str) -> Option<PathBuf> {
 
     // Expand environment variables first: `%ProgramFiles%\thing\thing.exe` is
     // common and useless left as written.
-    let expanded = expand(command);
+    let expanded = kam_core::env::expand(command);
     let trimmed = expanded.trim();
 
     // A quoted path is unambiguous, which is why installers that get this right
@@ -139,41 +139,6 @@ pub fn executable_in(command: &str) -> Option<PathBuf> {
     }
 
     None
-}
-
-/// Expand `%NAME%` references against the current environment.
-fn expand(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-
-    while let Some(start) = rest.find('%') {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 1..];
-        match after.find('%') {
-            Some(end) => {
-                let name = &after[..end];
-                match std::env::var(name) {
-                    Ok(value) => out.push_str(&value),
-                    // An unset variable is left as written rather than silently
-                    // becoming an empty string, which would produce a path that
-                    // looks plausible and is wrong.
-                    Err(_) => {
-                        out.push('%');
-                        out.push_str(name);
-                        out.push('%');
-                    }
-                }
-                rest = &after[end + 1..];
-            }
-            None => {
-                out.push('%');
-                rest = after;
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 /// The auto-start registry keys worth reading, and what each one means.
@@ -538,14 +503,6 @@ mod tests {
             executable_in(command).is_some(),
             "an unexpanded variable makes the path useless"
         );
-    }
-
-    #[test]
-    fn an_unset_variable_is_left_alone_rather_than_blanked() {
-        // Blanking would produce `\Thing\thing.exe`, which looks like a real
-        // path and is not one.
-        let text = expand(r"%KAM_DEFINITELY_NOT_SET%\thing.exe");
-        assert_eq!(text, r"%KAM_DEFINITELY_NOT_SET%\thing.exe");
     }
 
     #[test]

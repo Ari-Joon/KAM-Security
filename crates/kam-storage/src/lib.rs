@@ -30,6 +30,7 @@ pub mod provenance;
 /// needed it too.
 pub use kam_core::registry;
 pub mod scan;
+pub mod shortcuts;
 pub mod steam;
 pub mod volumes;
 

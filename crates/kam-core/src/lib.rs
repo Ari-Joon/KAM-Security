@@ -6,6 +6,7 @@
 
 pub mod audit;
 pub mod db;
+pub mod env;
 pub mod error;
 pub mod mui;
 pub mod progress;
