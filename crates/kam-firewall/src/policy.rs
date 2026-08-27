@@ -733,6 +733,83 @@ mod tests {
         println!("wrote {} names to {}", report.rules.len(), path.display());
     }
 
+    /// Create a real block rule, verify Windows holds it, then remove it.
+    ///
+    /// Ignored by default because it writes to the machine's firewall. It is
+    /// the only way to test the one thing in this product that changes the
+    /// system unprompted, and it cleans up after itself whether it passes or
+    /// fails.
+    ///
+    /// Run with: cargo test -p kam-firewall -- --ignored --test-threads=1
+    #[test]
+    #[ignore = "creates a real firewall rule"]
+    fn a_real_block_rule_is_created_and_removed() {
+        // Something present on every Windows install, that nothing depends on
+        // reaching the network. Blocking notepad outbound costs nothing even
+        // if the cleanup somehow fails.
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+        let program = format!(r"{root}\System32\notepad.exe");
+        let expected = block_rule_name(&program);
+
+        // Leave nothing behind from an earlier failed run.
+        let _ = remove_our_rule(&expected);
+
+        let before = survey().expect("the firewall should be readable");
+        let existed = before.rules.iter().any(|rule| rule.name == expected);
+        assert!(!existed, "the rule was already there before the test");
+
+        // --- create ------------------------------------------------------
+        let created = block_program(&program).expect("the rule should be created");
+        assert_eq!(created, expected);
+
+        let after = survey().expect("the firewall should still be readable");
+        let rule = after
+            .rules
+            .iter()
+            .find(|rule| rule.name == expected)
+            .expect("Windows does not have the rule that was just added");
+
+        // Everything the interface promises about it.
+        assert!(rule.ours, "the rule is not marked as ours");
+        assert_eq!(rule.grouping.as_deref(), Some(OUR_GROUP));
+        assert_eq!(rule.action, Default::Block);
+        assert_eq!(rule.direction, Direction::Out, "should be outgoing only");
+        assert!(rule.enabled, "a block that is not enabled blocks nothing");
+        assert_eq!(
+            rule.application.as_deref().map(str::to_lowercase),
+            Some(program.to_lowercase()),
+            "the rule names the wrong program"
+        );
+        assert_eq!(
+            after.our_rules,
+            before.our_rules + 1,
+            "the count of our rules did not go up by exactly one"
+        );
+        assert_eq!(
+            after.total_rules,
+            before.total_rules + 1,
+            "more than one rule appeared"
+        );
+
+        // --- remove ------------------------------------------------------
+        remove_our_rule(&expected).expect("our own rule should be removable");
+
+        let finally = survey().expect("the firewall should be readable");
+        assert!(
+            !finally.rules.iter().any(|rule| rule.name == expected),
+            "the rule is still there after being removed"
+        );
+        assert_eq!(
+            finally.total_rules, before.total_rules,
+            "the machine was left with a different number of rules than it started with"
+        );
+
+        println!(
+            "created and removed {expected}; {} rules before and after",
+            before.total_rules
+        );
+    }
+
     #[test]
     fn this_machine_has_a_firewall_with_rules() {
         // Every Windows install ships hundreds of rules. Finding none means

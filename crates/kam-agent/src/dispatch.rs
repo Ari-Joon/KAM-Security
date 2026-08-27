@@ -674,6 +674,212 @@ mod tests {
         }
     }
 
+    /// A scratch directory sitting directly inside a real data root.
+    ///
+    /// It has to be there rather than in the temp folder: the fence only
+    /// allows a directory that sits *directly* inside `ProgramData`,
+    /// `LocalAppData` or `Roaming`, which is exactly the shape of a leftover.
+    /// Testing anywhere else would test something the product never does.
+    struct Leftover {
+        path: std::path::PathBuf,
+    }
+
+    impl Leftover {
+        fn new(tag: &str) -> Self {
+            let base = std::env::var("LOCALAPPDATA").expect("a local app data folder");
+            let path = std::path::PathBuf::from(base).join(format!(
+                "kam-quarantine-test-{}-{tag}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(path.join("cache")).unwrap();
+            std::fs::write(path.join("settings.cfg"), b"user settings worth keeping").unwrap();
+            std::fs::write(path.join("cache").join("blob.bin"), vec![7_u8; 4096]).unwrap();
+            Self { path }
+        }
+
+        fn text(&self) -> String {
+            std::fs::read_to_string(self.path.join("settings.cfg")).unwrap()
+        }
+    }
+
+    impl Drop for Leftover {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Quarantine, list, restore, and check the contents came back.
+    ///
+    /// The store has its own tests; this exercises the whole agent path around
+    /// it — the fence, the size measurement, the audit entry with its undo
+    /// token, and the response as it actually travels. That last part is not
+    /// incidental: this response could be produced and never delivered,
+    /// because its payload was flattened into the frame alongside a field of
+    /// the same name, and no test went through serde to notice.
+    #[test]
+    fn a_leftover_survives_being_quarantined_and_restored() {
+        let context = context(Mode::Console);
+        let leftover = Leftover::new("roundtrip");
+        let original = leftover.path.display().to_string();
+
+        // --- take ------------------------------------------------------
+        let taken = handle(
+            Request::QuarantinePath {
+                path: original.clone(),
+                reason: "left behind by a test".to_owned(),
+            },
+            &context,
+            &Reporter::silent(),
+        );
+
+        let Response::Quarantined(manifest) = &taken else {
+            panic!("expected the item to be quarantined, got {taken:?}");
+        };
+        assert_eq!(manifest.original_path, original);
+        assert!(manifest.bytes >= 4096, "size was not measured: {}", manifest.bytes);
+        assert!(!manifest.restored);
+        assert!(
+            !leftover.path.exists(),
+            "the directory is still where it was after being quarantined"
+        );
+
+        // --- it has to survive the wire --------------------------------
+        let json = serde_json::to_string(&taken).expect("should serialise");
+        let returned: Response =
+            serde_json::from_str(&json).expect("a quarantine response must be readable back");
+        let Response::Quarantined(same) = returned else {
+            panic!("the response changed shape crossing the wire");
+        };
+        assert_eq!(same.id, manifest.id);
+        assert_eq!(same.kind, manifest.kind, "the manifest's own kind survived");
+
+        // --- list ------------------------------------------------------
+        let listed = handle(Request::ListQuarantine, &context, &Reporter::silent());
+        let Response::QuarantineList { items } = listed else {
+            panic!("expected a quarantine listing");
+        };
+        assert!(
+            items.iter().any(|item| item.id == manifest.id),
+            "the item is not in the store's own listing"
+        );
+
+        // --- restore ---------------------------------------------------
+        let restored = handle(
+            Request::RestoreQuarantined {
+                id: manifest.id.clone(),
+            },
+            &context,
+            &Reporter::silent(),
+        );
+        let Response::Quarantined(back) = &restored else {
+            panic!("expected the item back, got {restored:?}");
+        };
+        assert!(back.restored, "the manifest should say it was restored");
+
+        // --- and it is genuinely the same thing -------------------------
+        assert!(leftover.path.exists(), "the directory did not come back");
+        assert_eq!(
+            leftover.text(),
+            "user settings worth keeping",
+            "the contents changed while it was away"
+        );
+        assert_eq!(
+            std::fs::read(leftover.path.join("cache").join("blob.bin")).unwrap(),
+            vec![7_u8; 4096],
+            "the nested file did not survive byte for byte"
+        );
+    }
+
+    /// Both halves are recorded, and the take carries the handle that undoes it.
+    #[test]
+    fn quarantining_is_written_to_the_audit_log_with_its_undo_token() {
+        let context = context(Mode::Console);
+        let leftover = Leftover::new("audit");
+
+        let taken = handle(
+            Request::QuarantinePath {
+                path: leftover.path.display().to_string(),
+                reason: "left behind by a test".to_owned(),
+            },
+            &context,
+            &Reporter::silent(),
+        );
+        let Response::Quarantined(manifest) = &taken else {
+            panic!("expected the item to be quarantined");
+        };
+
+        let entries = context.store.recent_audit(50).unwrap();
+        let take = entries
+            .iter()
+            .find(|entry| entry.action == "take")
+            .expect("the take was not recorded at all");
+
+        assert_eq!(take.module, "quarantine");
+        assert_eq!(
+            take.undo_token.as_deref(),
+            Some(manifest.id.as_str()),
+            "the log records how to undo it"
+        );
+
+        handle(
+            Request::RestoreQuarantined {
+                id: manifest.id.clone(),
+            },
+            &context,
+            &Reporter::silent(),
+        );
+        let entries = context.store.recent_audit(50).unwrap();
+        assert!(
+            entries.iter().any(|entry| entry.action == "restore"),
+            "the restore was not recorded"
+        );
+    }
+
+    /// The fence, and that a refusal is recorded rather than passed over.
+    #[test]
+    fn the_dangerous_shapes_are_refused_and_the_refusal_is_logged() {
+        let context = context(Mode::Console);
+        let local = std::env::var("LOCALAPPDATA").unwrap();
+
+        let refusals = [
+            // A data root itself. Quarantining the whole of LocalAppData
+            // would take the user's entire profile with it.
+            local.clone(),
+            // Nested below a root: only a directory directly inside one is a
+            // leftover, anything deeper is part of something still installed.
+            format!("{local}\\Microsoft\\Windows"),
+            // Outside every root altogether.
+            r"C:\Windows\System32".to_owned(),
+        ];
+
+        for path in refusals {
+            let outcome = handle(
+                Request::QuarantinePath {
+                    path: path.clone(),
+                    reason: "a test that should not succeed".to_owned(),
+                },
+                &context,
+                &Reporter::silent(),
+            );
+            assert!(
+                matches!(outcome, Response::Error { .. }),
+                "{path} was not refused: {outcome:?}"
+            );
+            assert!(
+                std::path::Path::new(&path).exists(),
+                "{path} was touched despite being refused"
+            );
+        }
+
+        let entries = context.store.recent_audit(50).unwrap();
+        let refused = entries
+            .iter()
+            .filter(|entry| entry.action == "take" && entry.effect == Effect::Refused)
+            .count();
+        assert_eq!(refused, 3, "every refusal should be in the log");
+    }
+
     #[test]
     fn status_reports_the_current_protocol_version() {
         let context = context(Mode::Console);
