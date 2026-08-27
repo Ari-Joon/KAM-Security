@@ -49,23 +49,16 @@ use crate::shortcuts::{self, Shortcut};
 
 
 /// Largest number of files to add up before answering with a floor.
-
 ///
-
 /// A leftover directory is usually a cache holding a great many small files.
-
 /// Counting every one is not worth making somebody wait for, and "at least
-
 /// this much" is enough to decide by.
-
 const MAX_FILES_COUNTED: usize = 200_000;
 
 
 
 /// One directory an application left behind.
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-
 pub struct Remnant {
 
     pub path: String,
@@ -75,9 +68,7 @@ pub struct Remnant {
     pub kind: LocationKind,
 
     /// True when the count hit the ceiling, so `bytes` is a floor rather than
-
     /// a total. Said plainly rather than quietly rounded.
-
     pub partial: bool,
 
     pub files: usize,
@@ -87,29 +78,22 @@ pub struct Remnant {
 
 
 /// Everything still on disk for an application that has been removed.
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-
 pub struct Remnants {
 
     pub name: String,
 
     /// Directories that still exist. Ones the uninstaller did clear are simply
-
     /// absent, so this is a list of what is left rather than what there was.
-
     pub locations: Vec<Remnant>,
 
     /// Shortcuts pointing into those directories, or at a target now gone.
-
     pub shortcuts: Vec<Shortcut>,
 
     pub total_bytes: u64,
 
     /// Paths asked about that sit outside the folders this will look in.
-
     /// Reported rather than silently dropped.
-
     pub refused: Vec<String>,
 
 }
@@ -129,17 +113,11 @@ impl Remnants {
 
 
 /// Roots this is willing to measure inside.
-
 ///
-
 /// The caller supplies the paths, and the caller is the interface. A path is
-
 /// only looked at if it sits under a folder applications actually install
-
 /// into, so a malformed or mischievous request cannot turn the privileged
-
 /// agent into a general-purpose disk reader.
-
 fn allowed_roots() -> Vec<String> {
 
     [
@@ -203,7 +181,6 @@ fn is_allowed(path: &str, roots: &[String]) -> bool {
 
 
 /// Add up a directory, stopping at a sane ceiling.
-
 fn measure(path: &std::path::Path) -> (u64, usize, bool) {
 
     let mut bytes = 0_u64;
@@ -267,9 +244,7 @@ fn measure(path: &std::path::Path) -> (u64, usize, bool) {
 
 
 /// What is still on disk for `name`, given the locations measured for it
-
 /// before its uninstaller ran.
-
 pub fn of(name: &str, paths: &[String], kinds: &[LocationKind]) -> Remnants {
 
     let roots = allowed_roots();
@@ -399,9 +374,7 @@ pub fn of(name: &str, paths: &[String], kinds: &[LocationKind]) -> Remnants {
 
 
 #[cfg(test)]
-
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 mod tests {
 
     use super::*;
@@ -409,9 +382,7 @@ mod tests {
 
 
     #[test]
-
     #[ignore = "machine specific"]
-
     fn the_logitech_leftover_is_found() {
 
         let program_data = std::env::var("ProgramData").unwrap();
@@ -469,7 +440,6 @@ mod tests {
 
 
     #[test]
-
     fn a_path_outside_the_allowed_roots_is_refused() {
 
         // The fence that stops the privileged agent being asked to measure
@@ -487,7 +457,6 @@ mod tests {
 
 
     #[test]
-
     fn a_root_itself_is_refused() {
 
         // Offering to quarantine the whole of ProgramData is not a feature.
@@ -511,7 +480,6 @@ mod tests {
 
 
     #[test]
-
     fn a_directory_the_uninstaller_cleared_is_simply_absent() {
 
         let gone = format!(
@@ -535,7 +503,6 @@ mod tests {
 
 
     #[test]
-
     fn a_real_leftover_directory_is_measured() {
 
         let base = std::env::var("LOCALAPPDATA").unwrap();
@@ -581,7 +548,6 @@ mod tests {
 
 
     #[test]
-
     fn nothing_is_offered_for_an_application_with_no_paths() {
 
         let outcome = of("thing", &[], &[]);
