@@ -2270,3 +2270,34 @@ pre.error {
   margin-top: 1px;
   font-variant-numeric: tabular-nums;
 }
+
+/* --- Openable paths ----------------------------------------------------- *
+ * A path on screen refers to something real, and clicking it should go there.
+ * Styled to inherit whatever it sits inside rather than imposing a link look,
+ * so a path in a monospace row still reads as that row: the only signal it
+ * carries by default is that it responds to the pointer.
+ */
+
+.path-link {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.path-link:hover {
+  color: var(--accent-soft);
+  text-decoration: underline;
+}
+
+.path-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}

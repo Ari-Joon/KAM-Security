@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
+import PathLink from "../components/PathLink";
 import type {
   AppFootprint,
   ApplicationReport,
@@ -394,7 +395,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
                       disabled={clearing}
                     />
                     <span className="leftover-body">
-                      <span className="leftover-path">{item.path}</span>
+                      <PathLink path={item.path} className="leftover-path" />
                       <span className="leftover-meta">
                         {fmt.bytes(item.bytes)}
                         {item.partial ? " or more" : ""} · {fmt.count(item.files)} files
@@ -414,7 +415,9 @@ export default function Applications({ volumes, onMeasured }: Props) {
                       disabled={clearing}
                     />
                     <span className="leftover-body">
-                      <span className="leftover-path">{shortcut.name}</span>
+                      <PathLink path={shortcut.path} className="leftover-path">
+                        {shortcut.name}
+                      </PathLink>
                       <span className="leftover-meta">
                         {shortcut.place === "start_menu"
                           ? "Start Menu"

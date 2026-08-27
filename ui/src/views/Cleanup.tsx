@@ -4,6 +4,7 @@ import ProgressBar from "../components/ProgressBar";
 import { runJob, stopJob, type Progress } from "../lib/jobs";
 import * as fmt from "../lib/format";
 import FileRow from "../components/FileRow";
+import PathLink from "../components/PathLink";
 import type {
   Confidence,
   Download,
@@ -58,7 +59,7 @@ function OrphanRow({
       </div>
       {open && (
         <div className="orphan-detail">
-          <code className="orphan-path">{orphan.path}</code>
+          <PathLink path={orphan.path} className="orphan-path" />
           <ul className="orphan-reasons">
             {orphan.reasons.map((why) => (
               <li key={why}>{why}</li>
@@ -493,7 +494,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                 .map((move) => (
                   <li key={move.id} className="held">
                     <div className="held-body">
-                      <span className="held-path">{move.to}</span>
+                      <PathLink path={move.to} className="held-path" />
                       <span className="held-reason">was {move.from}</span>
                     </div>
                     <button onClick={() => void undoMove(move.id)}>Put back</button>
@@ -595,7 +596,17 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             {active.map((item) => (
               <li key={item.id} className="held">
                 <div className="held-body">
-                  <span className="held-path">{item.original_path}</span>
+                  <PathLink
+                    path={item.restored ? item.original_path : ""}
+                    className="held-path"
+                    title={
+                      item.restored
+                        ? `Show ${item.original_path} in Explorer`
+                        : "This is in quarantine; restore it to open where it was"
+                    }
+                  >
+                    {item.original_path}
+                  </PathLink>
                   <span className="held-reason">{item.reason}</span>
                 </div>
                 <span className="held-size">{fmt.bytes(item.bytes)}</span>
