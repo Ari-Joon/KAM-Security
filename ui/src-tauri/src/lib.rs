@@ -330,6 +330,26 @@ async fn stream_job<T: Send + 'static>(
     .map_err(|error| format!("the job did not finish: {error}"))?
 }
 
+/// What an application left behind after its uninstaller ran.
+///
+/// The paths come from the footprint measured before the uninstall, because
+/// afterwards the registry entry is gone and there is nothing left to measure
+/// from. The agent fences them regardless of what is sent.
+#[tauri::command]
+fn find_remnants(
+    name: String,
+    paths: Vec<String>,
+    kinds: Vec<kam_storage::apps::LocationKind>,
+) -> Result<kam_storage::remnants::Remnants, String> {
+    match kam_ipc::client::call(&Request::FindRemnants { name, paths, kinds })
+        .map_err(|error| error.to_string())?
+    {
+        Response::Remnants(report) => Ok(*report),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 #[tauri::command]
 fn firewall() -> Result<kam_firewall::policy::FirewallReport, String> {
     match kam_ipc::client::call(&Request::GetFirewall).map_err(|e| e.to_string())? {
@@ -497,6 +517,7 @@ pub fn run() {
             defender_threats,
             survey_provenance,
             cancel_job,
+            find_remnants,
             firewall,
             connections,
             block_program,

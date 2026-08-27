@@ -18,6 +18,8 @@ use kam_firewall::connections::ConnectionReport;
 use kam_firewall::policy::FirewallReport;
 use kam_scanner::provenance::Report as ProvenanceReport;
 use kam_scanner::{DefenderStatus, Threat};
+use kam_storage::apps::LocationKind;
+use kam_storage::remnants::Remnants as RemnantReport;
 use kam_storage::{
     AppFootprint, Download, DownloadSummary, DuplicateGroup, DuplicateSummary, FootprintSummary,
     OrganiseSummary, Orphan, OrphanSummary, Proposal, Scan, Volume,
@@ -113,6 +115,16 @@ pub enum Request {
     UndoMove { id: String },
     /// Every move recorded, newest first.
     ListMoves,
+    /// What an application left behind after its uninstaller ran.
+    ///
+    /// `paths` are the locations measured for it before the uninstall, which
+    /// the agent re-checks and fences: anything outside the folders
+    /// applications install into is refused and reported.
+    FindRemnants {
+        name: String,
+        paths: Vec<String>,
+        kinds: Vec<LocationKind>,
+    },
     /// Windows Defender Firewall's profile state and every rule it holds.
     GetFirewall,
     /// Every open socket, joined to the program that owns it.
@@ -198,6 +210,7 @@ pub enum Response {
         threats: Vec<Threat>,
     },
     Provenance(ProvenanceReport),
+    Remnants(Box<RemnantReport>),
     Firewall(Box<FirewallReport>),
     Connections(ConnectionReport),
     /// A firewall rule was created; the name is how it is undone.

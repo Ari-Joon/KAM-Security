@@ -312,6 +312,18 @@ pub fn handle(request: Request, context: &Context, reporter: &Reporter) -> Respo
             }
         },
 
+        Request::FindRemnants { name, paths, kinds } => {
+            let report = kam_storage::remnants::of(&name, &paths, &kinds);
+            tracing::info!(
+                %name,
+                locations = report.locations.len(),
+                shortcuts = report.shortcuts.len(),
+                refused = report.refused.len(),
+                "looked for what {name} left behind"
+            );
+            Response::Remnants(Box::new(report))
+        }
+
         Request::GetFirewall => match kam_firewall::policy::survey() {
             Ok(report) => Response::Firewall(Box::new(report)),
             Err(error) => {

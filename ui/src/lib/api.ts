@@ -16,6 +16,7 @@ import type {
   Verdict,
   FirewallReport,
   ConnectionReport,
+  Remnants,
 } from "./types";
 
 /**
@@ -39,6 +40,8 @@ export const api = {
   provenance: (job: string) =>
     invoke<ProvenanceReport | null>("survey_provenance", { job }),
   cancelJob: (job: string) => invoke<void>("cancel_job", { job }),
+  findRemnants: (name: string, paths: string[], kinds: string[]) =>
+    invoke<Remnants>("find_remnants", { name, paths, kinds }),
   firewall: () => invoke<FirewallReport>("firewall"),
   connections: () => invoke<ConnectionReport>("connections"),
   blockProgram: (path: string) => invoke<string>("block_program", { path }),

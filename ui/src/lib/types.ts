@@ -433,3 +433,34 @@ export type ConnectionReport = {
   external: number;
   programs: number;
 };
+
+/** What an uninstaller left behind, and the shortcuts pointing at it. */
+export type ShortcutPlace = "start_menu" | "desktop" | "taskbar";
+
+export type Shortcut = {
+  path: string;
+  name: string;
+  place: ShortcutPlace;
+  target: string | null;
+  broken: boolean;
+  machine_wide: boolean;
+  bytes: number;
+};
+
+export type Remnant = {
+  path: string;
+  bytes: number;
+  kind: string;
+  /** True when the size is a floor because counting hit its ceiling. */
+  partial: boolean;
+  files: number;
+};
+
+export type Remnants = {
+  name: string;
+  locations: Remnant[];
+  shortcuts: Shortcut[];
+  total_bytes: number;
+  /** Paths the agent declined to look at, reported rather than dropped. */
+  refused: string[];
+};

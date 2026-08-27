@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
-import type { AppFootprint, ApplicationReport, Volume } from "../lib/types";
+import type {
+  AppFootprint,
+  ApplicationReport,
+  Remnants,
+  Volume,
+} from "../lib/types";
 
 type Props = { volumes: Volume[]; onMeasured: () => void };
 
@@ -172,7 +177,10 @@ export default function Applications({ volumes, onMeasured }: Props) {
   // Names an uninstaller was launched for and whose result has not been
   // measured yet. A ref rather than state because the focus handler below
   // reads it from outside React's render cycle.
-  const awaitingUninstall = useRef<string | null>(null);
+  const awaitingUninstall = useRef<AppFootprint | null>(null);
+  const [remnants, setRemnants] = useState<Remnants | null>(null);
+  const [chosen, setChosen] = useState<Set<string>>(new Set());
+  const [clearing, setClearing] = useState(false);
 
   const measure = useCallback(async () => {
     setRunning(true);
@@ -202,15 +210,32 @@ export default function Applications({ volumes, onMeasured }: Props) {
    */
   useEffect(() => {
     function recheck() {
-      const name = awaitingUninstall.current;
-      if (!name || document.hidden) {
+      const app = awaitingUninstall.current;
+      if (!app || document.hidden) {
         return;
       }
       awaitingUninstall.current = null;
-      setNote(`Checking whether ${name} is really gone…`);
-      void measure().then(() => {
-        setNote(`Measured again after uninstalling ${name}.`);
-      });
+      setNote(`Checking what ${app.name} left behind…`);
+
+      // The footprint has to come from before the uninstall: afterwards the
+      // registry entry is gone and there is nothing left to measure from.
+      void api
+        .findRemnants(
+          app.name,
+          app.locations.map((location) => location.path),
+          app.locations.map((location) => location.kind),
+        )
+        .then((left) => {
+          const anything = left.locations.length > 0 || left.shortcuts.length > 0;
+          setRemnants(anything ? left : null);
+          setNote(
+            anything
+              ? `${app.name} was uninstalled, but some of it is still on disk.`
+              : `${app.name} was uninstalled and left nothing behind.`,
+          );
+        })
+        .catch(() => setNote(`${app.name} was uninstalled.`))
+        .finally(() => void measure());
     }
 
     window.addEventListener("focus", recheck);
@@ -226,7 +251,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
     setError(null);
     try {
       await api.uninstall(app.name, app.uninstall_command ?? "");
-      awaitingUninstall.current = app.name;
+      awaitingUninstall.current = app;
       setNote(
         `Started the uninstaller for ${app.name}. This list still shows what ` +
           `was there before it ran, and will measure again when you come back ` +
@@ -237,6 +262,64 @@ export default function Applications({ volumes, onMeasured }: Props) {
     } finally {
       onMeasured();
     }
+  }
+
+  function toggle(path: string) {
+    setChosen((current) => {
+      const next = new Set(current);
+      if (next.has(path)) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+      return next;
+    });
+  }
+
+  /**
+   * Quarantine everything ticked.
+   *
+   * One item at a time and through quarantine, never a delete: each gets its
+   * own manifest and its own thirty days, so a wrong choice here is one that
+   * can be taken back.
+   */
+  async function clearChosen() {
+    if (!remnants || chosen.size === 0) {
+      return;
+    }
+    setClearing(true);
+    setError(null);
+
+    let taken = 0;
+    let reclaimed = 0;
+    const failures: string[] = [];
+
+    for (const path of chosen) {
+      const location = remnants.locations.find((item) => item.path === path);
+      try {
+        await api.quarantine(
+          path,
+          `left behind by ${remnants.name} after it was uninstalled`,
+        );
+        taken += 1;
+        reclaimed += location?.bytes ?? 0;
+      } catch (cause) {
+        failures.push(`${path}: ${reason(cause)}`);
+      }
+    }
+
+    setClearing(false);
+    setChosen(new Set());
+    setRemnants(null);
+    if (failures.length > 0) {
+      setError(`Some items could not be moved:\n${failures.join("\n")}`);
+    }
+    setNote(
+      `Moved ${taken} item${taken === 1 ? "" : "s"} into quarantine` +
+        (reclaimed > 0 ? `, reclaiming ${fmt.bytes(reclaimed)}` : "") +
+        ". Restorable for 30 days from Cleanup.",
+    );
+    void measure();
   }
 
   async function reveal(path: string) {
@@ -287,6 +370,106 @@ export default function Applications({ volumes, onMeasured }: Props) {
 
         {error && <pre className="error">{error}</pre>}
         {note && <div className="notice notice-ok">{note}</div>}
+
+        {remnants && (
+          <div className="notice notice-warn leftovers">
+            <strong>
+              {remnants.name} is gone, but {fmt.bytes(remnants.total_bytes)} of
+              it is not.
+            </strong>
+            <p className="leftover-lede">
+              Its own uninstaller cleared the install folder and left the rest.
+              Tick what should go. Everything moves to quarantine and can be
+              restored for thirty days, so nothing here is deleted.
+            </p>
+
+            <ul className="leftover-list">
+              {remnants.locations.map((item) => (
+                <li key={item.path}>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={chosen.has(item.path)}
+                      onChange={() => toggle(item.path)}
+                      disabled={clearing}
+                    />
+                    <span className="leftover-body">
+                      <span className="leftover-path">{item.path}</span>
+                      <span className="leftover-meta">
+                        {fmt.bytes(item.bytes)}
+                        {item.partial ? " or more" : ""} · {fmt.count(item.files)} files
+                      </span>
+                    </span>
+                  </label>
+                </li>
+              ))}
+
+              {remnants.shortcuts.map((shortcut) => (
+                <li key={shortcut.path}>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={chosen.has(shortcut.path)}
+                      onChange={() => toggle(shortcut.path)}
+                      disabled={clearing}
+                    />
+                    <span className="leftover-body">
+                      <span className="leftover-path">{shortcut.name}</span>
+                      <span className="leftover-meta">
+                        {shortcut.place === "start_menu"
+                          ? "Start Menu"
+                          : shortcut.place === "desktop"
+                            ? "Desktop"
+                            : "Taskbar"}{" "}
+                        shortcut
+                        {shortcut.broken ? " · points at something that is gone" : ""}
+                        {shortcut.machine_wide ? " · for everyone on this PC" : ""}
+                      </span>
+                    </span>
+                  </label>
+                </li>
+              ))}
+            </ul>
+
+            {remnants.refused.length > 0 && (
+              <p className="footnote">
+                {remnants.refused.length} location
+                {remnants.refused.length === 1 ? " was" : "s were"} outside the
+                folders this will touch and {remnants.refused.length === 1 ? "was" : "were"}{" "}
+                not examined.
+              </p>
+            )}
+
+            <div className="confirm-actions">
+              <button
+                onClick={() => void clearChosen()}
+                disabled={clearing || chosen.size === 0}
+              >
+                {clearing
+                  ? "Moving…"
+                  : chosen.size === 0
+                    ? "Nothing ticked"
+                    : `Quarantine ${chosen.size} item${chosen.size === 1 ? "" : "s"}`}
+              </button>
+              <button
+                className="link-button"
+                onClick={() =>
+                  setChosen(new Set(remnants.locations.map((item) => item.path)))
+                }
+                disabled={clearing}
+              >
+                Tick every folder
+              </button>
+              <button
+                className="link-button"
+                onClick={() => setRemnants(null)}
+                disabled={clearing}
+              >
+                Leave it
+              </button>
+            </div>
+          </div>
+        )}
 
         {summary && (
           <div className="stat-row tight">
