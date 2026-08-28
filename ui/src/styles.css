@@ -2665,3 +2665,13 @@ button.ghost {
   border-color: rgba(240, 180, 41, 0.3);
   background: rgba(240, 180, 41, 0.08);
 }
+
+/* A second, quieter figure inside a stat: the count behind the time, so the
+   number has something to be judged against. */
+.stat-value .unit {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-2);
+  letter-spacing: 0;
+}

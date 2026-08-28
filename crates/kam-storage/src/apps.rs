@@ -553,8 +553,11 @@ pub fn footprints(
     // Read once for the whole run: the registry is cheap but there are several
     // hundred applications and reopening the key per application would be
     // several hundred opens for one answer.
-    let usage = crate::usage::by_path(user);
-    let unattributed = crate::usage::unattributed(user);
+    // One read, both halves. Reading it twice meant resolving every shortcut
+    // on the machine through COM twice, for one answer.
+    let history = crate::usage::history(user);
+    let usage = history.by_path;
+    let unattributed = history.unattributed;
 
     let candidates: Vec<(Installed, Vec<Location>)> = with_steam_games(installed(user), &steam)
         .into_iter()
@@ -651,18 +654,66 @@ pub struct StorageReport {
     pub orphan_summary: crate::orphans::OrphanSummary,
     pub downloads: Vec<crate::provenance::Download>,
     pub download_summary: crate::provenance::DownloadSummary,
+    pub timings: Timings,
+}
+
+/// How long each stage of a survey took, in milliseconds.
+///
+/// Reported rather than logged. "It feels slow" is not something anybody can
+/// act on, and the answer to it is almost never where people assume: on this
+/// machine the file table is most of it and always was, so the interesting
+/// number is how much of the rest is avoidable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Timings {
+    /// Reading the master file table off the volume.
+    pub read_table: u64,
+    /// Of that, the part spent waiting on the disk rather than parsing.
+    pub read_table_io: u64,
+    /// File records the table held.
+    pub records: u64,
+    /// Turning that into a directory tree with sizes.
+    pub build_index: u64,
+    /// Registry, launch history, and matching applications to directories.
+    pub applications: u64,
+    /// Looking for directories no installed application accounts for.
+    pub orphans: u64,
+    /// Looking for large files that arrived from the internet.
+    pub downloads: u64,
+    pub total: u64,
 }
 
 /// Read the volume's table, then measure applications and find leftovers.
 pub fn survey(drive_letter: char, now_unix: u64, user: &UserContext) -> Result<StorageReport> {
+    let whole = std::time::Instant::now();
+    let mut timings = Timings::default();
+
+    let step = std::time::Instant::now();
     let snapshot = crate::mft::read(drive_letter)?;
+    timings.read_table = step.elapsed().as_millis() as u64;
+    timings.read_table_io = snapshot.stats.io_millis;
+    timings.records = snapshot.stats.records_seen;
+
+    let step = std::time::Instant::now();
     let index = VolumeIndex::build(snapshot);
+    timings.build_index = step.elapsed().as_millis() as u64;
+
     let root = format!("{drive_letter}:");
+
+    let step = std::time::Instant::now();
     let apps = footprints(&index, &root, user)?;
+    timings.applications = step.elapsed().as_millis() as u64;
     let summary = summarise(&apps);
+
+    let step = std::time::Instant::now();
     let orphans = crate::orphans::find(&index, &apps, now_unix, user);
     let orphan_summary = crate::orphans::summarise(&orphans);
+    timings.orphans = step.elapsed().as_millis() as u64;
+
+    let step = std::time::Instant::now();
     let (downloads, download_summary) = crate::provenance::find(&index, &root, now_unix);
+    timings.downloads = step.elapsed().as_millis() as u64;
+
+    timings.total = whole.elapsed().as_millis() as u64;
     Ok(StorageReport {
         apps,
         summary,
@@ -670,6 +721,7 @@ pub fn survey(drive_letter: char, now_unix: u64, user: &UserContext) -> Result<S
         orphan_summary,
         downloads,
         download_summary,
+        timings,
     })
 }
 

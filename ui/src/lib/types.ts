@@ -225,6 +225,20 @@ export type MoveRecord = {
   undone: boolean;
 };
 
+/** How long each stage of a measurement took, in milliseconds. */
+export type Timings = {
+  read_table: number;
+  /** Of that, the part spent waiting on the disk rather than parsing. */
+  read_table_io: number;
+  /** File records the table held. */
+  records: number;
+  build_index: number;
+  applications: number;
+  orphans: number;
+  downloads: number;
+  total: number;
+};
+
 export type ApplicationReport = {
   apps: AppFootprint[];
   summary: FootprintSummary;
@@ -232,6 +246,7 @@ export type ApplicationReport = {
   orphan_summary: OrphanSummary;
   downloads: Download[];
   download_summary: DownloadSummary;
+  timings: Timings;
 };
 
 export type ScanMethod = "master_file_table" | "directory_walk";

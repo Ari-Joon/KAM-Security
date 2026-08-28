@@ -87,6 +87,7 @@ fn list_applications(drive: String) -> Result<ApplicationReport, String> {
             orphan_summary,
             downloads,
             download_summary,
+            timings,
         } => Ok(ApplicationReport {
             apps,
             summary,
@@ -94,6 +95,7 @@ fn list_applications(drive: String) -> Result<ApplicationReport, String> {
             orphan_summary,
             downloads,
             download_summary,
+            timings,
         }),
         Response::Error { message } => Err(message),
         other => Err(unexpected(&other)),
@@ -109,6 +111,7 @@ struct ApplicationReport {
     orphan_summary: OrphanSummary,
     downloads: Vec<Download>,
     download_summary: DownloadSummary,
+    timings: kam_storage::apps::Timings,
 }
 
 /// Byte-for-byte duplicate files.

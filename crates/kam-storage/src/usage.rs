@@ -323,23 +323,51 @@ fn ends_with_lnk(value: &str) -> bool {
     value.len() > 4 && value[value.len() - 4..].eq_ignore_ascii_case(".lnk")
 }
 
-/// Launches recorded under a name rather than a path, by that name.
+/// Everything one caller needs from the launch history, read once.
 ///
-/// The applications survey matches these against what it knows is installed;
-/// nothing else can, because a name like `Microsoft.VisualStudioCode` appears
-/// nowhere on disk.
-pub fn unattributed(user: &UserContext) -> Vec<Usage> {
-    all(user)
+/// The two halves used to be separate calls, and each of them read the registry
+/// and resolved every shortcut on the machine through COM to do it -- so a
+/// survey did all of that twice for one answer. Splitting one read is a hundred
+/// and thirty milliseconds cheaper and considerably easier to reason about.
+#[derive(Debug)]
+pub struct History {
+    /// Launches by the path of the program they started.
+    pub by_path: HashMap<String, Usage>,
+    /// Launches recorded under a name rather than a path. The applications
+    /// survey matches these against what it knows is installed; nothing else
+    /// can, because a name like `Microsoft.VisualStudioCode` appears nowhere on
+    /// disk.
+    pub unattributed: Vec<Usage>,
+}
+
+pub fn history(user: &UserContext) -> History {
+    let (attributed, unattributed): (Vec<Usage>, Vec<Usage>) = all(user)
         .into_iter()
-        .filter(|usage| usage.path.is_empty() && usage.app_id.is_some())
-        .collect()
+        .partition(|usage| !usage.path.is_empty());
+
+    History {
+        by_path: index_by_path(attributed),
+        unattributed: unattributed
+            .into_iter()
+            .filter(|usage| usage.app_id.is_some())
+            .collect(),
+    }
 }
 
 /// Usage indexed by lowercased executable path, for joining against anything
 /// that knows where a program lives.
 pub fn by_path(user: &UserContext) -> HashMap<String, Usage> {
+    index_by_path(
+        all(user)
+            .into_iter()
+            .filter(|u| !u.path.is_empty())
+            .collect(),
+    )
+}
+
+fn index_by_path(found: Vec<Usage>) -> HashMap<String, Usage> {
     let mut index: HashMap<String, Usage> = HashMap::new();
-    for usage in all(user).into_iter().filter(|u| !u.path.is_empty()) {
+    for usage in found {
         let key = usage.path.to_lowercase().replace('/', "\\");
         // The same program can appear more than once — under a versioned path
         // and a stable one. Keep whichever ran most recently.
@@ -383,6 +411,38 @@ pub fn latest_under(usage: &HashMap<String, Usage>, directory: &str) -> Option<U
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "times the real machine"]
+    fn where_the_survey_spends_its_time() {
+        use std::time::Instant;
+        let user = kam_core::UserContext::current();
+
+        let t = Instant::now();
+        let shortcuts = crate::shortcuts::all(&user);
+        println!(
+            "shortcuts::all         {:>7} ms  ({} found)",
+            t.elapsed().as_millis(),
+            shortcuts.len()
+        );
+
+        let t = Instant::now();
+        let both = history(&user);
+        println!(
+            "usage::history         {:>7} ms  ({} by path, {} by name)",
+            t.elapsed().as_millis(),
+            both.by_path.len(),
+            both.unattributed.len()
+        );
+
+        let t = Instant::now();
+        let games = crate::steam::installed_games(&user);
+        println!(
+            "steam::installed_games {:>7} ms  ({} games)",
+            t.elapsed().as_millis(),
+            games.len()
+        );
+    }
 
     #[test]
     fn a_path_is_told_apart_from_an_application_name() {

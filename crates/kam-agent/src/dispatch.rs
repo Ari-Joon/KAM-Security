@@ -179,13 +179,19 @@ pub fn handle(
                         "survey",
                         Effect::Observed,
                         format!(
-                            "surveyed {letter}: — {} applications using {}, {} leftover directories holding {}, {} downloads holding {}",
+                            "surveyed {letter}: — {} applications using {}, {} leftover directories holding {}, {} downloads holding {}, in {} ms (table {}, index {}, applications {}, leftovers {}, downloads {})",
                             report.summary.applications,
                             human_bytes(report.summary.measured_bytes),
                             report.orphan_summary.found,
                             human_bytes(report.orphan_summary.total_bytes),
                             report.download_summary.found,
-                            human_bytes(report.download_summary.total_bytes)
+                            human_bytes(report.download_summary.total_bytes),
+                            report.timings.total,
+                            report.timings.read_table,
+                            report.timings.build_index,
+                            report.timings.applications,
+                            report.timings.orphans,
+                            report.timings.downloads
                         ),
                     );
                     Response::Applications {
@@ -195,6 +201,7 @@ pub fn handle(
                         orphan_summary: report.orphan_summary,
                         downloads: report.downloads,
                         download_summary: report.download_summary,
+                        timings: report.timings,
                     }
                 }
                 Err(error) => {

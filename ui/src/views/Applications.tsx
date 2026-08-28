@@ -642,6 +642,27 @@ export default function Applications({ volumes, onMeasured }: Props) {
                 {fmt.count(summary.without_reported_size)}
               </span>
             </div>
+            {report && (
+              <div
+                className="stat"
+                title={
+                  `File table ${report.timings.read_table} ms ` +
+                  `(${report.timings.read_table_io} ms of it waiting on the disk), ` +
+                  `index ${report.timings.build_index} ms, ` +
+                  `applications ${report.timings.applications} ms, ` +
+                  `leftovers ${report.timings.orphans} ms, ` +
+                  `downloads ${report.timings.downloads} ms`
+                }
+              >
+                <span className="stat-label">Measured in</span>
+                <span className="stat-value">
+                  {fmt.duration(report.timings.total)}
+                  <span className="unit">
+                    {fmt.count(report.timings.records)} records
+                  </span>
+                </span>
+              </div>
+            )}
           </div>
         )}
       </section>

@@ -116,6 +116,14 @@ pub struct MftStats {
     pub sizes_from_extensions: u64,
     /// Files left at zero bytes because no `$DATA` was found anywhere.
     pub sizeless_files: u64,
+    /// Milliseconds spent inside the reads themselves.
+    ///
+    /// Kept beside the counters because "the table read is slow" has two very
+    /// different causes with two very different fixes, and guessing which costs
+    /// an afternoon. Everything else in the read is parsing.
+    pub io_millis: u64,
+    /// Bytes pulled off the volume.
+    pub bytes_read: u64,
 }
 
 struct Volume(HANDLE);
@@ -487,6 +495,135 @@ fn parse_record(record: &[u8]) -> Option<RawRecord> {
     })
 }
 
+/// One run of whole records, handed to a parser thread.
+///
+/// The framing stays on the reading thread. Deciding where a record begins is
+/// the part that has to happen in order — a run can end mid-record, so the
+/// remainder carries into the next read — and it is also the cheap part. What
+/// gets handed out is always a whole number of records, with the index of the
+/// first, so a worker can label its results without knowing what came before.
+struct Block {
+    /// Position in the stream, so results merge in the order they were read.
+    sequence: usize,
+    first_record: u32,
+    bytes: Vec<u8>,
+}
+
+/// What one block yielded.
+#[derive(Default)]
+struct Parsed {
+    entries: Vec<(u32, MftEntry)>,
+    extension_sizes: Vec<(u32, u64)>,
+    stats: MftStats,
+    skipped: u64,
+}
+
+/// Parse every record in one block.
+///
+/// This is the same work the reader used to do inline, moved somewhere it can
+/// happen several times at once. On this machine the table holds 1.9 million
+/// records: reading them off an NVMe disk takes about half a second and parsing
+/// them took nearly two, so the disk was idle for three quarters of the wait.
+fn parse_block(block: &mut Block, record_bytes: usize, bytes_per_sector: u64) -> Parsed {
+    let mut parsed = Parsed::default();
+    let mut record_index = block.first_record;
+
+    for start in (0..block.bytes.len()).step_by(record_bytes) {
+        let record = &mut block.bytes[start..start + record_bytes];
+        let is_file_record = record.get(0..4) == Some(b"FILE");
+        if is_file_record {
+            parsed.stats.records_seen += 1;
+        }
+
+        if apply_fixups(record, bytes_per_sector).is_some() {
+            if let Some(raw) = parse_record(record) {
+                if raw.in_use {
+                    parsed.stats.in_use += 1;
+                    match raw.base {
+                        Some(base) => {
+                            parsed.stats.extensions += 1;
+                            if let Some(bytes) = raw.data {
+                                parsed.extension_sizes.push((base, bytes));
+                            }
+                        }
+                        None => match raw.name {
+                            Some((_, name, parent)) => parsed.entries.push((
+                                record_index,
+                                MftEntry {
+                                    parent,
+                                    name,
+                                    is_directory: raw.is_directory,
+                                    bytes: if raw.is_directory {
+                                        0
+                                    } else {
+                                        raw.data.unwrap_or(0)
+                                    },
+                                    modified: raw.modified,
+                                    created: raw.created,
+                                    accessed: raw.accessed,
+                                },
+                            )),
+                            None => parsed.stats.nameless += 1,
+                        },
+                    }
+                }
+            }
+        } else if is_file_record {
+            parsed.skipped += 1;
+        }
+
+        record_index = record_index.saturating_add(1);
+    }
+
+    parsed
+}
+
+/// Read buffers, waiting to be used again.
+///
+/// A survey reads about two gigabytes of table in four-megabyte pieces, and a
+/// fresh `Vec` for each one is two gigabytes of zeroing that nothing ever looks
+/// at before the disk overwrites it. Handing the buffers back means the memory
+/// is written once by the disk instead of twice.
+///
+/// The pool is capped, so the memory in flight stays bounded by the number of
+/// parsers rather than by the size of the volume.
+struct BufferPool {
+    spare: std::sync::Mutex<Vec<Vec<u8>>>,
+    limit: usize,
+}
+
+impl BufferPool {
+    fn new(limit: usize) -> Self {
+        Self {
+            spare: std::sync::Mutex::new(Vec::with_capacity(limit)),
+            limit,
+        }
+    }
+
+    /// A buffer of exactly `want` bytes, recycled where possible.
+    ///
+    /// Growing a recycled buffer only zeroes the few bytes it was short by,
+    /// because it comes back holding whole records and goes out holding the
+    /// same chunk size.
+    fn take(&self, want: usize) -> Vec<u8> {
+        let mut buffer = match self.spare.lock() {
+            Ok(mut spare) => spare.pop().unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        buffer.clear();
+        buffer.resize(want, 0);
+        buffer
+    }
+
+    fn give_back(&self, buffer: Vec<u8>) {
+        if let Ok(mut spare) = self.spare.lock() {
+            if spare.len() < self.limit {
+                spare.push(buffer);
+            }
+        }
+    }
+}
+
 /// Read the whole master file table for one drive letter.
 pub fn read(drive_letter: char) -> Result<MftSnapshot> {
     let volume = Volume::open(drive_letter)?;
@@ -509,6 +646,146 @@ pub fn read(drive_letter: char) -> Result<MftSnapshot> {
         return Err(Error::Refused("the $MFT reported no data runs".to_owned()));
     }
 
+    let mut io_millis = 0_u64;
+    let mut bytes_read = 0_u64;
+
+    let record_bytes = geometry.record_bytes as usize;
+    let bytes_per_sector = geometry.bytes_per_sector;
+
+    // One thread reads, the rest parse.
+    //
+    // The reading is nearly free and the parsing is not: 1.9 million records
+    // came off this machine's disk in about half a second and took nearly two
+    // to interpret, so for three quarters of the wait the disk sat idle and one
+    // core did arithmetic. The queue is deliberately short -- a few blocks in
+    // flight, not the whole table -- so the memory this costs stays in the tens
+    // of megabytes rather than the size of the volume's table.
+    let threads = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4)
+        .clamp(1, 8);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Block>(threads + 1);
+    let receiver = std::sync::Mutex::new(receiver);
+    let pool = BufferPool::new(threads + 2);
+
+    let mut read_error: Option<Error> = None;
+    let mut blocks: Vec<(usize, Parsed)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                let receiver = &receiver;
+                let pool = &pool;
+                scope.spawn(move || {
+                    let mut mine = Vec::new();
+                    loop {
+                        // The lock is held only long enough to take one block,
+                        // never while parsing it.
+                        let taken = match receiver.lock() {
+                            Ok(queue) => queue.recv(),
+                            Err(_) => break,
+                        };
+                        let Ok(mut block) = taken else { break };
+                        let parsed = parse_block(&mut block, record_bytes, bytes_per_sector);
+                        mine.push((block.sequence, parsed));
+                        pool.give_back(block.bytes);
+                    }
+                    mine
+                })
+            })
+            .collect();
+
+        // Reading happens here, on the thread that already owns the volume
+        // handle, and the queue's depth is what stops it running ahead.
+        //
+        // Records are framed out of a rolling remainder rather than assumed to
+        // sit neatly inside a run: with 512-byte clusters a run can end
+        // mid-record, and the tail has to join the front of the next read.
+        let mut carry: Vec<u8> = Vec::new();
+        let mut record_index: u32 = 0;
+        let mut sequence = 0_usize;
+
+        'reading: for run in &runs {
+            let mut remaining = run.clusters * geometry.bytes_per_cluster;
+            let mut offset = run.start_cluster * geometry.bytes_per_cluster;
+
+            while remaining > 0 {
+                let want = remaining.min(CHUNK_BYTES as u64) as usize;
+                // Handed away to a parser, and handed back when it is done.
+                let mut buffer = pool.take(want);
+
+                let waited = std::time::Instant::now();
+                let read = match volume.read_at(offset, &mut buffer) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        read_error = Some(error);
+                        break 'reading;
+                    }
+                };
+                io_millis += waited.elapsed().as_millis() as u64;
+                bytes_read += read as u64;
+                if read == 0 {
+                    break;
+                }
+                offset += read as u64;
+                remaining -= read as u64;
+                buffer.truncate(read);
+
+                // Only happens at a run boundary, where the previous read
+                // stopped part-way through a record.
+                if !carry.is_empty() {
+                    let mut joined = Vec::with_capacity(carry.len() + buffer.len());
+                    joined.extend_from_slice(&carry);
+                    joined.extend_from_slice(&buffer);
+                    carry.clear();
+                    buffer = joined;
+                }
+
+                let whole = buffer.len() / record_bytes;
+                if whole == 0 {
+                    carry = buffer;
+                    continue;
+                }
+                let take = whole * record_bytes;
+                carry.extend_from_slice(&buffer[take..]);
+                buffer.truncate(take);
+
+                if sender
+                    .send(Block {
+                        sequence,
+                        first_record: record_index,
+                        bytes: buffer,
+                    })
+                    .is_err()
+                {
+                    // Every parser has gone, which cannot happen while this
+                    // thread holds the only sender -- but there is nothing to
+                    // read for if it does.
+                    break 'reading;
+                }
+                sequence += 1;
+                record_index = record_index.saturating_add(whole as u32);
+            }
+        }
+
+        // Closing the queue is what tells the parsers there is no more.
+        drop(sender);
+
+        let mut all = Vec::new();
+        for worker in workers {
+            if let Ok(mine) = worker.join() {
+                all.extend(mine);
+            }
+        }
+        all
+    });
+
+    if let Some(error) = read_error {
+        return Err(error);
+    }
+
+    // Merged in the order the blocks were read, so the result does not depend
+    // on which thread happened to finish first.
+    blocks.sort_by_key(|(sequence, _)| *sequence);
+
     let mut entries: HashMap<u32, MftEntry> = HashMap::with_capacity(1 << 18);
     // Sizes found in extension records, keyed by the base they belong to. An
     // extension can be read before or after its base, so they are collected
@@ -516,81 +793,18 @@ pub fn read(drive_letter: char) -> Result<MftSnapshot> {
     let mut extension_sizes: HashMap<u32, u64> = HashMap::new();
     let mut stats = MftStats::default();
     let mut skipped = 0_u64;
-    let record_bytes = geometry.record_bytes as usize;
 
-    // Records are parsed out of a rolling buffer rather than assuming they sit
-    // neatly inside a run: with 512-byte clusters a run can end mid-record.
-    let mut carry: Vec<u8> = Vec::new();
-    let mut record_index: u32 = 0;
-    let mut chunk = vec![0_u8; CHUNK_BYTES];
-
-    for run in &runs {
-        let mut remaining = run.clusters * geometry.bytes_per_cluster;
-        let mut offset = run.start_cluster * geometry.bytes_per_cluster;
-
-        while remaining > 0 {
-            let want = remaining.min(CHUNK_BYTES as u64) as usize;
-            let read = volume.read_at(offset, &mut chunk[..want])?;
-            if read == 0 {
-                break;
-            }
-            offset += read as u64;
-            remaining -= read as u64;
-
-            carry.extend_from_slice(&chunk[..read]);
-
-            let whole = carry.len() / record_bytes;
-            for index in 0..whole {
-                let start = index * record_bytes;
-                let record = &mut carry[start..start + record_bytes];
-                let is_file_record = record.get(0..4) == Some(b"FILE");
-                if is_file_record {
-                    stats.records_seen += 1;
-                }
-
-                if apply_fixups(record, geometry.bytes_per_sector).is_some() {
-                    if let Some(raw) = parse_record(record) {
-                        if raw.in_use {
-                            stats.in_use += 1;
-                            match raw.base {
-                                Some(base) => {
-                                    stats.extensions += 1;
-                                    if let Some(bytes) = raw.data {
-                                        extension_sizes.insert(base, bytes);
-                                    }
-                                }
-                                None => match raw.name {
-                                    Some((_, name, parent)) => {
-                                        entries.insert(
-                                            record_index,
-                                            MftEntry {
-                                                parent,
-                                                name,
-                                                is_directory: raw.is_directory,
-                                                bytes: if raw.is_directory {
-                                                    0
-                                                } else {
-                                                    raw.data.unwrap_or(0)
-                                                },
-                                                modified: raw.modified,
-                                                created: raw.created,
-                                                accessed: raw.accessed,
-                                            },
-                                        );
-                                    }
-                                    None => stats.nameless += 1,
-                                },
-                            }
-                        }
-                    }
-                } else if is_file_record {
-                    skipped += 1;
-                }
-                record_index = record_index.saturating_add(1);
-            }
-            carry.drain(..whole * record_bytes);
-        }
+    for (_, parsed) in blocks {
+        entries.extend(parsed.entries);
+        extension_sizes.extend(parsed.extension_sizes);
+        skipped += parsed.skipped;
+        stats.records_seen += parsed.stats.records_seen;
+        stats.in_use += parsed.stats.in_use;
+        stats.nameless += parsed.stats.nameless;
+        stats.extensions += parsed.stats.extensions;
     }
+    stats.io_millis = io_millis;
+    stats.bytes_read = bytes_read;
 
     // Give every base record that came up empty the size its extension holds.
     for (index, entry) in entries.iter_mut() {

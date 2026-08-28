@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -221,6 +221,9 @@ pub enum Response {
         orphan_summary: OrphanSummary,
         downloads: Vec<Download>,
         download_summary: DownloadSummary,
+        /// How long each stage took. Shown, so "it feels slow" can become a
+        /// number somebody can argue with.
+        timings: kam_storage::apps::Timings,
     },
     Duplicates {
         groups: Vec<DuplicateGroup>,
