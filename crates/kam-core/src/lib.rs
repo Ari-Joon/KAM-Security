@@ -11,10 +11,12 @@ pub mod error;
 pub mod mui;
 pub mod progress;
 pub mod registry;
+pub mod user;
 
 pub use db::Store;
 pub use error::{Error, Result};
 pub use progress::{Cancelled, Progress, Reporter};
+pub use user::UserContext;
 
 /// Product name as shown in the UI, service registration, and log output.
 pub const PRODUCT_NAME: &str = "KAM Security";

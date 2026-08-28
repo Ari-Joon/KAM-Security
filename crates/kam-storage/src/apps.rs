@@ -24,8 +24,9 @@
 use std::collections::HashMap;
 
 use kam_core::Result;
+use kam_core::UserContext;
 use serde::{Deserialize, Serialize};
-use windows::Win32::System::Registry::{HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+use windows::Win32::System::Registry::{HKEY, HKEY_LOCAL_MACHINE};
 
 use crate::index::VolumeIndex;
 use crate::registry::{Key, View};
@@ -143,20 +144,25 @@ fn install_date(raw: &str) -> Option<String> {
 }
 
 /// Read every uninstall key across both registry views and both hives.
-fn installed() -> Vec<Installed> {
-    let sources: [(HKEY, View); 3] = [
-        (HKEY_LOCAL_MACHINE, View::Native),
+///
+/// The third source is the *user's* hive, not the running process's. Anything
+/// installed just for one person — which on a modern machine is most of what
+/// somebody chose to install themselves — is registered only there.
+fn installed(user: &UserContext) -> Vec<Installed> {
+    let (user_hive, user_prefix) = user.hive();
+    let sources: [(HKEY, String, View); 3] = [
+        (HKEY_LOCAL_MACHINE, String::new(), View::Native),
         // 32-bit software on 64-bit Windows lives in a separate view, and it is
         // roughly half of what is installed on a typical machine.
-        (HKEY_LOCAL_MACHINE, View::Wow6432),
-        (HKEY_CURRENT_USER, View::Native),
+        (HKEY_LOCAL_MACHINE, String::new(), View::Wow6432),
+        (user_hive, user_prefix, View::Native),
     ];
 
     let mut found: Vec<Installed> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
 
-    for (root, view) in sources {
-        let Some(key) = Key::open(root, UNINSTALL, view) else {
+    for (root, prefix, view) in sources {
+        let Some(key) = Key::open(root, &format!("{prefix}{UNINSTALL}"), view) else {
             continue;
         };
         for subkey in key.subkey_names() {
@@ -202,7 +208,9 @@ fn installed() -> Vec<Installed> {
                 uninstall_command: entry
                     .string("QuietUninstallString")
                     .or_else(|| entry.string("UninstallString")),
-                installed_on: entry.string("InstallDate").and_then(|raw| install_date(&raw)),
+                installed_on: entry
+                    .string("InstallDate")
+                    .and_then(|raw| install_date(&raw)),
                 name,
             });
         }
@@ -259,6 +267,48 @@ pub(crate) fn normalise(text: &str) -> String {
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+/// Match a launch recorded under an application's name to the application.
+///
+/// Deliberately the last resort. It compares only stripped-down letters and
+/// digits, requires the record's name to be *contained in* the program's or the
+/// other way round, and refuses anything short enough to collide -- "Code" or
+/// "App" would otherwise match half the machine. Getting this wrong puts a
+/// wrong date on a screen people use to decide what to delete, so it errs
+/// towards saying nothing.
+fn match_by_name(
+    unattributed: &[crate::usage::Usage],
+    name: &str,
+    publisher: Option<&str>,
+) -> Option<crate::usage::Usage> {
+    let wanted = normalise(name);
+    if wanted.len() < 6 {
+        return None;
+    }
+    let with_publisher = publisher.map(|publisher| format!("{}{wanted}", normalise(publisher)));
+
+    unattributed
+        .iter()
+        .filter(|usage| usage.last_run.is_some())
+        .filter(|usage| {
+            let Some(id) = usage.app_id.as_deref() else {
+                return false;
+            };
+            // An id is a dotted name: `Microsoft.VisualStudioCode`. Stripping
+            // the punctuation is what makes it comparable at all.
+            let id = normalise(id);
+            if id.len() < 6 {
+                return false;
+            }
+            id.contains(&wanted)
+                || wanted.contains(&id)
+                || with_publisher
+                    .as_deref()
+                    .is_some_and(|both| id.contains(both) || both.contains(&id))
+        })
+        .max_by_key(|usage| usage.last_run)
+        .cloned()
 }
 
 /// Directories that plausibly belong to this application, and their sizes.
@@ -416,26 +466,21 @@ fn push_unique(locations: &mut Vec<Location>, candidate: Location) {
 }
 
 /// Where per-user and machine-wide application data lives on this machine.
-pub(crate) fn data_roots() -> Vec<(LocationKind, String)> {
+pub(crate) fn data_roots(user: &UserContext) -> Vec<(LocationKind, String)> {
     let mut roots = Vec::new();
+    // Machine-wide, and so the same whoever is asking.
     if let Some(value) = std::env::var_os("ProgramData") {
         roots.push((
             LocationKind::ProgramData,
             value.to_string_lossy().into_owned(),
         ));
     }
-    if let Some(value) = std::env::var_os("LOCALAPPDATA") {
-        roots.push((
-            LocationKind::LocalData,
-            value.to_string_lossy().into_owned(),
-        ));
-    }
-    if let Some(value) = std::env::var_os("APPDATA") {
-        roots.push((
-            LocationKind::RoamingData,
-            value.to_string_lossy().into_owned(),
-        ));
-    }
+    // These two are not. Taken from the environment they would be the
+    // *running account's* AppData, which inside a LocalSystem service is
+    // `C:\Windows\system32\config\systemprofile\AppData` -- a real
+    // directory containing nothing anybody installed.
+    roots.push((LocationKind::LocalData, user.local_app_data()));
+    roots.push((LocationKind::RoamingData, user.roaming_app_data()));
     roots
 }
 
@@ -491,16 +536,21 @@ fn drop_ancestors(locations: &mut Vec<Location>) {
 /// of every total. It is still listed, with a count, because "45 GB in a folder
 /// six NVIDIA packages share" is a useful thing to be told — it is just not a
 /// fact about any one of them.
-pub fn footprints(index: &VolumeIndex, drive_root: &str) -> Result<Vec<AppFootprint>> {
-    let roots = data_roots();
-    let steam = crate::steam::installed_games();
+pub fn footprints(
+    index: &VolumeIndex,
+    drive_root: &str,
+    user: &UserContext,
+) -> Result<Vec<AppFootprint>> {
+    let roots = data_roots(user);
+    let steam = crate::steam::installed_games(user);
 
     // Read once for the whole run: the registry is cheap but there are several
     // hundred applications and reopening the key per application would be
     // several hundred opens for one answer.
-    let usage = crate::usage::by_path();
+    let usage = crate::usage::by_path(user);
+    let unattributed = crate::usage::unattributed(user);
 
-    let candidates: Vec<(Installed, Vec<Location>)> = with_steam_games(installed(), &steam)
+    let candidates: Vec<(Installed, Vec<Location>)> = with_steam_games(installed(user), &steam)
         .into_iter()
         .map(|app| {
             let mut locations = locate(&app, index, &roots, &steam, drive_root);
@@ -547,7 +597,14 @@ pub fn footprints(index: &VolumeIndex, drive_root: &str) -> Result<Vec<AppFootpr
                 .iter()
                 .filter(|location| location.kind == LocationKind::Install)
                 .filter_map(|location| crate::usage::latest_under(&usage, &location.path))
-                .max_by_key(|found| (found.last_run, found.runs));
+                .max_by_key(|found| (found.last_run, found.runs))
+                // Nothing under its own folder. Some programs tell Windows
+                // their own name at startup instead of declaring it in a
+                // shortcut, and the launch is then recorded under that name and
+                // no path at all -- Visual Studio Code among them. Matching by
+                // name is weaker than matching by path, so it is only ever
+                // reached when the path told us nothing.
+                .or_else(|| match_by_name(&unattributed, &app.name, Some(app.publisher.as_str())));
 
             AppFootprint {
                 name: app.name,
@@ -586,13 +643,13 @@ pub struct StorageReport {
 }
 
 /// Read the volume's table, then measure applications and find leftovers.
-pub fn survey(drive_letter: char, now_unix: u64) -> Result<StorageReport> {
+pub fn survey(drive_letter: char, now_unix: u64, user: &UserContext) -> Result<StorageReport> {
     let snapshot = crate::mft::read(drive_letter)?;
     let index = VolumeIndex::build(snapshot);
     let root = format!("{drive_letter}:");
-    let apps = footprints(&index, &root)?;
+    let apps = footprints(&index, &root, user)?;
     let summary = summarise(&apps);
-    let orphans = crate::orphans::find(&index, &apps, now_unix);
+    let orphans = crate::orphans::find(&index, &apps, now_unix, user);
     let orphan_summary = crate::orphans::summarise(&orphans);
     let (downloads, download_summary) = crate::provenance::find(&index, &root, now_unix);
     Ok(StorageReport {
@@ -611,10 +668,13 @@ pub fn survey(drive_letter: char, now_unix: u64) -> Result<StorageReport> {
 /// directory-walking fallback: the candidate directories add up to most of the
 /// disk, so walking them would cost more than reading the whole table and give
 /// a worse answer.
-pub fn measure(drive_letter: char) -> Result<(Vec<AppFootprint>, FootprintSummary)> {
+pub fn measure(
+    drive_letter: char,
+    user: &UserContext,
+) -> Result<(Vec<AppFootprint>, FootprintSummary)> {
     let snapshot = crate::mft::read(drive_letter)?;
     let index = VolumeIndex::build(snapshot);
-    let apps = footprints(&index, &format!("{drive_letter}:"))?;
+    let apps = footprints(&index, &format!("{drive_letter}:"), user)?;
     let summary = summarise(&apps);
     Ok((apps, summary))
 }
@@ -652,6 +712,56 @@ pub fn summarise(apps: &[AppFootprint]) -> FootprintSummary {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    fn recorded(id: &str, at: u64) -> crate::usage::Usage {
+        crate::usage::Usage {
+            path: String::new(),
+            app_id: Some(id.to_owned()),
+            runs: 0,
+            last_run: Some(at),
+        }
+    }
+
+    #[test]
+    fn a_launch_recorded_under_a_name_finds_its_application() {
+        // The real case: Explorer records this launch as
+        // `Microsoft.VisualStudioCode`, which appears nowhere on disk, while
+        // the uninstall entry calls it "Microsoft Visual Studio Code (User)".
+        let records = vec![
+            recorded("Microsoft.VisualStudioCode", 1_787_389_214),
+            recorded("com.squirrel.Discord.Discord", 1_787_907_537),
+        ];
+        let found = match_by_name(
+            &records,
+            "Microsoft Visual Studio Code (User)",
+            Some("Microsoft Corporation"),
+        );
+        assert_eq!(found.and_then(|usage| usage.last_run), Some(1_787_389_214));
+    }
+
+    #[test]
+    fn a_name_short_enough_to_collide_matches_nothing() {
+        // "Code" would otherwise match Visual Studio Code, VS Code Insiders,
+        // and anything else with those four letters in its id.
+        let records = vec![recorded("Microsoft.VisualStudioCode", 1_787_389_214)];
+        assert!(match_by_name(&records, "Code", None).is_none());
+        assert!(match_by_name(&records, "App", None).is_none());
+    }
+
+    #[test]
+    fn an_unrelated_application_is_not_given_somebody_elses_date() {
+        let records = vec![recorded("Valve.Steam.Client", 1_787_770_031)];
+        assert!(match_by_name(&records, "Mozilla Firefox", Some("Mozilla")).is_none());
+        assert!(match_by_name(&records, "Notepad++", Some("Don Ho")).is_none());
+    }
+
+    #[test]
+    fn a_record_with_no_time_is_not_worth_matching() {
+        let mut record = recorded("Microsoft.VisualStudioCode", 0);
+        record.last_run = None;
+        assert!(match_by_name(&[record], "Microsoft Visual Studio Code", None).is_none());
+    }
+
     use kam_core::Reporter;
 
     #[test]
@@ -824,7 +934,7 @@ mod tests {
 
     #[test]
     fn this_machine_has_installed_software_with_names() {
-        let apps = installed();
+        let apps = installed(&kam_core::UserContext::current());
         assert!(!apps.is_empty(), "no installed applications found at all");
         assert!(apps.iter().all(|app| !app.name.trim().is_empty()));
     }
@@ -840,7 +950,7 @@ mod tests {
             .unwrap_or(0);
         let snapshot = crate::mft::read('C').unwrap();
         let index = VolumeIndex::build(snapshot);
-        let apps = footprints(&index, "C:").unwrap();
+        let apps = footprints(&index, "C:", &kam_core::UserContext::current()).unwrap();
         let summary = summarise(&apps);
 
         let gb = |bytes: u64| bytes as f64 / 1024.0 / 1024.0 / 1024.0;
@@ -884,12 +994,16 @@ ORGANISE: {} proposals from {} loose files, {:.1} GB",
             );
         }
 
-        let (dupes, dsum) = crate::duplicates::find(&index, "C:", &Reporter::silent()).unwrap();
+        let user = kam_core::UserContext::current();
+        let (dupes, dsum) =
+            crate::duplicates::find(&index, "C:", &Reporter::silent(), &user).unwrap();
         println!(
             "
-DUPLICATES: {} sets wasting {:.1} GB | {} files sized, {} heads read, {} read whole | {} ms{}",
+DUPLICATES: {} sets holding {:.1} GB of copies, {:.1} GB of it reclaimable across {} sets | {} files sized, {} heads read, {} read whole | {} ms{}",
             dsum.groups,
             gb(dsum.wasted_bytes),
+            gb(dsum.reclaimable_bytes),
+            dsum.actionable,
             dsum.examined,
             dsum.head_hashed,
             dsum.fully_hashed,
@@ -900,15 +1014,26 @@ DUPLICATES: {} sets wasting {:.1} GB | {} files sized, {} heads read, {} read wh
                 ""
             }
         );
-        for group in dupes.iter().take(8) {
+        for group in dupes.iter().take(10) {
             println!(
-                "  {:>7.2} GB wasted, {} copies of {:.2} GB:",
-                gb(group.wasted_bytes),
-                group.paths.len(),
-                gb(group.bytes)
+                "  {:?}: {} copies of {:.2} GB, {:.2} GB reclaimable",
+                group.verdict,
+                group.copies.len(),
+                gb(group.bytes),
+                gb(group.reclaimable_bytes)
             );
-            for path in group.paths.iter().take(3) {
-                println!("       {path}");
+            for why in &group.reasons {
+                println!("       {why}");
+            }
+            for (n, copy) in group.copies.iter().take(4).enumerate() {
+                let mark = if group.suggested_keep == Some(n) {
+                    "keep"
+                } else if copy.removable {
+                    "spare"
+                } else {
+                    "    "
+                };
+                println!("       [{mark}] {:?}  {}", copy.owner, copy.path);
             }
         }
 
@@ -939,10 +1064,10 @@ DUPLICATES: {} sets wasting {:.1} GB | {} files sized, {} heads read, {} read wh
         }
         println!(
             "\nSTEAM: {} games located from manifests",
-            crate::steam::installed_games().len()
+            crate::steam::installed_games(&kam_core::UserContext::current()).len()
         );
 
-        let orphans = crate::orphans::find(&index, &apps, now);
+        let orphans = crate::orphans::find(&index, &apps, now, &kam_core::UserContext::current());
         let orphan_summary = crate::orphans::summarise(&orphans);
         println!(
             "\nLEFTOVERS: {} directories holding {:.1} GB, of which {:.1} GB is high confidence",

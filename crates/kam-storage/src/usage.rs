@@ -34,18 +34,30 @@
 
 use std::collections::HashMap;
 
+use kam_core::UserContext;
 use serde::{Deserialize, Serialize};
-use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 
-use kam_core::registry::{Key, View};
+use kam_core::registry::View;
 
 /// Where Explorer keeps the counts.
-const USER_ASSIST: &str =
-    r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist";
+const USER_ASSIST: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist";
 
-/// The subkey holding executables. The other well-known one holds shortcuts,
-/// which point at the same programs and would double-count them.
+/// The subkey holding launches of executables by path.
 const EXECUTABLES: &str = "{CEBFF5CD-ACE2-4F4F-9178-9926F41749EA}";
+
+/// The subkey holding launches of *shortcuts*.
+///
+/// Reading only the first key was a real gap rather than a simplification.
+/// Anything started from the Start Menu, the taskbar or a desktop icon is
+/// recorded here and nowhere else, and that is how most people start most
+/// things: on this machine, Visual Studio Code and Discord both showed as never
+/// opened while being open at the time.
+///
+/// The values are paths to `.lnk` files, so each is resolved to what it points
+/// at before being joined against install directories. A shortcut that no
+/// longer resolves is dropped rather than counted against its own path, which
+/// would attribute a launch to the Start Menu folder.
+const SHORTCUTS: &str = "{F4E57C4B-2036-45F0-A9AB-443BCFE33D9F}";
 
 /// Offsets into the 72-byte record. Undocumented by Microsoft and stable since
 /// Windows 7; verified against real values on a live machine rather than taken
@@ -61,7 +73,13 @@ const FILETIME_EPOCH_OFFSET: u64 = 11_644_473_600;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
     /// The executable, with known-folder GUIDs expanded back to real paths.
+    ///
+    /// Empty when the record names an application rather than a file and no
+    /// shortcut could be found to translate it; `app_id` carries the name in
+    /// that case.
     pub path: String,
+    /// The name Windows recorded the launch under, when it recorded one.
+    pub app_id: Option<String>,
     /// How many times this account has launched it.
     pub runs: u32,
     /// Seconds since the Unix epoch. `None` when the record has no time, which
@@ -93,21 +111,45 @@ fn rot13(text: &str) -> String {
 /// Only the ones that actually appear in these records. An unrecognised GUID
 /// is left as written rather than guessed at, so a path that cannot be
 /// resolved stays visibly unresolved instead of quietly becoming wrong.
-fn expand_known_folder(path: &str) -> String {
+fn expand_known_folder(path: &str, user: &UserContext) -> String {
     const FOLDERS: &[(&str, &str)] = &[
         ("{6D809377-6AF0-444B-8957-A3773F02200E}", "ProgramFiles"),
-        ("{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}", "ProgramFiles(x86)"),
-        ("{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}", "SystemRoot\\System32"),
+        (
+            "{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}",
+            "ProgramFiles(x86)",
+        ),
+        (
+            "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}",
+            "SystemRoot\\System32",
+        ),
         ("{F38BF404-1D43-42F2-9305-67DE0B28FC23}", "SystemRoot"),
-        ("{D65231B0-B2F1-4857-A4CE-A8E7C6EA7D27}", "SystemRoot\\System32"),
-        ("{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}", "USERPROFILE\\Desktop"),
-        ("{FDD39AD0-238F-46AF-ADB4-6C85480369C7}", "USERPROFILE\\Documents"),
-        ("{374DE290-123F-4565-9164-39C4925E467B}", "USERPROFILE\\Downloads"),
+        (
+            "{D65231B0-B2F1-4857-A4CE-A8E7C6EA7D27}",
+            "SystemRoot\\System32",
+        ),
+        (
+            "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}",
+            "USERPROFILE\\Desktop",
+        ),
+        (
+            "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}",
+            "USERPROFILE\\Documents",
+        ),
+        (
+            "{374DE290-123F-4565-9164-39C4925E467B}",
+            "USERPROFILE\\Downloads",
+        ),
         ("{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}", "LOCALAPPDATA"),
         ("{3EB685DB-65F9-4CF6-A03A-E3EF65729F3D}", "APPDATA"),
         ("{62AB5D82-FDC1-4DC3-A9DD-070D1D495D97}", "ProgramData"),
-        ("{0139D44E-6AFE-49F2-8690-3DAFCAE6FFB8}", "ProgramData\\Microsoft\\Windows\\Start Menu\\Programs"),
-        ("{A77F5D77-2E2B-44C3-A6A2-ABA601054A51}", "APPDATA\\Microsoft\\Windows\\Start Menu\\Programs"),
+        (
+            "{0139D44E-6AFE-49F2-8690-3DAFCAE6FFB8}",
+            "ProgramData\\Microsoft\\Windows\\Start Menu\\Programs",
+        ),
+        (
+            "{A77F5D77-2E2B-44C3-A6A2-ABA601054A51}",
+            "APPDATA\\Microsoft\\Windows\\Start Menu\\Programs",
+        ),
     ];
 
     let upper = path.to_uppercase();
@@ -120,8 +162,18 @@ fn expand_known_folder(path: &str) -> String {
             Some((name, tail)) => (name, Some(tail)),
             None => (*variable, None),
         };
-        let Ok(base) = std::env::var(name) else {
-            return path.to_owned();
+        // The three per-user roots come from `user`. Taken from the
+        // environment inside the agent they resolve to LocalSystem's profile,
+        // and every known-folder path under a person's AppData silently points
+        // somewhere nobody has ever installed anything.
+        let base = match name {
+            "USERPROFILE" => user.profile().to_owned(),
+            "LOCALAPPDATA" => user.local_app_data(),
+            "APPDATA" => user.roaming_app_data(),
+            other => match std::env::var(other) {
+                Ok(value) => value,
+                Err(_) => return path.to_owned(),
+            },
         };
         let rest = &path[guid.len()..];
         let mut resolved = base;
@@ -135,7 +187,7 @@ fn expand_known_folder(path: &str) -> String {
     path.to_owned()
 }
 
-fn parse(name: &str, data: &[u8]) -> Option<Usage> {
+fn parse(name: &str, data: &[u8], user: &UserContext) -> Option<Usage> {
     if data.len() < RECORD_BYTES {
         return None;
     }
@@ -173,33 +225,121 @@ fn parse(name: &str, data: &[u8]) -> Option<Usage> {
         .filter(|seconds| *seconds > 946_684_800 && *seconds < 4_102_444_800);
 
     Some(Usage {
-        path: expand_known_folder(&decoded),
+        path: expand_known_folder(&decoded, user),
+        app_id: None,
         runs,
         last_run,
     })
 }
 
-/// Everything Explorer has recorded for this account.
-pub fn all() -> Vec<Usage> {
-    let path = format!("{USER_ASSIST}\\{EXECUTABLES}\\Count");
-    let Some(key) = Key::open(HKEY_CURRENT_USER, &path, View::Native) else {
+/// Read one of the two count keys.
+fn read_key(subkey: &str, user: &UserContext) -> Vec<Usage> {
+    let path = format!("{USER_ASSIST}\\{subkey}\\Count");
+    let Some(key) = user.open_key(&path, View::Native) else {
         return Vec::new();
     };
-
     key.value_names()
         .into_iter()
         .filter_map(|name| {
             let data = key.binary(&name)?;
-            parse(&name, &data)
+            parse(&name, &data, user)
         })
+        .collect()
+}
+
+/// Everything Explorer has recorded for one account.
+///
+/// `user` matters here more than anywhere else in this crate. This data lives
+/// only under the account that produced it, so reading it from the wrong hive
+/// does not fail — it returns nothing, and every program looks as though it has
+/// never been opened. The agent runs as LocalSystem, whose hive has no launch
+/// history at all, which is precisely how that bug reached a screenshot.
+pub fn all(user: &UserContext) -> Vec<Usage> {
+    let mut found = read_key(EXECUTABLES, user);
+    found.extend(read_key(SHORTCUTS, user));
+
+    // Not every record names a file.
+    //
+    // Both keys mix two kinds of value: a path, and the name Windows knows a
+    // program by -- `Microsoft.VisualStudioCode`, `com.squirrel.Discord.Discord`,
+    // `Valve.Steam.Client`. The second kind is how anything started from the
+    // Start Menu or the taskbar is recorded, which is how most people start
+    // most things, and no amount of path matching will ever join one to an
+    // install directory. Reading only the first kind left Visual Studio Code
+    // and Discord showing as never opened while both were running.
+    //
+    // Shortcuts are what connect the two: a `.lnk` knows both the name and the
+    // program, so it is read once and used as the translation table.
+    let mut by_lnk: HashMap<String, String> = HashMap::new();
+    let mut by_app_id: HashMap<String, String> = HashMap::new();
+    for shortcut in crate::shortcuts::all(user) {
+        let Some(target) = shortcut.target.filter(|target| !target.is_empty()) else {
+            continue;
+        };
+        by_lnk.insert(shortcut.path.to_lowercase(), target.clone());
+        if let Some(id) = shortcut.app_id {
+            // A Start Menu entry and its pinned twin share an id and point at
+            // the same program, so the first wins rather than the last
+            // overwriting it for nothing.
+            by_app_id.entry(id.to_lowercase()).or_insert(target);
+        }
+    }
+
+    found
+        .into_iter()
+        .map(|mut usage| {
+            if looks_like_a_path(&usage.path) && !ends_with_lnk(&usage.path) {
+                return usage;
+            }
+            let key = usage.path.to_lowercase();
+            if let Some(target) = by_lnk.get(&key).or_else(|| by_app_id.get(&key)) {
+                usage.app_id = Some(usage.path.clone());
+                usage.path = target.clone();
+                return usage;
+            }
+            // A name no shortcut explains. Some of these are Store apps with no
+            // install directory to attribute anything to; some are ordinary
+            // programs that set their own name at runtime, which a shortcut
+            // therefore never records -- Visual Studio Code does exactly that.
+            //
+            // The path is emptied rather than left as the name: a name in a
+            // list of file locations matches nothing and reads as a bug. The
+            // name is kept beside it, so the applications survey can try it
+            // against what it knows is installed.
+            usage.app_id = Some(std::mem::take(&mut usage.path));
+            usage
+        })
+        .collect()
+}
+
+/// Whether a recorded value is a file path rather than an application name.
+fn looks_like_a_path(value: &str) -> bool {
+    // A drive letter, or a UNC path. Application ids contain neither.
+    value.starts_with("\\\\")
+        || matches!(value.as_bytes(), [letter, b':', b'\\', ..] if letter.is_ascii_alphabetic())
+}
+
+fn ends_with_lnk(value: &str) -> bool {
+    value.len() > 4 && value[value.len() - 4..].eq_ignore_ascii_case(".lnk")
+}
+
+/// Launches recorded under a name rather than a path, by that name.
+///
+/// The applications survey matches these against what it knows is installed;
+/// nothing else can, because a name like `Microsoft.VisualStudioCode` appears
+/// nowhere on disk.
+pub fn unattributed(user: &UserContext) -> Vec<Usage> {
+    all(user)
+        .into_iter()
+        .filter(|usage| usage.path.is_empty() && usage.app_id.is_some())
         .collect()
 }
 
 /// Usage indexed by lowercased executable path, for joining against anything
 /// that knows where a program lives.
-pub fn by_path() -> HashMap<String, Usage> {
+pub fn by_path(user: &UserContext) -> HashMap<String, Usage> {
     let mut index: HashMap<String, Usage> = HashMap::new();
-    for usage in all() {
+    for usage in all(user).into_iter().filter(|u| !u.path.is_empty()) {
         let key = usage.path.to_lowercase().replace('/', "\\");
         // The same program can appear more than once — under a versioned path
         // and a stable one. Keep whichever ran most recently.
@@ -226,7 +366,10 @@ pub fn latest_under(usage: &HashMap<String, Usage>, directory: &str) -> Option<U
     }
     let prefix = format!(
         "{}\\",
-        directory.to_lowercase().replace('/', "\\").trim_end_matches('\\')
+        directory
+            .to_lowercase()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
     );
 
     usage
@@ -242,16 +385,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_path_is_told_apart_from_an_application_name() {
+        assert!(looks_like_a_path(r"C:\Program Files\Thing\thing.exe"));
+        assert!(looks_like_a_path(r"d:\games\a.exe"));
+        assert!(looks_like_a_path(r"\\server\share\a.exe"));
+
+        // Every one of these is a real value from this machine's own records.
+        assert!(!looks_like_a_path("Microsoft.VisualStudioCode"));
+        assert!(!looks_like_a_path("com.squirrel.Discord.Discord"));
+        assert!(!looks_like_a_path("Valve.Steam.Client"));
+        assert!(!looks_like_a_path("Chrome"));
+        assert!(!looks_like_a_path(
+            "Microsoft.WindowsStore_8wekyb3d8bbwe!App"
+        ));
+        // Steam's own protocol form, which is not a file either.
+        assert!(!looks_like_a_path(r"steam:\\rungameid\1203220"));
+    }
+
+    #[test]
+    fn a_shortcut_is_not_treated_as_the_program_it_points_at() {
+        assert!(ends_with_lnk(r"C:\Users\me\Desktop\Thing.LNK"));
+        assert!(ends_with_lnk(r"a.lnk"));
+        assert!(!ends_with_lnk(r"C:\Program Files\Thing\thing.exe"));
+        assert!(!ends_with_lnk(".lnk"));
+    }
+
+    #[test]
+    fn records_naming_an_application_never_reach_the_path_index() {
+        // A name in a list of file locations matches nothing and reads as a
+        // bug, which is what it was before these were separated out.
+        let index = by_path(&UserContext::current());
+        for (key, usage) in &index {
+            assert!(
+                looks_like_a_path(key),
+                "{key} is not a path but is in the path index"
+            );
+            assert!(!usage.path.is_empty());
+        }
+    }
+
+    #[test]
     fn rot13_is_its_own_inverse() {
         assert_eq!(rot13("Zvpebfbsg"), "Microsoft");
         assert_eq!(rot13(&rot13("Microsoft")), "Microsoft");
         // Digits, braces and separators pass through untouched.
-        assert_eq!(rot13(r"{6D809377-6AF0}\App\a.exe"), r"{6Q809377-6NS0}\Ncc\n.rkr");
+        assert_eq!(
+            rot13(r"{6D809377-6AF0}\App\a.exe"),
+            r"{6Q809377-6NS0}\Ncc\n.rkr"
+        );
     }
 
     #[test]
     fn a_known_folder_becomes_a_real_path() {
-        let expanded = expand_known_folder(r"{6D809377-6AF0-444B-8957-A3773F02200E}\App\thing.exe");
+        let expanded = expand_known_folder(
+            r"{6D809377-6AF0-444B-8957-A3773F02200E}\App\thing.exe",
+            &UserContext::current(),
+        );
         assert!(
             expanded.to_lowercase().contains("program files"),
             "did not expand: {expanded}"
@@ -263,19 +452,19 @@ mod tests {
     fn an_unknown_guid_is_left_visibly_unresolved() {
         // Better an obviously unresolved path than a confidently wrong one.
         let path = r"{00000000-0000-0000-0000-000000000000}\thing.exe";
-        assert_eq!(expand_known_folder(path), path);
+        assert_eq!(expand_known_folder(path, &UserContext::current()), path);
     }
 
     #[test]
     fn explorers_own_bookkeeping_is_not_a_program() {
         // UEME_CTLSESSION and friends are counters, not applications.
         let name = super::rot13("UEME_CTLSESSION");
-        assert!(parse(&name, &[0_u8; 72]).is_none());
+        assert!(parse(&name, &[0_u8; 72], &UserContext::current()).is_none());
     }
 
     #[test]
     fn a_short_record_is_ignored_rather_than_read_past() {
-        assert!(parse("nccyr", &[0_u8; 8]).is_none());
+        assert!(parse("nccyr", &[0_u8; 8], &UserContext::current()).is_none());
     }
 
     #[test]
@@ -287,7 +476,7 @@ mod tests {
         record[OFFSET_LAST_RUN..OFFSET_LAST_RUN + 8]
             .copy_from_slice(&33_777_293_561_036_915_u64.to_le_bytes());
 
-        let usage = parse("nccyr.rkr", &record).unwrap();
+        let usage = parse("nccyr.rkr", &record, &UserContext::current()).unwrap();
         assert_eq!(usage.runs, 5);
         assert_eq!(usage.last_run, None, "an absurd date must not be shown");
     }
@@ -300,7 +489,7 @@ mod tests {
         record[OFFSET_LAST_RUN..OFFSET_LAST_RUN + 8]
             .copy_from_slice(&134_319_915_724_930_000_u64.to_le_bytes());
 
-        let usage = parse("nccyr.rkr", &record).unwrap();
+        let usage = parse("nccyr.rkr", &record, &UserContext::current()).unwrap();
         assert_eq!(usage.runs, 3);
         let seconds = usage.last_run.expect("should have kept the time");
         // Somewhere in 2026.
@@ -312,7 +501,7 @@ mod tests {
     fn this_machine_has_a_usage_record() {
         // Every account that has launched anything has these. Finding none
         // means the reading is broken rather than the machine unused.
-        let usage = all();
+        let usage = all(&kam_core::UserContext::current());
         println!("{} programs with a launch record", usage.len());
         assert!(!usage.is_empty(), "no usage records at all");
 
@@ -329,7 +518,7 @@ mod tests {
 
     #[test]
     fn a_directory_resolves_to_its_most_recent_launch() {
-        let index = by_path();
+        let index = by_path(&kam_core::UserContext::current());
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
         match latest_under(&index, &root) {
             Some(usage) => println!("most recent under {root}: {}", usage.path),

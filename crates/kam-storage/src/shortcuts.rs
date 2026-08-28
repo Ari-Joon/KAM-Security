@@ -18,17 +18,36 @@
 
 use std::path::{Path, PathBuf};
 
+use kam_core::UserContext;
+
 use serde::{Deserialize, Serialize};
-use windows::core::{Interface, PCWSTR};
+use windows::core::{Interface, GUID, PCWSTR};
+use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
+use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED, STGM_READ,
 };
+use windows::Win32::System::Variant::VT_LPWSTR;
+use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
 
 /// Return the path as stored, without resolving or searching for it.
 const SLGP_RAWPATH: u32 = 0x4;
+
+/// `System.AppUserModel.ID`, the name Windows knows a program by.
+///
+/// Explorer records a launch under this name rather than under a path whenever
+/// the shortcut declares one, which is most things people pin. Reading only
+/// paths left Visual Studio Code and Discord showing as never opened while both
+/// were running -- they are recorded as `Microsoft.VisualStudioCode` and
+/// `com.squirrel.Discord.Discord`, which no amount of path matching will ever
+/// join to an install directory.
+const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0x9F4C2855_9F79_4B39_A8D0_E1D42DE1D5F3),
+    pid: 5,
+};
 
 /// Where a shortcut was found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +82,11 @@ pub struct Shortcut {
     /// shortcut has no file target at all — the Store publishes its entries
     /// that way.
     pub target: Option<String>,
+    /// The name Windows knows the program by, when the shortcut declares one.
+    ///
+    /// Explorer records a launch under this rather than under a path whenever
+    /// it exists, so it is how a taskbar launch is joined back to a program.
+    pub app_id: Option<String>,
     /// True when the target is named but is not there any more.
     pub broken: bool,
     /// Whether this is for everyone on the machine, which needs administrator
@@ -100,22 +124,61 @@ fn wide(path: &Path) -> Vec<u16> {
         .collect()
 }
 
-/// Read where a `.lnk` points, without resolving it.
+/// Read where a `.lnk` points, and what Windows calls it.
+///
+/// Both come out of one load, because loading is the expensive part and a
+/// second pass over 159 shortcuts to read one more property would double the
+/// cost of the whole survey.
 ///
 /// The caller must already be inside a COM apartment.
-fn target_of(lnk: &Path) -> Option<String> {
-    let link: IShellLinkW =
-        unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.ok()?;
-    let file: IPersistFile = link.cast().ok()?;
+fn read_link(lnk: &Path) -> (Option<String>, Option<String>) {
+    let Ok(link) =
+        (unsafe { CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER) })
+    else {
+        return (None, None);
+    };
+    let Ok(file) = link.cast::<IPersistFile>() else {
+        return (None, None);
+    };
 
     let path = wide(lnk);
-    unsafe { file.Load(PCWSTR(path.as_ptr()), STGM_READ) }.ok()?;
+    if unsafe { file.Load(PCWSTR(path.as_ptr()), STGM_READ) }.is_err() {
+        return (None, None);
+    }
 
+    (target_from(&link), app_id_from(&link))
+}
+
+/// The application id a shortcut declares, if it declares one.
+fn app_id_from(link: &IShellLinkW) -> Option<String> {
+    let store: IPropertyStore = link.cast().ok()?;
+    let mut value = unsafe { store.GetValue(&PKEY_APP_USER_MODEL_ID) }.ok()?;
+
+    // Anything other than a string means the property is absent or is
+    // something this does not understand; either way there is no id here.
+    let id = unsafe {
+        if value.Anonymous.Anonymous.vt != VT_LPWSTR {
+            None
+        } else {
+            let text = value.Anonymous.Anonymous.Anonymous.pwszVal;
+            (!text.is_null()).then(|| text.to_string().ok()).flatten()
+        }
+    };
+    // The variant owns a string allocation whichever branch was taken.
+    let _ = unsafe { PropVariantClear(&mut value) };
+
+    id.filter(|id| !id.trim().is_empty())
+}
+
+fn target_from(link: &IShellLinkW) -> Option<String> {
     let mut buffer = [0_u16; 1024];
     let mut found = WIN32_FIND_DATAW::default();
     unsafe { link.GetPath(&mut buffer, &mut found, SLGP_RAWPATH) }.ok()?;
 
-    let end = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
+    let end = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
     let target = String::from_utf16_lossy(&buffer[..end]).trim().to_owned();
     if target.is_empty() {
         return None;
@@ -129,30 +192,41 @@ fn target_of(lnk: &Path) -> Option<String> {
     Some(kam_core::env::expand(&target))
 }
 
-fn folder(variable: &str, tail: &str) -> Option<PathBuf> {
-    let base = std::env::var(variable).ok()?;
+fn folder(base: &str, tail: &str) -> Option<PathBuf> {
+    if base.is_empty() {
+        return None;
+    }
     let path = PathBuf::from(base).join(tail);
     path.is_dir().then_some(path)
 }
 
-/// Every place Windows keeps shortcuts, and who they belong to.
-fn places() -> Vec<(PathBuf, Place, bool)> {
-    let mut found = Vec::new();
+fn machine(variable: &str, tail: &str) -> Option<PathBuf> {
+    folder(&std::env::var(variable).ok()?, tail)
+}
 
-    if let Some(path) = folder("APPDATA", r"Microsoft\Windows\Start Menu\Programs") {
+/// Every place Windows keeps shortcuts, and who they belong to.
+///
+/// The per-user places come from `user` rather than the environment. Read from
+/// the environment inside the agent they would be LocalSystem's Start Menu and
+/// LocalSystem's desktop, both of which are empty.
+fn places(user: &UserContext) -> Vec<(PathBuf, Place, bool)> {
+    let mut found = Vec::new();
+    let roaming = user.roaming_app_data();
+
+    if let Some(path) = folder(&roaming, r"Microsoft\Windows\Start Menu\Programs") {
         found.push((path, Place::StartMenu, false));
     }
-    if let Some(path) = folder("ProgramData", r"Microsoft\Windows\Start Menu\Programs") {
+    if let Some(path) = machine("ProgramData", r"Microsoft\Windows\Start Menu\Programs") {
         found.push((path, Place::StartMenu, true));
     }
-    if let Some(path) = folder("USERPROFILE", "Desktop") {
+    if let Some(path) = folder(user.profile(), "Desktop") {
         found.push((path, Place::Desktop, false));
     }
-    if let Some(path) = folder("PUBLIC", "Desktop") {
+    if let Some(path) = machine("PUBLIC", "Desktop") {
         found.push((path, Place::Desktop, true));
     }
     if let Some(path) = folder(
-        "APPDATA",
+        &roaming,
         r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar",
     ) {
         found.push((path, Place::Taskbar, false));
@@ -188,18 +262,18 @@ fn walk(folder: &Path, depth: usize, found: &mut Vec<PathBuf>) {
 }
 
 /// Every shortcut on this machine, with what it points at.
-pub fn all() -> Vec<Shortcut> {
+pub fn all(user: &UserContext) -> Vec<Shortcut> {
     let Some(_com) = ComGuard::enter() else {
         return Vec::new();
     };
 
     let mut shortcuts = Vec::new();
-    for (folder, place, machine_wide) in places() {
+    for (folder, place, machine_wide) in places(user) {
         let mut files = Vec::new();
         walk(&folder, 0, &mut files);
 
         for file in files {
-            let target = target_of(&file);
+            let (target, app_id) = read_link(&file);
             shortcuts.push(Shortcut {
                 name: file
                     .file_stem()
@@ -215,6 +289,7 @@ pub fn all() -> Vec<Shortcut> {
                 place,
                 machine_wide,
                 target,
+                app_id,
             });
         }
     }
@@ -222,7 +297,10 @@ pub fn all() -> Vec<Shortcut> {
 }
 
 fn canonical(path: &str) -> String {
-    path.to_lowercase().replace('/', "\\").trim_end_matches('\\').to_owned()
+    path.to_lowercase()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_owned()
 }
 
 /// Shortcuts that point inside any of `roots`.
@@ -230,13 +308,13 @@ fn canonical(path: &str) -> String {
 /// Used after an uninstall: the application's own measured directories are the
 /// roots, so this finds the Start Menu folder and desktop icon belonging to
 /// the thing just removed, without guessing from its name.
-pub fn pointing_into(roots: &[String]) -> Vec<Shortcut> {
+pub fn pointing_into(roots: &[String], user: &UserContext) -> Vec<Shortcut> {
     if roots.is_empty() {
         return Vec::new();
     }
     let roots: Vec<String> = roots.iter().map(|root| canonical(root)).collect();
 
-    all()
+    all(user)
         .into_iter()
         .filter(|shortcut| {
             let Some(target) = shortcut.target.as_deref() else {
@@ -260,7 +338,7 @@ mod tests {
         // Every Windows install has a Start Menu full of them. Finding none, or
         // finding them all without targets, means the reading is broken rather
         // than the machine unusual.
-        let shortcuts = all();
+        let shortcuts = all(&kam_core::UserContext::current());
         println!("{} shortcuts", shortcuts.len());
         assert!(!shortcuts.is_empty(), "no shortcuts at all");
 
@@ -292,10 +370,17 @@ mod tests {
         // The join the cleanup depends on: given a directory, find the Start
         // Menu entries that launch something inside it.
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
-        let matches = pointing_into(std::slice::from_ref(&root));
+        let matches = pointing_into(
+            std::slice::from_ref(&root),
+            &kam_core::UserContext::current(),
+        );
         println!("{} shortcuts point inside {root}", matches.len());
         for shortcut in matches.iter().take(5) {
-            println!("  {} -> {}", shortcut.name, shortcut.target.as_deref().unwrap_or("?"));
+            println!(
+                "  {} -> {}",
+                shortcut.name,
+                shortcut.target.as_deref().unwrap_or("?")
+            );
         }
         // Windows ships accessories that launch out of System32.
         assert!(
@@ -308,7 +393,7 @@ mod tests {
     fn an_empty_root_list_matches_nothing() {
         // Guards against the obvious catastrophe: an empty prefix matching
         // every shortcut on the machine and offering to delete the lot.
-        assert!(pointing_into(&[]).is_empty());
+        assert!(pointing_into(&[], &kam_core::UserContext::current()).is_empty());
     }
 
     #[test]
@@ -321,6 +406,9 @@ mod tests {
 
         assert!(inside.starts_with(&format!("{root}\\")));
         assert!(!sibling.starts_with(&format!("{root}\\")));
-        assert!(sibling.starts_with(&root), "the naive check would have matched");
+        assert!(
+            sibling.starts_with(&root),
+            "the naive check would have matched"
+        );
     }
 }

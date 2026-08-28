@@ -28,10 +28,14 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use kam_core::{Error, Result};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, LocalFree, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL};
+use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::Security::{
+    GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+    TOKEN_USER,
+};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES,
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
@@ -41,7 +45,8 @@ use windows::Win32::System::Pipes::{
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 use crate::{MAX_PIPE_INSTANCES, PIPE_NAME};
@@ -180,6 +185,64 @@ impl PipeStream {
         Ok(PathBuf::from(OsString::from_wide(
             &buffer[..length as usize],
         )))
+    }
+
+    /// Textual SID of the account the caller is running as. Server side only.
+    ///
+    /// This is how the agent knows whose data a request is about. It runs as
+    /// LocalSystem, so its own environment and `HKEY_CURRENT_USER` describe
+    /// SYSTEM and nobody else; asking the caller who they are would be worse
+    /// still, since a client could then name anybody. The answer comes from the
+    /// caller's own access token, which the caller does not get to write.
+    ///
+    /// `PROCESS_QUERY_LIMITED_INFORMATION` is enough to open the token for
+    /// reading, and `TOKEN_QUERY` is enough to read the user out of it. Neither
+    /// permits impersonation, and nothing here acquires the caller's rights.
+    pub fn client_sid(&self) -> Result<String> {
+        let process_id = self.client_process_id()?;
+
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
+            .map_err(|error| win32(error, "could not open the calling process"))?;
+        let process = OwnedHandle(process);
+
+        let mut token = HANDLE::default();
+        unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) }
+            .map_err(|error| win32(error, "could not open the caller's token"))?;
+        let token = OwnedHandle(token);
+
+        // Two calls: the first fails with the required length, which is the
+        // documented way to size a variable-length token structure.
+        let mut needed = 0_u32;
+        let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut needed) };
+        if needed == 0 {
+            return Err(Error::Privileged(
+                "the caller's token reported no size for its user".to_owned(),
+            ));
+        }
+
+        let mut buffer = vec![0_u8; needed as usize];
+        unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                Some(buffer.as_mut_ptr().cast()),
+                needed,
+                &mut needed,
+            )
+        }
+        .map_err(|error| win32(error, "could not read the caller's user"))?;
+
+        // The SID sits after the structure in the same allocation, which is
+        // why the buffer must outlive the pointer read out of it.
+        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        let mut text = PWSTR::null();
+        unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) }
+            .map_err(|error| win32(error, "could not format the caller's SID"))?;
+
+        let sid = unsafe { text.to_string() }
+            .map_err(|_| Error::Protocol("the caller's SID was not valid text".to_owned()))?;
+        unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
+        Ok(sid)
     }
 }
 
@@ -419,6 +482,7 @@ mod tests {
             (
                 stream.client_process_id().unwrap(),
                 stream.client_image_path().unwrap(),
+                stream.client_sid().unwrap(),
             )
         });
 
@@ -434,7 +498,7 @@ mod tests {
         }
         let _client = client.expect("the listener never came up");
 
-        let (process_id, image_path) = server.join().unwrap();
+        let (process_id, image_path, sid) = server.join().unwrap();
         // Both ends are this test binary, so the answer is checkable.
         assert_eq!(process_id, std::process::id());
         assert!(
@@ -444,6 +508,21 @@ mod tests {
                 .contains("kam_ipc"),
             "unexpected image path: {}",
             image_path.display()
+        );
+
+        // A user SID, not a service account: S-1-5-21-... is a domain or local
+        // machine account, and SYSTEM would be S-1-5-18. The agent reads this
+        // to work out whose AppData and whose launch history a request is
+        // about, so getting SYSTEM's here would reproduce exactly the bug that
+        // made it report every application as never opened.
+        assert!(sid.starts_with("S-1-5-21-"), "unexpected SID: {sid}");
+        assert_ne!(sid, "S-1-5-18", "that is LocalSystem, not the caller");
+
+        // And it must name a real profile, since that is what it is used for.
+        let user = kam_core::UserContext::for_sid(&sid).expect("the caller has a profile");
+        assert_eq!(
+            user.profile().to_lowercase(),
+            kam_core::UserContext::current().profile().to_lowercase()
         );
     }
 

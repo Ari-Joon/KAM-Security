@@ -25,6 +25,8 @@
 
 use std::collections::HashSet;
 
+use kam_core::UserContext;
+
 use serde::{Deserialize, Serialize};
 
 use crate::apps::{normalise, LocationKind};
@@ -153,11 +155,16 @@ fn is_claimed(folder: &str, claimed: &HashSet<String>) -> bool {
 ///
 /// `apps` comes from [`crate::apps::footprints`] against the same index, so the
 /// two share one read of the table.
-pub fn find(index: &VolumeIndex, apps: &[crate::apps::AppFootprint], now_unix: u64) -> Vec<Orphan> {
+pub fn find(
+    index: &VolumeIndex,
+    apps: &[crate::apps::AppFootprint],
+    now_unix: u64,
+    user: &UserContext,
+) -> Vec<Orphan> {
     let claimed = claimed_names(apps);
     let mut orphans = Vec::new();
 
-    for (kind, root) in crate::apps::data_roots() {
+    for (kind, root) in crate::apps::data_roots(user) {
         let Some(root_index) = index.resolve(&root) else {
             continue;
         };
@@ -242,10 +249,10 @@ pub fn find(index: &VolumeIndex, apps: &[crate::apps::AppFootprint], now_unix: u
 /// The rule is narrow on purpose: exactly one level below one of the three data
 /// roots, and not a name Windows owns. `C:\Windows`, `C:\ProgramData` itself,
 /// and anything nested deeper are all refused.
-pub fn check_quarantinable(path: &str) -> std::result::Result<(), String> {
+pub fn check_quarantinable(path: &str, user: &UserContext) -> std::result::Result<(), String> {
     let normalised_path = path.trim_end_matches(['\\', '/']).replace('/', "\\");
 
-    for (_, root) in crate::apps::data_roots() {
+    for (_, root) in crate::apps::data_roots(user) {
         let root = root.trim_end_matches(['\\', '/']).to_owned();
         let prefix = format!("{}\\", root.to_lowercase());
         let lowered = normalised_path.to_lowercase();
@@ -368,15 +375,25 @@ mod tests {
     #[test]
     fn the_fence_allows_a_directory_directly_inside_a_data_root() {
         let root = std::env::var("LOCALAPPDATA").unwrap();
-        assert!(check_quarantinable(&format!("{root}\\SomeDeadVendor")).is_ok());
-        assert!(check_quarantinable(&format!("{root}/SomeDeadVendor/")).is_ok());
+        assert!(check_quarantinable(
+            &format!("{root}\\SomeDeadVendor"),
+            &kam_core::UserContext::current()
+        )
+        .is_ok());
+        assert!(check_quarantinable(
+            &format!("{root}/SomeDeadVendor/"),
+            &kam_core::UserContext::current()
+        )
+        .is_ok());
     }
 
     #[test]
     fn the_fence_refuses_a_data_root_itself() {
         let root = std::env::var("ProgramData").unwrap();
-        assert!(check_quarantinable(&root).is_err());
-        assert!(check_quarantinable(&format!("{root}\\")).is_err());
+        assert!(check_quarantinable(&root, &kam_core::UserContext::current()).is_err());
+        assert!(
+            check_quarantinable(&format!("{root}\\"), &kam_core::UserContext::current()).is_err()
+        );
     }
 
     #[test]
@@ -384,14 +401,25 @@ mod tests {
         // One level only. Deeper paths are where a mistake stops being a
         // leftover folder and starts being someone's saved games.
         let root = std::env::var("LOCALAPPDATA").unwrap();
-        assert!(check_quarantinable(&format!("{root}\\Vendor\\Inner")).is_err());
+        assert!(check_quarantinable(
+            &format!("{root}\\Vendor\\Inner"),
+            &kam_core::UserContext::current()
+        )
+        .is_err());
     }
 
     #[test]
     fn the_fence_refuses_directories_windows_owns() {
         let root = std::env::var("LOCALAPPDATA").unwrap();
-        assert!(check_quarantinable(&format!("{root}\\Microsoft")).is_err());
-        assert!(check_quarantinable(&format!("{root}\\Temp")).is_err());
+        assert!(check_quarantinable(
+            &format!("{root}\\Microsoft"),
+            &kam_core::UserContext::current()
+        )
+        .is_err());
+        assert!(
+            check_quarantinable(&format!("{root}\\Temp"), &kam_core::UserContext::current())
+                .is_err()
+        );
     }
 
     #[test]
@@ -404,7 +432,7 @@ mod tests {
             r"C:\Users\someone\Documents",
         ] {
             assert!(
-                check_quarantinable(path).is_err(),
+                check_quarantinable(path, &kam_core::UserContext::current()).is_err(),
                 "{path} should have been refused"
             );
         }

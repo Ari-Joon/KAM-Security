@@ -121,9 +121,33 @@ fn handle_connection(
         return Ok(());
     }
 
+    // Who the work is for, resolved from the caller's own token.
+    //
+    // This process runs as LocalSystem, so its environment and its
+    // `HKEY_CURRENT_USER` describe SYSTEM: a real account with a real profile
+    // directory that nobody has ever installed anything into. Measuring
+    // against it does not fail, it silently answers about the wrong person.
+    // That is how the agent came to report no application data in any user
+    // profile, no Steam install at all, and every program as never opened.
+    //
+    // Falling back to the agent's own account would reintroduce exactly that,
+    // so a caller whose profile cannot be resolved is refused instead.
+    let sid = stream.client_sid()?;
+    let Some(user) = kam_core::UserContext::for_sid(&sid) else {
+        tracing::warn!(%sid, "the caller has no profile on this machine");
+        write_frame(
+            stream,
+            &Reply::Done(Response::Error {
+                message: "the account you are signed in as has no profile on this machine"
+                    .to_owned(),
+            }),
+        )?;
+        return Ok(());
+    };
+
     let request: Request = read_frame(stream)?;
-    tracing::debug!(client = %image_path.display(), ?request, "serving request");
-    let response = run_request(stream, request, context);
+    tracing::debug!(client = %image_path.display(), user = %user.profile(), ?request, "serving");
+    let response = run_request(stream, request, context, user);
     write_frame(stream, &Reply::Done(response))
 }
 
@@ -138,7 +162,12 @@ fn handle_connection(
 /// The channel closes when the last clone of the reporter is dropped, which
 /// happens when the job returns. So draining until the channel is empty *is*
 /// waiting for the job to finish, and there is no separate signal to get wrong.
-fn run_request(stream: &mut PipeStream, request: Request, context: &Arc<Context>) -> Response {
+fn run_request(
+    stream: &mut PipeStream,
+    request: Request,
+    context: &Arc<Context>,
+    user: kam_core::UserContext,
+) -> Response {
     let (sender, receiver) = mpsc::channel::<Progress>();
     let reporter = Reporter::new(move |progress| {
         // A failed send means the reader has gone: the client hung up. The job
@@ -149,7 +178,7 @@ fn run_request(stream: &mut PipeStream, request: Request, context: &Arc<Context>
     let context = Arc::clone(context);
     let worker = std::thread::Builder::new()
         .name("kam-job".to_owned())
-        .spawn(move || dispatch::handle(request, &context, &reporter));
+        .spawn(move || dispatch::handle(request, &context, &reporter, &user));
 
     let worker = match worker {
         Ok(worker) => worker,

@@ -21,8 +21,11 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::registry::{Key, View};
-use windows::Win32::System::Registry::HKEY_CURRENT_USER;
+use crate::registry::View;
+use kam_core::UserContext;
+
+/// Windows' path separator, spelled once so escaping it is not a hazard.
+const SEPARATOR: &str = r"\";
 
 /// One installed game, as Steam describes it.
 #[derive(Debug, Clone)]
@@ -68,8 +71,11 @@ fn find_value(text: &str, wanted: &str) -> Option<String> {
 }
 
 /// Steam's own install directory, from the registry.
-fn steam_root() -> Option<PathBuf> {
-    let key = Key::open(HKEY_CURRENT_USER, r"Software\Valve\Steam", View::Native)?;
+///
+/// Recorded per-user, which is why this needs to know which user. Read from the
+/// wrong hive it simply is not there, and every Steam library along with it.
+fn steam_root(user: &UserContext) -> Option<PathBuf> {
+    let key = user.open_key(r"Software\Valve\Steam", View::Native)?;
     // Steam writes this with forward slashes, which Windows accepts anyway.
     key.string("SteamPath").map(PathBuf::from)
 }
@@ -79,7 +85,7 @@ fn steam_root() -> Option<PathBuf> {
 /// The main install is always a library even though it is not always listed as
 /// one, so it is added regardless.
 fn library_paths(root: &Path) -> Vec<PathBuf> {
-    let mut libraries = vec![root.to_path_buf()];
+    let mut libraries = vec![tidy(root)];
 
     let manifest = root.join("steamapps").join("libraryfolders.vdf");
     if let Ok(text) = std::fs::read_to_string(&manifest) {
@@ -87,8 +93,8 @@ fn library_paths(root: &Path) -> Vec<PathBuf> {
             if let Some((key, value)) = key_value(line) {
                 if key.eq_ignore_ascii_case("path") {
                     // Paths are escaped in the file: C:\\Games\\SteamLibrary.
-                    let path = PathBuf::from(value.replace("\\\\", "\\"));
-                    if !libraries.contains(&path) {
+                    let path = tidy(&PathBuf::from(value.replace("\\\\", "\\")));
+                    if !libraries.iter().any(|known| same_place(known, &path)) {
                         libraries.push(path);
                     }
                 }
@@ -99,9 +105,34 @@ fn library_paths(root: &Path) -> Vec<PathBuf> {
     libraries
 }
 
+/// Put a path into one shape.
+///
+/// Steam writes its own install directory into the registry with forward
+/// slashes and a lowercase drive letter, and writes that same folder into
+/// `libraryfolders.vdf` in ordinary Windows form. They are one directory, and
+/// without this it is found twice under two spellings -- which showed up as the
+/// same download cache being listed, measured and offered for clearing twice.
+fn tidy(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy().replace('/', SEPARATOR);
+    PathBuf::from(text.trim_end_matches(SEPARATOR))
+}
+
+fn same_place(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+/// Every library folder on this machine, for anything that needs to look
+/// inside one without caring what is installed there.
+pub fn library_roots(user: &UserContext) -> Vec<PathBuf> {
+    steam_root(user)
+        .map(|root| library_paths(&root))
+        .unwrap_or_default()
+}
+
 /// Read every `appmanifest_*.acf` across every library.
-pub fn installed_games() -> Vec<SteamApp> {
-    let Some(root) = steam_root() else {
+pub fn installed_games(user: &UserContext) -> Vec<SteamApp> {
+    let Some(root) = steam_root(user) else {
         return Vec::new();
     };
 
@@ -219,9 +250,9 @@ mod tests {
     fn this_machine_lists_steam_games_if_steam_is_installed() {
         // Informational rather than an assertion about the machine: a build box
         // without Steam must not fail the suite.
-        match steam_root() {
+        match steam_root(&kam_core::UserContext::current()) {
             Some(root) => {
-                let games = installed_games();
+                let games = installed_games(&kam_core::UserContext::current());
                 println!("steam at {} with {} games", root.display(), games.len());
                 assert!(
                     games.iter().all(|game| !game.name.trim().is_empty()),
