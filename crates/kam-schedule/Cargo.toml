@@ -1,5 +1,5 @@
 [package]
-name = "kam-ipc"
+name = "kam-schedule"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,13 +7,8 @@ license.workspace = true
 
 [dependencies]
 kam-core = { workspace = true }
-kam-firewall = { workspace = true }
-kam-quarantine = { workspace = true }
-kam-scanner = { workspace = true }
-kam-schedule = { workspace = true }
-kam-storage = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+tracing = { workspace = true }
 windows = { workspace = true }
 
 [lints]

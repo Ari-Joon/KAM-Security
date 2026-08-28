@@ -10,6 +10,7 @@
 //! trusted directory and passes the check the shell will later have to pass —
 //! ordinary development exercises that path instead of bypassing it.
 
+mod check;
 mod dispatch;
 mod server;
 mod service;
@@ -36,6 +37,8 @@ pub enum Mode {
     Install,
     /// Stop and remove the service. Requires elevation.
     Uninstall,
+    /// Run the weekly check once and exit. What the scheduled task starts.
+    Check,
 }
 
 const USAGE: &str = "\
@@ -45,7 +48,8 @@ usage: kam-agent <mode>
   --service     run under the service control manager (set by --install)
   --probe       ask a running agent for its status and exit
   --install     register the service; requires elevation
-  --uninstall   stop and remove the service; requires elevation";
+  --uninstall   stop and remove the service; requires elevation
+  --check       run the weekly check once and exit";
 
 fn main() -> ExitCode {
     let mode = match parse_mode() {
@@ -75,6 +79,7 @@ fn run(mode: Mode) -> kam_core::Result<()> {
         Mode::Probe => return server::probe(),
         Mode::Install => return service::install(),
         Mode::Uninstall => return service::uninstall(),
+        Mode::Check => return run_check(),
         Mode::Console | Mode::Service => {}
     }
 
@@ -103,6 +108,54 @@ fn run(mode: Mode) -> kam_core::Result<()> {
     server::serve(&listener, &context, &shutdown)
 }
 
+/// One pass of the weekly check, started by the scheduled task.
+///
+/// It asks the running service to do the work rather than doing it here, and
+/// that is the whole point of the mode. The first version ran the checks in
+/// this process and failed on its first real run: the audit log lives under
+/// `ProgramData` where only SYSTEM may write, so a task running as a person
+/// could read it and not record anything, and every finding went to the log
+/// file instead of to the place the window reads.
+///
+/// Going through the pipe fixes that and something better. The service is
+/// already SYSTEM, so it writes; it already knows how to identify its caller,
+/// so the per-user half of the check is about the right person; and it is
+/// exactly the path the "Check now" button takes, so there is one code path
+/// rather than two that can drift.
+///
+/// It also means the scheduled task needs no privileges at all. Adding
+/// something to somebody's machine that runs as them, with their ordinary
+/// rights, once a week, is a much smaller thing to ask than adding something
+/// elevated.
+fn run_check() -> kam_core::Result<()> {
+    let reply = kam_ipc::client::call(&kam_ipc::Request::RunCheck)?;
+
+    let findings = match reply {
+        kam_ipc::Response::Checked { findings } => findings,
+        kam_ipc::Response::Error { message } => {
+            return Err(kam_core::Error::Refused(message));
+        }
+        other => {
+            return Err(kam_core::Error::Protocol(format!(
+                "the agent answered a check with {other:?}"
+            )))
+        }
+    };
+
+    if findings.is_empty() {
+        println!("Checked. Nothing to report.");
+        return Ok(());
+    }
+    for finding in &findings {
+        println!(
+            "{} {}",
+            if finding.serious { "!" } else { "-" },
+            finding.summary
+        );
+    }
+    Ok(())
+}
+
 fn parse_mode() -> Result<Mode, String> {
     let mut mode = None;
     for argument in std::env::args().skip(1) {
@@ -112,6 +165,7 @@ fn parse_mode() -> Result<Mode, String> {
             "--probe" => Mode::Probe,
             "--install" => Mode::Install,
             "--uninstall" => Mode::Uninstall,
+            kam_schedule::CHECK_ARGUMENT => Mode::Check,
             other => return Err(format!("unrecognised argument: {other}")),
         };
         if mode.is_some_and(|existing| existing != parsed) {

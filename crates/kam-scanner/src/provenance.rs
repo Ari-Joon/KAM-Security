@@ -39,6 +39,8 @@ use kam_core::{Cancelled, Reporter};
 use kam_storage::provenance::{origin_of, Origin};
 use serde::{Deserialize, Serialize};
 
+use kam_core::UserContext;
+
 use crate::persistence::{self, Anchor, Entry};
 use crate::signature::{self, Signature};
 
@@ -461,7 +463,7 @@ fn walk(folder: &Path, depth: usize, found: &mut Vec<PathBuf>) {
 
 /// Examine everything on this machine that starts itself, plus executables
 /// that arrived from outside and are sitting where downloads land.
-pub fn survey(reporter: &Reporter) -> Result<Report, Cancelled> {
+pub fn survey(reporter: &Reporter, user: &UserContext) -> Result<Report, Cancelled> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs())
@@ -471,7 +473,7 @@ pub fn survey(reporter: &Reporter) -> Result<Report, Cancelled> {
     // useful thing to know while waiting is what is being done, not how far
     // through an opaque sequence it is.
     reporter.stage("Reading what starts itself", None);
-    let persistence = persistence::survey();
+    let persistence = persistence::survey(user);
     reporter.check()?;
 
     // One file, many anchors: svchost hosts dozens of services, and an updater
@@ -739,7 +741,7 @@ mod tests {
     #[test]
     fn this_machine_produces_a_readable_report() {
         let started = std::time::Instant::now();
-        let report = survey(&Reporter::silent()).unwrap();
+        let report = survey(&Reporter::silent(), &UserContext::current()).unwrap();
         let elapsed = started.elapsed();
 
         println!(

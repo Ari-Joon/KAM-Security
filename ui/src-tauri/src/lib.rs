@@ -144,6 +144,42 @@ struct DuplicateReport {
     summary: DuplicateSummary,
 }
 
+/// Whether a weekly check is registered, and when it runs.
+#[tauri::command]
+fn schedule() -> Result<kam_schedule::Schedule, String> {
+    match kam_ipc::client::call(&Request::GetSchedule).map_err(|error| error.to_string())? {
+        Response::Schedule(schedule) => Ok(schedule),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Turn the weekly check on or off.
+///
+/// Only the day and the hour travel. What gets run, and as whom, are the
+/// agent's decision, because this registers something that runs elevated on a
+/// timer.
+#[tauri::command]
+fn set_schedule(enabled: bool, day: String, hour: u8) -> Result<kam_schedule::Schedule, String> {
+    match kam_ipc::client::call(&Request::SetSchedule { enabled, day, hour })
+        .map_err(|error| error.to_string())?
+    {
+        Response::Schedule(schedule) => Ok(schedule),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Run the check now rather than waiting for the schedule.
+#[tauri::command]
+fn run_check() -> Result<Vec<kam_ipc::CheckFinding>, String> {
+    match kam_ipc::client::call(&Request::RunCheck).map_err(|error| error.to_string())? {
+        Response::Checked { findings } => Ok(findings),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Every cache and scratch directory holding anything, largest first.
 #[tauri::command]
 fn survey_caches() -> Result<Vec<kam_storage::Cache>, String> {
@@ -593,6 +629,9 @@ pub fn run() {
             quarantine_copy,
             survey_caches,
             clear_cache,
+            schedule,
+            set_schedule,
+            run_check,
             list_quarantine,
             restore_quarantined,
             reveal_in_explorer,

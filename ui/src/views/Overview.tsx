@@ -1,6 +1,24 @@
+import { useEffect, useState } from "react";
 import * as fmt from "../lib/format";
-import type { AuditRecord, SystemStatus, Volume } from "../lib/types";
+import { api, reason } from "../lib/api";
+import type {
+  AuditRecord,
+  CheckFinding,
+  Schedule,
+  SystemStatus,
+  Volume,
+} from "../lib/types";
 import EffectBadge from "../components/EffectBadge";
+
+const DAYS = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+];
 
 type Props = {
   status: SystemStatus | null;
@@ -21,6 +39,149 @@ function UsageBar({ used, total }: { used: number; total: number }) {
       </div>
       <span className="usage-label">{pct.toFixed(0)}% used</span>
     </div>
+  );
+}
+
+
+/**
+ * The one thing here that happens without being asked.
+ *
+ * It is off until somebody turns it on, and it is a Windows scheduled task
+ * rather than a timer inside this program: the agent costs nothing while
+ * nobody is asking it anything, and a thread waking every few minutes to check
+ * the clock would throw that away. Windows also already knows how to hold a run
+ * back until the machine is idle and on mains power.
+ */
+function WeeklyCheck() {
+  const [schedule, setSchedule] = useState<Schedule | null>(null);
+  const [day, setDay] = useState("Sunday");
+  const [hour, setHour] = useState(3);
+  const [busy, setBusy] = useState(false);
+  const [findings, setFindings] = useState<CheckFinding[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const current = await api.schedule();
+        setSchedule(current);
+        if (current.day) setDay(current.day);
+        if (current.at) setHour(parseInt(current.at.slice(0, 2), 10) || 3);
+      } catch {
+        // The panel is secondary; a failure here must not blank the Overview.
+      }
+    })();
+  }, []);
+
+  async function apply(enabled: boolean) {
+    setBusy(true);
+    setError(null);
+    try {
+      setSchedule(await api.setSchedule(enabled, day, hour));
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function checkNow() {
+    setBusy(true);
+    setError(null);
+    try {
+      setFindings(await api.runCheck());
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const on = schedule?.enabled === true;
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>Weekly check</h2>
+        <button onClick={() => void checkNow()} disabled={busy}>
+          {busy ? "Working…" : "Check now"}
+        </button>
+      </div>
+      <p className="muted">
+        Reads state rather than scanning: whether Defender is on and current,
+        whether the firewall is up, whether anything unsigned has taken up
+        residence in a startup location, and whether a drive is nearly full.
+        Seconds, and almost no disk. It never pops anything up, because a weekly
+        balloon saying everything is fine is how a program teaches you to ignore
+        it.
+      </p>
+
+      <div className="schedule-row">
+        <label>
+          Every
+          <select value={day} onChange={(event) => setDay(event.target.value)}>
+            {DAYS.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          at
+          <select
+            value={hour}
+            onChange={(event) => setHour(Number(event.target.value))}
+          >
+            {Array.from({ length: 24 }, (_, n) => n).map((n) => (
+              <option key={n} value={n}>
+                {String(n).padStart(2, "0")}:00
+              </option>
+            ))}
+          </select>
+        </label>
+        <button onClick={() => void apply(true)} disabled={busy}>
+          {on ? "Change" : "Turn on"}
+        </button>
+        {on && (
+          <button className="ghost" onClick={() => void apply(false)} disabled={busy}>
+            Turn off
+          </button>
+        )}
+      </div>
+
+      <p className={on ? "schedule-state on" : "schedule-state"}>
+        {on
+          ? `Registered: every ${schedule?.day ?? day} at ${schedule?.at ?? ""}, only when the machine is idle and on mains power.`
+          : "Nothing is registered. This program reports on what starts itself at boot, so it does not quietly add itself to that list."}
+      </p>
+      {on && schedule?.command && (
+        <p className="muted small">
+          Runs <code>{schedule.command}</code> as you, with administrator
+          rights. It appears in Task Scheduler under <code>KAM Security</code>,
+          and in this program's own list of what starts itself.
+        </p>
+      )}
+
+      {error && <pre className="error">{error}</pre>}
+
+      {findings && (
+        <ul className="findings">
+          {findings.length === 0 ? (
+            <li className="finding ok">Nothing to report.</li>
+          ) : (
+            findings.map((finding) => (
+              <li
+                key={finding.summary}
+                className={finding.serious ? "finding serious" : "finding"}
+              >
+                {finding.summary}
+              </li>
+            ))
+          )}
+        </ul>
+      )}
+    </section>
   );
 }
 
@@ -98,6 +259,8 @@ export default function Overview({ status, volumes, entries, onOpenStorage }: Pr
           </div>
         )}
       </section>
+
+      <WeeklyCheck />
 
       <section className="panel">
         <div className="panel-head">

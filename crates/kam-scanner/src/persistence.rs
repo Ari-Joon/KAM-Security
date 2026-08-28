@@ -28,8 +28,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use kam_core::registry::{self, View};
+use kam_core::UserContext;
 use serde::{Deserialize, Serialize};
-use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 
 /// Where an auto-start entry was found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,21 +154,27 @@ const RUN_KEYS: &[(&str, Anchor)] = &[
     ),
 ];
 
-fn read_run_keys(entries: &mut Vec<Entry>) {
+fn read_run_keys(entries: &mut Vec<Entry>, user: &UserContext) {
     // Both hives and both views. A 32-bit installer writing to the Run key on a
     // 64-bit machine lands in `WOW6432Node`, and reading only the native view
     // would miss it entirely — which is exactly the kind of blind spot that
     // makes people distrust a tool like this.
+    //
+    // The per-user hive is the *caller's*, not the running process's. Inside a
+    // LocalSystem service `HKEY_CURRENT_USER` is SYSTEM's own hive, where
+    // nobody has ever put a startup entry, so a survey of what starts itself
+    // silently omitted half of what does.
+    let (user_hive, user_prefix) = user.hive();
     let hives = [
-        (HKEY_LOCAL_MACHINE, "HKLM", true),
-        (HKEY_CURRENT_USER, "HKCU", false),
+        (HKEY_LOCAL_MACHINE, String::new(), "HKLM", true),
+        (user_hive, user_prefix, "HKCU", false),
     ];
     let views = [(View::Native, ""), (View::Wow6432, r"\WOW6432Node")];
 
-    for (hive, hive_label, machine_wide) in hives {
+    for (hive, prefix, hive_label, machine_wide) in hives {
         for (view, view_label) in views {
             for (path, anchor) in RUN_KEYS {
-                let Some(key) = registry::Key::open(hive, path, view) else {
+                let Some(key) = registry::Key::open(hive, &format!("{prefix}{path}"), view) else {
                     continue;
                 };
                 for name in key.value_names() {
@@ -192,15 +199,15 @@ fn read_run_keys(entries: &mut Vec<Entry>) {
 }
 
 /// Files sitting in a Startup folder.
-fn read_startup_folders(entries: &mut Vec<Entry>) {
+fn read_startup_folders(entries: &mut Vec<Entry>, user: &UserContext) {
     let mut folders: Vec<(PathBuf, bool)> = Vec::new();
 
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        folders.push((
-            PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Startup"),
-            false,
-        ));
-    }
+    // Per-user, so it comes from the caller rather than from `%APPDATA%`.
+    folders.push((
+        PathBuf::from(user.roaming_app_data())
+            .join(r"Microsoft\Windows\Start Menu\Programs\Startup"),
+        false,
+    ));
     if let Ok(program_data) = std::env::var("ProgramData") {
         folders.push((
             PathBuf::from(program_data).join(r"Microsoft\Windows\Start Menu\Programs\Startup"),
@@ -439,10 +446,10 @@ impl Survey {
 }
 
 /// Everything on this machine that starts itself.
-pub fn survey() -> Survey {
+pub fn survey(user: &UserContext) -> Survey {
     let mut survey = Survey::default();
-    read_run_keys(&mut survey.entries);
-    read_startup_folders(&mut survey.entries);
+    read_run_keys(&mut survey.entries, user);
+    read_startup_folders(&mut survey.entries, user);
     read_services(&mut survey.entries);
     read_scheduled_tasks(&mut survey);
 
@@ -560,7 +567,7 @@ mod tests {
 
     #[test]
     fn this_machine_has_things_that_start_themselves() {
-        let survey = survey();
+        let survey = survey(&kam_core::UserContext::current());
         assert!(
             !survey.entries.is_empty(),
             "every Windows machine has auto-start entries; finding none means the readers are broken"

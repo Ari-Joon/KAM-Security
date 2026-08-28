@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   ApplicationReport,
   Cache,
+  CheckFinding,
   Cleared,
   DefenderReport,
   DuplicateReport,
@@ -19,6 +20,7 @@ import type {
   FirewallReport,
   ConnectionReport,
   Remnants,
+  Schedule,
 } from "./types";
 
 /**
@@ -63,6 +65,10 @@ export const api = {
   quarantineCopy: (path: string, reason: string) =>
     invoke<Manifest>("quarantine_copy", { path, reason }),
   caches: () => invoke<Cache[]>("survey_caches"),
+  schedule: () => invoke<Schedule>("schedule"),
+  setSchedule: (enabled: boolean, day: string, hour: number) =>
+    invoke<Schedule>("set_schedule", { enabled, day, hour }),
+  runCheck: () => invoke<CheckFinding[]>("run_check"),
   clearCache: (id: string) => invoke<Cleared>("clear_cache", { id }),
   quarantineList: () => invoke<Manifest[]>("list_quarantine"),
   restore: (id: string) => invoke<Manifest>("restore_quarantined", { id }),

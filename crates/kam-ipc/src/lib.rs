@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -102,6 +102,21 @@ pub enum Request {
     ListQuarantine,
     /// Put a quarantined item back where it came from.
     RestoreQuarantined { id: String },
+    /// Whether a weekly check is registered, and when it runs.
+    GetSchedule,
+    /// Register the weekly check, or take it away.
+    ///
+    /// The program the task starts and the account it runs as are both decided
+    /// by the agent: this creates something that runs elevated on a timer, and
+    /// a request that could name the program would be a request to run anything
+    /// at all, on a schedule, as the person using the machine.
+    SetSchedule {
+        enabled: bool,
+        day: String,
+        hour: u8,
+    },
+    /// Run the check now, without waiting for the schedule.
+    RunCheck,
     /// Every cache and scratch directory that currently holds anything.
     SurveyCaches,
     /// Empty one of them.
@@ -211,6 +226,12 @@ pub enum Response {
         groups: Vec<DuplicateGroup>,
         summary: DuplicateSummary,
     },
+    Schedule(kam_schedule::Schedule),
+    /// What a check found, most serious first. Empty means nothing to report,
+    /// which is a result rather than a failure.
+    Checked {
+        findings: Vec<CheckFinding>,
+    },
     Caches {
         caches: Vec<Cache>,
     },
@@ -253,6 +274,14 @@ pub enum Response {
     Error {
         message: String,
     },
+}
+
+/// One thing a check thought was worth mentioning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckFinding {
+    pub summary: String,
+    /// True when this is a state to be corrected rather than a note.
+    pub serious: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

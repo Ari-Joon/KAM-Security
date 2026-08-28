@@ -2605,6 +2605,7 @@ dependencies = [
  "kam-ipc",
  "kam-quarantine",
  "kam-scanner",
+ "kam-schedule",
  "kam-storage",
  "serde",
  "serde_json",
@@ -2643,6 +2644,7 @@ dependencies = [
  "kam-firewall",
  "kam-quarantine",
  "kam-scanner",
+ "kam-schedule",
  "kam-storage",
  "serde",
  "serde_json",
@@ -2681,6 +2683,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kam-schedule"
+version = "0.1.0"
+dependencies = [
+ "kam-core",
+ "serde",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "kam-shell"
 version = "0.1.0"
 dependencies = [
@@ -2690,6 +2702,7 @@ dependencies = [
  "kam-quarantine",
  "kam-rules",
  "kam-scanner",
+ "kam-schedule",
  "kam-storage",
  "kam-virustotal",
  "serde",

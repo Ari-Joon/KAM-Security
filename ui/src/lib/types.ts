@@ -142,6 +142,23 @@ export type DuplicateSummary = {
   truncated: boolean;
 };
 
+/** What the weekly check is set to, if anything. */
+export type Schedule = {
+  enabled: boolean;
+  day: string | null;
+  /** Local time of day, HH:MM. */
+  at: string | null;
+  account: string | null;
+  /** The program the task starts, shown so it can be seen rather than trusted. */
+  command: string | null;
+};
+
+export type CheckFinding = {
+  summary: string;
+  /** True when this is a state to correct rather than a note. */
+  serious: boolean;
+};
+
 export type CacheSafety = "routine" | "considered";
 
 export type CacheLocation = {

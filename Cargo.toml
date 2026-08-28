@@ -23,6 +23,7 @@ kam-core = { path = "crates/kam-core", version = "0.1.0" }
 kam-ipc = { path = "crates/kam-ipc", version = "0.1.0" }
 kam-scanner = { path = "crates/kam-scanner", version = "0.1.0" }
 kam-firewall = { path = "crates/kam-firewall", version = "0.1.0" }
+kam-schedule = { path = "crates/kam-schedule", version = "0.1.0" }
 kam-storage = { path = "crates/kam-storage", version = "0.1.0" }
 kam-virustotal = { path = "crates/kam-virustotal", version = "0.1.0" }
 kam-quarantine = { path = "crates/kam-quarantine", version = "0.1.0" }
@@ -53,6 +54,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Memory",
     "Win32_System_Pipes",
     "Win32_System_Com",
+    "Win32_System_TaskScheduler",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Ole",
     "Win32_System_Registry",

@@ -255,6 +255,101 @@ pub fn handle(
             }
         }
 
+        Request::GetSchedule => Response::Schedule(kam_schedule::current()),
+
+        Request::SetSchedule { enabled, day, hour } => {
+            if !enabled {
+                return match kam_schedule::disable() {
+                    Ok(()) => {
+                        context.audit(
+                            "schedule",
+                            "disable",
+                            Effect::Changed,
+                            "removed the weekly check".to_owned(),
+                        );
+                        Response::Schedule(kam_schedule::current())
+                    }
+                    Err(error) => {
+                        context.audit(
+                            "schedule",
+                            "disable",
+                            Effect::Refused,
+                            format!("could not remove the weekly check: {error}"),
+                        );
+                        Response::Error {
+                            message: error.to_string(),
+                        }
+                    }
+                };
+            }
+
+            // The request is checked before anything is looked up, so a
+            // malformed one is answered with what is wrong with it rather than
+            // with whatever the first lookup happened to fail at. A silly hour
+            // is a caller error, not something to clamp quietly: 25 o'clock
+            // means the request was built wrong.
+            if hour > 23 {
+                return Response::Error {
+                    message: "give an hour between 0 and 23".to_owned(),
+                };
+            }
+
+            // The program is this executable and the account is the caller's,
+            // both decided here. Neither travels over the pipe, because a
+            // request that could name them would be a request to run anything
+            // at all, elevated, on a timer.
+            let Ok(program) = std::env::current_exe() else {
+                return Response::Error {
+                    message: "the agent could not find its own path".to_owned(),
+                };
+            };
+            let Some(account) = user.sid().map(str::to_owned) else {
+                return Response::Error {
+                    message: "the caller could not be identified".to_owned(),
+                };
+            };
+
+            match kam_schedule::enable(&program.to_string_lossy(), &account, &day, hour) {
+                Ok(schedule) => {
+                    context.audit(
+                        "schedule",
+                        "enable",
+                        Effect::Changed,
+                        format!(
+                            "weekly check registered for {} at {}",
+                            schedule.day.as_deref().unwrap_or(&day),
+                            schedule.at.as_deref().unwrap_or("an unknown time")
+                        ),
+                    );
+                    Response::Schedule(schedule)
+                }
+                Err(error) => {
+                    context.audit(
+                        "schedule",
+                        "enable",
+                        Effect::Refused,
+                        format!("could not register the weekly check: {error}"),
+                    );
+                    Response::Error {
+                        message: error.to_string(),
+                    }
+                }
+            }
+        }
+
+        Request::RunCheck => {
+            let findings = crate::check::run_and_record(&context.store, user);
+            Response::Checked {
+                findings: findings
+                    .into_iter()
+                    .map(|finding| kam_ipc::CheckFinding {
+                        summary: finding.summary,
+                        serious: finding.serious,
+                    })
+                    .collect(),
+            }
+        }
+
         Request::SurveyCaches => {
             let caches = kam_storage::caches::survey(user);
             let total: u64 = caches.iter().map(|cache| cache.bytes).sum();
@@ -452,7 +547,7 @@ pub fn handle(
 
         Request::SurveyProvenance { job } => {
             context.register_job(&job, reporter.cancel_token());
-            let outcome = kam_scanner::provenance::survey(reporter);
+            let outcome = kam_scanner::provenance::survey(reporter, user);
             context.finish_job(&job);
 
             match outcome {
@@ -812,6 +907,104 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// The schedule request carries a day and an hour, and nothing else.
+    ///
+    /// This registers something that runs elevated on a timer, so the program
+    /// it starts and the account it runs as are decided by the agent. If a
+    /// future change lets either of those in over the pipe, this is the test
+    /// that should stop it.
+    #[test]
+    fn the_schedule_request_cannot_name_a_program_or_an_account() {
+        let wire = serde_json::to_string(&Request::SetSchedule {
+            enabled: true,
+            day: "Sunday".to_owned(),
+            hour: 3,
+        })
+        .unwrap();
+
+        let fields: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        let object = fields.as_object().unwrap();
+        let mut keys: Vec<&String> = object.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["day", "enabled", "hour", "op"],
+            "the request grew a field: {wire}"
+        );
+    }
+
+    #[test]
+    fn an_hour_outside_the_clock_is_refused_rather_than_clamped() {
+        let context = context(Mode::Service);
+        let response = handle(
+            Request::SetSchedule {
+                enabled: true,
+                day: "Sunday".to_owned(),
+                hour: 25,
+            },
+            &context,
+            &Reporter::silent(),
+            &UserContext::current(),
+        );
+        let Response::Error { message } = &response else {
+            panic!("25 o'clock was accepted: {response:?}");
+        };
+        assert!(message.contains("between 0 and 23"), "{message}");
+    }
+
+    #[test]
+    fn asking_for_the_schedule_answers_whether_or_not_one_exists() {
+        let context = context(Mode::Service);
+        let response = handle(
+            Request::GetSchedule,
+            &context,
+            &Reporter::silent(),
+            &UserContext::current(),
+        );
+        let Response::Schedule(schedule) = &response else {
+            panic!("expected a schedule, got {response:?}");
+        };
+        // Nothing is registered in a test run, and that is a real answer.
+        if !schedule.enabled {
+            assert!(schedule.command.is_none() || schedule.day.is_some());
+        }
+
+        // And it survives the wire, which is the check the last protocol
+        // addition shipped without.
+        let wire = serde_json::to_string(&kam_ipc::Reply::Done(response.clone())).unwrap();
+        let back: kam_ipc::Reply = serde_json::from_str(&wire).unwrap();
+        assert!(matches!(back, kam_ipc::Reply::Done(Response::Schedule(_))));
+    }
+
+    #[test]
+    fn a_check_run_on_demand_answers_and_is_recorded() {
+        let context = context(Mode::Service);
+        let response = handle(
+            Request::RunCheck,
+            &context,
+            &Reporter::silent(),
+            &UserContext::current(),
+        );
+        let Response::Checked { findings } = &response else {
+            panic!("expected findings, got {response:?}");
+        };
+        for finding in findings {
+            assert!(!finding.summary.is_empty());
+        }
+
+        let recorded = context
+            .store
+            .recent_audit(200)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.module == "check")
+            .count();
+        assert!(
+            recorded > findings.len(),
+            "the run itself should be recorded too"
+        );
     }
 
     /// The clear takes an id, and an id it does not know clears nothing.

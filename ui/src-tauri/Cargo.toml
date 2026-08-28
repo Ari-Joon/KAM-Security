@@ -26,6 +26,7 @@ kam-firewall = { workspace = true }
 kam-quarantine = { workspace = true }
 kam-rules = { workspace = true }
 kam-scanner = { workspace = true }
+kam-schedule = { workspace = true }
 kam-storage = { workspace = true }
 kam-virustotal = { workspace = true }
 serde = { workspace = true }
