@@ -11,6 +11,14 @@ import type {
 
 type Props = { volumes: Volume[]; onMeasured: () => void };
 
+/**
+ * A row with no measurement behind it yet.
+ *
+ * Shown as a waiting mark rather than as `0 B`, because a zero in that column
+ * is a claim, and the claim would be wrong for every row on screen.
+ */
+const NOT_MEASURED = "—";
+
 type SortKey = "size" | "name" | "publisher" | "installed" | "used";
 type Filter = "all" | "unused" | "unknown" | "understated";
 
@@ -62,19 +70,24 @@ function Row({
   app,
   onReveal,
   onUninstall,
+  measuring = false,
 }: {
   app: AppFootprint;
   onReveal: (path: string) => void;
   onUninstall: (app: AppFootprint) => void;
+  /** True while this row came from the registry and has no measurement yet. */
+  measuring?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   // Zero measured bytes and zero directories found are different claims. The
   // first says an application uses no space; the second says we could not find
-  // it -- usually because it lives on another drive.
-  const notFound = app.locations.length === 0;
-  const ratio = app.reported_bytes && app.reported_bytes > 0
-    ? app.actual_bytes / app.reported_bytes
-    : null;
+  // it -- usually because it lives on another drive. A third case joins them
+  // while a measurement is running: nobody has looked yet.
+  const notFound = !measuring && app.locations.length === 0;
+  const ratio =
+    !measuring && app.reported_bytes && app.reported_bytes > 0
+      ? app.actual_bytes / app.reported_bytes
+      : null;
 
   return (
     <li className="app-row">
@@ -110,7 +123,11 @@ function Row({
           )}
         </span>
         <span className="app-actual">
-          {notFound ? (
+          {measuring ? (
+            <span className="app-none" title="Reading the file table">
+              {NOT_MEASURED}
+            </span>
+          ) : notFound ? (
             <span className="app-none">not found here</span>
           ) : (
             fmt.bytes(app.actual_bytes)
@@ -244,16 +261,49 @@ export default function Applications({ volumes, onMeasured }: Props) {
   const [sort, setSort] = useState<SortKey>("size");
   const [filter, setFilter] = useState<Filter>("all");
   const [grouped, setGrouped] = useState(false);
+  /** The registry's own list, shown while the disk is being read. */
+  const [preview, setPreview] = useState<AppFootprint[] | null>(null);
 
+  /**
+   * Measure, in two parts, because the two halves cost wildly different
+   * amounts.
+   *
+   * What an installer *claims* is a registry read: every name, publisher,
+   * version, install date and claimed size on the machine, in about a fifth of
+   * a second, needing no privileges. What it actually occupies needs the whole
+   * master file table, which is over a second and a half.
+   *
+   * Waiting for the second before showing the first meant a second and a half
+   * of nothing on screen for a list that already existed. Now the list appears
+   * at once and can be searched, sorted and grouped immediately; only the size
+   * column has to wait, and it says it is waiting rather than showing a zero.
+   */
   const measure = useCallback(async () => {
     setRunning(true);
     setError(null);
+    setReport(null);
+
+    // Not awaited before the measurement starts: the point is that the
+    // expensive half is already underway while this is being drawn.
+    const showing = api
+      .applicationsPreview()
+      .then((listing) => setPreview(listing))
+      .catch(() => {
+        // The measured list is the real answer; failing to preview it is not
+        // worth an error message.
+      });
+
     try {
-      setReport(await api.applications(drive));
+      const measured = await api.applications(drive);
+      setReport(measured);
+      setPreview(null);
     } catch (cause) {
       setError(reason(cause));
       setReport(null);
+      // The preview stays: knowing what is installed is still worth having
+      // when the measurement is what failed.
     } finally {
+      await showing;
       setRunning(false);
       onMeasured();
     }
@@ -401,8 +451,12 @@ export default function Applications({ volumes, onMeasured }: Props) {
    * by name would be absurd, and every one of these turns on data already in
    * hand.
    */
+  const measuring = report === null && preview !== null;
+  /** Whichever list is in hand, for the counts beside the filters. */
+  const everything = report?.apps ?? preview ?? [];
+
   const shown = useMemo(() => {
-    const apps = report?.apps ?? [];
+    const apps = report?.apps ?? preview ?? [];
     const needle = query.trim().toLowerCase();
 
     const kept = apps.filter((app) => {
@@ -450,7 +504,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
       }
     });
     return order;
-  }, [report, query, filter, sort]);
+  }, [report, preview, query, filter, sort]);
 
   const shownBytes = useMemo(
     () => shown.reduce((total, app) => total + app.actual_bytes, 0),
@@ -667,16 +721,16 @@ export default function Applications({ volumes, onMeasured }: Props) {
         )}
       </section>
 
-      {report && (
+      {(report || preview) && (
         <section className="panel">
           <div className="panel-head">
-            <h2>By real size</h2>
+            <h2>{measuring ? "Installed applications" : "By real size"}</h2>
+            {measuring && <span className="measuring">Measuring real sizes…</span>}
           </div>
           <p className="muted">
-            A folder matched by more than one application — several NVIDIA
-            packages sharing one data directory, for instance — is listed but
-            not added to any of their totals. Totals understate rather than
-            double-count.
+            {measuring
+              ? "This is what the installers say about themselves, read from the registry. The measured sizes are being read off the disk now and will replace the claims when they arrive; searching, sorting and grouping all work in the meantime."
+              : "A folder matched by more than one application — several NVIDIA packages sharing one data directory, for instance — is listed but not added to any of their totals. Totals understate rather than double-count."}
           </p>
 
           <div className="app-controls">
@@ -718,9 +772,9 @@ export default function Applications({ volumes, onMeasured }: Props) {
               By publisher
             </label>
             <span className="app-count">
-              {shown.length === report.apps.length
+              {shown.length === everything.length
                 ? `${fmt.count(shown.length)} shown`
-                : `${fmt.count(shown.length)} of ${fmt.count(report.apps.length)}`}
+                : `${fmt.count(shown.length)} of ${fmt.count(everything.length)}`}
               {shownBytes > 0 ? ` · ${fmt.bytes(shownBytes)}` : ""}
             </span>
           </div>
@@ -729,12 +783,12 @@ export default function Applications({ volumes, onMeasured }: Props) {
             <span />
             <span>Application</span>
             <span className="right">Reported</span>
-            <span className="right">Actual</span>
+            <span className="right">{measuring ? "Measuring…" : "Actual"}</span>
             <span />
           </div>
           {shown.length === 0 ? (
             <p className="empty">
-              Nothing matches. {report.apps.length > 0 && "Clear the filter to see everything again."}
+              Nothing matches. {everything.length > 0 && "Clear the filter to see everything again."}
             </p>
           ) : groups ? (
             groups.map((group) => (
@@ -751,6 +805,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
                     <Row
                       key={`${app.name}-${app.version}`}
                       app={app}
+                      measuring={measuring}
                       onReveal={(path) => void reveal(path)}
                       onUninstall={setConfirming}
                     />
@@ -764,6 +819,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
                 <Row
                   key={`${app.name}-${app.version}`}
                   app={app}
+                  measuring={measuring}
                   onReveal={(path) => void reveal(path)}
                   onUninstall={setConfirming}
                 />
@@ -781,7 +837,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
         />
       )}
 
-      {!report && !running && !error && (
+      {!report && !preview && !running && !error && (
         <section className="panel">
           <p className="empty">Nothing measured yet. Pick a drive and press Measure.</p>
         </section>

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AppFootprint,
   ApplicationReport,
   Cache,
   CheckFinding,
@@ -38,6 +39,7 @@ export const api = {
   scan: (path: string) => invoke<Scan>("scan_path", { path }),
   applications: (drive: string) =>
     invoke<ApplicationReport>("list_applications", { drive }),
+  applicationsPreview: () => invoke<AppFootprint[]>("list_applications_preview"),
   duplicates: (drive: string, job: string) =>
     invoke<DuplicateReport | null>("find_duplicates", { drive, job }),
   defenderStatus: () => invoke<DefenderReport>("defender_status"),

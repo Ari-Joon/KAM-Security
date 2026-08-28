@@ -682,6 +682,73 @@ pub struct Timings {
     pub total: u64,
 }
 
+/// Everything the registry knows, without reading the disk at all.
+///
+/// The point of this product is the gap between what an installer claims and
+/// what it occupies, and the two halves cost wildly different amounts to
+/// answer. The claim is a registry read: every name, publisher, version,
+/// install date and `EstimatedSize` on the machine, in about fifty
+/// milliseconds. The truth needs the whole master file table, which is over a
+/// second and a half.
+///
+/// So they are separated, and the interface shows the claims immediately and
+/// replaces them as the measurements arrive. Sorting by name, publisher or
+/// install date works on the first set; only the sizes have to wait.
+///
+/// Needs no privileges: the uninstall keys and Steam's manifests are both
+/// readable by the person they belong to. That is why this runs in the window
+/// rather than in the agent, and why it costs nothing to call.
+pub fn registry_listing(user: &UserContext) -> Vec<AppFootprint> {
+    let steam = crate::steam::installed_games(user);
+    let history = crate::usage::history(user);
+
+    let mut listing: Vec<AppFootprint> = with_steam_games(installed(user), &steam)
+        .into_iter()
+        .map(|app| {
+            // Where the launch history can be joined without the file table:
+            // by the install directory the registry already names.
+            let launched = app
+                .install_location
+                .as_deref()
+                .and_then(|path| crate::usage::latest_under(&history.by_path, path));
+
+            AppFootprint {
+                reported_bytes: app.estimated_kilobytes.map(|kb| kb as u64 * 1024),
+                // Nothing has been measured yet, and nothing here pretends
+                // otherwise: the interface shows these rows as unmeasured
+                // rather than as zero bytes.
+                actual_bytes: 0,
+                shared_bytes: 0,
+                locations: Vec::new(),
+                last_used: app
+                    .last_played
+                    .or_else(|| launched.as_ref().and_then(|found| found.last_run))
+                    .or_else(|| {
+                        match_by_name(&history.unattributed, &app.name, Some(&app.publisher))
+                            .and_then(|found| found.last_run)
+                    }),
+                launches: launched.as_ref().map(|found| found.runs),
+                name: app.name,
+                publisher: app.publisher,
+                version: app.version,
+                uninstall_command: app.uninstall_command,
+                installed_on: app.installed_on,
+            }
+        })
+        .collect();
+
+    // The same order the measured list will arrive in for everything that has
+    // no claimed size, so the rows move as little as possible when the real
+    // figures land.
+    listing.sort_by(|a, b| {
+        b.reported_bytes
+            .unwrap_or(0)
+            .cmp(&a.reported_bytes.unwrap_or(0))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    listing
+}
+
 /// Read the volume's table, then measure applications and find leftovers.
 pub fn survey(drive_letter: char, now_unix: u64, user: &UserContext) -> Result<StorageReport> {
     let whole = std::time::Instant::now();
@@ -775,6 +842,60 @@ pub fn summarise(apps: &[AppFootprint]) -> FootprintSummary {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_registry_listing_costs_nothing_and_claims_nothing_it_has_not_read() {
+        let started = std::time::Instant::now();
+        let listing = registry_listing(&kam_core::UserContext::current());
+        let elapsed = started.elapsed();
+
+        // The whole reason it exists: it must be fast enough to show before
+        // anybody notices, or the measured list may as well be the only one.
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "the registry listing took {elapsed:?}, which is no longer worth showing first"
+        );
+
+        for app in &listing {
+            assert!(!app.name.is_empty());
+            // Nothing has been measured, and nothing pretends it has.
+            assert_eq!(app.actual_bytes, 0, "{} claims a measured size", app.name);
+            assert_eq!(app.shared_bytes, 0);
+            assert!(app.locations.is_empty(), "{} claims a location", app.name);
+        }
+
+        // Largest claim first, then by name, so the rows move as little as
+        // possible when the real figures replace them.
+        for pair in listing.windows(2) {
+            let (a, b) = (
+                pair[0].reported_bytes.unwrap_or(0),
+                pair[1].reported_bytes.unwrap_or(0),
+            );
+            assert!(a >= b, "the listing is not ordered by claimed size");
+        }
+    }
+
+    #[test]
+    #[ignore = "compares against this machine's real registry"]
+    fn the_listing_names_the_same_applications_the_measurement_does() {
+        let user = kam_core::UserContext::current();
+        let listing = registry_listing(&user);
+        println!(
+            "
+{} applications from the registry alone",
+            listing.len()
+        );
+        for app in listing.iter().take(10) {
+            println!(
+                "  {:<44} claimed {:>10}  last used {:?}",
+                app.name,
+                app.reported_bytes
+                    .map(|b| format!("{} MB", b / 1_000_000))
+                    .unwrap_or_else(|| "none".to_owned()),
+                app.last_used
+            );
+        }
+    }
 
     fn recorded(id: &str, at: u64) -> crate::usage::Usage {
         crate::usage::Usage {

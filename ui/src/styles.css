@@ -2704,3 +2704,11 @@ button.ghost {
   display: flex;
   gap: 8px;
 }
+
+/* Shown beside the heading while the sizes are still being read. */
+.measuring {
+  font-size: 12px;
+  color: var(--text-2);
+  margin-left: auto;
+  padding-right: 10px;
+}
