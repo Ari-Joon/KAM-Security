@@ -218,7 +218,11 @@ impl Store {
         Ok(manifest)
     }
 
-    /// Delete an item permanently. Only allowed once retention has elapsed.
+    /// Delete an item permanently, once its retention has elapsed.
+    ///
+    /// This is the automatic path: nothing here decides on its own that an
+    /// item is old enough, but when something does, the age rule is checked
+    /// here rather than trusted from the caller.
     pub fn purge(&self, id: &str) -> Result<u64> {
         let manifest = self.manifest(id)?;
         let remaining = manifest.retention_remaining(now_seconds());
@@ -229,8 +233,35 @@ impl Store {
                 remaining.div_ceil(86_400)
             )));
         }
-        fs::remove_dir_all(self.item_directory(id))?;
-        Ok(manifest.bytes)
+        self.remove(id, manifest.bytes)
+    }
+
+    /// Delete an item permanently, at somebody's explicit request.
+    ///
+    /// The retention period exists so that a mistake has thirty days to be
+    /// noticed, and nothing in this product deletes anything on its own. But it
+    /// is the machine's owner asking, about something they put here themselves,
+    /// and a quarantine that can only be emptied by waiting a month is a
+    /// quarantine that fills up with things somebody has already decided about.
+    ///
+    /// Separate from [`Store::purge`] rather than a flag on it, so that the
+    /// automatic path cannot ever take this one by passing the wrong argument,
+    /// and so the audit log records which of the two happened.
+    pub fn delete_now(&self, id: &str) -> Result<u64> {
+        let manifest = self.manifest(id)?;
+        self.remove(id, manifest.bytes)
+    }
+
+    /// Take the item's directory off the disk.
+    ///
+    /// A restored item has already had its payload moved back, so removing the
+    /// directory takes only the manifest and frees nothing; reporting the size
+    /// it once held would be a lie in a column of real numbers.
+    fn remove(&self, id: &str, bytes: u64) -> Result<u64> {
+        let directory = self.item_directory(id);
+        let held = directory.join(PAYLOAD).exists();
+        fs::remove_dir_all(directory)?;
+        Ok(if held { bytes } else { 0 })
     }
 
     pub fn manifest(&self, id: &str) -> Result<Manifest> {
@@ -415,6 +446,64 @@ impl Store {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Deleting on request works; deleting on the automatic path still waits.
+    ///
+    /// The two exist separately so that the rule protecting somebody from their
+    /// own mistake cannot be lifted by the code that is meant to enforce it.
+    #[test]
+    fn an_item_can_be_deleted_on_request_but_not_by_the_clock_alone() {
+        let scratch = Scratch::new("delete-now");
+        let store = scratch.store();
+
+        let source = scratch.join("victim.bin");
+        std::fs::write(&source, vec![4_u8; 3000]).unwrap();
+        let manifest = store.take(&source, 3000, "a test").unwrap();
+
+        // Fresh, so the automatic path must refuse it.
+        let refused = store.purge(&manifest.id);
+        assert!(refused.is_err(), "retention was not enforced");
+        assert!(
+            store.manifest(&manifest.id).is_ok(),
+            "it was removed anyway"
+        );
+
+        // Asked for directly, it goes, and reports what that freed.
+        let freed = store.delete_now(&manifest.id).unwrap();
+        assert_eq!(freed, 3000);
+        assert!(store.manifest(&manifest.id).is_err(), "it is still there");
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    /// Deleting a restored item frees nothing, and says so.
+    ///
+    /// Its payload went back where it came from; only the record is left, and
+    /// reporting the size it once held would be a lie in a column of real
+    /// numbers.
+    #[test]
+    fn deleting_a_restored_record_frees_nothing() {
+        let scratch = Scratch::new("delete-restored");
+        let store = scratch.store();
+
+        let source = scratch.join("returned.bin");
+        std::fs::write(&source, vec![5_u8; 2048]).unwrap();
+        let manifest = store.take(&source, 2048, "a test").unwrap();
+        store.restore(&manifest.id).unwrap();
+        assert!(source.exists());
+
+        assert_eq!(store.delete_now(&manifest.id).unwrap(), 0);
+        assert!(
+            source.exists(),
+            "restoring then deleting took the file back"
+        );
+    }
+
+    #[test]
+    fn deleting_something_that_is_not_there_is_an_error_rather_than_a_silence() {
+        let scratch = Scratch::new("delete-missing");
+        let store = scratch.store();
+        assert!(store.delete_now("no-such-id").is_err());
+    }
 
     struct Scratch(PathBuf);
 

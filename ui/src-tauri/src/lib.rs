@@ -147,6 +147,44 @@ struct DuplicateReport {
     summary: DuplicateSummary,
 }
 
+/// Delete one quarantined item for good.
+///
+/// There is no undo, which is why the interface asks first and why this is a
+/// separate command rather than a flag on restore.
+#[tauri::command]
+fn delete_quarantined(id: String) -> Result<Removal, String> {
+    finish_removal(kam_ipc::client::call(&Request::DeleteQuarantined { id }))
+}
+
+/// Delete everything currently held.
+#[tauri::command]
+fn empty_quarantine() -> Result<Removal, String> {
+    finish_removal(kam_ipc::client::call(&Request::EmptyQuarantine))
+}
+
+#[derive(serde::Serialize)]
+struct Removal {
+    items: usize,
+    bytes_freed: u64,
+    refused: Vec<String>,
+}
+
+fn finish_removal(reply: kam_core::Result<Response>) -> Result<Removal, String> {
+    match reply.map_err(|error| error.to_string())? {
+        Response::Deleted {
+            items,
+            bytes_freed,
+            refused,
+        } => Ok(Removal {
+            items,
+            bytes_freed,
+            refused,
+        }),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Whether a weekly check is registered, and when it runs.
 #[tauri::command]
 fn schedule() -> Result<kam_schedule::Schedule, String> {
@@ -637,6 +675,8 @@ pub fn run() {
             run_check,
             list_quarantine,
             restore_quarantined,
+            delete_quarantined,
+            empty_quarantine,
             reveal_in_explorer,
             run_uninstaller,
             protocol_version

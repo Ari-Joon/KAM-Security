@@ -142,6 +142,9 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const [clearingCache, setClearingCache] = useState<string | null>(null);
   const [openCache, setOpenCache] = useState<string | null>(null);
   const [cleared, setCleared] = useState<Record<string, Cleared>>({});
+  /** Which held item is one press from being deleted for good. */
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const [emptying, setEmptying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
 
@@ -342,6 +345,59 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     } catch (cause) {
       setError(reason(cause));
     } finally {
+      setBusyPath(null);
+      onChanged();
+    }
+  }
+
+
+  /**
+   * Delete one held item for good.
+   *
+   * The whole point of quarantine is that acting on a suggestion is reversible,
+   * so the one operation that is not reversible asks first and says so in those
+   * words. The agent does the deleting; nothing here removes a file.
+   */
+  async function deleteOne(id: string, bytes: number) {
+    setBusyPath(id);
+    setError(null);
+    try {
+      const removal = await api.deleteQuarantined(id);
+      setNote(
+        removal.items > 0
+          ? `Deleted for good, freeing ${fmt.bytes(removal.bytes_freed || bytes)}.`
+          : "Nothing was deleted.",
+      );
+      if (removal.refused.length > 0) {
+        setError(removal.refused.join("\n"));
+      }
+      await loadQuarantine();
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
+      setConfirming(null);
+      setBusyPath(null);
+      onChanged();
+    }
+  }
+
+  async function emptyAll() {
+    setBusyPath("all");
+    setError(null);
+    try {
+      const removal = await api.emptyQuarantine();
+      setNote(
+        `Deleted ${fmt.count(removal.items)} ${removal.items === 1 ? "item" : "items"}, ` +
+          `freeing ${fmt.bytes(removal.bytes_freed)}.`,
+      );
+      if (removal.refused.length > 0) {
+        setError(removal.refused.join("\n"));
+      }
+      await loadQuarantine();
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
+      setEmptying(false);
       setBusyPath(null);
       onChanged();
     }
@@ -920,7 +976,41 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         <div className="panel-head">
           <h2>Quarantine</h2>
           <button onClick={() => void loadQuarantine()}>Refresh</button>
+          {active.length > 0 && (
+            <button
+              className="ghost"
+              disabled={busyPath !== null}
+              onClick={() => setEmptying(true)}
+            >
+              Empty it
+            </button>
+          )}
         </div>
+        <p className="muted">
+          Everything here was moved rather than deleted, and goes back where it
+          came from with one press for thirty days. Deleting is the other
+          direction and there is no undo for it, so both ways of doing it ask
+          first.
+        </p>
+
+        {emptying && (
+          <div className="confirm">
+            <p>
+              Delete all {fmt.count(active.length)} held{" "}
+              {active.length === 1 ? "item" : "items"}, freeing{" "}
+              {fmt.bytes(active.reduce((total, item) => total + item.bytes, 0))}?
+              This cannot be undone.
+            </p>
+            <div className="confirm-actions">
+              <button onClick={() => void emptyAll()} disabled={busyPath !== null}>
+                Delete them
+              </button>
+              <button className="ghost" onClick={() => setEmptying(false)}>
+                Keep them
+              </button>
+            </div>
+          </div>
+        )}
         {active.length === 0 ? (
           <p className="empty">Nothing held.</p>
         ) : (
@@ -942,7 +1032,31 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                   <span className="held-reason">{item.reason}</span>
                 </div>
                 <span className="held-size">{fmt.bytes(item.bytes)}</span>
-                <button onClick={() => void restore(item.id)}>Restore</button>
+                {confirming === item.id ? (
+                  <>
+                    <span className="held-warn">Delete for good?</span>
+                    <button
+                      disabled={busyPath !== null}
+                      onClick={() => void deleteOne(item.id, item.bytes)}
+                    >
+                      Yes
+                    </button>
+                    <button className="ghost" onClick={() => setConfirming(null)}>
+                      No
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button onClick={() => void restore(item.id)}>Restore</button>
+                    <button
+                      className="ghost"
+                      onClick={() => setConfirming(item.id)}
+                      title="Delete this permanently. There is no undo."
+                    >
+                      Delete
+                    </button>
+                  </>
+                )}
               </li>
             ))}
           </ul>

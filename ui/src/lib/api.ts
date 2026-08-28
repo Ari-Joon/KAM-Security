@@ -20,6 +20,7 @@ import type {
   FirewallReport,
   ConnectionReport,
   Remnants,
+  Removal,
   Schedule,
 } from "./types";
 
@@ -72,6 +73,8 @@ export const api = {
   clearCache: (id: string) => invoke<Cleared>("clear_cache", { id }),
   quarantineList: () => invoke<Manifest[]>("list_quarantine"),
   restore: (id: string) => invoke<Manifest>("restore_quarantined", { id }),
+  deleteQuarantined: (id: string) => invoke<Removal>("delete_quarantined", { id }),
+  emptyQuarantine: () => invoke<Removal>("empty_quarantine"),
   reveal: (path: string) => invoke<void>("reveal_in_explorer", { path }),
   uninstall: (name: string, command: string) =>
     invoke<void>("run_uninstaller", { name, command }),

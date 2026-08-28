@@ -159,6 +159,14 @@ export type CheckFinding = {
   serious: boolean;
 };
 
+/** What a deliberate deletion removed. There is no undo for it. */
+export type Removal = {
+  items: number;
+  bytes_freed: number;
+  /** Anything that could not be removed, phrased for a person. */
+  refused: string[];
+};
+
 export type CacheSafety = "routine" | "considered";
 
 export type CacheLocation = {

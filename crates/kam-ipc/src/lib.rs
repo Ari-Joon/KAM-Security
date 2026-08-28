@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -102,6 +102,15 @@ pub enum Request {
     ListQuarantine,
     /// Put a quarantined item back where it came from.
     RestoreQuarantined { id: String },
+    /// Delete a quarantined item permanently, now, because somebody asked.
+    ///
+    /// The thirty-day retention exists so a mistake has time to be noticed, and
+    /// nothing here deletes anything on its own. This is the other case: the
+    /// owner of the machine deciding about something they put here themselves.
+    /// It cannot be undone, and the interface says so before sending it.
+    DeleteQuarantined { id: String },
+    /// Delete everything currently held. Same rules, once per item.
+    EmptyQuarantine,
     /// Whether a weekly check is registered, and when it runs.
     GetSchedule,
     /// Register the weekly check, or take it away.
@@ -268,6 +277,13 @@ pub enum Response {
         records: Vec<MoveRecord>,
     },
     Quarantined(Manifest),
+    /// Items deleted for good, and what that freed.
+    Deleted {
+        items: usize,
+        bytes_freed: u64,
+        /// Anything that could not be removed, phrased for a person.
+        refused: Vec<String>,
+    },
     /// Nothing to return beyond "recorded".
     Acknowledged,
     QuarantineList {

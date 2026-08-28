@@ -2675,3 +2675,32 @@ button.ghost {
   color: var(--text-2);
   letter-spacing: 0;
 }
+
+/* Quarantine's one irreversible action ------------------------------------
+   Everything else here is a move that goes back with one press. Deleting is
+   the exception, so it reads like one rather than sitting flush with Restore. */
+
+.held-warn {
+  font-size: 12px;
+  color: var(--warn);
+  white-space: nowrap;
+}
+
+.confirm {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 9px;
+  border: 1px solid rgba(240, 180, 41, 0.35);
+  background: rgba(240, 180, 41, 0.08);
+}
+
+.confirm p {
+  margin: 0 0 10px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.confirm-actions {
+  display: flex;
+  gap: 8px;
+}

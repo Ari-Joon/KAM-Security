@@ -527,6 +527,165 @@ mod tests {
         path
     }
 
+    /// Nothing in the catalogue can reach outside the places it names.
+    ///
+    /// The clear takes an id and resolves paths here, so this is the whole
+    /// fence. Every location has to sit under a root this product is entitled
+    /// to empty; a typo in one entry would otherwise be a LocalSystem process
+    /// deleting somebody's documents.
+    #[test]
+    fn no_cache_resolves_outside_the_roots_it_is_allowed_to_touch() {
+        let user = UserContext::current();
+        let allowed: Vec<String> = [
+            windir().join("Temp").to_string_lossy().into_owned(),
+            windir()
+                .join("SoftwareDistribution")
+                .to_string_lossy()
+                .into_owned(),
+            windir().join("Minidump").to_string_lossy().into_owned(),
+            windir()
+                .join("LiveKernelReports")
+                .to_string_lossy()
+                .into_owned(),
+            program_data()
+                .join(r"Microsoft\Windows\WER")
+                .to_string_lossy()
+                .into_owned(),
+            user.local_app_data(),
+            user.roaming_app_data(),
+            PathBuf::from(user.profile())
+                .join(".cargo")
+                .to_string_lossy()
+                .into_owned(),
+            PathBuf::from(user.profile())
+                .join(".nuget")
+                .to_string_lossy()
+                .into_owned(),
+            system_drive()
+                .join("Windows.old")
+                .to_string_lossy()
+                .into_owned(),
+        ]
+        .iter()
+        .map(|root| root.to_lowercase())
+        .collect();
+
+        // Steam libraries are wherever Steam says, so they are allowed by
+        // shape rather than by prefix.
+        for entry in CATALOGUE {
+            for path in (entry.locate)(&user) {
+                let text = path.to_string_lossy().to_lowercase();
+                let steam = text.contains(r"\steamapps\");
+                let known = allowed.iter().any(|root| text.starts_with(root));
+                assert!(
+                    known || steam,
+                    "{} resolves to {text}, which is outside every root it may touch",
+                    entry.id
+                );
+            }
+        }
+    }
+
+    /// A cache entry may never name a whole profile or data root.
+    ///
+    /// Emptying `AppData\Local` would take every program's settings with it.
+    /// The entries are all supposed to be a folder *inside* one.
+    #[test]
+    fn no_cache_is_a_root_itself() {
+        let user = UserContext::current();
+        let roots: Vec<String> = [
+            user.profile().to_owned(),
+            user.local_app_data(),
+            user.roaming_app_data(),
+            program_data().to_string_lossy().into_owned(),
+            windir().to_string_lossy().into_owned(),
+        ]
+        .iter()
+        .map(|root| root.to_lowercase())
+        .collect();
+
+        for entry in CATALOGUE {
+            for path in (entry.locate)(&user) {
+                let text = path.to_string_lossy().to_lowercase();
+                assert!(
+                    !roots.contains(&text),
+                    "{} would empty {text} itself",
+                    entry.id
+                );
+            }
+        }
+    }
+
+    /// The clear never follows a link out of the folder it was given.
+    ///
+    /// A junction inside a cache pointing at somebody's documents would
+    /// otherwise mean emptying the cache emptied the documents.
+    #[test]
+    fn a_link_is_removed_as_a_link_rather_than_followed() {
+        let root = scratch("junction");
+        let outside = scratch("junction-target");
+        std::fs::write(outside.join("precious.txt"), b"do not delete me").unwrap();
+
+        // Creating a junction needs no special rights; a symlink would.
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(root.join("link"))
+            .arg(&outside)
+            .output();
+        let linked = made.map(|out| out.status.success()).unwrap_or(false);
+        if !linked {
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+
+        let mut result = Cleared {
+            id: "test".to_owned(),
+            bytes_freed: 0,
+            files_removed: 0,
+            files_in_use: 0,
+            refused: Vec::new(),
+        };
+        empty(&root, &mut result);
+
+        assert!(
+            outside.join("precious.txt").exists(),
+            "the clear followed a junction and deleted through it"
+        );
+        assert_eq!(
+            result.files_removed, 0,
+            "nothing on the other side was ours"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    /// Measuring does not follow one either, or the sizes would be nonsense.
+    #[test]
+    fn measuring_stops_at_a_link() {
+        let root = scratch("measure-junction");
+        let outside = scratch("measure-target");
+        std::fs::write(outside.join("big.bin"), vec![0_u8; 50_000]).unwrap();
+
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(root.join("link"))
+            .arg(&outside)
+            .output();
+        if !made.map(|out| out.status.success()).unwrap_or(false) {
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+
+        let (bytes, files, _) = measure(&root);
+        assert_eq!((bytes, files), (0, 0), "the walk went through the junction");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
     #[test]
     fn every_id_is_unique_because_it_is_the_only_thing_a_caller_sends() {
         let mut ids = known_ids();

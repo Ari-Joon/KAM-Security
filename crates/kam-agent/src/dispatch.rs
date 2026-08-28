@@ -609,6 +609,21 @@ pub fn handle(
             }
         },
 
+        Request::DeleteQuarantined { id } => delete_quarantined(&[id], context),
+
+        Request::EmptyQuarantine => {
+            let held: Vec<String> = match context.quarantine.list() {
+                Ok(items) => items.into_iter().map(|item| item.id).collect(),
+                Err(error) => {
+                    tracing::error!(%error, "could not list quarantine");
+                    return Response::Error {
+                        message: "the quarantine store could not be read".to_owned(),
+                    };
+                }
+            };
+            delete_quarantined(&held, context)
+        }
+
         Request::RestoreQuarantined { id } => match context.quarantine.restore(&id) {
             Ok(manifest) => {
                 context.audit_with_token(
@@ -740,6 +755,49 @@ fn quarantine_copy(path: &str, reason: &str, context: &Context, user: &UserConte
                 message: error.to_string(),
             }
         }
+    }
+}
+
+/// Delete quarantined items for good.
+///
+/// One code path for one item and for all of them, because emptying the store
+/// is the same decision repeated and should fail the same way per item: one
+/// that cannot be removed is reported and the rest still go, rather than the
+/// whole thing stopping half way with no way to tell what happened.
+fn delete_quarantined(ids: &[String], context: &Context) -> Response {
+    let mut items = 0_usize;
+    let mut bytes_freed = 0_u64;
+    let mut refused = Vec::new();
+
+    for id in ids {
+        match context.quarantine.delete_now(id) {
+            Ok(bytes) => {
+                items += 1;
+                bytes_freed += bytes;
+                // Recorded without an undo token, because there is no undo.
+                context.audit(
+                    "quarantine",
+                    "delete",
+                    Effect::Changed,
+                    format!("deleted {id} for good, freeing {}", human_bytes(bytes)),
+                );
+            }
+            Err(error) => {
+                context.audit(
+                    "quarantine",
+                    "delete",
+                    Effect::Refused,
+                    format!("could not delete {id}: {error}"),
+                );
+                refused.push(error.to_string());
+            }
+        }
+    }
+
+    Response::Deleted {
+        items,
+        bytes_freed,
+        refused,
     }
 }
 
