@@ -81,6 +81,29 @@ try {
         }
     }
 
+    # --- the interface has to be newer than the sources it was built from ----
+    #
+    # `cargo build --release` compiles kam-shell.exe perfectly well and does
+    # *not* run the frontend build, because that is wired to Tauri's
+    # `beforeBuildCommand` and nothing else calls it. So a run of
+    # `cargo build --release --workspace` followed by `npm run build` produces
+    # a binary carrying the interface from the build before last, silently, and
+    # the window then shows an interface that does not match the agent it is
+    # talking to.
+    #
+    # This is a refusal rather than a warning. A stale interface is the kind of
+    # fault that costs an hour to recognise, because everything looks fine and
+    # only one screen is wrong.
+    $shell = Join-Path $root "target\release\kam-shell.exe"
+    $shellBuilt = (Get-Item $shell).LastWriteTime
+    $newest = Get-ChildItem -Path (Join-Path $root "ui\src"), (Join-Path $root "ui\dist") -Recurse -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($newest -and $newest.LastWriteTime -gt $shellBuilt) {
+        throw ("kam-shell.exe was built at {0}, but {1} changed at {2}. " +
+               "Rebuild it with: npm run tauri build -- --no-bundle  (from the ui folder)") -f
+               $shellBuilt.ToString('HH:mm:ss'), $newest.Name, $newest.LastWriteTime.ToString('HH:mm:ss')
+    }
+
     # --- close the window ----------------------------------------------------
     #
     # kam-shell.exe holds a write lock on itself while it runs, and deploying
