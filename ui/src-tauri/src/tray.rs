@@ -35,7 +35,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager, WindowEvent};
 
 /// Bring the window back, building it again if closing destroyed it.
-fn show_window(app: &AppHandle) {
+pub fn show_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -46,15 +46,12 @@ fn show_window(app: &AppHandle) {
     // The window was closed, so its WebView went with it. Rebuilding costs a
     // moment here and saves the memory the rest of the time, which is the
     // trade this whole module is built around.
-    let built = tauri::WebviewWindowBuilder::new(
-        app,
-        "main",
-        tauri::WebviewUrl::App("index.html".into()),
-    )
-    .title("KAM Security")
-    .inner_size(1040.0, 720.0)
-    .min_inner_size(720.0, 520.0)
-    .build();
+    let built =
+        tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
+            .title("KAM Security")
+            .inner_size(1040.0, 720.0)
+            .min_inner_size(720.0, 520.0)
+            .build();
 
     match built {
         Ok(window) => {
