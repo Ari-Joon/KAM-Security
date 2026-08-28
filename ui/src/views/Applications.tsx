@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
 import PathLink from "../components/PathLink";
@@ -10,6 +10,46 @@ import type {
 } from "../lib/types";
 
 type Props = { volumes: Volume[]; onMeasured: () => void };
+
+type SortKey = "size" | "name" | "publisher" | "installed" | "used";
+type Filter = "all" | "unused" | "unknown" | "understated";
+
+const SORT_LABEL: Record<SortKey, string> = {
+  size: "Largest first",
+  name: "Name",
+  publisher: "Publisher",
+  installed: "Recently installed",
+  used: "Recently used",
+};
+
+const FILTER_LABEL: Record<Filter, string> = {
+  all: "Everything",
+  unused: "Not opened in a year",
+  unknown: "Never opened",
+  understated: "Bigger than claimed",
+};
+
+/**
+ * How long ago, in words.
+ *
+ * Days for the recent past, months and years beyond it. Nobody decides whether
+ * to keep a program on whether it was 340 days or 350.
+ */
+function ago(seconds: number | null): string | null {
+  if (seconds === null) return null;
+  const days = Math.floor((Date.now() / 1000 - seconds) / 86400);
+  if (days <= 0) return "today";
+  if (days === 1) return "yesterday";
+  if (days < 30) return `${days} days ago`;
+  if (days < 365) return `${Math.floor(days / 30)} months ago`;
+  const years = Math.floor(days / 365);
+  return years === 1 ? "over a year ago" : `over ${years} years ago`;
+}
+
+function daysSince(seconds: number | null): number | null {
+  if (seconds === null) return null;
+  return Math.floor((Date.now() / 1000 - seconds) / 86400);
+}
 
 const KIND_LABEL: Record<string, string> = {
   install: "Install",
@@ -42,7 +82,25 @@ function Row({
         <span className="app-caret">{open ? "▾" : "▸"}</span>
         <span className="app-name">
           {app.name}
-          {app.publisher && <span className="app-publisher">{app.publisher}</span>}
+          <span className="app-meta">
+            {app.publisher && <span className="app-publisher">{app.publisher}</span>}
+            {app.version && <span className="app-version">v{app.version}</span>}
+            {app.installed_on && (
+              <span className="app-when">installed {app.installed_on}</span>
+            )}
+            <span
+              className={`app-when${app.last_used === null ? " app-when-never" : ""}`}
+              title={
+                app.last_used === null
+                  ? "Explorer has no record of this account launching it. Something started by a service, a terminal or another account leaves no trace, so this is not proof it was never run."
+                  : `${app.launches ?? 0} launches recorded`
+              }
+            >
+              {app.last_used === null
+                ? "no record of opening it"
+                : `opened ${ago(app.last_used)}`}
+            </span>
+          </span>
         </span>
         <span className="app-reported">
           {app.reported_bytes === null ? (
@@ -182,6 +240,10 @@ export default function Applications({ volumes, onMeasured }: Props) {
   const [remnants, setRemnants] = useState<Remnants | null>(null);
   const [chosen, setChosen] = useState<Set<string>>(new Set());
   const [clearing, setClearing] = useState(false);
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState<SortKey>("size");
+  const [filter, setFilter] = useState<Filter>("all");
+  const [grouped, setGrouped] = useState(false);
 
   const measure = useCallback(async () => {
     setRunning(true);
@@ -330,6 +392,92 @@ export default function Applications({ volumes, onMeasured }: Props) {
       setError(reason(cause));
     }
   }
+
+  /**
+   * The list actually shown: filtered, then searched, then sorted.
+   *
+   * Done here rather than in the agent because it is a question about the
+   * answer, not a question about the machine — re-measuring the disk to sort
+   * by name would be absurd, and every one of these turns on data already in
+   * hand.
+   */
+  const shown = useMemo(() => {
+    const apps = report?.apps ?? [];
+    const needle = query.trim().toLowerCase();
+
+    const kept = apps.filter((app) => {
+      if (needle) {
+        const haystack = `${app.name} ${app.publisher}`.toLowerCase();
+        if (!haystack.includes(needle)) return false;
+      }
+      switch (filter) {
+        case "unused": {
+          const days = daysSince(app.last_used);
+          return days !== null && days >= 365;
+        }
+        case "unknown":
+          return app.last_used === null;
+        case "understated":
+          return (
+            app.reported_bytes !== null &&
+            app.reported_bytes > 0 &&
+            app.actual_bytes / app.reported_bytes >= 1.5
+          );
+        default:
+          return true;
+      }
+    });
+
+    const order = [...kept];
+    order.sort((a, b) => {
+      switch (sort) {
+        case "name":
+          return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+        case "publisher":
+          return (
+            (a.publisher || "\uffff").localeCompare(b.publisher || "\uffff", undefined, {
+              sensitivity: "base",
+            }) || b.actual_bytes - a.actual_bytes
+          );
+        case "installed":
+          // Unknown dates sort last rather than pretending to be old.
+          return (b.installed_on ?? "").localeCompare(a.installed_on ?? "");
+        case "used":
+          // Never-opened sorts last: it is the absence of a date, not an old one.
+          return (b.last_used ?? -1) - (a.last_used ?? -1);
+        default:
+          return b.actual_bytes - a.actual_bytes;
+      }
+    });
+    return order;
+  }, [report, query, filter, sort]);
+
+  const shownBytes = useMemo(
+    () => shown.reduce((total, app) => total + app.actual_bytes, 0),
+    [shown],
+  );
+
+  /** Publishers, largest first, when grouping is on. */
+  const groups = useMemo(() => {
+    if (!grouped) return null;
+    const byPublisher = new Map<string, AppFootprint[]>();
+    for (const app of shown) {
+      const key = app.publisher || "No publisher named";
+      const list = byPublisher.get(key);
+      if (list) {
+        list.push(app);
+      } else {
+        byPublisher.set(key, [app]);
+      }
+    }
+    return [...byPublisher.entries()]
+      .map(([publisher, apps]) => ({
+        publisher,
+        apps,
+        bytes: apps.reduce((total, app) => total + app.actual_bytes, 0),
+      }))
+      .sort((a, b) => b.bytes - a.bytes);
+  }, [shown, grouped]);
 
   const summary = report?.summary;
 
@@ -510,6 +658,52 @@ export default function Applications({ volumes, onMeasured }: Props) {
             double-count.
           </p>
 
+          <div className="app-controls">
+            <input
+              type="search"
+              className="app-search"
+              placeholder="Filter by name or publisher"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+            <select
+              value={sort}
+              onChange={(event) => setSort(event.target.value as SortKey)}
+              aria-label="Sort by"
+            >
+              {(Object.keys(SORT_LABEL) as SortKey[]).map((key) => (
+                <option key={key} value={key}>
+                  {SORT_LABEL[key]}
+                </option>
+              ))}
+            </select>
+            <select
+              value={filter}
+              onChange={(event) => setFilter(event.target.value as Filter)}
+              aria-label="Show"
+            >
+              {(Object.keys(FILTER_LABEL) as Filter[]).map((key) => (
+                <option key={key} value={key}>
+                  {FILTER_LABEL[key]}
+                </option>
+              ))}
+            </select>
+            <label className="app-group-toggle">
+              <input
+                type="checkbox"
+                checked={grouped}
+                onChange={(event) => setGrouped(event.target.checked)}
+              />
+              By publisher
+            </label>
+            <span className="app-count">
+              {shown.length === report.apps.length
+                ? `${fmt.count(shown.length)} shown`
+                : `${fmt.count(shown.length)} of ${fmt.count(report.apps.length)}`}
+              {shownBytes > 0 ? ` · ${fmt.bytes(shownBytes)}` : ""}
+            </span>
+          </div>
+
           <div className="app-header">
             <span />
             <span>Application</span>
@@ -517,16 +711,44 @@ export default function Applications({ volumes, onMeasured }: Props) {
             <span className="right">Actual</span>
             <span />
           </div>
-          <ul className="app-list">
-            {report.apps.map((app) => (
-              <Row
-                key={`${app.name}-${app.version}`}
-                app={app}
-                onReveal={(path) => void reveal(path)}
-                onUninstall={setConfirming}
-              />
-            ))}
-          </ul>
+          {shown.length === 0 ? (
+            <p className="empty">
+              Nothing matches. {report.apps.length > 0 && "Clear the filter to see everything again."}
+            </p>
+          ) : groups ? (
+            groups.map((group) => (
+              <div key={group.publisher} className="app-group-block">
+                <div className="app-group-head">
+                  <span className="app-group-name">{group.publisher}</span>
+                  <span className="app-group-meta">
+                    {fmt.count(group.apps.length)}{" "}
+                    {group.apps.length === 1 ? "entry" : "entries"} · {fmt.bytes(group.bytes)}
+                  </span>
+                </div>
+                <ul className="app-list">
+                  {group.apps.map((app) => (
+                    <Row
+                      key={`${app.name}-${app.version}`}
+                      app={app}
+                      onReveal={(path) => void reveal(path)}
+                      onUninstall={setConfirming}
+                    />
+                  ))}
+                </ul>
+              </div>
+            ))
+          ) : (
+            <ul className="app-list">
+              {shown.map((app) => (
+                <Row
+                  key={`${app.name}-${app.version}`}
+                  app={app}
+                  onReveal={(path) => void reveal(path)}
+                  onUninstall={setConfirming}
+                />
+              ))}
+            </ul>
+          )}
         </section>
       )}
 

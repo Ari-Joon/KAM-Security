@@ -33,6 +33,7 @@ pub use kam_core::registry;
 pub mod scan;
 pub mod shortcuts;
 pub mod steam;
+pub mod usage;
 pub mod volumes;
 
 pub use apps::{AppFootprint, FootprintSummary};

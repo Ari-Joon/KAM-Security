@@ -77,6 +77,22 @@ pub struct AppFootprint {
     /// Shown to the user before it runs. It is a command line out of the
     /// registry, and the only honest way to present that is literally.
     pub uninstall_command: Option<String>,
+    /// When the installer says it was installed, as `YYYY-MM-DD`.
+    ///
+    /// From `InstallDate`, which installers write inconsistently and often not
+    /// at all, so this is absent more than it is present. Shown as unknown
+    /// rather than guessed at from a directory timestamp, which would be a
+    /// different fact wearing this one's label.
+    pub installed_on: Option<String>,
+    /// Seconds since the Unix epoch when this account last launched anything
+    /// inside the install directory.
+    ///
+    /// `None` means Explorer has no record of you launching it — which is not
+    /// the same as never run, and the interface says so. Something started by
+    /// a service, a terminal or another account leaves no trace here.
+    pub last_used: Option<u64>,
+    /// How many times this account has launched it, by the same record.
+    pub launches: Option<u32>,
 }
 
 impl AppFootprint {
@@ -100,6 +116,30 @@ struct Installed {
     install_location: Option<String>,
     estimated_kilobytes: Option<u32>,
     uninstall_command: Option<String>,
+    installed_on: Option<String>,
+}
+
+/// Make sense of `InstallDate`, which is written three different ways.
+///
+/// Most installers write `YYYYMMDD`. Some write a locale-formatted date, which
+/// cannot be read without knowing the locale that produced it and is therefore
+/// not read at all. A wrong date is worse than no date on a screen people use
+/// to decide what to delete.
+fn install_date(raw: &str) -> Option<String> {
+    let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() != 8 {
+        return None;
+    }
+
+    let year: u32 = digits[0..4].parse().ok()?;
+    let month: u32 = digits[4..6].parse().ok()?;
+    let day: u32 = digits[6..8].parse().ok()?;
+
+    // Windows did not exist before 1985 and this is not a calendar.
+    if !(1985..=2100).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(format!("{year:04}-{month:02}-{day:02}"))
 }
 
 /// Read every uninstall key across both registry views and both hives.
@@ -162,6 +202,7 @@ fn installed() -> Vec<Installed> {
                 uninstall_command: entry
                     .string("QuietUninstallString")
                     .or_else(|| entry.string("UninstallString")),
+                installed_on: entry.string("InstallDate").and_then(|raw| install_date(&raw)),
                 name,
             });
         }
@@ -199,6 +240,9 @@ fn with_steam_games(mut apps: Vec<Installed>, steam: &[crate::steam::SteamApp]) 
             // EstimatedSize: written by the installer about itself. Left absent
             // so the measured figure stands on its own.
             estimated_kilobytes: None,
+            // Steam's manifest carries a last-played time, but reading it is a
+            // separate job; the launch record covers the game either way.
+            installed_on: None,
         });
     }
 
@@ -451,6 +495,11 @@ pub fn footprints(index: &VolumeIndex, drive_root: &str) -> Result<Vec<AppFootpr
     let roots = data_roots();
     let steam = crate::steam::installed_games();
 
+    // Read once for the whole run: the registry is cheap but there are several
+    // hundred applications and reopening the key per application would be
+    // several hundred opens for one answer.
+    let usage = crate::usage::by_path();
+
     let candidates: Vec<(Installed, Vec<Location>)> = with_steam_games(installed(), &steam)
         .into_iter()
         .map(|app| {
@@ -490,6 +539,16 @@ pub fn footprints(index: &VolumeIndex, drive_root: &str) -> Result<Vec<AppFootpr
                 .map(|location| location.bytes)
                 .sum();
 
+            // When did anything in this application's own directories last
+            // run. Only the install location counts: a launch out of AppData
+            // is usually an updater doing its own thing rather than the person
+            // opening the program.
+            let launched = locations
+                .iter()
+                .filter(|location| location.kind == LocationKind::Install)
+                .filter_map(|location| crate::usage::latest_under(&usage, &location.path))
+                .max_by_key(|found| (found.last_run, found.runs));
+
             AppFootprint {
                 name: app.name,
                 publisher: app.publisher,
@@ -500,6 +559,9 @@ pub fn footprints(index: &VolumeIndex, drive_root: &str) -> Result<Vec<AppFootpr
                 shared_bytes,
                 locations,
                 uninstall_command: app.uninstall_command,
+                installed_on: app.installed_on,
+                last_used: launched.as_ref().and_then(|found| found.last_run),
+                launches: launched.as_ref().map(|found| found.runs),
             }
         })
         .collect();
@@ -636,6 +698,7 @@ mod tests {
             install_location: None,
             estimated_kilobytes: None,
             uninstall_command: None,
+            installed_on: None,
         }];
         let steam = vec![
             crate::steam::SteamApp {
@@ -746,6 +809,9 @@ mod tests {
             shared_bytes: 0,
             locations: Vec::new(),
             uninstall_command: None,
+            installed_on: None,
+            last_used: None,
+            launches: None,
         };
         assert!(app.understatement().is_none());
 
@@ -778,6 +844,29 @@ mod tests {
         let summary = summarise(&apps);
 
         let gb = |bytes: u64| bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+
+        // What the depth work added: when each was installed, and when this
+        // account last actually launched it.
+        let dated = apps.iter().filter(|a| a.installed_on.is_some()).count();
+        let used = apps.iter().filter(|a| a.last_used.is_some()).count();
+        println!(
+            "
+DEPTH: {} applications, {dated} with an install date, {used} with a launch record",
+            apps.len()
+        );
+        for app in apps.iter().take(14) {
+            let age = app
+                .last_used
+                .map(|last| format!("{}d ago", now.saturating_sub(last) / 86_400))
+                .unwrap_or_else(|| "no record".to_owned());
+            println!(
+                "  {:>8.1} GB  installed {:<11} used {:<11} {}",
+                gb(app.actual_bytes),
+                app.installed_on.as_deref().unwrap_or("unknown"),
+                age,
+                app.name
+            );
+        }
 
         let profile = std::env::var("USERPROFILE").unwrap();
         let (proposals, osum) = crate::organise::find(&index, profile.trim_end_matches('\\'));

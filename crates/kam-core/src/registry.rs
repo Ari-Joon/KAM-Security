@@ -14,7 +14,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, HKEY, KEY_READ, KEY_WOW64_32KEY,
-    KEY_WOW64_64KEY, REG_DWORD, REG_EXPAND_SZ, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
+    KEY_WOW64_64KEY, REG_BINARY, REG_DWORD, REG_EXPAND_SZ, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
 };
 
 /// Which of the two registry views to read.
@@ -195,6 +195,49 @@ impl Key {
             .collect();
         let text = from_wide(&units).trim().to_owned();
         (!text.is_empty()).then_some(text)
+    }
+
+    /// Read a raw binary value.
+    ///
+    /// Windows keeps a surprising amount in `REG_BINARY` blobs whose layout is
+    /// documented nowhere official — the run counts and last-run times under
+    /// `UserAssist` among them. Handing back the bytes keeps the decoding with
+    /// the code that understands the layout, rather than teaching this module
+    /// about every structure Windows invents.
+    pub fn binary(&self, value: &str) -> Option<Vec<u8>> {
+        let name = wide(value);
+        let mut kind = REG_VALUE_TYPE::default();
+        let mut size = 0_u32;
+
+        let status = unsafe {
+            RegQueryValueExW(
+                self.0,
+                PCWSTR(name.as_ptr()),
+                None,
+                Some(&mut kind),
+                None,
+                Some(&mut size),
+            )
+        };
+        if status != ERROR_SUCCESS || kind != REG_BINARY || size == 0 {
+            return None;
+        }
+
+        let mut data = vec![0_u8; size as usize];
+        let status = unsafe {
+            RegQueryValueExW(
+                self.0,
+                PCWSTR(name.as_ptr()),
+                None,
+                None,
+                Some(data.as_mut_ptr()),
+                Some(&mut size),
+            )
+        };
+        (status == ERROR_SUCCESS).then(|| {
+            data.truncate(size as usize);
+            data
+        })
     }
 
     pub fn dword(&self, value: &str) -> Option<u32> {

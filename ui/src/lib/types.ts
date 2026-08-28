@@ -61,6 +61,9 @@ export type AppFootprint = {
   shared_bytes: number;
   locations: AppLocation[];
   uninstall_command: string | null;
+  installed_on: string | null;
+  last_used: number | null;
+  launches: number | null;
 };
 
 export type FootprintSummary = {
