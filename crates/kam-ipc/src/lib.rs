@@ -13,22 +13,22 @@ pub mod pipe;
 
 use kam_core::audit::Record;
 use kam_core::Progress;
-use kam_quarantine::{Manifest, MoveRecord};
 use kam_firewall::connections::ConnectionReport;
 use kam_firewall::policy::FirewallReport;
+use kam_quarantine::{Manifest, MoveRecord};
 use kam_scanner::provenance::Report as ProvenanceReport;
 use kam_scanner::{DefenderStatus, Threat};
 use kam_storage::apps::LocationKind;
 use kam_storage::remnants::Remnants as RemnantReport;
 use kam_storage::{
-    AppFootprint, Download, DownloadSummary, DuplicateGroup, DuplicateSummary, FootprintSummary,
-    OrganiseSummary, Orphan, OrphanSummary, Proposal, Scan, Volume,
+    AppFootprint, Cache, Cleared, Download, DownloadSummary, DuplicateGroup, DuplicateSummary,
+    FootprintSummary, OrganiseSummary, Orphan, OrphanSummary, Proposal, Scan, Volume,
 };
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -102,6 +102,22 @@ pub enum Request {
     ListQuarantine,
     /// Put a quarantined item back where it came from.
     RestoreQuarantined { id: String },
+    /// Every cache and scratch directory that currently holds anything.
+    SurveyCaches,
+    /// Empty one of them.
+    ///
+    /// `id` names an entry in the agent's own compiled-in catalogue. There is
+    /// deliberately no variant that carries a path: this runs as LocalSystem,
+    /// and a request that could name a directory to empty would be a request to
+    /// empty any directory on the machine.
+    ClearCache { id: String },
+    /// Move one redundant copy of a duplicated file into quarantine.
+    ///
+    /// Separate from `QuarantinePath`, which fences to leftover directories
+    /// directly inside a data root. This one fences to a *file* in a folder the
+    /// person owns, and the agent re-derives that from the path rather than
+    /// trusting the list the interface displayed.
+    QuarantineCopy { path: String, reason: String },
     /// Find byte-for-byte duplicate files on `drive`.
     ///
     /// Separate from the survey because it reads file contents rather than the
@@ -195,6 +211,10 @@ pub enum Response {
         groups: Vec<DuplicateGroup>,
         summary: DuplicateSummary,
     },
+    Caches {
+        caches: Vec<Cache>,
+    },
+    CacheCleared(Cleared),
     Organise {
         proposals: Vec<Proposal>,
         summary: OrganiseSummary,
@@ -214,7 +234,9 @@ pub enum Response {
     Firewall(Box<FirewallReport>),
     Connections(ConnectionReport),
     /// A firewall rule was created; the name is how it is undone.
-    Blocked { rule: String },
+    Blocked {
+        rule: String,
+    },
     /// The job stopped because it was asked to. Not an error, and the
     /// interface should not present it as one.
     Stopped,

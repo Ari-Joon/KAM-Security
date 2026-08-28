@@ -20,6 +20,7 @@
 //! directory walking.
 
 pub mod apps;
+pub mod caches;
 pub mod duplicates;
 pub mod index;
 pub mod mft;
@@ -37,7 +38,8 @@ pub mod usage;
 pub mod volumes;
 
 pub use apps::{AppFootprint, FootprintSummary};
-pub use duplicates::{DuplicateGroup, DuplicateSummary};
+pub use caches::{Cache, CacheLocation, Cleared};
+pub use duplicates::{DuplicateGroup, DuplicateSummary, FileCopy, Owner, Verdict};
 pub use index::VolumeIndex;
 pub use organise::{OrganiseSummary, Proposal};
 pub use orphans::{Confidence, Orphan, OrphanSummary};

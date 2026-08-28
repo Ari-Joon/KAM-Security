@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use kam_core::audit::{Effect, Entry};
-use kam_core::{Reporter, Store};
+use kam_core::{Reporter, Store, UserContext};
 use kam_ipc::{Request, Response, SystemStatus};
 
 use crate::server;
@@ -110,7 +110,12 @@ impl Context {
     }
 }
 
-pub fn handle(request: Request, context: &Context, reporter: &Reporter) -> Response {
+pub fn handle(
+    request: Request,
+    context: &Context,
+    reporter: &Reporter,
+    user: &UserContext,
+) -> Response {
     match request {
         Request::GetSystemStatus => {
             let status = SystemStatus {
@@ -167,7 +172,7 @@ pub fn handle(request: Request, context: &Context, reporter: &Reporter) -> Respo
                 };
             };
 
-            match kam_storage::apps::survey(letter.to_ascii_uppercase(), now_seconds()) {
+            match kam_storage::apps::survey(letter.to_ascii_uppercase(), now_seconds(), user) {
                 Ok(report) => {
                     context.audit(
                         "storage",
@@ -211,7 +216,8 @@ pub fn handle(request: Request, context: &Context, reporter: &Reporter) -> Respo
             };
 
             context.register_job(&job, reporter.cancel_token());
-            let outcome = kam_storage::duplicates::survey(letter.to_ascii_uppercase(), reporter);
+            let outcome =
+                kam_storage::duplicates::survey(letter.to_ascii_uppercase(), reporter, user);
             context.finish_job(&job);
 
             if reporter.is_cancelled() {
@@ -226,9 +232,12 @@ pub fn handle(request: Request, context: &Context, reporter: &Reporter) -> Respo
                         "find_duplicates",
                         Effect::Observed,
                         format!(
-                            "found {} duplicate sets on {letter}: wasting {}, reading {} files in full",
+                            "found {} duplicate sets on {letter}: {} duplicated, {} of it \
+                             reclaimable across {} sets, reading {} files in full",
                             summary.groups,
                             human_bytes(summary.wasted_bytes),
+                            human_bytes(summary.reclaimable_bytes),
+                            summary.actionable,
                             summary.fully_hashed
                         ),
                     );
@@ -245,6 +254,53 @@ pub fn handle(request: Request, context: &Context, reporter: &Reporter) -> Respo
                 }
             }
         }
+
+        Request::SurveyCaches => {
+            let caches = kam_storage::caches::survey(user);
+            let total: u64 = caches.iter().map(|cache| cache.bytes).sum();
+            context.audit(
+                "storage",
+                "survey_caches",
+                Effect::Observed,
+                format!(
+                    "{} caches holding {} for {}",
+                    caches.len(),
+                    human_bytes(total),
+                    user.profile()
+                ),
+            );
+            Response::Caches { caches }
+        }
+
+        Request::ClearCache { id } => match kam_storage::caches::clear(&id, user) {
+            Ok(cleared) => {
+                context.audit(
+                    "storage",
+                    "clear_cache",
+                    Effect::Changed,
+                    format!(
+                        "cleared {id}: freed {} across {} files, {} still in use",
+                        human_bytes(cleared.bytes_freed),
+                        cleared.files_removed,
+                        cleared.files_in_use
+                    ),
+                );
+                Response::CacheCleared(cleared)
+            }
+            Err(refusal) => {
+                // An id that is not in the catalogue is the shape a tampered
+                // request takes, so it is recorded rather than shrugged off.
+                context.audit(
+                    "storage",
+                    "clear_cache",
+                    Effect::Refused,
+                    format!("refused to clear {id}: {refusal}"),
+                );
+                Response::Error { message: refusal }
+            }
+        },
+
+        Request::QuarantineCopy { path, reason } => quarantine_copy(&path, &reason, context, user),
 
         Request::FindOrganiseProposals { drive } => {
             let Some(letter) = drive.chars().next().filter(|c| c.is_ascii_alphabetic()) else {
@@ -313,7 +369,7 @@ pub fn handle(request: Request, context: &Context, reporter: &Reporter) -> Respo
         },
 
         Request::FindRemnants { name, paths, kinds } => {
-            let report = kam_storage::remnants::of(&name, &paths, &kinds);
+            let report = kam_storage::remnants::of(&name, &paths, &kinds, user);
             tracing::info!(
                 %name,
                 locations = report.locations.len(),
@@ -439,7 +495,7 @@ pub fn handle(request: Request, context: &Context, reporter: &Reporter) -> Respo
             Response::Acknowledged
         }
 
-        Request::QuarantinePath { path, reason } => quarantine_path(&path, &reason, context),
+        Request::QuarantinePath { path, reason } => quarantine_path(&path, &reason, context, user),
 
         Request::ListQuarantine => match context.quarantine.list() {
             Ok(items) => Response::QuarantineList { items },
@@ -489,8 +545,8 @@ fn now_seconds() -> u64 {
 /// The path arrives as a string from a client. The agent runs as LocalSystem,
 /// so it is re-checked against the fence here rather than trusted because the
 /// UI only offered safe ones -- a different client need not be so polite.
-fn quarantine_path(path: &str, reason: &str, context: &Context) -> Response {
-    if let Err(refusal) = kam_storage::orphans::check_quarantinable(path) {
+fn quarantine_path(path: &str, reason: &str, context: &Context, user: &UserContext) -> Response {
+    if let Err(refusal) = kam_storage::orphans::check_quarantinable(path, user) {
         context.audit(
             "quarantine",
             "take",
@@ -526,6 +582,57 @@ fn quarantine_path(path: &str, reason: &str, context: &Context) -> Response {
                 "take",
                 Effect::Refused,
                 format!("could not quarantine {path}: {error}"),
+            );
+            Response::Error {
+                message: error.to_string(),
+            }
+        }
+    }
+}
+
+/// Take one redundant copy of a duplicated file.
+///
+/// The fence is [`kam_storage::duplicates::check_removable`], and it is checked
+/// here rather than trusted from the list the interface drew. Quarantine rather
+/// than deletion, for the same reason as everywhere else: the copy is held, the
+/// move is recorded, and it goes back with one press if this was wrong.
+fn quarantine_copy(path: &str, reason: &str, context: &Context, user: &UserContext) -> Response {
+    if let Err(refusal) = kam_storage::duplicates::check_removable(path, user) {
+        context.audit(
+            "quarantine",
+            "take_copy",
+            Effect::Refused,
+            format!("refused to remove {path}: {refusal}"),
+        );
+        return Response::Error { message: refusal };
+    }
+
+    let target = std::path::Path::new(path);
+    let bytes = std::fs::metadata(target)
+        .map(|data| data.len())
+        .unwrap_or(0);
+
+    match context.quarantine.take(target, bytes, reason) {
+        Ok(manifest) => {
+            context.audit_with_token(
+                "quarantine",
+                "take_copy",
+                Effect::Changed,
+                format!(
+                    "held a duplicate copy: {} ({})",
+                    manifest.original_path,
+                    human_bytes(manifest.bytes)
+                ),
+                Some(manifest.id.clone()),
+            );
+            Response::Quarantined(manifest)
+        }
+        Err(error) => {
+            context.audit(
+                "quarantine",
+                "take_copy",
+                Effect::Refused,
+                format!("could not hold {path}: {error}"),
             );
             Response::Error {
                 message: error.to_string(),
@@ -687,10 +794,8 @@ mod tests {
     impl Leftover {
         fn new(tag: &str) -> Self {
             let base = std::env::var("LOCALAPPDATA").expect("a local app data folder");
-            let path = std::path::PathBuf::from(base).join(format!(
-                "kam-quarantine-test-{}-{tag}",
-                std::process::id()
-            ));
+            let path = std::path::PathBuf::from(base)
+                .join(format!("kam-quarantine-test-{}-{tag}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(path.join("cache")).unwrap();
             std::fs::write(path.join("settings.cfg"), b"user settings worth keeping").unwrap();
@@ -707,6 +812,159 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// The clear takes an id, and an id it does not know clears nothing.
+    ///
+    /// This is the whole security argument for the cache feature: the agent
+    /// runs as LocalSystem, so if a request could name a directory to empty
+    /// then anything that reached the pipe could empty any directory. It names
+    /// an id instead, and these are the shapes an attempt to smuggle a path
+    /// through one would take.
+    #[test]
+    fn a_cache_id_the_agent_does_not_know_clears_nothing() {
+        let context = context(Mode::Service);
+        let user = UserContext::current();
+
+        for id in [
+            r"C:\Windows",
+            r"C:\Users\someone\Documents",
+            "temp-user\\..\\..\\Windows",
+            "../../Windows",
+            "",
+            "TEMP-USER",
+        ] {
+            let response = handle(
+                Request::ClearCache { id: id.to_owned() },
+                &context,
+                &Reporter::silent(),
+                &user,
+            );
+            assert!(
+                matches!(response, Response::Error { .. }),
+                "{id} was not refused: {response:?}"
+            );
+        }
+
+        // And every refusal is on the record, because an id that is not in the
+        // catalogue is the shape a tampered request takes.
+        let refusals = context
+            .store
+            .recent_audit(50)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.action == "clear_cache")
+            .count();
+        assert_eq!(refusals, 6, "every attempt should have been recorded");
+    }
+
+    /// Only a copy in a folder of the caller's is ever removed.
+    #[test]
+    fn a_duplicate_copy_a_program_owns_is_refused() {
+        let context = context(Mode::Service);
+        let user = UserContext::current();
+
+        for path in [
+            r"C:\Windows\System32\kernel32.dll",
+            r"C:\Program Files\Something\thing.dll",
+            r"C:\ProgramData\Package Cache\x\setup.exe",
+        ] {
+            let response = handle(
+                Request::QuarantineCopy {
+                    path: path.to_owned(),
+                    reason: "a test".to_owned(),
+                },
+                &context,
+                &Reporter::silent(),
+                &user,
+            );
+            let Response::Error { message } = &response else {
+                panic!("{path} was not refused: {response:?}");
+            };
+            assert!(
+                message.contains("folder of yours"),
+                "the refusal should say why: {message}"
+            );
+        }
+
+        // Nothing was touched.
+        assert!(std::path::Path::new(r"C:\Windows\System32\kernel32.dll").exists());
+    }
+
+    /// A real redundant copy is held, and comes back.
+    #[test]
+    fn a_copy_in_a_folder_of_yours_is_held_and_restored() {
+        let context = context(Mode::Service);
+        let user = UserContext::current();
+
+        let downloads = std::path::Path::new(user.profile()).join("Downloads");
+        if !downloads.is_dir() {
+            return;
+        }
+        let copy = downloads.join(format!("kam-copy-test-{}.bin", std::process::id()));
+        std::fs::write(&copy, vec![9_u8; 2048]).unwrap();
+        let path = copy.to_string_lossy().into_owned();
+
+        let held = handle(
+            Request::QuarantineCopy {
+                path: path.clone(),
+                reason: "a redundant copy".to_owned(),
+            },
+            &context,
+            &Reporter::silent(),
+            &user,
+        );
+        let Response::Quarantined(manifest) = &held else {
+            let _ = std::fs::remove_file(&copy);
+            panic!("expected the copy to be held, got {held:?}");
+        };
+        assert_eq!(manifest.bytes, 2048, "the size was not measured");
+        assert!(!copy.exists(), "the copy is still where it was");
+
+        // The whole reason this is quarantine rather than deletion.
+        let back = handle(
+            Request::RestoreQuarantined {
+                id: manifest.id.clone(),
+            },
+            &context,
+            &Reporter::silent(),
+            &user,
+        );
+        assert!(matches!(back, Response::Quarantined(_)), "{back:?}");
+        assert!(copy.exists(), "the copy did not come back");
+        assert_eq!(std::fs::read(&copy).unwrap().len(), 2048);
+
+        std::fs::remove_file(&copy).unwrap();
+    }
+
+    /// The cache survey answers, and the reply survives the wire.
+    ///
+    /// The last protocol addition shipped broken because nothing ever put a
+    /// `Response` through serde and back, so every new variant does that here.
+    #[test]
+    fn the_cache_survey_answers_and_survives_serialisation() {
+        let context = context(Mode::Service);
+        let response = handle(
+            Request::SurveyCaches,
+            &context,
+            &Reporter::silent(),
+            &UserContext::current(),
+        );
+
+        let Response::Caches { caches } = &response else {
+            panic!("expected a cache list, got {response:?}");
+        };
+        for cache in caches {
+            assert!(!cache.id.is_empty());
+            assert!(cache.files > 0, "{} was listed while empty", cache.id);
+        }
+
+        let wire = serde_json::to_string(&kam_ipc::Reply::Done(response.clone())).unwrap();
+        let back: kam_ipc::Reply = serde_json::from_str(&wire).unwrap();
+        let kam_ipc::Reply::Done(Response::Caches { caches: returned }) = back else {
+            panic!("the cache list did not survive the wire");
+        };
+        assert_eq!(returned.len(), caches.len());
     }
 
     /// Quarantine, list, restore, and check the contents came back.
@@ -731,13 +989,18 @@ mod tests {
             },
             &context,
             &Reporter::silent(),
+            &UserContext::current(),
         );
 
         let Response::Quarantined(manifest) = &taken else {
             panic!("expected the item to be quarantined, got {taken:?}");
         };
         assert_eq!(manifest.original_path, original);
-        assert!(manifest.bytes >= 4096, "size was not measured: {}", manifest.bytes);
+        assert!(
+            manifest.bytes >= 4096,
+            "size was not measured: {}",
+            manifest.bytes
+        );
         assert!(!manifest.restored);
         assert!(
             !leftover.path.exists(),
@@ -755,7 +1018,12 @@ mod tests {
         assert_eq!(same.kind, manifest.kind, "the manifest's own kind survived");
 
         // --- list ------------------------------------------------------
-        let listed = handle(Request::ListQuarantine, &context, &Reporter::silent());
+        let listed = handle(
+            Request::ListQuarantine,
+            &context,
+            &Reporter::silent(),
+            &UserContext::current(),
+        );
         let Response::QuarantineList { items } = listed else {
             panic!("expected a quarantine listing");
         };
@@ -771,6 +1039,7 @@ mod tests {
             },
             &context,
             &Reporter::silent(),
+            &UserContext::current(),
         );
         let Response::Quarantined(back) = &restored else {
             panic!("expected the item back, got {restored:?}");
@@ -804,6 +1073,7 @@ mod tests {
             },
             &context,
             &Reporter::silent(),
+            &UserContext::current(),
         );
         let Response::Quarantined(manifest) = &taken else {
             panic!("expected the item to be quarantined");
@@ -828,6 +1098,7 @@ mod tests {
             },
             &context,
             &Reporter::silent(),
+            &UserContext::current(),
         );
         let entries = context.store.recent_audit(50).unwrap();
         assert!(
@@ -861,6 +1132,7 @@ mod tests {
                 },
                 &context,
                 &Reporter::silent(),
+                &UserContext::current(),
             );
             assert!(
                 matches!(outcome, Response::Error { .. }),
@@ -883,7 +1155,12 @@ mod tests {
     #[test]
     fn status_reports_the_current_protocol_version() {
         let context = context(Mode::Console);
-        let Response::SystemStatus(status) = handle(Request::GetSystemStatus, &context, &Reporter::silent()) else {
+        let Response::SystemStatus(status) = handle(
+            Request::GetSystemStatus,
+            &context,
+            &Reporter::silent(),
+            &UserContext::current(),
+        ) else {
             panic!("expected a status response");
         };
         assert_eq!(status.protocol_version, kam_ipc::PROTOCOL_VERSION);
@@ -896,8 +1173,18 @@ mod tests {
         // were audited the log would fill with entries about being looked at,
         // and the entries that matter would be unfindable.
         let context = context(Mode::Service);
-        let _ = handle(Request::GetSystemStatus, &context, &Reporter::silent());
-        let _ = handle(Request::GetRecentAudit { limit: 10 }, &context, &Reporter::silent());
+        let _ = handle(
+            Request::GetSystemStatus,
+            &context,
+            &Reporter::silent(),
+            &UserContext::current(),
+        );
+        let _ = handle(
+            Request::GetRecentAudit { limit: 10 },
+            &context,
+            &Reporter::silent(),
+            &UserContext::current(),
+        );
 
         assert!(context.store.recent_audit(10).unwrap().is_empty());
     }
@@ -911,6 +1198,7 @@ mod tests {
             },
             &context,
             &Reporter::silent(),
+            &UserContext::current(),
         );
 
         assert!(matches!(response, Response::Error { .. }));
@@ -930,6 +1218,7 @@ mod tests {
             },
             &context,
             &Reporter::silent(),
+            &UserContext::current(),
         );
 
         assert!(matches!(response, Response::Scan(_)));
@@ -950,7 +1239,12 @@ mod tests {
     #[test]
     fn an_oversized_audit_request_is_clamped_rather_than_refused() {
         let context = context(Mode::Console);
-        let response = handle(Request::GetRecentAudit { limit: u32::MAX }, &context, &Reporter::silent());
+        let response = handle(
+            Request::GetRecentAudit { limit: u32::MAX },
+            &context,
+            &Reporter::silent(),
+            &UserContext::current(),
+        );
         assert!(matches!(response, Response::RecentAudit { .. }));
     }
 }
