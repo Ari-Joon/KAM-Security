@@ -426,16 +426,28 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "registers a real scheduled task; needs administrative rights"]
+    #[ignore = "registers a real scheduled task"]
     fn a_schedule_can_be_registered_read_back_and_removed() {
+        // Proven against a live machine through the agent: nothing registered,
+        // then Wednesday at 03:00 running as the caller, read back identically,
+        // then removed with no task and no folder left behind.
         let program = std::env::current_exe().unwrap().display().to_string();
         let account = std::env::var("USERNAME").unwrap();
+
+        assert!(!current().enabled, "something is already registered");
 
         let registered = enable(&program, &account, "Wednesday", 3).expect("could not register");
         assert!(registered.enabled);
         assert_eq!(registered.day.as_deref(), Some("Wednesday"));
         assert_eq!(registered.at.as_deref(), Some("03:00"));
         assert_eq!(registered.command.as_deref(), Some(program.as_str()));
+
+        // Reading it back is a separate call through the same API the window
+        // uses, not the value `enable` happened to return.
+        let read = current();
+        assert_eq!(read.day, registered.day);
+        assert_eq!(read.at, registered.at);
+        assert_eq!(read.command, registered.command);
 
         disable().expect("could not remove");
         assert!(!current().enabled, "the task is still registered");

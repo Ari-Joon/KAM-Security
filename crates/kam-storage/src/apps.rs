@@ -844,6 +844,39 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "reads the whole master file table and needs elevation"]
+    fn the_quick_listing_and_the_measurement_name_the_same_applications() {
+        // The window shows one and then replaces it with the other, so a
+        // difference between them is a row appearing or vanishing under
+        // somebody's cursor. They are built from the same registry read and
+        // the same Steam manifests, and this is what says so.
+        //
+        // Run once against a machine that had 88 of each and agreed name for
+        // name. An earlier count of 87 turned out to be a survey from half an
+        // hour before, on a machine that had installed something in between --
+        // which is exactly the confusion this test exists to settle.
+        let user = kam_core::UserContext::current();
+        let listed = registry_listing(&user);
+        let report = survey('C', 0, &user).expect("the file table could not be read");
+
+        let listed_names: std::collections::HashSet<String> =
+            listed.iter().map(|app| app.name.to_lowercase()).collect();
+        let measured_names: std::collections::HashSet<String> = report
+            .apps
+            .iter()
+            .map(|app| app.name.to_lowercase())
+            .collect();
+
+        let only_listed: Vec<&String> = listed_names.difference(&measured_names).collect();
+        let only_measured: Vec<&String> = measured_names.difference(&listed_names).collect();
+
+        assert!(
+            only_listed.is_empty() && only_measured.is_empty(),
+            "the two lists disagree.\n  only in the quick listing: {only_listed:?}\n  only in the measurement: {only_measured:?}"
+        );
+    }
+
+    #[test]
     fn the_registry_listing_costs_nothing_and_claims_nothing_it_has_not_read() {
         let started = std::time::Instant::now();
         let listing = registry_listing(&kam_core::UserContext::current());

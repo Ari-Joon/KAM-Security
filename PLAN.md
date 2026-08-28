@@ -386,7 +386,18 @@ documentation, screenshots. Decide on code signing here, not before.
 
 ---
 
-## 6. Open decisions
+## 6. Decisions taken
+
+- **Code signing — staying unsigned.** Decided 28 August 2026. An EV
+  certificate is around £300 a year and needs a FIPS hardware key, which is not
+  a sensible cost for a project whose purpose is to be read. The consequences
+  are accepted rather than hidden: SmartScreen warns the first person who runs
+  a release, and this product's own weekly check reports its own agent as
+  carrying no signature, correctly and by name. Both are documented rather than
+  worked around. Revisit only if it is ever distributed to people who did not
+  come looking for the source.
+
+## 7. Open decisions
 
 - **YARA integration** — Rust bindings vs. bundling `yara.exe`. Spike in Phase 3.
 - **ETW consumer** — crate maturity unverified; polling fallback exists. Spike in Phase 4.

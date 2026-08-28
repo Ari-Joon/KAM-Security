@@ -754,6 +754,13 @@ mod tests {
     /// system unprompted, and it cleans up after itself whether it passes or
     /// fails.
     ///
+    /// Run for the first time on 28 August 2026, through the agent, against a
+    /// machine holding 675 rules: the rule was created, found again by name,
+    /// removed, and the count came back to 675 with nothing left behind. The
+    /// removal fence was exercised in the same pass and refused Windows' own
+    /// DNS rule, which is the half that matters more -- see
+    /// `removing_a_rule_we_did_not_create_is_refused`.
+    ///
     /// Run with: cargo test -p kam-firewall -- --ignored --test-threads=1
     #[test]
     #[ignore = "creates a real firewall rule"]
