@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ApplicationReport,
+  Cache,
+  Cleared,
   DefenderReport,
   DuplicateReport,
   Manifest,
@@ -58,6 +60,10 @@ export const api = {
   moves: () => invoke<MoveRecord[]>("list_moves"),
   quarantine: (path: string, reason: string) =>
     invoke<Manifest>("quarantine_path", { path, reason }),
+  quarantineCopy: (path: string, reason: string) =>
+    invoke<Manifest>("quarantine_copy", { path, reason }),
+  caches: () => invoke<Cache[]>("survey_caches"),
+  clearCache: (id: string) => invoke<Cleared>("clear_cache", { id }),
   quarantineList: () => invoke<Manifest[]>("list_quarantine"),
   restore: (id: string) => invoke<Manifest>("restore_quarantined", { id }),
   reveal: (path: string) => invoke<void>("reveal_in_explorer", { path }),

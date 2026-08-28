@@ -99,20 +99,76 @@ export type DownloadSummary = {
   examined: number;
 };
 
+/** Who put a copy where it is, which decides whether it can go. */
+export type Owner =
+  | "windows"
+  | "servicing"
+  | "program"
+  | "program_data"
+  | "yours"
+  | "deleted"
+  | "elsewhere";
+
+/** What a set of identical files means, taken as a whole. */
+export type DuplicateVerdict = "keep" | "deliberate" | "choose" | "unclear";
+
+export type FileCopy = {
+  path: string;
+  owner: Owner;
+  removable: boolean;
+};
+
 export type DuplicateGroup = {
   bytes: number;
+  /** Everything past the first copy, whether or not any of it can go. */
   wasted_bytes: number;
-  paths: string[];
+  /** The part that could actually be freed. Often zero, and the honest number. */
+  reclaimable_bytes: number;
+  copies: FileCopy[];
+  verdict: DuplicateVerdict;
+  suggested_keep: number | null;
+  reasons: string[];
 };
 
 export type DuplicateSummary = {
   groups: number;
   wasted_bytes: number;
+  reclaimable_bytes: number;
+  actionable: number;
   examined: number;
   head_hashed: number;
   fully_hashed: number;
   elapsed_ms: number;
   truncated: boolean;
+};
+
+export type CacheSafety = "routine" | "considered";
+
+export type CacheLocation = {
+  path: string;
+  bytes: number;
+  files: number;
+  partial: boolean;
+};
+
+export type Cache = {
+  id: string;
+  name: string;
+  what: string;
+  /** What clearing it costs you. Empty when the answer is genuinely nothing. */
+  cost: string;
+  safety: CacheSafety;
+  locations: CacheLocation[];
+  bytes: number;
+  files: number;
+};
+
+export type Cleared = {
+  id: string;
+  bytes_freed: number;
+  files_removed: number;
+  files_in_use: number;
+  refused: string[];
 };
 
 export type DuplicateReport = {

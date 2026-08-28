@@ -14,12 +14,12 @@ use kam_core::audit::Record;
 use kam_ipc::{Request, Response, SystemStatus};
 use kam_quarantine::{Manifest, MoveRecord};
 use kam_scanner::provenance::Report as ProvenanceReport;
-use tauri::Emitter;
 use kam_scanner::{DefenderStatus, Threat};
 use kam_storage::{
     AppFootprint, Download, DownloadSummary, DuplicateGroup, DuplicateSummary, FootprintSummary,
     OrganiseSummary, Orphan, OrphanSummary, Proposal, Scan, Volume,
 };
+use tauri::Emitter;
 
 /// Turn a response into the value a command promised, or a message for the UI.
 ///
@@ -142,6 +142,45 @@ async fn find_duplicates(
 struct DuplicateReport {
     groups: Vec<DuplicateGroup>,
     summary: DuplicateSummary,
+}
+
+/// Every cache and scratch directory holding anything, largest first.
+#[tauri::command]
+fn survey_caches() -> Result<Vec<kam_storage::Cache>, String> {
+    match kam_ipc::client::call(&Request::SurveyCaches).map_err(|error| error.to_string())? {
+        Response::Caches { caches } => Ok(caches),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Empty one of them.
+///
+/// Only the id travels. The agent holds the catalogue and resolves the paths
+/// itself, so nothing this process is told can widen what gets deleted.
+#[tauri::command]
+fn clear_cache(id: String) -> Result<kam_storage::Cleared, String> {
+    match kam_ipc::client::call(&Request::ClearCache { id }).map_err(|error| error.to_string())? {
+        Response::CacheCleared(cleared) => Ok(cleared),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Hold one redundant copy of a duplicated file.
+///
+/// Quarantine rather than deletion: the whole point of the analysis is that
+/// being wrong about a duplicate costs data, so being wrong here costs a press
+/// of "put back" instead.
+#[tauri::command]
+fn quarantine_copy(path: String, reason: String) -> Result<Manifest, String> {
+    match kam_ipc::client::call(&Request::QuarantineCopy { path, reason })
+        .map_err(|error| error.to_string())?
+    {
+        Response::Quarantined(manifest) => Ok(manifest),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
 }
 
 /// Move a leftover directory into quarantine.
@@ -292,16 +331,21 @@ async fn survey_provenance(
     app: tauri::AppHandle,
     job: String,
 ) -> Result<Option<ProvenanceReport>, String> {
-    stream_job(app, job.clone(), Request::SurveyProvenance { job }, |response| {
-        match response {
-            Response::Provenance(report) => Ok(Some(report)),
-            // Stopping is not a failure, so it comes back as an absent result
-            // rather than an error the interface would have to render in red.
-            Response::Stopped => Ok(None),
-            Response::Error { message } => Err(message),
-            other => Err(unexpected(&other)),
-        }
-    })
+    stream_job(
+        app,
+        job.clone(),
+        Request::SurveyProvenance { job },
+        |response| {
+            match response {
+                Response::Provenance(report) => Ok(Some(report)),
+                // Stopping is not a failure, so it comes back as an absent result
+                // rather than an error the interface would have to render in red.
+                Response::Stopped => Ok(None),
+                Response::Error { message } => Err(message),
+                other => Err(unexpected(&other)),
+            }
+        },
+    )
     .await
 }
 
@@ -500,6 +544,21 @@ mod tray;
 
 pub fn run() {
     tauri::Builder::default()
+        // Registered before anything else, deliberately. A second launch hands
+        // its arguments to the instance already running and exits immediately,
+        // so this has to be in place before that instance has spent anything on
+        // a window or a tray icon.
+        //
+        // Without it a second launch is invisible: closing the window leaves
+        // this program in the notification area, so clicking the shortcut again
+        // looks like starting it fresh and is really starting it twice. The
+        // taskbar shows one window, because the first instance has none, while
+        // the notification area shows two icons — which is exactly how the bug
+        // was reported. Two shells also means two pipe clients competing for
+        // the agent's connection slots for no benefit whatever.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            tray::show_window(app);
+        }))
         .setup(|app| {
             tray::install(app.handle())?;
             Ok(())
@@ -531,6 +590,9 @@ pub fn run() {
             undo_move,
             list_moves,
             quarantine_path,
+            quarantine_copy,
+            survey_caches,
+            clear_cache,
             list_quarantine,
             restore_quarantined,
             reveal_in_explorer,

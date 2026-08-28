@@ -2412,3 +2412,185 @@ pre.error {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+
+/* Duplicate verdicts ------------------------------------------------------
+   A set nothing can be done about is drawn quieter than one that is a real
+   choice, so the eye lands on the two rows worth reading rather than on the
+   forty Windows keeps on purpose. */
+
+.dupe-filter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  font-size: 12.5px;
+}
+
+.dupe-filter label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.dupe-choose {
+  border-color: var(--border-strong);
+}
+
+.dupe-keep,
+.dupe-deliberate,
+.dupe-unclear {
+  opacity: 0.82;
+}
+
+.dupe-reasons {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.dupe-reasons li {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-2);
+  padding-left: 12px;
+  position: relative;
+}
+
+.dupe-reasons li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--border-strong);
+}
+
+.dupe-copy-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.owner {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--surface-3);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+/* Only the two that mean something get a colour: the copy that is yours to
+   remove, and the one being kept. Everything else is a label, not a signal. */
+.owner-yours {
+  color: var(--ok);
+  background: rgba(61, 214, 140, 0.1);
+  border-color: rgba(61, 214, 140, 0.3);
+}
+
+.owner-keep {
+  color: var(--accent);
+  background: rgba(74, 124, 255, 0.12);
+  border-color: rgba(74, 124, 255, 0.4);
+}
+
+.owner-deleted {
+  color: var(--warn);
+  background: rgba(240, 180, 41, 0.1);
+  border-color: rgba(240, 180, 41, 0.3);
+}
+
+.dupe-take {
+  font-size: 11px;
+  padding: 2px 9px;
+}
+
+/* Caches ------------------------------------------------------------------ */
+
+.caches {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+}
+
+.cache {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 8px;
+  background: var(--surface-2);
+}
+
+.cache-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+}
+
+.cache-toggle {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+  min-width: 0;
+}
+
+.cache-name {
+  font-size: 13px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cache-size {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  font-size: 12.5px;
+  text-align: right;
+  flex: none;
+}
+
+.cache-detail {
+  padding: 0 12px 12px 34px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.cache-detail p {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-2);
+  margin: 0 0 8px;
+}
+
+.cache-cost {
+  color: var(--warn) !important;
+}
+
+.cache-result {
+  margin: 0;
+  padding: 8px 12px 10px 34px;
+  font-size: 12.5px;
+  color: var(--ok);
+  border-top: 1px solid var(--border);
+}
+
+.stat-value.strong {
+  color: var(--ok);
+}
