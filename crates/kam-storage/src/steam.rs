@@ -38,6 +38,13 @@ pub struct SteamApp {
     /// Steam title means asking Steam, not running an uninstaller it does not
     /// have.
     pub app_id: String,
+    /// When it was last played, in seconds since the Unix epoch.
+    ///
+    /// Steam writes this itself and it is the only reliable answer for a game.
+    /// Explorer's launch history never sees one: Steam starts the game, so the
+    /// person launched Steam, and every title on the machine shows as never
+    /// opened. That is exactly what it did before this was read.
+    pub last_played: Option<u64>,
 }
 
 /// Pull the quoted key and value out of a line, when it has both.
@@ -169,6 +176,11 @@ pub fn installed_games(user: &UserContext) -> Vec<SteamApp> {
                 name: title,
                 path: path.display().to_string(),
                 app_id,
+                // Absent, or zero, for a game that has been installed and
+                // never started. Zero would otherwise read as January 1970.
+                last_played: find_value(&text, "LastPlayed")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|seconds| *seconds > 0),
             });
         }
     }
@@ -180,6 +192,36 @@ pub fn installed_games(user: &UserContext) -> Vec<SteamApp> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "reads this machine's real Steam library"]
+    fn every_installed_game_carries_a_date_or_honestly_carries_none() {
+        let games = installed_games(&UserContext::current());
+        if games.is_empty() {
+            return;
+        }
+        let played = games
+            .iter()
+            .filter(|game| game.last_played.is_some())
+            .count();
+        println!(
+            "
+{} games, {played} with a last-played time",
+            games.len()
+        );
+        for game in games.iter().take(12) {
+            println!("  {:<44} {:?}", game.name, game.last_played);
+        }
+        for game in &games {
+            if let Some(seconds) = game.last_played {
+                assert!(
+                    (1_100_000_000..4_102_444_800).contains(&seconds),
+                    "{} has an implausible time: {seconds}",
+                    game.name
+                );
+            }
+        }
+    }
 
     const MANIFEST: &str = r#"
 "AppState"

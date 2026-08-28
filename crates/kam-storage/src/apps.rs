@@ -118,6 +118,8 @@ struct Installed {
     estimated_kilobytes: Option<u32>,
     uninstall_command: Option<String>,
     installed_on: Option<String>,
+    /// Set only for Steam titles, which keep their own record of it.
+    last_played: Option<u64>,
 }
 
 /// Make sense of `InstallDate`, which is written three different ways.
@@ -211,6 +213,7 @@ fn installed(user: &UserContext) -> Vec<Installed> {
                 installed_on: entry
                     .string("InstallDate")
                     .and_then(|raw| install_date(&raw)),
+                last_played: None,
                 name,
             });
         }
@@ -248,9 +251,12 @@ fn with_steam_games(mut apps: Vec<Installed>, steam: &[crate::steam::SteamApp]) 
             // EstimatedSize: written by the installer about itself. Left absent
             // so the measured figure stands on its own.
             estimated_kilobytes: None,
-            // Steam's manifest carries a last-played time, but reading it is a
-            // separate job; the launch record covers the game either way.
             installed_on: None,
+            // Steam's own record, and the only one there is for a game. The
+            // comment that used to sit here said the launch history covered
+            // this; it does not, because Steam is what starts the game, and
+            // every title on the machine read as never opened.
+            last_played: game.last_played,
         });
     }
 
@@ -617,7 +623,12 @@ pub fn footprints(
                 locations,
                 uninstall_command: app.uninstall_command,
                 installed_on: app.installed_on,
-                last_used: launched.as_ref().and_then(|found| found.last_run),
+                // Steam's figure wins where there is one: it is written by
+                // the thing that actually starts the game, rather than
+                // inferred from what Explorer happened to see.
+                last_used: app
+                    .last_played
+                    .or_else(|| launched.as_ref().and_then(|found| found.last_run)),
                 launches: launched.as_ref().map(|found| found.runs),
             }
         })
@@ -798,6 +809,35 @@ mod tests {
     }
 
     #[test]
+    fn a_steam_title_takes_its_date_from_steam_rather_than_from_explorer() {
+        // The bug this pins: Steam starts the game, so Explorer's launch
+        // history records Steam and nothing else, and every title on the
+        // machine showed "no record of you opening it" -- including ones
+        // played that week.
+        let steam = vec![crate::steam::SteamApp {
+            name: "ELDEN RING".to_owned(),
+            path: r"C:\Steam\steamapps\common\ELDEN RING".to_owned(),
+            app_id: "1245620".to_owned(),
+            last_played: Some(1_784_058_206),
+        }];
+        let merged = with_steam_games(Vec::new(), &steam);
+        assert_eq!(merged[0].last_played, Some(1_784_058_206));
+    }
+
+    #[test]
+    fn a_game_installed_and_never_started_has_no_date_rather_than_1970() {
+        // Steam writes a zero there, which read as a date would be the first
+        // of January 1970 in a column of real ones.
+        let steam = vec![crate::steam::SteamApp {
+            name: "SWORN".to_owned(),
+            path: r"C:\Steam\steamapps\common\SWORN".to_owned(),
+            app_id: "1763250".to_owned(),
+            last_played: None,
+        }];
+        assert_eq!(with_steam_games(Vec::new(), &steam)[0].last_played, None);
+    }
+
+    #[test]
     fn steam_games_missing_from_the_registry_are_added() {
         // Steam does not register every title, so without this a 40 GB game can
         // be absent from the list of installed software entirely.
@@ -809,17 +849,20 @@ mod tests {
             estimated_kilobytes: None,
             uninstall_command: None,
             installed_on: None,
+            last_played: None,
         }];
         let steam = vec![
             crate::steam::SteamApp {
                 name: "Warframe".to_owned(),
                 path: r"C:\Steam\steamapps\common\Warframe".to_owned(),
                 app_id: "230410".to_owned(),
+                last_played: Some(1_780_000_000),
             },
             crate::steam::SteamApp {
                 name: "Deep Rock Galactic".to_owned(),
                 path: r"C:\Steam\steamapps\common\Deep Rock Galactic".to_owned(),
                 app_id: "548430".to_owned(),
+                last_played: None,
             },
         ];
 
