@@ -17,8 +17,8 @@ use std::time::Duration;
 use kam_core::{Error, Result, SERVICE_NAME};
 use kam_ipc::pipe::PipeListener;
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-    ServiceAction, ServiceActionType, ServiceFailureActions, ServiceFailureResetPeriod,
+    ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
+    ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
     ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};

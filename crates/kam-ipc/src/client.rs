@@ -26,10 +26,7 @@ pub fn call_on(pipe_name: &str, request: &Request) -> Result<Response> {
 }
 
 /// Send one request, reporting progress as it arrives, and return the result.
-pub fn call_streaming(
-    request: &Request,
-    on_progress: impl FnMut(Progress),
-) -> Result<Response> {
+pub fn call_streaming(request: &Request, on_progress: impl FnMut(Progress)) -> Result<Response> {
     call_streaming_on(PIPE_NAME, request, on_progress)
 }
 

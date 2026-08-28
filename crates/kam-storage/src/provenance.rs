@@ -102,10 +102,7 @@ impl Origin {
     /// Just the host, which is what is safe to put on screen.
     pub fn host(&self) -> Option<&str> {
         let url = self.host_url.as_deref()?;
-        let rest = url
-            .split_once("://")
-            .map(|(_, rest)| rest)
-            .unwrap_or(url);
+        let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
         let host = rest.split(['/', '?', '#']).next()?;
         // Strip any credentials, which have no business on screen either.
         let host = host.rsplit('@').next()?;

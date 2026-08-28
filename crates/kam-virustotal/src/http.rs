@@ -132,10 +132,8 @@ pub fn get(host: &str, path: &str, headers: &str) -> kam_core::Result<Response> 
 
     if !headers.is_empty() {
         let headers_wide: Vec<u16> = headers.encode_utf16().collect();
-        unsafe {
-            WinHttpAddRequestHeaders(request.0, &headers_wide, WINHTTP_ADDREQ_FLAG_ADD)
-        }
-        .map_err(|error| refused("the request headers were rejected", error))?;
+        unsafe { WinHttpAddRequestHeaders(request.0, &headers_wide, WINHTTP_ADDREQ_FLAG_ADD) }
+            .map_err(|error| refused("the request headers were rejected", error))?;
     }
 
     unsafe { WinHttpSendRequest(request.0, None, None, 0, 0, 0) }.map_err(|error| {
@@ -248,11 +246,7 @@ mod tests {
         // unreachable host must come back, and with something a person can
         // read.
         let started = std::time::Instant::now();
-        let outcome = get(
-            "kam-security-this-host-does-not-exist.invalid",
-            "/",
-            "",
-        );
+        let outcome = get("kam-security-this-host-does-not-exist.invalid", "/", "");
         assert!(outcome.is_err(), "a nonexistent host should not succeed");
         assert!(
             started.elapsed() < Duration::from_secs(60),

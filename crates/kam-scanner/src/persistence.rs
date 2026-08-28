@@ -143,7 +143,10 @@ pub fn executable_in(command: &str) -> Option<PathBuf> {
 
 /// The auto-start registry keys worth reading, and what each one means.
 const RUN_KEYS: &[(&str, Anchor)] = &[
-    (r"Software\Microsoft\Windows\CurrentVersion\Run", Anchor::RunKey),
+    (
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        Anchor::RunKey,
+    ),
     (
         r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
         Anchor::RunOnceKey,
@@ -304,9 +307,9 @@ fn read_scheduled_tasks(survey: &mut Survey) {
     // rather than return an empty list when it does not.
     if let Err(error) = std::fs::read_dir(&store) {
         if error.kind() == std::io::ErrorKind::PermissionDenied {
-            survey.unreadable.push(
-                "Scheduled tasks could not be read without administrator rights.".to_owned(),
-            );
+            survey
+                .unreadable
+                .push("Scheduled tasks could not be read without administrator rights.".to_owned());
         }
         return;
     }
@@ -464,7 +467,10 @@ pub fn by_executable(entries: &[Entry]) -> BTreeMap<PathBuf, Vec<&Entry>> {
         if let Some(executable) = &entry.executable {
             grouped
                 .entry(PathBuf::from(
-                    executable.to_string_lossy().to_lowercase().replace('/', "\\"),
+                    executable
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .replace('/', "\\"),
                 ))
                 .or_default()
                 .push(entry);
@@ -482,7 +488,10 @@ mod tests {
     fn a_quoted_path_with_arguments_resolves() {
         let command = format!("\"{}\" --background", system32("notepad.exe").display());
         assert_eq!(
-            executable_in(&command).unwrap().to_string_lossy().to_lowercase(),
+            executable_in(&command)
+                .unwrap()
+                .to_string_lossy()
+                .to_lowercase(),
             system32("notepad.exe").to_string_lossy().to_lowercase()
         );
     }
@@ -493,7 +502,10 @@ mod tests {
         // most often.
         let root = std::env::var("SystemRoot").unwrap();
         let command = format!(r"{root}\System32\notepad.exe /a");
-        assert!(executable_in(&command).is_some(), "should have found notepad");
+        assert!(
+            executable_in(&command).is_some(),
+            "should have found notepad"
+        );
     }
 
     #[test]
@@ -521,10 +533,7 @@ mod tests {
     fn a_resource_reference_never_reaches_the_screen() {
         // Whether or not it resolves, what comes back must be a name rather
         // than a pointer into a library.
-        let resolved = kam_core::mui::resolve(
-            r"@%SystemRoot%\system32\wscsvc.dll,-200",
-            "wscsvc",
-        );
+        let resolved = kam_core::mui::resolve(r"@%SystemRoot%\system32\wscsvc.dll,-200", "wscsvc");
         assert!(
             !resolved.starts_with('@'),
             "an unresolved reference leaked to the caller: {resolved}"
@@ -532,7 +541,10 @@ mod tests {
         println!("resolved to: {resolved}");
 
         // A plain name is passed through untouched.
-        assert_eq!(kam_core::mui::resolve("Print Spooler", "spooler"), "Print Spooler");
+        assert_eq!(
+            kam_core::mui::resolve("Print Spooler", "spooler"),
+            "Print Spooler"
+        );
     }
 
     #[test]
@@ -585,11 +597,18 @@ mod tests {
                 "the task store was readable but produced no entries"
             );
         } else {
-            assert_eq!(tasks, 0, "tasks were read despite being reported unreadable");
+            assert_eq!(
+                tasks, 0,
+                "tasks were read despite being reported unreadable"
+            );
         }
         println!("scheduled tasks: {tasks}");
 
-        let resolved = survey.entries.iter().filter(|e| e.executable.is_some()).count();
+        let resolved = survey
+            .entries
+            .iter()
+            .filter(|e| e.executable.is_some())
+            .count();
         println!(
             "resolved {resolved}/{} commands to an executable",
             survey.entries.len()

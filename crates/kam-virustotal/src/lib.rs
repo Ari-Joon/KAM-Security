@@ -213,8 +213,9 @@ pub fn hash_file(path: &str) -> kam_core::Result<String> {
 
 /// Parse the file report VirusTotal returns.
 fn parse(body: &str, sha256: &str) -> kam_core::Result<Verdict> {
-    let root: serde_json::Value = serde_json::from_str(body)
-        .map_err(|error| kam_core::Error::Refused(format!("the reply was not readable: {error}")))?;
+    let root: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+        kam_core::Error::Refused(format!("the reply was not readable: {error}"))
+    })?;
 
     let attributes = root
         .get("data")
@@ -267,7 +268,9 @@ fn parse(body: &str, sha256: &str) -> kam_core::Result<Verdict> {
         undetected,
         engines,
         detections,
-        reputation: attributes.get("reputation").and_then(serde_json::Value::as_i64),
+        reputation: attributes
+            .get("reputation")
+            .and_then(serde_json::Value::as_i64),
         first_seen: timestamp(attributes, "first_submission_date"),
         last_analysed: timestamp(attributes, "last_analysis_date"),
         common_name: text(attributes, "meaningful_name"),
@@ -362,9 +365,7 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
         assert_eq!(
             hash_file(&path.display().to_string()).unwrap(),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                .to_owned()
-                + "",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned() + "",
         );
         std::fs::remove_file(&path).unwrap();
     }
@@ -406,10 +407,7 @@ mod tests {
     fn broad_agreement_is_stated_plainly() {
         let (standing, summary) = interpret(48, 3, 70);
         assert_eq!(standing, Standing::Substantial);
-        assert!(
-            summary.contains("rarely agree by accident"),
-            "{summary}"
-        );
+        assert!(summary.contains("rarely agree by accident"), "{summary}");
     }
 
     #[test]
@@ -460,7 +458,11 @@ mod tests {
         // Only the engines that flagged it, and an engine that flagged without
         // naming anything still gets listed.
         assert_eq!(verdict.detections.len(), 3);
-        let engines: Vec<&str> = verdict.detections.iter().map(|d| d.engine.as_str()).collect();
+        let engines: Vec<&str> = verdict
+            .detections
+            .iter()
+            .map(|d| d.engine.as_str())
+            .collect();
         assert_eq!(engines, vec!["AlphaAV", "DeltaAV", "GammaAV"]);
         assert_eq!(verdict.detections[1].verdict, "flagged without a name");
     }

@@ -41,7 +41,9 @@ pub fn key_path() -> kam_core::Result<PathBuf> {
     let base = std::env::var("APPDATA").map_err(|_| {
         kam_core::Error::Refused("this account has no application data folder".to_owned())
     })?;
-    Ok(PathBuf::from(base).join("KAM Security").join("virustotal.key"))
+    Ok(PathBuf::from(base)
+        .join("KAM Security")
+        .join("virustotal.key"))
 }
 
 fn blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
@@ -56,8 +58,7 @@ fn take(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
     if out.pbData.is_null() || out.cbData == 0 {
         return Vec::new();
     }
-    let copied =
-        unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
+    let copied = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
     unsafe {
         // DPAPI allocates with LocalAlloc, so this is the matching free.
         let _ = LocalFree(Some(HLOCAL(out.pbData as *mut core::ffi::c_void)));
@@ -119,7 +120,9 @@ fn store_at(path: &Path, key: &str) -> kam_core::Result<()> {
         )
     }
     .map_err(|error| {
-        kam_core::Error::Refused(format!("the key could not be encrypted for storage: {error}"))
+        kam_core::Error::Refused(format!(
+            "the key could not be encrypted for storage: {error}"
+        ))
     })?;
 
     let sealed = take(output);
@@ -203,7 +206,8 @@ mod tests {
 
         let raw = std::fs::read(&path).unwrap();
         assert!(
-            !raw.windows(sample.len()).any(|window| window == sample.as_bytes()),
+            !raw.windows(sample.len())
+                .any(|window| window == sample.as_bytes()),
             "the key was written to disk in the clear"
         );
         assert!(!raw.is_empty(), "nothing was written at all");
@@ -222,9 +226,8 @@ mod tests {
         let input = blob(&sealed);
         let wrong = blob(b"some other program's entropy");
         let mut output = CRYPT_INTEGER_BLOB::default();
-        let opened = unsafe {
-            CryptUnprotectData(&input, None, Some(&wrong), None, None, 0, &mut output)
-        };
+        let opened =
+            unsafe { CryptUnprotectData(&input, None, Some(&wrong), None, None, 0, &mut output) };
         assert!(opened.is_err(), "the blob opened with the wrong entropy");
 
         clear_at(&path).unwrap();

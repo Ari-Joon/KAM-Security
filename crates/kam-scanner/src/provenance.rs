@@ -251,8 +251,8 @@ fn weigh(finding: &mut Finding) {
         .origin
         .as_ref()
         .is_some_and(|origin| origin.zone.is_external());
-    let exposed = finding.location == Location::UserWritable
-        || finding.location == Location::Elsewhere;
+    let exposed =
+        finding.location == Location::UserWritable || finding.location == Location::Elsewhere;
 
     // --- the signature ---------------------------------------------------
     match &finding.signature {
@@ -385,7 +385,9 @@ fn examine(path: &Path, anchored: &[Entry], now: u64) -> Option<Finding> {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| text.clone()),
-        origin_host: origin.as_ref().and_then(|origin| origin.host().map(str::to_owned)),
+        origin_host: origin
+            .as_ref()
+            .and_then(|origin| origin.host().map(str::to_owned)),
         origin,
         bytes: metadata.len(),
         arrived_days_ago: arrival(&metadata, now),
@@ -500,18 +502,15 @@ pub fn survey(reporter: &Reporter) -> Result<Report, Cancelled> {
     }
 
     let mut candidates: Vec<(PathBuf, Vec<Entry>)> = anchored.into_values().collect();
-    let known: std::collections::HashSet<String> = candidates
-        .iter()
-        .map(|(path, _)| canonical(path))
-        .collect();
+    let known: std::collections::HashSet<String> =
+        candidates.iter().map(|(path, _)| canonical(path)).collect();
 
     let swept_files = loose.len();
     for (path, policy) in loose {
         if known.contains(&canonical(&path)) {
             continue;
         }
-        let keep = policy == Sweep::Everything
-            || origin_of(&path.to_string_lossy()).is_some();
+        let keep = policy == Sweep::Everything || origin_of(&path.to_string_lossy()).is_some();
         if keep {
             candidates.push((path, Vec::new()));
         }
@@ -762,7 +761,9 @@ mod tests {
             *places.entry(finding.location.label()).or_default() += 1;
             *signatures
                 .entry(match &finding.signature {
-                    Signature::Valid { catalogue: Some(_), .. } => "signed (catalogue)",
+                    Signature::Valid {
+                        catalogue: Some(_), ..
+                    } => "signed (catalogue)",
                     Signature::Valid { .. } => "signed",
                     Signature::Invalid { .. } => "signature rejected",
                     Signature::Unsigned => "unsigned",
@@ -781,7 +782,11 @@ mod tests {
                 .iter()
                 .filter(|f| f.persists() && matches!(f.signature, Signature::Unsigned))
                 .count(),
-            report.findings.iter().filter(|f| f.origin.is_some()).count(),
+            report
+                .findings
+                .iter()
+                .filter(|f| f.origin.is_some())
+                .count(),
         );
 
         // The claim this module makes is that the list is short enough to read.

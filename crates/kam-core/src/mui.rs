@@ -32,7 +32,10 @@ pub fn resolve(name: &str, fallback: &str) -> String {
     let mut buffer = [0_u16; 1024];
 
     if unsafe { SHLoadIndirectString(PCWSTR(source.as_ptr()), &mut buffer, None) }.is_ok() {
-        let end = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
+        let end = buffer
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(buffer.len());
         let text = String::from_utf16_lossy(&buffer[..end]).trim().to_owned();
         if !text.is_empty() {
             return text;

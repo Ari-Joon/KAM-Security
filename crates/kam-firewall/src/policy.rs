@@ -330,7 +330,9 @@ fn read_rule(rule: &INetFwRule) -> Option<Rule> {
         direction: unsafe { rule.Direction() }
             .map(Direction::from)
             .unwrap_or(Direction::Unknown),
-        action: unsafe { rule.Action() }.map(Default::from).unwrap_or(Default::Unknown),
+        action: unsafe { rule.Action() }
+            .map(Default::from)
+            .unwrap_or(Default::Unknown),
         enabled: unsafe { rule.Enabled() }
             .map(|enabled| enabled.as_bool())
             .unwrap_or(false),
@@ -477,8 +479,9 @@ pub fn block_program(path: &str) -> kam_core::Result<String> {
 
     let _com = ComGuard::enter()?;
     let policy = open_policy()?;
-    let rules = unsafe { policy.Rules() }
-        .map_err(|error| kam_core::Error::Refused(format!("the rules could not be opened: {error}")))?;
+    let rules = unsafe { policy.Rules() }.map_err(|error| {
+        kam_core::Error::Refused(format!("the rules could not be opened: {error}"))
+    })?;
 
     let name = block_rule_name(path);
 
@@ -523,8 +526,9 @@ pub fn block_program(path: &str) -> kam_core::Result<String> {
 pub fn remove_our_rule(name: &str) -> kam_core::Result<()> {
     let _com = ComGuard::enter()?;
     let policy = open_policy()?;
-    let rules = unsafe { policy.Rules() }
-        .map_err(|error| kam_core::Error::Refused(format!("the rules could not be opened: {error}")))?;
+    let rules = unsafe { policy.Rules() }.map_err(|error| {
+        kam_core::Error::Refused(format!("the rules could not be opened: {error}"))
+    })?;
 
     let existing: INetFwRule = unsafe { rules.Item(&BSTR::from(name)) }.map_err(|_| {
         kam_core::Error::Refused(format!("there is no firewall rule called {name}"))
@@ -556,7 +560,10 @@ mod tests {
             block_rule_name(r"C:\Program Files\Thing\thing.exe"),
             "KAM Security: block thing.exe"
         );
-        assert_eq!(block_rule_name("thing.exe"), "KAM Security: block thing.exe");
+        assert_eq!(
+            block_rule_name("thing.exe"),
+            "KAM Security: block thing.exe"
+        );
     }
 
     #[test]
@@ -590,7 +597,10 @@ mod tests {
         // guard is broken and this product can delete the operating system's
         // own firewall rules.
         let outcome = remove_our_rule("Core Networking - DNS (UDP-Out)");
-        assert!(outcome.is_err(), "a Windows rule must never be removable here");
+        assert!(
+            outcome.is_err(),
+            "a Windows rule must never be removable here"
+        );
     }
 
     #[test]
@@ -694,7 +704,11 @@ mod tests {
 
         assert!(ours.ours, "the rule is not marked as ours");
         assert_eq!(ours.action, Default::Block);
-        assert_eq!(ours.direction, Direction::Out, "blocks must be outbound only");
+        assert_eq!(
+            ours.direction,
+            Direction::Out,
+            "blocks must be outbound only"
+        );
         assert!(ours.enabled, "a block that is not enabled blocks nothing");
         assert_eq!(ours.grouping.as_deref(), Some(OUR_GROUP));
         assert_eq!(

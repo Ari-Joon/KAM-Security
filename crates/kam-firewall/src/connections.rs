@@ -196,9 +196,7 @@ fn image_of(pid: u32) -> Option<String> {
 ///
 /// Returns the raw bytes. The shape differs per address family and protocol,
 /// so the caller casts.
-fn table_bytes(
-    fetch: impl Fn(Option<*mut core::ffi::c_void>, *mut u32) -> u32,
-) -> Option<Vec<u8>> {
+fn table_bytes(fetch: impl Fn(Option<*mut core::ffi::c_void>, *mut u32) -> u32) -> Option<Vec<u8>> {
     let mut size = 0_u32;
     let outcome = fetch(None, &mut size);
     if outcome != ERROR_INSUFFICIENT_BUFFER.0 || size == 0 {
@@ -318,7 +316,14 @@ pub fn survey() -> ConnectionReport {
     // port open. Still worth showing — an unexpected program bound to a port
     // is exactly the sort of thing this view is for.
     if let Some(bytes) = table_bytes(|buffer, size| unsafe {
-        GetExtendedUdpTable(buffer, size, false, AF_INET.0 as u32, UDP_TABLE_OWNER_PID, 0)
+        GetExtendedUdpTable(
+            buffer,
+            size,
+            false,
+            AF_INET.0 as u32,
+            UDP_TABLE_OWNER_PID,
+            0,
+        )
     }) {
         for row in unsafe { rows::<MIB_UDPTABLE_OWNER_PID, MIB_UDPROW_OWNER_PID>(&bytes) } {
             found.push(Connection {
@@ -339,7 +344,14 @@ pub fn survey() -> ConnectionReport {
     }
 
     if let Some(bytes) = table_bytes(|buffer, size| unsafe {
-        GetExtendedUdpTable(buffer, size, false, AF_INET6.0 as u32, UDP_TABLE_OWNER_PID, 0)
+        GetExtendedUdpTable(
+            buffer,
+            size,
+            false,
+            AF_INET6.0 as u32,
+            UDP_TABLE_OWNER_PID,
+            0,
+        )
     }) {
         for row in unsafe { rows::<MIB_UDP6TABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID>(&bytes) } {
             found.push(Connection {
@@ -524,17 +536,17 @@ mod tests {
                 connection
                     .remote_address
                     .as_deref()
-                    .map(|address| format!(
-                        "{address}:{}",
-                        connection.remote_port.unwrap_or(0)
-                    ))
+                    .map(|address| format!("{address}:{}", connection.remote_port.unwrap_or(0)))
                     .unwrap_or_else(|| "-".to_owned()),
                 connection.state.label(),
-                connection.signer.as_deref().unwrap_or(match connection.unsigned {
-                    Some(true) => "unsigned",
-                    Some(false) => "signed, unnamed",
-                    None => "unknown",
-                }),
+                connection
+                    .signer
+                    .as_deref()
+                    .unwrap_or(match connection.unsigned {
+                        Some(true) => "unsigned",
+                        Some(false) => "signed, unnamed",
+                        None => "unknown",
+                    }),
             );
         }
     }

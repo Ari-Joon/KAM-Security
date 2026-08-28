@@ -102,7 +102,10 @@ mod tests {
 
     #[test]
     fn text_without_variables_is_untouched() {
-        assert_eq!(expand(r"C:\Program Files\App\app.exe"), r"C:\Program Files\App\app.exe");
+        assert_eq!(
+            expand(r"C:\Program Files\App\app.exe"),
+            r"C:\Program Files\App\app.exe"
+        );
         assert_eq!(expand(""), "");
     }
 

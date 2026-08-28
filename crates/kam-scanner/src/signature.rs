@@ -31,22 +31,22 @@ use windows::Win32::Security::Cryptography::Catalog::{
     CryptCATAdminEnumCatalogFromHash, CryptCATAdminReleaseCatalogContext,
     CryptCATAdminReleaseContext, CryptCATCatalogInfoFromContext, CATALOG_INFO,
 };
-use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING,
-};
 use windows::Win32::Security::Cryptography::{
-    CertCloseStore, CertFreeCertificateContext, CertGetNameStringW, CryptMsgClose,
-    CryptMsgGetParam, CertFindCertificateInStore, CERT_FIND_SUBJECT_CERT, CERT_NAME_SIMPLE_DISPLAY_TYPE,
-    CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED, CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
-    CERT_QUERY_CONTENT_TYPE_FLAGS, CERT_QUERY_FORMAT_FLAG_ALL,
-    CERT_QUERY_ENCODING_TYPE, CERT_QUERY_OBJECT_FILE, CMSG_SIGNER_INFO, CMSG_SIGNER_INFO_PARAM,
-    CERT_INFO, CryptQueryObject, HCERTSTORE, X509_ASN_ENCODING, PKCS_7_ASN_ENCODING,
+    CertCloseStore, CertFindCertificateInStore, CertFreeCertificateContext, CertGetNameStringW,
+    CryptMsgClose, CryptMsgGetParam, CryptQueryObject, CERT_FIND_SUBJECT_CERT, CERT_INFO,
+    CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
+    CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED, CERT_QUERY_CONTENT_TYPE_FLAGS,
+    CERT_QUERY_ENCODING_TYPE, CERT_QUERY_FORMAT_FLAG_ALL, CERT_QUERY_OBJECT_FILE, CMSG_SIGNER_INFO,
+    CMSG_SIGNER_INFO_PARAM, HCERTSTORE, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
 use windows::Win32::Security::WinTrust::{
     WinVerifyTrustEx, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_CATALOG_INFO, WINTRUST_DATA,
     WINTRUST_DATA_0, WINTRUST_FILE_INFO, WTD_CHOICE_CATALOG, WTD_CHOICE_FILE, WTD_REVOKE_NONE,
     WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
 /// What is known about a file's signature.
@@ -65,7 +65,10 @@ pub enum Signature {
     /// Signed, but Windows will not accept it: expired, revoked, untrusted
     /// root, or tampered with since. The name is still worth showing —
     /// something claimed to be that publisher.
-    Invalid { signer: Option<String>, reason: String },
+    Invalid {
+        signer: Option<String>,
+        reason: String,
+    },
     /// No signature at all, embedded or catalogue.
     Unsigned,
     /// The file could not be read to find out.
@@ -230,7 +233,13 @@ fn catalogue_hash(admin: isize, handle: HANDLE) -> Option<Vec<u8>> {
     }
     let mut hash = vec![0_u8; size as usize];
     unsafe {
-        CryptCATAdminCalcHashFromFileHandle2(admin, handle, &mut size, Some(hash.as_mut_ptr()), None)
+        CryptCATAdminCalcHashFromFileHandle2(
+            admin,
+            handle,
+            &mut size,
+            Some(hash.as_mut_ptr()),
+            None,
+        )
     }
     .ok()?;
     Some(hash)
@@ -455,13 +464,7 @@ fn signer_name(path: &Path) -> Option<String> {
 
             if !certificate.is_null() {
                 let length = unsafe {
-                    CertGetNameStringW(
-                        certificate,
-                        CERT_NAME_SIMPLE_DISPLAY_TYPE,
-                        0,
-                        None,
-                        None,
-                    )
+                    CertGetNameStringW(certificate, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, None, None)
                 };
                 if length > 1 {
                     let mut text = vec![0_u16; length as usize];
@@ -491,7 +494,6 @@ fn signer_name(path: &Path) -> Option<String> {
         let _ = CryptMsgClose(Some(message));
         let _ = CertCloseStore(Some(store), 0);
     }
-
 
     name
 }
