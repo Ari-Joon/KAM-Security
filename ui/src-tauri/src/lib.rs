@@ -596,7 +596,24 @@ async fn virustotal_lookup(path: String) -> Result<kam_virustotal::Verdict, Stri
     // Hashing reads the whole file and the request waits on the network, so
     // neither belongs on the interface thread.
     tauri::async_runtime::spawn_blocking(move || {
-        kam_virustotal::look_up_file(&path).map_err(|error| error.to_string())
+        let verdict = kam_virustotal::look_up_file(&path).map_err(|error| error.to_string())?;
+
+        // Asking the agent to write it down, because the lookup happens here
+        // and the audit log lives there. This is the one action in the product
+        // that sends anything off the machine, so it is the one most worth a
+        // record; a failure to record it is not worth failing the lookup over,
+        // but it is worth saying out loud.
+        if let Err(error) = kam_ipc::client::call(&Request::RecordLookup {
+            sha256: verdict.sha256.clone(),
+            outcome: format!(
+                "{:?}, {} of {} engines flagged it",
+                verdict.standing, verdict.malicious, verdict.engines
+            ),
+        }) {
+            eprintln!("the VirusTotal lookup was not recorded in the audit log: {error}");
+        }
+
+        Ok(verdict)
     })
     .await
     .map_err(|error| format!("the lookup did not finish: {error}"))?

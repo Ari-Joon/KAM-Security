@@ -43,6 +43,10 @@ construction, so nothing in that layer deletes, blocks or quarantines anything �
 presenting circumstantial evidence as a verdict is the whole business model of
 the software this replaces.
 
+<p align="center">
+  <img src="docs/images/overview.png" width="900" alt="The Overview: drives, and the weekly check that is off until you turn it on">
+</p>
+
 ## Reading a terabyte in two seconds
 
 Storage is the part that works today. It reads the NTFS master file table
@@ -57,6 +61,29 @@ Measured on a 1 TB system drive holding 1.4 million files:
 | Repeat scan, warm cache | **2.4 s** | 15.2 s |
 | Agreement with the 1036.3 GB Windows reports | **99.6%** | 97.6% |
 | Needs administrator rights | yes | no |
+
+The table read was later measured properly rather than assumed, on a 1.8 TB
+drive whose table holds **1,912,577 records**. Almost none of the time was the
+disk:
+
+| | Before | After |
+|---|---|---|
+| Reading the table | 2356 ms | **1204 ms** |
+| — of that, waiting on the disk | 588 ms | 549 ms |
+| — of that, interpreting records | 1768 ms | **655 ms** |
+| Building the directory tree | 344 ms | 319 ms |
+| Measuring every application | 194 ms | 108 ms |
+| **Whole survey** | **2937 ms** | **1668 ms** |
+
+Two gigabytes of records came off an NVMe disk in half a second and took nearly
+two to interpret, one at a time, while the disk sat idle. The framing stays on
+the reading thread, because a data run can end mid-record and deciding where
+records begin has to happen in order; the interpreting moved to a pool of
+parsers behind a short queue. Identical output either way, down to the record
+count.
+
+The window shows what the measurement cost, with the per-stage breakdown behind
+the tooltip. "It feels slow" is not something anybody can act on.
 
 Both figures are given because the walk gains hugely from a warm filesystem
 cache while the table barely notices one — it is a single sequential read either
@@ -74,6 +101,17 @@ front and centre: fragmented files spill their attributes into **extension
 records**, and only the `$DATA` fragment starting at **virtual cluster 0** knows
 the file's real length. Missing either reports a 138 GB archive as 0 bytes.
 Between them they accounted for 270 GB on the test volume.
+
+### The list arrives before the sizes
+
+What an installer *claims* about itself is a registry read: every name,
+publisher, version, install date and claimed size, in about a fifth of a second,
+needing no privileges at all. What it *occupies* needs the whole file table.
+
+So the list appears immediately and can be searched, sorted and grouped straight
+away; only the size column waits, and it shows a waiting mark rather than a zero,
+because a zero in that column is a claim and it would be wrong for every row on
+screen.
 
 ## What this is not
 
@@ -117,7 +155,7 @@ See [PLAN.md](PLAN.md) for the full design and phase breakdown.
 
 ## Status
 
-Phases 0 to 2 are complete and phase 3 is in progress. Nothing claims to be
+Phases 0 to 4 are complete and phase 5 is in progress. Nothing claims to be
 finished software.
 
 | Phase | Scope | State |
@@ -126,8 +164,11 @@ finished software.
 | 1 | Agent, IPC, audit log, shell | Done |
 | 2 | Storage intelligence | Done |
 | 3 | Scanner | Done |
-| 4 | Firewall | Rules, connections and one-click block done; ETW watcher not started |
-| 5 | Installer, scheduler, polish | Not started |
+| 4 | Firewall | Rules, connections and one-click block done; ETW watcher deliberately deferred |
+| 5 | Installer, scheduler, polish | Scheduler and cleaning done; **no installer yet** |
+
+The honest gap: there is no installer. It runs from a folder, and anyone else
+would have to build it from source.
 
 Phase 2 covers: the master file table reader, a zoomable treemap, true
 application footprint across every location an app touches, uninstalling from
@@ -172,6 +213,44 @@ second. The agent streams named stages and counts down the same pipe that
 carries the result, and a second connection carries the request to stop.
 
 Results are reported as "N of M engines", never as a bare count.
+
+## Cleaning, and what it refuses to do
+
+There is no registry cleaner and no health score. Both are how this category of
+software makes money and neither has ever made a machine faster.
+
+What is here is the small real list: temporary files, update downloads, crash
+dumps, error reports, thumbnails, shader caches, browser caches, developer
+package caches, Steam scratch, and a previous Windows that never removed itself.
+On the machine this was written on that came to **72.6 GB**, of which 51.9 GB
+was one graphics shader cache whose own size limit was plainly not working. Each
+entry says what it holds and what clearing it costs, and the ones that cost
+something say so rather than being presented as free.
+
+Prefetch is deliberately absent: clearing it is folklore, and it makes the next
+launch of everything slower for a few megabytes. The component store is left
+alone too — it looks enormous and is mostly hard links to files in use.
+
+Clearing runs in the agent, so the interface names an **id** from a compiled-in
+catalogue and never a path. There is no request shape that carries a directory
+to empty, because there is no version of that which is safe in a LocalSystem
+process. Only contents go, never the folder; a junction is removed as a link
+rather than followed, because a junction inside a cache pointing at your
+documents would otherwise mean emptying the cache emptied the documents.
+
+### Duplicates that are not waste
+
+Identical is not the same as spare. Windows keeps several copies of the same
+library on purpose, every installer keeps a second copy of itself so it can
+repair later, and two programs shipping the same runtime each look for it beside
+themselves. A list calling all of that "wasted" is a list that gets somebody to
+break their own machine.
+
+So every copy is judged by where it lives, and there are two numbers rather than
+one — *duplicated* and *reclaimable* — which are usually very different. Only a
+copy in a folder you own is ever offered, anything it cannot attribute is shown
+without a recommendation, and removing one goes through quarantine like
+everything else.
 
 ## The firewall
 
@@ -226,6 +305,13 @@ That is the honest cost of the category. The source is published in full, the
 binaries are never packed or obfuscated, and every release ships a SHA-256
 checksum. Building it yourself is the strongest guarantee available, and takes
 one command.
+
+Staying unsigned is a decision rather than an oversight, and it is recorded as
+one in [PLAN.md](PLAN.md). It has a consequence worth stating: this product's
+own weekly check reports **its own agent** as carrying no signature, by name,
+alongside anything else on the machine that does. A program that reports on what
+starts itself and then quietly omits its own entry would not be worth trusting
+about anything else.
 
 ## Contributing
 

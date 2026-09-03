@@ -559,19 +559,68 @@ pub fn handle(
 
             match outcome {
                 Ok(report) => {
-                    tracing::info!(
-                        judged = report.examined,
-                        swept = report.swept_files,
-                        flagged = report.worth_reading().count(),
-                        "provenance survey"
+                    // Recorded like everything else the agent does. This was
+                    // the one privileged action that left no trace, in the
+                    // half of the product whose whole argument is that it
+                    // writes down what it looked at.
+                    context.audit(
+                        "scanner",
+                        "survey_provenance",
+                        Effect::Observed,
+                        format!(
+                            "examined {} programs that start themselves and {} files that \
+                             arrived from outside; {} worth reading",
+                            report.examined,
+                            report.swept_files,
+                            report.worth_reading().count()
+                        ),
                     );
                     Response::Provenance(report)
                 }
                 Err(_) => {
-                    tracing::info!(%job, "provenance survey stopped");
+                    context.audit(
+                        "scanner",
+                        "survey_provenance",
+                        Effect::Observed,
+                        "the survey was stopped before it finished".to_owned(),
+                    );
                     Response::Stopped
                 }
             }
+        }
+
+        Request::RecordLookup { sha256, outcome } => {
+            // The one thing in this product that sends anything off the
+            // machine, and therefore the one thing most worth writing down.
+            //
+            // The lookup itself happens in the window, deliberately: the rule
+            // engine and the VirusTotal client are kept out of the privileged
+            // process entirely, and there is a test that fails if either ever
+            // appears in its dependency tree. So the record has to be asked
+            // for rather than produced where the work happened.
+            //
+            // The request carries a hash and a one-line outcome and nothing
+            // else. A client that could write free-form audit entries could
+            // write a plausible history of things that never happened.
+            let digest: String = sha256
+                .chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .take(64)
+                .collect();
+            if digest.len() != 64 {
+                return Response::Error {
+                    message: "a lookup record needs the file's SHA-256".to_owned(),
+                };
+            }
+            let outcome: String = outcome.chars().take(120).collect();
+
+            context.audit(
+                "virustotal",
+                "look_up",
+                Effect::Changed,
+                format!("sent the hash {digest} to VirusTotal: {outcome}"),
+            );
+            Response::Acknowledged
         }
 
         Request::GetDefenderThreats => match kam_scanner::defender::threats() {
@@ -1069,6 +1118,61 @@ mod tests {
         assert!(
             recorded > findings.len(),
             "the run itself should be recorded too"
+        );
+    }
+
+    /// A lookup record carries a hash and a line, and nothing a caller invents.
+    ///
+    /// The lookup itself happens in the window, so the record has to be asked
+    /// for over the pipe. That makes it the one audit entry a client can cause,
+    /// which is why its shape is checked rather than trusted.
+    #[test]
+    fn a_lookup_record_needs_a_real_hash_and_cannot_carry_a_story() {
+        let context = context(Mode::Service);
+        let user = UserContext::current();
+
+        for bad in ["", "not-a-hash", "abc123", &"f".repeat(63)] {
+            let response = handle(
+                Request::RecordLookup {
+                    sha256: bad.to_owned(),
+                    outcome: "Clean".to_owned(),
+                },
+                &context,
+                &Reporter::silent(),
+                &user,
+            );
+            assert!(
+                matches!(response, Response::Error { .. }),
+                "{bad:?} was accepted as a hash"
+            );
+        }
+
+        // A real one is recorded, and the free-text half is clipped so it
+        // cannot be used to write paragraphs into the log.
+        let digest = "a".repeat(64);
+        let response = handle(
+            Request::RecordLookup {
+                sha256: digest.clone(),
+                outcome: "x".repeat(500),
+            },
+            &context,
+            &Reporter::silent(),
+            &user,
+        );
+        assert!(matches!(response, Response::Acknowledged), "{response:?}");
+
+        let recorded = context
+            .store
+            .recent_audit(10)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.module == "virustotal")
+            .expect("the lookup was not recorded");
+        assert!(recorded.detail.contains(&digest));
+        assert!(
+            recorded.detail.len() < 260,
+            "the outcome was not clipped: {} chars",
+            recorded.detail.len()
         );
     }
 

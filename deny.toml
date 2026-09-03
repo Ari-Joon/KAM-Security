@@ -49,6 +49,27 @@ ignore = [
     { id = "RUSTSEC-2024-0419", reason = "gdkwayland-sys — Linux-only Tauri dependency, not built on Windows" },
     { id = "RUSTSEC-2024-0420", reason = "gdkx11-sys — Linux-only Tauri dependency, not built on Windows" },
 
+    # A real vulnerability, in code this project does not compile.
+    #
+    # RUSTSEC-2026-0269 is a sandbox escape in Wasmtime's WASI *filesystem*
+    # implementation, reached when a guest resolves a path with a trailing
+    # slash. Wasmtime is here because yara-x compiles YARA rules to WebAssembly
+    # and executes them, and the fix is in wasmtime 46, which no published
+    # yara-x depends on yet -- 1.20, the newest, still pins 45.
+    #
+    # It is ignored because the vulnerable code is not linked, not because it is
+    # inconvenient. `wasmtime-wasi` does not appear anywhere in the dependency
+    # tree and wasmtime's `wasi` feature is not enabled, so there is no
+    # filesystem sandbox to escape from; the rules yara-x compiles are pure
+    # computation over bytes already in memory, with no host imports.
+    #
+    # Both facts are checkable:
+    #     cargo tree -p kam-rules -i wasmtime-wasi     -> no such package
+    #     cargo tree -p kam-rules -e features          -> no wasi feature
+    #
+    # Revisit when yara-x moves to wasmtime 46 or later, and delete this.
+    { id = "RUSTSEC-2026-0269", reason = "wasmtime WASI filesystem escape; wasmtime-wasi is not in the tree and the wasi feature is off, so the code is never compiled" },
+
     # Unmaintained transitive crates with no published successor. None is a
     # vulnerability; all arrive through Tauri and none is reachable from code
     # this project writes.

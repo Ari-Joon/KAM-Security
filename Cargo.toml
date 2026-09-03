@@ -82,7 +82,7 @@ sha2 = "0.10"
 # Reached only by `kam-rules`, which only the unprivileged shell links. It
 # carries wasmtime's JIT, and that does not belong in a LocalSystem service --
 # see the note in deny.toml.
-yara-x = { version = "1.19", default-features = false, features = [
+yara-x = { version = "1.20", default-features = false, features = [
     "pe-module",
     "hash-module",
     "math-module",

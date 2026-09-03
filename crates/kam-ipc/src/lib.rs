@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -111,6 +111,16 @@ pub enum Request {
     DeleteQuarantined { id: String },
     /// Delete everything currently held. Same rules, once per item.
     EmptyQuarantine,
+    /// Record that a file's hash was sent to VirusTotal.
+    ///
+    /// The lookup happens in the window, because the VirusTotal client is
+    /// deliberately kept out of the privileged process. This is how the one
+    /// action that sends anything off the machine still reaches the audit log.
+    ///
+    /// Carries a hash and a one-line outcome and nothing else: a client that
+    /// could write free-form entries could write a plausible history of things
+    /// that never happened.
+    RecordLookup { sha256: String, outcome: String },
     /// Whether a weekly check is registered, and when it runs.
     GetSchedule,
     /// Register the weekly check, or take it away.
