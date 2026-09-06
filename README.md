@@ -163,7 +163,7 @@ finished software.
 | 0 | Workspace, CI, tooling | Done |
 | 1 | Agent, IPC, audit log, shell | Done |
 | 2 | Storage intelligence | Done |
-| 3 | Scanner | Done, plus a continuous behaviour watcher for what newly starts itself |
+| 3 | Scanner | Done, plus a behaviour watcher, canary files, a browser extension inventory and a Defender hardening report |
 | 4 | Firewall | Rules, connections and one-click block done; ETW watcher deliberately deferred |
 | 5 | Installer, scheduler, polish | Scheduler and cleaning done; **no installer yet** |
 

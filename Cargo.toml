@@ -7,7 +7,7 @@ resolver = "2"
 members = ["crates/*", "ui/src-tauri"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Raised from 1.82 by yara-x, which the scanner uses for rule matching.
 rust-version = "1.91"
@@ -19,16 +19,16 @@ repository = "https://github.com/Ari-Joon/KAM-Security"
 # Versions alongside the paths so these are not wildcard dependencies. Nothing
 # here is published to crates.io, but a wildcard is a real hazard in general and
 # `cargo deny` is right to reject it rather than special-case us.
-kam-core = { path = "crates/kam-core", version = "0.1.0" }
-kam-ipc = { path = "crates/kam-ipc", version = "0.1.0" }
-kam-scanner = { path = "crates/kam-scanner", version = "0.1.0" }
-kam-firewall = { path = "crates/kam-firewall", version = "0.1.0" }
-kam-schedule = { path = "crates/kam-schedule", version = "0.1.0" }
-kam-storage = { path = "crates/kam-storage", version = "0.1.0" }
-kam-virustotal = { path = "crates/kam-virustotal", version = "0.1.0" }
-kam-quarantine = { path = "crates/kam-quarantine", version = "0.1.0" }
-kam-rules = { path = "crates/kam-rules", version = "0.1.0" }
-kam-canary = { path = "crates/kam-canary", version = "0.1.0" }
+kam-core = { path = "crates/kam-core", version = "0.2.0" }
+kam-ipc = { path = "crates/kam-ipc", version = "0.2.0" }
+kam-scanner = { path = "crates/kam-scanner", version = "0.2.0" }
+kam-firewall = { path = "crates/kam-firewall", version = "0.2.0" }
+kam-schedule = { path = "crates/kam-schedule", version = "0.2.0" }
+kam-storage = { path = "crates/kam-storage", version = "0.2.0" }
+kam-virustotal = { path = "crates/kam-virustotal", version = "0.2.0" }
+kam-quarantine = { path = "crates/kam-quarantine", version = "0.2.0" }
+kam-rules = { path = "crates/kam-rules", version = "0.2.0" }
+kam-canary = { path = "crates/kam-canary", version = "0.2.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
