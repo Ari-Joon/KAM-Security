@@ -354,22 +354,34 @@ fn weigh(finding: &mut Finding) {
             );
         }
 
-        // A hidden scheduled task. Windows hides a handful of its own
-        // maintenance tasks; third-party software that hides is choosing not to
-        // be found in Task Scheduler's list, which is worth saying plainly.
+        // A hidden scheduled task.
+        //
+        // Hiding on its own says nothing, and assuming otherwise was a real
+        // mistake: Windows marks a great many of its own maintenance tasks
+        // hidden, and a stock installation flagged eighteen of fifty-nine
+        // programs on that basis alone. Every one of those runs a
+        // catalogue-signed Microsoft binary from a protected folder, which is
+        // exactly what distinguishes them. So hiding counts when it is hiding
+        // *something*: an unsigned or unverifiable target, or one in a folder
+        // any program can write to.
         if finding.persistence.iter().any(|entry| entry.hidden) {
-            weight += 3;
-            reasons.push(
-                "It starts from a scheduled task that is marked hidden, so it does not show in Task Scheduler."
-                    .to_owned(),
-            );
+            let vouched_for = finding.signature.is_valid();
+            if !vouched_for || exposed {
+                weight += 3;
+                reasons.push(
+                    "It starts from a scheduled task that is marked hidden, so it does not show in Task Scheduler."
+                        .to_owned(),
+                );
+            }
         }
 
         // Started through a launcher: cmd, PowerShell, MSBuild, rundll32. This
         // is how something arranges to run while the thing Task Manager shows is
-        // a trusted Microsoft program. Ordinary software occasionally does it;
-        // in a writable folder it is the launcher pattern this release was
-        // written after.
+        // a trusted Microsoft program.
+        //
+        // Only counted in a writable folder, and for the same reason as above:
+        // Windows starts plenty of its own signed work through rundll32 and
+        // cmd, and scoring that would be scoring Windows for being Windows.
         if let Some(host) = finding
             .persistence
             .iter()
@@ -380,7 +392,7 @@ fn weigh(finding: &mut Finding) {
                 reasons.push(format!(
                     "It does not run directly: {host} is told to run it, which is how something keeps the program Task Manager shows looking like part of Windows."
                 ));
-            } else {
+            } else if !finding.signature.is_valid() {
                 weight += 1;
                 reasons.push(format!("It is run by {host} rather than started directly."));
             }
@@ -678,6 +690,62 @@ mod tests {
             hidden: true,
             machine_wide: true,
         }
+    }
+
+    #[test]
+    fn windows_own_hidden_maintenance_tasks_stay_ordinary() {
+        // The false positive that failed CI on a stock Windows image: a great
+        // many of Windows' own scheduled tasks are marked hidden, and scoring
+        // that alone flagged eighteen of fifty-nine programs. What separates
+        // them from something worth reading is that they run a catalogue-signed
+        // binary from a protected folder, so that is what has to be checked.
+        let mut entry = hidden_launcher(r"C:\Windows\System32\some-maintenance.exe");
+        entry.host = None;
+        entry.payload = None;
+        let finding = finding(
+            Signature::Valid {
+                signer: "Microsoft Windows".to_owned(),
+                catalogue: Some(r"C:\Windows\...\thing.cat".to_owned()),
+            },
+            Location::System,
+            vec![entry],
+        );
+        assert_eq!(
+            finding.attention,
+            Attention::Ordinary,
+            "hiding is only worth saying when it hides something: {:?}",
+            finding.reasons
+        );
+    }
+
+    #[test]
+    fn windows_running_its_own_signed_work_through_a_launcher_stays_ordinary() {
+        // Windows starts plenty of its own tasks through rundll32 and cmd.
+        // Scoring that would be scoring Windows for being Windows.
+        let finding = finding(
+            Signature::Valid {
+                signer: "Microsoft Windows".to_owned(),
+                catalogue: Some(r"C:\Windows\...\thing.cat".to_owned()),
+            },
+            Location::System,
+            vec![Entry {
+                name: "SomeTask".to_owned(),
+                anchor: Anchor::ScheduledTask,
+                location: r"C:\Windows\System32\Tasks\SomeTask".to_owned(),
+                command: r"rundll32.exe C:\Windows\System32\thing.dll,Entry".to_owned(),
+                executable: Some(PathBuf::from(r"C:\Windows\System32\rundll32.exe")),
+                payload: Some(PathBuf::from(r"C:\Windows\System32\thing.dll")),
+                host: Some("rundll32.exe".to_owned()),
+                hidden: false,
+                machine_wide: true,
+            }],
+        );
+        assert_eq!(
+            finding.attention,
+            Attention::Ordinary,
+            "{:?}",
+            finding.reasons
+        );
     }
 
     #[test]
