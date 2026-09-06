@@ -125,12 +125,6 @@ pub fn object_name(user: &UserContext, decoy: &RegistryDecoy) -> String {
     }
 }
 
-/// The path as it appears in a Security log event, in the kernel's namespace.
-pub fn kernel_name(user: &UserContext, decoy: &RegistryDecoy) -> Option<String> {
-    let sid = user.sid()?;
-    Some(format!(r"\REGISTRY\USER\{sid}\{}", decoy.relative))
-}
-
 /// A readable path for the window, in the form a person would type.
 pub fn display_name(user: &UserContext, decoy: &RegistryDecoy) -> String {
     match user.sid() {
@@ -325,13 +319,6 @@ mod tests {
 
         // SetNamedSecurityInfoW wants USERS\<sid>\...
         assert!(object_name(&user, decoy).starts_with(r"USERS\S-1-5-21-1-2-3-1001\Software\"));
-        // The Security log writes the kernel namespace instead.
-        assert_eq!(
-            kernel_name(&user, decoy).as_deref(),
-            Some(
-                r"\REGISTRY\USER\S-1-5-21-1-2-3-1001\Software\SimonTatham\PuTTY\Sessions\KAM-Security-decoy-do-not-use"
-            )
-        );
         // And a person reads HKEY_USERS.
         assert!(display_name(&user, decoy).starts_with(r"HKEY_USERS\"));
 
@@ -340,7 +327,14 @@ mod tests {
         let mine = UserContext::new(None, r"C:\Users\me");
         assert!(object_name(&mine, decoy).starts_with(r"CURRENT_USER\"));
         assert!(display_name(&mine, decoy).starts_with(r"HKEY_CURRENT_USER\"));
-        assert_eq!(kernel_name(&mine, decoy), None);
+
+        // Whichever form Windows writes into the event, the decoy's own name is
+        // in the tail — which is what the trip matching keys on, because the
+        // hive prefix depends on who is asking and is not always knowable.
+        assert!(decoy
+            .relative
+            .to_lowercase()
+            .ends_with("kam-security-decoy-do-not-use"));
     }
 
     #[test]

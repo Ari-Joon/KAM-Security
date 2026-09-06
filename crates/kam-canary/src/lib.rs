@@ -430,10 +430,14 @@ fn watched_names(user: &UserContext) -> Vec<String> {
         .iter()
         .map(|decoy| path_for(user, decoy).display().to_string())
         .collect();
+    // The relative path rather than the whole one. Which hive prefix Windows
+    // writes into the event depends on the account, and resolving it needs a SID
+    // the shell does not have — but every decoy's own name is in the tail, so
+    // matching there works whoever is asking.
     names.extend(
         REGISTRY_DECOYS
             .iter()
-            .filter_map(|decoy| registry::kernel_name(user, decoy)),
+            .map(|decoy| decoy.relative.to_lowercase()),
     );
     names
 }
@@ -697,6 +701,72 @@ mod tests {
         assert!(
             caught.process.is_some(),
             "the event did not name the process that read it"
+        );
+    }
+
+    #[test]
+    #[ignore = "changes the machine's audit policy and writes to the real hive"]
+    fn a_read_of_a_real_registry_canary_is_caught() {
+        // The registry half of the mechanism, end to end. Separate from the file
+        // test because it depends on a different audit subcategory, and getting
+        // only one of the two switched on is a failure that looks like success.
+        let _guard = registry::hive_guard();
+        let user = UserContext::current();
+        let was_auditing = auditing_enabled();
+
+        let planted = plant(&user);
+        let keys: Vec<_> = planted
+            .canaries
+            .iter()
+            .filter(|canary| canary.kind == Kind::RegistryKey)
+            .collect();
+        println!("planted {} registry decoys", keys.len());
+        for canary in &keys {
+            println!(
+                "  {} armed={} {:?}",
+                canary.path, canary.armed, canary.problem
+            );
+        }
+        assert!(
+            !keys.is_empty() && keys.iter().all(|canary| canary.armed),
+            "not every key could be armed; run this elevated. problems: {:?}",
+            planted.problems
+        );
+
+        set_auditing(true).expect("auditing should be switchable on when privileged");
+
+        // Read one, exactly as something enumerating saved sessions would.
+        let decoy = &REGISTRY_DECOYS[0];
+        assert!(registry::is_ours(&user, decoy), "the decoy key is not ours");
+
+        let expected = decoy.relative.to_lowercase();
+        let mut caught = None;
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            // Reading it again each pass, since the event is what is awaited.
+            let _ = registry::is_ours(&user, decoy);
+            let trips = status(&user).trips;
+            caught = trips
+                .iter()
+                .find(|trip| trip.path.to_lowercase().ends_with(&expected))
+                .cloned();
+            if caught.is_some() {
+                break;
+            }
+        }
+        println!("caught: {caught:#?}");
+
+        let (removed, refused) = remove(&user);
+        if !was_auditing {
+            let _ = set_auditing(false);
+        }
+        println!("removed {removed}, refused {refused:?}");
+
+        let caught = caught
+            .expect("the registry read was not recorded; is the Registry audit subcategory on?");
+        assert!(
+            caught.process.is_some(),
+            "the event did not name the reader"
         );
     }
 

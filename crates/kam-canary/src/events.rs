@@ -209,7 +209,16 @@ pub fn trips(paths: &[String]) -> Vec<Trip> {
                 if let Some(xml) = render(event) {
                     if let Some(object) = data(&xml, "ObjectName") {
                         let lower = object.to_lowercase();
-                        if wanted.contains(&lower) {
+                        // Files match exactly. A registry key is named by
+                        // Windows in the kernel's own namespace rather than the
+                        // form anything types, and which hive prefix it carries
+                        // depends on the account — so those match on the tail of
+                        // the path, which contains the decoy's own name and so
+                        // cannot collide with anything else.
+                        if wanted
+                            .iter()
+                            .any(|path| lower == *path || lower.ends_with(path))
+                        {
                             let process = data(&xml, "ProcessName");
                             // The indexer and the antimalware engine read
                             // everything; reporting them would make the canary
