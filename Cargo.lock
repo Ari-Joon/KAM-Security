@@ -2679,6 +2679,7 @@ dependencies = [
 name = "kam-agent"
 version = "0.1.0"
 dependencies = [
+ "kam-canary",
  "kam-core",
  "kam-firewall",
  "kam-ipc",
@@ -2691,6 +2692,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-service",
+]
+
+[[package]]
+name = "kam-canary"
+version = "0.1.0"
+dependencies = [
+ "kam-core",
+ "serde",
+ "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -2719,6 +2730,7 @@ dependencies = [
 name = "kam-ipc"
 version = "0.1.0"
 dependencies = [
+ "kam-canary",
  "kam-core",
  "kam-firewall",
  "kam-quarantine",
@@ -2776,6 +2788,7 @@ dependencies = [
 name = "kam-shell"
 version = "0.1.0"
 dependencies = [
+ "kam-canary",
  "kam-core",
  "kam-firewall",
  "kam-ipc",

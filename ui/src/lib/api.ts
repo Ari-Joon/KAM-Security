@@ -17,6 +17,7 @@ import type {
   Volume,
   ProvenanceReport,
   BehaviourReport,
+  CanaryReport,
   ExtensionReport,
   HardeningReport,
   RuleReport,
@@ -50,6 +51,10 @@ export const api = {
   behaviourEvents: () => invoke<BehaviourReport>("behaviour_events"),
   browserExtensions: () => invoke<ExtensionReport>("browser_extensions"),
   hardening: () => invoke<HardeningReport>("hardening"),
+  canaries: () => invoke<CanaryReport>("canaries"),
+  setCanaries: (planted: boolean) => invoke<CanaryReport>("set_canaries", { planted }),
+  setCanaryAuditing: (enabled: boolean) =>
+    invoke<CanaryReport>("set_canary_auditing", { enabled }),
   provenance: (job: string) =>
     invoke<ProvenanceReport | null>("survey_provenance", { job }),
   cancelJob: (job: string) => invoke<void>("cancel_job", { job }),

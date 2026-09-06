@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+kam-canary = { workspace = true }
 kam-core = { workspace = true }
 kam-firewall = { workspace = true }
 kam-quarantine = { workspace = true }

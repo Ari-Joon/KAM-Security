@@ -670,3 +670,36 @@ export type HardeningReport = {
   controlled_folder_access: FolderAccess | null;
   unreadable: string[];
 };
+
+/**
+ * Decoy files that exist only to be stolen.
+ *
+ * A canary read is the one signal in this product that is not circumstantial:
+ * these files are put there by KAM Security, nothing on the machine uses them,
+ * and no ordinary program has a reason to open one.
+ */
+export type Canary = {
+  id: string;
+  name: string;
+  path: string;
+  bait: string;
+  /** True when Windows is actually set to record reads of it. */
+  armed: boolean;
+  problem: string | null;
+};
+
+export type CanaryTrip = {
+  at: string;
+  path: string;
+  process: string | null;
+  process_id: string | null;
+  user: string | null;
+};
+
+export type CanaryReport = {
+  canaries: Canary[];
+  trips: CanaryTrip[];
+  /** Whether Windows is recording file access at all. Without it, inert. */
+  auditing: boolean;
+  problems: string[];
+};

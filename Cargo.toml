@@ -28,6 +28,7 @@ kam-storage = { path = "crates/kam-storage", version = "0.1.0" }
 kam-virustotal = { path = "crates/kam-virustotal", version = "0.1.0" }
 kam-quarantine = { path = "crates/kam-quarantine", version = "0.1.0" }
 kam-rules = { path = "crates/kam-rules", version = "0.1.0" }
+kam-canary = { path = "crates/kam-canary", version = "0.1.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -46,6 +47,7 @@ windows = { version = "0.62", features = [
     "Win32_NetworkManagement_WindowsFirewall",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Authentication_Identity",
     "Win32_Security_Cryptography",
     "Win32_Security_Cryptography_Catalog",
     "Win32_Security_WinTrust",
@@ -55,6 +57,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Memory",
     "Win32_System_Pipes",
     "Win32_System_Com",
+    "Win32_System_EventLog",
     "Win32_System_TaskScheduler",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Ole",

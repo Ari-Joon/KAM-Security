@@ -11,6 +11,7 @@ pub mod client;
 pub mod frame;
 pub mod pipe;
 
+use kam_canary::Report as CanaryReport;
 use kam_core::audit::Record;
 use kam_core::Progress;
 use kam_firewall::connections::ConnectionReport;
@@ -31,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -219,6 +220,21 @@ pub enum Request {
     /// Which of Defender's Attack Surface Reduction rules are switched on, and
     /// whether Controlled Folder Access is protecting anything.
     GetHardening,
+    /// What decoy files are planted, whether Windows is watching them, and
+    /// anything that has read one.
+    GetCanaries,
+    /// Plant the decoys, or take them away again.
+    ///
+    /// Carries a flag and nothing else. There is deliberately no variant that
+    /// names a path: this runs as LocalSystem, and a request that could say
+    /// where to write a file would be a request to write anywhere.
+    SetCanaries { planted: bool },
+    /// Turn Windows' file-access auditing on or off.
+    ///
+    /// The one machine-wide setting this product changes, so it is its own
+    /// request, it is only ever sent from a deliberate action, and it is
+    /// recorded in the audit log both ways.
+    SetCanaryAuditing { enabled: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +339,7 @@ pub enum Response {
         since: Option<String>,
     },
     Extensions(ExtensionReport),
+    Canaries(Box<CanaryReport>),
     Hardening(Box<HardeningReport>),
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {
@@ -426,6 +443,7 @@ mod tests {
         });
         round_trip(Response::Connections(Default::default()));
         round_trip(Response::Extensions(Default::default()));
+        round_trip(Response::Canaries(Default::default()));
         round_trip(Response::Hardening(Default::default()));
         round_trip(Response::BehaviourEvents {
             observations: Vec::new(),

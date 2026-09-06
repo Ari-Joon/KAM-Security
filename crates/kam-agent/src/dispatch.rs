@@ -674,6 +674,68 @@ pub fn handle(
             Response::Hardening(Box::new(kam_scanner::hardening::survey()))
         }
 
+        Request::GetCanaries => Response::Canaries(Box::new(kam_canary::status(user))),
+
+        Request::SetCanaries { planted } => {
+            if planted {
+                let report = kam_canary::plant(user);
+                // Effect::Changed: this writes files into somebody's Documents.
+                context.audit(
+                    "canary",
+                    "plant",
+                    Effect::Changed,
+                    format!(
+                        "planted {} decoy files for {}; {} armed",
+                        report.canaries.len(),
+                        user.profile(),
+                        report.canaries.iter().filter(|c| c.armed).count()
+                    ),
+                );
+                Response::Canaries(Box::new(report))
+            } else {
+                let (removed, refused) = kam_canary::remove(user);
+                context.audit(
+                    "canary",
+                    "remove",
+                    Effect::Changed,
+                    format!("removed {removed} decoy files for {}", user.profile()),
+                );
+                let mut report = kam_canary::status(user);
+                report.problems.extend(refused);
+                Response::Canaries(Box::new(report))
+            }
+        }
+
+        Request::SetCanaryAuditing { enabled } => {
+            match kam_canary::set_auditing(enabled) {
+                Ok(()) => {
+                    // The one machine-wide setting this product changes, so it
+                    // is recorded in both directions and in plain words.
+                    context.audit(
+                        "canary",
+                        "set_auditing",
+                        Effect::Changed,
+                        format!(
+                            "turned Windows file-access auditing {}",
+                            if enabled { "on" } else { "off" }
+                        ),
+                    );
+                    Response::Canaries(Box::new(kam_canary::status(user)))
+                }
+                Err(error) => {
+                    context.audit(
+                        "canary",
+                        "set_auditing",
+                        Effect::Refused,
+                        format!("could not change the audit policy: {error}"),
+                    );
+                    Response::Error {
+                        message: error.to_string(),
+                    }
+                }
+            }
+        }
+
         Request::NoteUninstallLaunched { name, command } => {
             // Effect::Changed, not Observed: the machine is about to change.
             // The wording says "launched" rather than "uninstalled" because

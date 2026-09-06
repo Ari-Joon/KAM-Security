@@ -20,6 +20,7 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+kam-canary = { workspace = true }
 kam-core = { workspace = true }
 kam-ipc = { workspace = true }
 kam-firewall = { workspace = true }

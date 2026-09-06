@@ -463,6 +463,41 @@ fn hardening() -> Result<kam_scanner::hardening::Report, String> {
     }
 }
 
+/// What decoys are planted, and anything that has read one.
+#[tauri::command]
+fn canaries() -> Result<kam_canary::Report, String> {
+    match kam_ipc::client::call(&Request::GetCanaries).map_err(|e| e.to_string())? {
+        Response::Canaries(report) => Ok(*report),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Plant the decoys, or take them away.
+#[tauri::command]
+fn set_canaries(planted: bool) -> Result<kam_canary::Report, String> {
+    match kam_ipc::client::call(&Request::SetCanaries { planted }).map_err(|e| e.to_string())? {
+        Response::Canaries(report) => Ok(*report),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Turn Windows' file-access auditing on or off.
+///
+/// The one machine-wide setting this product changes. It is behind its own
+/// deliberate action in the window, and the agent records it both ways.
+#[tauri::command]
+fn set_canary_auditing(enabled: bool) -> Result<kam_canary::Report, String> {
+    match kam_ipc::client::call(&Request::SetCanaryAuditing { enabled })
+        .map_err(|e| e.to_string())?
+    {
+        Response::Canaries(report) => Ok(*report),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Judge every executable that starts itself or arrived from outside.
 ///
 /// Read-only by construction: the agent gathers evidence and says what it
@@ -737,6 +772,9 @@ pub fn run() {
             behaviour_events,
             browser_extensions,
             hardening,
+            canaries,
+            set_canaries,
+            set_canary_auditing,
             survey_provenance,
             cancel_job,
             find_remnants,

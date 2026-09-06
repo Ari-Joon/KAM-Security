@@ -5,6 +5,7 @@ import { runJob, stopJob, type Progress } from "../lib/jobs";
 import type {
   Anchor,
   BehaviourReport,
+  CanaryReport,
   ExtensionReport,
   HardeningMode,
   HardeningReport,
@@ -246,6 +247,8 @@ export default function Scanner() {
         </>
       )}
 
+      <Canaries />
+
       <Hardening />
 
       <Extensions />
@@ -445,6 +448,207 @@ function signatureLabel(signature: Signature): string {
     case "unknown":
       return "could not be checked";
   }
+}
+
+/**
+ * Decoy files that exist only to be stolen.
+ *
+ * The one thing in this product that is not circumstantial. Everything else
+ * weighs evidence; a canary read has no innocent explanation, because the file
+ * was put there by this program and nothing on the machine knows it exists.
+ *
+ * Two switches rather than one, deliberately. Planting decoys only writes
+ * files. Turning on auditing changes a Windows setting, machine-wide, and that
+ * is a different kind of thing to ask for — so it is asked for separately and
+ * says exactly what it does.
+ */
+function Canaries() {
+  const [report, setReport] = useState<CanaryReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      setReport(await api.canaries());
+      setError(null);
+    } catch (cause) {
+      setError(reason(cause));
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const timer = setInterval(() => void refresh(), 20000);
+    return () => clearInterval(timer);
+  }, [refresh]);
+
+  async function act(work: () => Promise<CanaryReport>) {
+    setBusy(true);
+    setError(null);
+    try {
+      setReport(await work());
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const planted = report?.canaries.length ?? 0;
+  const trips = report?.trips ?? [];
+  const watching = report?.auditing === true && (report?.canaries.some((c) => c.armed) ?? false);
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>Decoy files</h2>
+        <button
+          onClick={() => void act(() => api.setCanaries(planted === 0))}
+          disabled={busy}
+        >
+          {busy ? "Working…" : planted === 0 ? "Plant decoys" : "Remove decoys"}
+        </button>
+      </div>
+
+      <p className="lede panel-lede">
+        Files that exist only to be stolen: a fake saved-password database, a
+        fake wallet, a fake recovery phrase. Nothing on this machine uses them
+        and no ordinary program has any reason to open one — so if something
+        reads one, that is not evidence to be weighed against other evidence.
+        It is close to proof that something is going through your files looking
+        for credentials, and Windows records which program did it.
+      </p>
+
+      {error && (
+        <div className="notice notice-down">
+          <strong>That did not work.</strong>
+          <pre className="error">{error}</pre>
+        </div>
+      )}
+
+      {report && (
+        <>
+          {trips.length > 0 && (
+            <div className="notice notice-down">
+              <strong>
+                Something read {trips.length === 1 ? "a decoy" : "your decoys"}.
+              </strong>{" "}
+              This is worth acting on rather than reading past.
+            </div>
+          )}
+
+          <div
+            className={
+              planted === 0
+                ? "notice"
+                : watching
+                  ? "notice notice-ok"
+                  : "notice notice-warn"
+            }
+          >
+            {planted === 0 ? (
+              <>Nothing is planted. Decoys are off until you turn them on.</>
+            ) : watching ? (
+              <>
+                <strong>{planted}</strong> decoys planted and being watched.
+              </>
+            ) : (
+              <>
+                <strong>{planted}</strong> decoys are planted, but Windows is not
+                recording file access, so reading one would go unnoticed. They
+                are inert until auditing is on.
+              </>
+            )}
+          </div>
+
+          {planted > 0 && (
+            <div className="schedule-row">
+              <button
+                onClick={() => void act(() => api.setCanaryAuditing(!report.auditing))}
+                disabled={busy}
+              >
+                {report.auditing
+                  ? "Stop recording file access"
+                  : "Record reads of these files"}
+              </button>
+              <span className="muted small">
+                {report.auditing
+                  ? "Windows is recording access to files that ask for it. Turning this off makes the decoys inert."
+                  : "Switches on Windows' File System auditing. It only produces events for files that ask to be watched — these five — so it does not fill your Security log."}
+              </span>
+            </div>
+          )}
+
+          {trips.length > 0 && (
+            <ul className="findings">
+              {trips.map((trip, index) => (
+                <li key={`${trip.at}-${trip.path}-${index}`} className="finding finding-unusual">
+                  <div className="finding-head">
+                    <span className="finding-name">
+                      {trip.process
+                        ? `${trip.process.split("\\").pop()} read a decoy`
+                        : "Something read a decoy"}
+                    </span>
+                    <span className="badge attention-unusual">worth a look</span>
+                  </div>
+                  <button
+                    className="finding-path"
+                    title="Open the containing folder"
+                    onClick={() => void api.reveal(trip.path)}
+                  >
+                    {trip.path}
+                  </button>
+                  <dl className="finding-facts">
+                    <div>
+                      <dt>Read by</dt>
+                      <dd>{trip.process ?? "not recorded"}</dd>
+                    </div>
+                    <div>
+                      <dt>Running as</dt>
+                      <dd>{trip.user ?? "not recorded"}</dd>
+                    </div>
+                    <div>
+                      <dt>When</dt>
+                      <dd>{fmtStamp(trip.at)}</dd>
+                    </div>
+                  </dl>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {planted > 0 && (
+            <ul className="finding-anchors">
+              {report.canaries.map((canary) => (
+                <li key={canary.id}>
+                  <span className="anchor-kind">
+                    {canary.armed ? "watched" : "not watched"}
+                  </span>
+                  <span className="anchor-where">{canary.path}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {report.problems.length > 0 && (
+            <div className="notice notice-warn">
+              <ul className="concerns">
+                {report.problems.map((problem) => (
+                  <li key={problem}>{problem}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <p className="footnote">
+            Decoys are written into your Documents folder and contain nothing
+            real — each one says so inside. Nothing already on disk is ever
+            overwritten, and removal only deletes files this program wrote.
+          </p>
+        </>
+      )}
+    </section>
+  );
 }
 
 function modeLabel(mode: HardeningMode): string {

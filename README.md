@@ -328,6 +328,44 @@ measurable CPU while idle; the watcher spends a little of that on one registry
 read a couple of times a minute. That trade is written down here rather than
 hidden, and the snapshot is deliberately not a scan.
 
+## Files that exist only to be stolen
+
+Everything above weighs circumstantial evidence, and says so. This does not.
+
+A canary is a file with no legitimate reason to be touched: a fake saved-password
+database, a fake wallet, a fake recovery phrase. Nothing on the machine uses
+them, no backup job wants them, and nothing but this program knows they exist. So
+if something reads one, there is no innocent explanation to weigh against — it is
+close to proof that a program is going through your files looking for
+credentials. The idea is borrowed from [canarytokens.org](https://canarytokens.org),
+which does it with documents that phone home; this does it locally, so nothing
+ever leaves the machine.
+
+It works through Windows' own auditing. Each decoy gets a **SACL** asking for an
+event whenever anyone reads it, and Windows then records event 4663 in the
+Security log naming the file, **the process that read it**, and the account. No
+driver, no hooking, no third party, no network. The answer is not "something read
+your documents" but "this program, at this time, as this user" — which is the
+difference between knowing you were robbed and knowing who did it.
+
+This is the one part of the product that changes a Windows setting, so it is
+opt-in twice over: planting decoys only writes files, and switching on file
+auditing is a separate, reversible action that says exactly what it does. It is
+narrower than it sounds — the subcategory only produces events for objects
+carrying a SACL, and almost nothing on a normal machine does, so five decoys do
+not make a noisy Security log.
+
+The rules it holds itself to are worth stating, because the decoy paths are
+deliberately chosen to look like things people really keep:
+
+- **Nothing is ever overwritten.** A decoy is only created where no file exists.
+- **Nothing is planted inside another program's data**, so a canary cannot
+  confuse a browser, a wallet, or the tools that read your real `.ssh` folder.
+- **Nothing is deleted that this program did not write.** Removal reads a marker
+  inside the file first and refuses anything without it.
+- **The contents are worthless.** Every decoy says inside what it is, so nobody
+  is misled by their own file and an attacker who takes one gains nothing.
+
 ## Running it
 
 Prebuilt binaries are on the [releases page](https://github.com/Ari-Joon/KAM-Security/releases).

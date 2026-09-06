@@ -1,0 +1,15 @@
+[package]
+name = "kam-canary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kam-core = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+windows = { workspace = true }
+
+[lints]
+workspace = true

@@ -152,6 +152,67 @@ fn sweep(baseline: &mut HashSet<String>, first_pass: bool) -> Vec<Observation> {
     found
 }
 
+/// Anything that has read a canary since the last look.
+///
+/// A canary read is the one signal in this product that is not circumstantial:
+/// those files exist for no other purpose, nothing on the machine knows they are
+/// there, and no legitimate program has a reason to open one. So it is reported
+/// as strongly as this module reports anything, and with the process named.
+fn canary_trips(seen: &mut HashSet<String>, first_pass: bool) -> Vec<Observation> {
+    let mut found = Vec::new();
+
+    for user in persistence::signed_in_users() {
+        let report = kam_canary::status(&user);
+        for trip in report.trips {
+            // Windows keeps these events for as long as the Security log holds
+            // them, so the first pass learns what is already there rather than
+            // reporting a read from last week as though it just happened.
+            let key = format!("{}\u{0}{}\u{0}{:?}", trip.at, trip.path, trip.process);
+            if !seen.insert(key) || first_pass {
+                continue;
+            }
+
+            let mut evidence = vec![
+                "This file is a decoy. It was put there by KAM Security, nothing on this machine \
+                 uses it, and no ordinary program has any reason to open it."
+                    .to_owned(),
+            ];
+            if let Some(process) = &trip.process {
+                evidence.push(format!("It was read by {process}."));
+            }
+            if let Some(user) = &trip.user {
+                evidence.push(format!("The program was running as {user}."));
+            }
+
+            found.push(Observation {
+                at: if trip.at.is_empty() {
+                    kam_core::clock::now_utc_iso()
+                } else {
+                    trip.at.clone()
+                },
+                kind: behaviour::Kind::ProcessStart,
+                concern: behaviour::Concern::Strong,
+                summary: match &trip.process {
+                    Some(process) => format!(
+                        "{} read a decoy file",
+                        std::path::Path::new(process)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| process.clone())
+                    ),
+                    None => "Something read a decoy file".to_owned(),
+                },
+                evidence,
+                subject: trip.path,
+                command: trip.process.clone().unwrap_or_default(),
+                pid: None,
+            });
+        }
+    }
+
+    found
+}
+
 /// Watch until told to stop. Runs on its own thread.
 fn run(log: Log, running_as_service: bool, shutdown: Shutdown) {
     // The watcher writes to the audit log through its own connection to the same
@@ -168,11 +229,13 @@ fn run(log: Log, running_as_service: bool, shutdown: Shutdown) {
 
     log.begin();
     let mut baseline: HashSet<String> = HashSet::new();
+    let mut canaries_seen: HashSet<String> = HashSet::new();
     let mut first_pass = true;
     tracing::info!("behaviour watcher started");
 
     loop {
-        let observations = sweep(&mut baseline, first_pass);
+        let mut observations = sweep(&mut baseline, first_pass);
+        observations.extend(canary_trips(&mut canaries_seen, first_pass));
         first_pass = false;
 
         for observation in observations {
