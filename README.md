@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/OWNER/kam-security/actions/workflows/ci.yml">
-    <img src="https://github.com/OWNER/kam-security/actions/workflows/ci.yml/badge.svg" alt="CI">
+  <a href="https://github.com/Ari-Joon/kam-security/actions/workflows/ci.yml">
+    <img src="https://github.com/Ari-Joon/kam-security/actions/workflows/ci.yml/badge.svg" alt="CI">
   </a>
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0">
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0a7bbb" alt="Windows 10/11">
@@ -330,7 +330,7 @@ hidden, and the snapshot is deliberately not a scan.
 
 ## Running it
 
-Prebuilt binaries are on the [releases page](https://github.com/OWNER/kam-security/releases).
+Prebuilt binaries are on the [releases page](https://github.com/Ari-Joon/kam-security/releases).
 Unzip anywhere and **keep both executables in the same folder** — the agent only
 serves clients installed alongside it.
 
