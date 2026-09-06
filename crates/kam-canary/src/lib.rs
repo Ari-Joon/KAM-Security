@@ -62,9 +62,11 @@ use serde::{Deserialize, Serialize};
 
 mod audit;
 mod events;
+mod registry;
 
 pub use audit::{auditing_enabled, set_auditing};
 pub use events::Trip;
+pub use registry::{RegistryDecoy, REGISTRY_DECOYS};
 
 /// Written inside every canary. Removal refuses to delete a file without it,
 /// which is what stops this ever removing something of the user's.
@@ -149,9 +151,31 @@ fn notice(name: &str) -> String {
     )
 }
 
+/// Whether a canary is a file on disk or a key in the registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    File,
+    RegistryKey,
+}
+
+impl Kind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::File => "a file",
+            Self::RegistryKey => "a registry key",
+        }
+    }
+}
+
 /// One planted canary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Canary {
+    /// What sort of thing it is. A registry decoy needs a different audit
+    /// subcategory from a file, and reads back under a different path shape, so
+    /// the window is told which it is looking at.
+    #[serde(default = "file_kind")]
+    pub kind: Kind,
     pub id: String,
     pub name: String,
     pub path: String,
@@ -182,6 +206,10 @@ impl Report {
     pub fn watching(&self) -> bool {
         self.auditing && self.canaries.iter().any(|canary| canary.armed)
     }
+}
+
+fn file_kind() -> Kind {
+    Kind::File
 }
 
 fn path_for(user: &UserContext, decoy: &Decoy) -> PathBuf {
@@ -291,6 +319,7 @@ pub fn plant(user: &UserContext) -> Report {
         };
 
         report.canaries.push(Canary {
+            kind: Kind::File,
             id: decoy.id.to_owned(),
             name: decoy.name.to_owned(),
             path: path.display().to_string(),
@@ -300,8 +329,44 @@ pub fn plant(user: &UserContext) -> Report {
         });
     }
 
-    report.trips = events::trips(&paths(user));
+    plant_registry(user, &mut report);
+    report.trips = events::trips(&watched_names(user));
     report
+}
+
+/// Create the registry decoys, with the same rules the files follow.
+fn plant_registry(user: &UserContext, report: &mut Report) {
+    for decoy in REGISTRY_DECOYS {
+        if registry::exists(user, decoy) && !registry::is_ours(user, decoy) {
+            report.problems.push(format!(
+                "{} was left alone: something else is already there.",
+                registry::display_name(user, decoy)
+            ));
+            continue;
+        }
+        if !registry::exists(user, decoy) {
+            if let Err(error) = registry::plant(user, decoy) {
+                report.problems.push(error.to_string());
+                continue;
+            }
+        }
+
+        let object = registry::object_name(user, decoy);
+        let (armed, problem) = match audit::watch_key(&object) {
+            Ok(()) => (true, None),
+            Err(error) => (false, Some(error.to_string())),
+        };
+
+        report.canaries.push(Canary {
+            kind: Kind::RegistryKey,
+            id: decoy.id.to_owned(),
+            name: decoy.name.to_owned(),
+            path: registry::display_name(user, decoy),
+            bait: decoy.bait.to_owned(),
+            armed,
+            problem,
+        });
+    }
 }
 
 /// Remove every canary this program planted.
@@ -342,15 +407,35 @@ pub fn remove(user: &UserContext) -> (usize, Vec<String>) {
         }
     }
 
+    for decoy in REGISTRY_DECOYS {
+        if !registry::exists(user, decoy) {
+            continue;
+        }
+        match registry::remove(user, decoy) {
+            Ok(()) => removed += 1,
+            Err(error) => refused.push(error.to_string()),
+        }
+    }
+
     (removed, refused)
 }
 
-/// Every canary path, whether or not it is currently planted.
-fn paths(user: &UserContext) -> Vec<String> {
-    DECOYS
+/// Every name a trip could be recorded against.
+///
+/// Files appear in the Security log by their ordinary path. Registry keys appear
+/// in the kernel's namespace instead, so both forms are collected here and the
+/// event reader matches whichever it is handed.
+fn watched_names(user: &UserContext) -> Vec<String> {
+    let mut names: Vec<String> = DECOYS
         .iter()
         .map(|decoy| path_for(user, decoy).display().to_string())
-        .collect()
+        .collect();
+    names.extend(
+        REGISTRY_DECOYS
+            .iter()
+            .filter_map(|decoy| registry::kernel_name(user, decoy)),
+    );
+    names
 }
 
 /// What is planted now, and what has touched it.
@@ -370,6 +455,7 @@ pub fn status(user: &UserContext) -> Report {
             Err(error) => (false, Some(error.to_string())),
         };
         report.canaries.push(Canary {
+            kind: Kind::File,
             id: decoy.id.to_owned(),
             name: decoy.name.to_owned(),
             path: path.display().to_string(),
@@ -379,7 +465,30 @@ pub fn status(user: &UserContext) -> Report {
         });
     }
 
-    report.trips = events::trips(&paths(user));
+    // Read-only, deliberately. Reporting what is planted must never plant
+    // anything: the window polls this every few seconds, and a status call that
+    // created keys would put decoys on a machine whose owner never asked.
+    for decoy in REGISTRY_DECOYS {
+        if !registry::is_ours(user, decoy) {
+            continue;
+        }
+        let object = registry::object_name(user, decoy);
+        let (armed, problem) = match audit::is_watched_key(&object) {
+            Ok(watched) => (watched, None),
+            Err(error) => (false, Some(error.to_string())),
+        };
+        report.canaries.push(Canary {
+            kind: Kind::RegistryKey,
+            id: decoy.id.to_owned(),
+            name: decoy.name.to_owned(),
+            path: registry::display_name(user, decoy),
+            bait: decoy.bait.to_owned(),
+            armed,
+            problem,
+        });
+    }
+
+    report.trips = events::trips(&watched_names(user));
     report
 }
 
@@ -437,29 +546,45 @@ mod tests {
 
     #[test]
     fn planting_creates_files_that_can_be_recognised_and_removed() {
+        let _guard = registry::hive_guard();
         let (user, root) = scratch_user();
         let report = plant(&user);
-        // Arming needs privilege the tests do not have; the files must still be
-        // written, and that is what is checked here.
-        assert_eq!(
-            report.canaries.len(),
-            DECOYS.len(),
-            "problems: {:?}",
-            report.problems
-        );
-        for canary in &report.canaries {
+        // Arming needs privilege the tests do not have; the decoys must still be
+        // created, and that is what is checked here.
+        //
+        // The profile is a scratch directory, so the file decoys land there. The
+        // registry decoys have nowhere scratch to go — a hive is not a directory
+        // — so they land in this account's real HKEY_CURRENT_USER, under paths
+        // that name themselves, and are removed again below.
+        let files: Vec<_> = report
+            .canaries
+            .iter()
+            .filter(|canary| canary.kind == Kind::File)
+            .collect();
+        assert_eq!(files.len(), DECOYS.len(), "problems: {:?}", report.problems);
+        for canary in &files {
             let path = Path::new(&canary.path);
             assert!(path.is_file(), "{} was not written", canary.path);
             assert!(is_ours(path), "{} is not recognisable as ours", canary.path);
         }
 
         let (removed, refused) = remove(&user);
-        assert_eq!(removed, DECOYS.len(), "refused: {refused:?}");
-        for canary in &report.canaries {
+        assert!(
+            removed >= DECOYS.len(),
+            "only {removed} removed, refused: {refused:?}"
+        );
+        for canary in &files {
             assert!(
                 !Path::new(&canary.path).exists(),
                 "{} survived",
                 canary.path
+            );
+        }
+        for decoy in REGISTRY_DECOYS {
+            assert!(
+                !registry::is_ours(&user, decoy),
+                "{} survived removal",
+                registry::display_name(&user, decoy)
             );
         }
         std::fs::remove_dir_all(&root).ok();
@@ -495,6 +620,7 @@ mod tests {
 
     #[test]
     fn planting_twice_is_harmless() {
+        let _guard = registry::hive_guard();
         let (user, root) = scratch_user();
         let first = plant(&user);
         let second = plant(&user);
@@ -576,10 +702,21 @@ mod tests {
 
     #[test]
     fn status_reports_nothing_when_nothing_is_planted() {
+        let _guard = registry::hive_guard();
         let (user, root) = scratch_user();
         let report = status(&user);
-        assert!(report.canaries.is_empty());
-        assert!(!report.watching());
+        // File decoys only. A scratch profile is a fresh directory, so there can
+        // be none of those; the registry decoys live in this account's real hive
+        // whatever profile is passed, so another test running beside this one
+        // may legitimately have planted some.
+        assert!(
+            report
+                .canaries
+                .iter()
+                .all(|canary| canary.kind != Kind::File),
+            "a scratch profile reported file decoys: {:?}",
+            report.canaries
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }

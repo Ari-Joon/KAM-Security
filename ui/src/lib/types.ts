@@ -678,7 +678,11 @@ export type HardeningReport = {
  * these files are put there by KAM Security, nothing on the machine uses them,
  * and no ordinary program has a reason to open one.
  */
+export type CanaryKind = "file" | "registry_key";
+
 export type Canary = {
+  /** A file on disk, or a key in the registry. */
+  kind: CanaryKind;
   id: string;
   name: string;
   path: string;

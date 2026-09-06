@@ -355,6 +355,29 @@ narrower than it sounds — the subcategory only produces events for objects
 carrying a SACL, and almost nothing on a normal machine does, so five decoys do
 not make a noisy Security log.
 
+### The registry gets decoys too
+
+Documents are only half of where a thief looks. Several programs people rely on
+keep connection details in the registry under well-known paths: PuTTY stores
+every saved session with its hostname and username, WinSCP stores its sessions
+with a reversibly-encrypted password beside them, and the Remote Desktop client
+records the machines you have connected to and the account you used. All of it is
+enumerated by stealers, because it maps out what else of yours is reachable.
+
+So there are decoy sessions there as well, watched the same way. Two details
+differ and both are handled: registry auditing is a **separate subcategory** from
+file auditing, so switching canaries on switches both — a decoy that produced no
+events because only half the policy was set would look like an all-clear — and
+Windows names a registry object in the kernel's own namespace
+(`\REGISTRY\USER\<sid>\…`) rather than the form anyone types, so the event
+matching accounts for that.
+
+A decoy session is a subkey alongside any real ones, never a value inside
+somebody's own session, and each is named `KAM-Security-decoy-do-not-use` so that
+a person who finds one in their own PuTTY list can tell at a glance it is not
+theirs. A stealer enumerates every session under those paths rather than opening
+one by name, so a decoy does not need to deceive anybody to be found.
+
 The rules it holds itself to are worth stating, because the decoy paths are
 deliberately chosen to look like things people really keep:
 

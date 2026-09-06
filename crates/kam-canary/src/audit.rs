@@ -27,7 +27,9 @@ use windows::Win32::Security::Authentication::Identity::{
     AuditSetSystemPolicy, AUDIT_POLICY_INFORMATION, POLICY_AUDIT_EVENT_NONE,
     POLICY_AUDIT_EVENT_SUCCESS,
 };
-use windows::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+use windows::Win32::Security::Authorization::{
+    SetNamedSecurityInfoW, SE_FILE_OBJECT, SE_OBJECT_TYPE, SE_REGISTRY_KEY,
+};
 use windows::Win32::Security::{
     AddAuditAccessAceEx, AdjustTokenPrivileges, CreateWellKnownSid, GetLengthSid,
     GetSecurityDescriptorSacl, InitializeAcl, LookupPrivilegeValueW, WinWorldSid, ACL,
@@ -46,6 +48,18 @@ use kam_core::{Error, Result};
 /// the same on every installation.
 const AUDIT_SUBCATEGORY_FILE_SYSTEM: windows::core::GUID =
     windows::core::GUID::from_u128(0x0cce921d_69ae_11d9_bed3_505054503030);
+
+/// The Registry subcategory, which is separate from File System.
+///
+/// A registry decoy produces nothing at all with only File System auditing on,
+/// which is a silent failure of the worst kind: it looks like an all-clear. So
+/// both are switched together and both are read back together.
+const AUDIT_SUBCATEGORY_REGISTRY: windows::core::GUID =
+    windows::core::GUID::from_u128(0x0cce921e_69ae_11d9_bed3_505054503030);
+
+/// Both subcategories a canary depends on.
+const SUBCATEGORIES: &[windows::core::GUID] =
+    &[AUDIT_SUBCATEGORY_FILE_SYSTEM, AUDIT_SUBCATEGORY_REGISTRY];
 
 /// Enable `SeSecurityPrivilege` in this process.
 ///
@@ -100,12 +114,8 @@ fn enable_security_privilege() -> Result<()> {
     }
 }
 
-fn wide(path: &Path) -> Vec<u16> {
-    path.as_os_str()
-        .to_string_lossy()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect()
+fn wide_str(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Build the Everyone SID on the stack.
@@ -127,6 +137,16 @@ fn everyone(buffer: &mut [u8]) -> Result<PSID> {
 
 /// Put an audit rule on one file: record every successful read, by anyone.
 pub fn watch_file(path: &Path) -> Result<()> {
+    watch_object(&path.as_os_str().to_string_lossy(), SE_FILE_OBJECT)
+}
+
+/// The same, for a registry key named as `USERS\<sid>\...`.
+pub fn watch_key(name: &str) -> Result<()> {
+    watch_object(name, SE_REGISTRY_KEY)
+}
+
+/// Put an audit rule on one object, whatever kind it is.
+fn watch_object(name: &str, kind: SE_OBJECT_TYPE) -> Result<()> {
     enable_security_privilege()?;
 
     let mut sid_buffer = [0_u8; 68];
@@ -155,10 +175,10 @@ pub fn watch_file(path: &Path) -> Result<()> {
         )
         .map_err(|error| Error::Privileged(format!("could not add the audit rule: {error}")))?;
 
-        let path = wide(path);
+        let name = wide_str(name);
         let status = SetNamedSecurityInfoW(
-            PCWSTR(path.as_ptr()),
-            SE_FILE_OBJECT,
+            PCWSTR(name.as_ptr()),
+            kind,
             SACL_SECURITY_INFORMATION,
             None,
             None,
@@ -177,17 +197,26 @@ pub fn watch_file(path: &Path) -> Result<()> {
 
 /// Whether a file already carries an audit rule.
 pub fn is_watched(path: &Path) -> Result<bool> {
+    is_watched_object(&path.as_os_str().to_string_lossy(), SE_FILE_OBJECT)
+}
+
+/// The same, for a registry key.
+pub fn is_watched_key(name: &str) -> Result<bool> {
+    is_watched_object(name, SE_REGISTRY_KEY)
+}
+
+fn is_watched_object(name: &str, kind: SE_OBJECT_TYPE) -> Result<bool> {
     use windows::Win32::Security::Authorization::GetNamedSecurityInfoW;
 
     enable_security_privilege()?;
-    let wide_path = wide(path);
+    let wide_path = wide_str(name);
     let mut sacl: *mut ACL = std::ptr::null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
 
     unsafe {
         let status = GetNamedSecurityInfoW(
             PCWSTR(wide_path.as_ptr()),
-            SE_FILE_OBJECT,
+            kind,
             SACL_SECURITY_INFORMATION,
             None,
             None,
@@ -232,11 +261,16 @@ pub fn auditing_enabled() -> bool {
     }
     unsafe {
         let mut policy: *mut AUDIT_POLICY_INFORMATION = std::ptr::null_mut();
-        let subcategories = [AUDIT_SUBCATEGORY_FILE_SYSTEM];
-        if !AuditQuerySystemPolicy(&subcategories, &mut policy) || policy.is_null() {
+        if !AuditQuerySystemPolicy(SUBCATEGORIES, &mut policy) || policy.is_null() {
             return false;
         }
-        let enabled = ((*policy).AuditingInformation & POLICY_AUDIT_EVENT_SUCCESS as u32) != 0;
+        // Both have to be on. Reporting "watching" while registry auditing was
+        // off would make a registry decoy look clear when it is simply blind.
+        let mut enabled = true;
+        for index in 0..SUBCATEGORIES.len() {
+            let entry = &*policy.add(index);
+            enabled &= (entry.AuditingInformation & POLICY_AUDIT_EVENT_SUCCESS as u32) != 0;
+        }
         windows::Win32::Security::Authentication::Identity::AuditFree(policy.cast());
         enabled
     }
@@ -249,18 +283,22 @@ pub fn auditing_enabled() -> bool {
 /// exact inverse, so nothing is left behind that the user did not ask for.
 pub fn set_auditing(on: bool) -> Result<()> {
     enable_security_privilege()?;
-    let policy = AUDIT_POLICY_INFORMATION {
-        AuditSubCategoryGuid: AUDIT_SUBCATEGORY_FILE_SYSTEM,
-        AuditingInformation: if on {
-            POLICY_AUDIT_EVENT_SUCCESS as u32
-        } else {
-            POLICY_AUDIT_EVENT_NONE as u32
-        },
-        AuditCategoryGuid: windows::core::GUID::zeroed(),
+    let wanted = if on {
+        POLICY_AUDIT_EVENT_SUCCESS as u32
+    } else {
+        POLICY_AUDIT_EVENT_NONE as u32
     };
+    let policies: Vec<AUDIT_POLICY_INFORMATION> = SUBCATEGORIES
+        .iter()
+        .map(|subcategory| AUDIT_POLICY_INFORMATION {
+            AuditSubCategoryGuid: *subcategory,
+            AuditingInformation: wanted,
+            AuditCategoryGuid: windows::core::GUID::zeroed(),
+        })
+        .collect();
 
     unsafe {
-        if !AuditSetSystemPolicy(&[policy]) {
+        if !AuditSetSystemPolicy(&policies) {
             return Err(Error::Privileged(
                 "Windows refused to change the audit policy. This needs the agent to be running \
                  as a service."
@@ -275,6 +313,19 @@ pub fn set_auditing(on: bool) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_registry_subcategory_is_the_documented_one() {
+        assert_eq!(
+            format!("{:?}", AUDIT_SUBCATEGORY_REGISTRY).to_lowercase(),
+            "0cce921e-69ae-11d9-bed3-505054503030"
+        );
+        assert_eq!(
+            SUBCATEGORIES.len(),
+            2,
+            "both subcategories must be switched"
+        );
+    }
 
     #[test]
     fn the_file_system_subcategory_is_the_documented_one() {

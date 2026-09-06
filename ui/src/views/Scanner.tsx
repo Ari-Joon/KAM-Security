@@ -511,12 +511,14 @@ function Canaries() {
       </div>
 
       <p className="lede panel-lede">
-        Files that exist only to be stolen: a fake saved-password database, a
-        fake wallet, a fake recovery phrase. Nothing on this machine uses them
-        and no ordinary program has any reason to open one — so if something
-        reads one, that is not evidence to be weighed against other evidence.
-        It is close to proof that something is going through your files looking
-        for credentials, and Windows records which program did it.
+        Decoys that exist only to be stolen: a fake saved-password database, a
+        fake wallet, a fake recovery phrase, and fake saved connections in the
+        registry where PuTTY, WinSCP and Remote Desktop keep theirs. Nothing on
+        this machine uses any of them and no ordinary program has a reason to
+        open one — so if something reads one, that is not evidence to be weighed
+        against other evidence. It is close to proof that something is going
+        through your machine looking for credentials, and Windows records which
+        program did it.
       </p>
 
       {error && (
@@ -623,6 +625,7 @@ function Canaries() {
                 <li key={canary.id}>
                   <span className="anchor-kind">
                     {canary.armed ? "watched" : "not watched"}
+                    {canary.kind === "registry_key" && " · registry"}
                   </span>
                   <span className="anchor-where">{canary.path}</span>
                 </li>
@@ -641,9 +644,10 @@ function Canaries() {
           )}
 
           <p className="footnote">
-            Decoys are written into your Documents folder and contain nothing
-            real — each one says so inside. Nothing already on disk is ever
-            overwritten, and removal only deletes files this program wrote.
+            Decoys are written into your Documents folder and, for the saved
+            connections, into your own registry hive. They contain nothing real
+            and each one says so. Nothing already there is ever overwritten, and
+            removal only deletes what this program wrote and marked as its own.
           </p>
         </>
       )}
