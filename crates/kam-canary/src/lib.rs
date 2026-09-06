@@ -188,6 +188,38 @@ fn path_for(user: &UserContext, decoy: &Decoy) -> PathBuf {
     PathBuf::from(user.profile()).join(decoy.relative)
 }
 
+/// Ask Windows Search not to index a file.
+///
+/// `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED` is the supported way to say "do not
+/// read this for the index". It keeps the indexer from generating a read that
+/// would otherwise look, to the canary, exactly like a program going through
+/// the documents.
+fn exclude_from_indexing(path: &Path) -> std::io::Result<()> {
+    use windows::Win32::Storage::FileSystem::{
+        GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+        FILE_FLAGS_AND_ATTRIBUTES, INVALID_FILE_ATTRIBUTES,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let current = GetFileAttributesW(windows::core::PCWSTR(wide.as_ptr()));
+        if current == INVALID_FILE_ATTRIBUTES {
+            return Err(std::io::Error::last_os_error());
+        }
+        SetFileAttributesW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(current | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED.0),
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))
+    }
+}
+
 /// Whether a file is one of ours, judged by the marker inside it.
 ///
 /// Read rather than assumed, because the alternative is deleting a file on the
@@ -234,6 +266,20 @@ pub fn plant(user: &UserContext) -> Report {
                     .problems
                     .push(format!("{} could not be written: {error}", path.display()));
                 continue;
+            }
+            // Tell Windows Search to leave it alone.
+            //
+            // Found by testing rather than by reasoning: the first end-to-end
+            // run caught `SearchProtocolHost.exe` reading a decoy within
+            // seconds, because the indexer reads everything new in Documents.
+            // That is a perfectly legitimate read, and left alone it would have
+            // made every canary cry wolf on the day it was planted — which is
+            // the exact failure this whole product is meant to avoid.
+            if let Err(error) = exclude_from_indexing(&path) {
+                report.problems.push(format!(
+                    "{} could not be hidden from Windows Search, so the indexer may read it: {error}",
+                    path.display()
+                ));
             }
         }
 
@@ -456,6 +502,76 @@ mod tests {
         assert!(second.problems.is_empty(), "{:?}", second.problems);
         remove(&user);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[ignore = "changes the machine's audit policy and writes into the real profile"]
+    fn a_read_of_a_real_canary_is_caught_and_names_the_reader() {
+        // The whole mechanism, end to end, on this machine: plant, arm, switch
+        // on auditing, read one, and see it come back with the process named.
+        //
+        // Ignored by default because it changes a machine-wide Windows setting
+        // and writes into the real Documents folder, in the same spirit as the
+        // firewall test that creates a real rule. It restores both.
+        //
+        // Needs to run as a user holding SeSecurityPrivilege — an elevated
+        // shell, or the service account.
+        let user = UserContext::current();
+        let was_auditing = auditing_enabled();
+
+        let planted = plant(&user);
+        println!("planted {} decoys", planted.canaries.len());
+        for canary in &planted.canaries {
+            println!(
+                "  {} armed={} {:?}",
+                canary.path, canary.armed, canary.problem
+            );
+        }
+        assert!(
+            planted.canaries.iter().all(|canary| canary.armed),
+            "not every decoy could be armed; run this elevated. problems: {:?}",
+            planted.problems
+        );
+
+        set_auditing(true).expect("auditing should be switchable on when privileged");
+        assert!(auditing_enabled(), "auditing did not come on");
+
+        // Read one, exactly as something rifling through the documents would.
+        let target = planted.canaries[0].path.clone();
+        let contents = std::fs::read_to_string(&target).expect("the decoy should be readable");
+        assert!(contents.contains(MARKER));
+
+        // Windows writes the event asynchronously; give it a moment.
+        let mut trips = Vec::new();
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            trips = status(&user).trips;
+            if trips
+                .iter()
+                .any(|trip| trip.path.eq_ignore_ascii_case(&target))
+            {
+                break;
+            }
+        }
+
+        let caught = trips
+            .iter()
+            .find(|trip| trip.path.eq_ignore_ascii_case(&target));
+        println!("caught: {caught:#?}");
+
+        // Put the machine back before asserting, so a failure does not leave
+        // auditing switched on behind it.
+        let (removed, refused) = remove(&user);
+        if !was_auditing {
+            let _ = set_auditing(false);
+        }
+        println!("removed {removed} decoys, refused {refused:?}");
+
+        let caught = caught.expect("the read was not recorded; is the Security log readable?");
+        assert!(
+            caught.process.is_some(),
+            "the event did not name the process that read it"
+        );
     }
 
     #[test]

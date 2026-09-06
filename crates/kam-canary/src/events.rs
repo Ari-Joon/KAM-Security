@@ -26,6 +26,47 @@ use windows::Win32::System::EventLog::{
 /// turns over quickly, and a canary that was read will be near the top.
 const MAX_EVENTS: usize = 400;
 
+/// Windows components whose job is to read every file on the machine.
+///
+/// This list exists because of what the first end-to-end test actually caught:
+/// not the read it had just performed, but `SearchProtocolHost.exe` indexing the
+/// decoy seconds after it was written. The indexer, the antimalware engine and
+/// the sync clients all walk everything, and a canary that reported them would
+/// be crying wolf on the day it was planted.
+///
+/// Filtering them is a real trade and worth stating plainly. Something that
+/// managed to run *as* one of these, from its real path in `System32` or
+/// `Program Files`, would go unreported here — but anything with that much
+/// access already owns the machine, and a decoy file is not what stands between
+/// you and it. The far likelier outcome without this list is that the feature
+/// becomes noise and gets ignored, which costs more.
+///
+/// Decoys are also marked not-content-indexed when planted, so the indexer
+/// should not read them at all. This is the second line, for the machines where
+/// that attribute does not take.
+const ROUTINE_READERS: &[&str] = &[
+    r"\windows\system32\searchprotocolhost.exe",
+    r"\windows\system32\searchindexer.exe",
+    r"\windows\system32\searchfilterhost.exe",
+    r"\windows\system32\svchost.exe",
+    r"\windows\explorer.exe",
+    r"\msmpeng.exe",
+    r"\mpcmdrun.exe",
+    r"\nissrv.exe",
+    r"\onedrive.exe",
+    r"\filesynchelper.exe",
+    r"\backgroundtaskhost.exe",
+];
+
+/// Whether a read came from something that reads everything anyway.
+fn routine(process: Option<&str>) -> bool {
+    let Some(process) = process else {
+        return false;
+    };
+    let lower = process.to_lowercase().replace('/', "\\");
+    ROUTINE_READERS.iter().any(|known| lower.ends_with(known))
+}
+
 /// Something read a canary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trip {
@@ -169,13 +210,19 @@ pub fn trips(paths: &[String]) -> Vec<Trip> {
                     if let Some(object) = data(&xml, "ObjectName") {
                         let lower = object.to_lowercase();
                         if wanted.contains(&lower) {
-                            found.push(Trip {
-                                at: timestamp(&xml).unwrap_or_default(),
-                                path: object,
-                                process: data(&xml, "ProcessName"),
-                                process_id: data(&xml, "ProcessId"),
-                                user: data(&xml, "SubjectUserName"),
-                            });
+                            let process = data(&xml, "ProcessName");
+                            // The indexer and the antimalware engine read
+                            // everything; reporting them would make the canary
+                            // noise on the day it was planted.
+                            if !routine(process.as_deref()) {
+                                found.push(Trip {
+                                    at: timestamp(&xml).unwrap_or_default(),
+                                    path: object,
+                                    process,
+                                    process_id: data(&xml, "ProcessId"),
+                                    user: data(&xml, "SubjectUserName"),
+                                });
+                            }
                         }
                     }
                 }
@@ -259,6 +306,34 @@ mod tests {
         // one the report distinguishes from "auditing is on and saw nothing".
         let trips = trips(&[r"C:\Users\nobody\Documents\nothing".to_owned()]);
         println!("{} trips", trips.len());
+    }
+
+    #[test]
+    fn the_windows_search_indexer_is_not_reported_as_a_thief() {
+        // The exact false positive the first end-to-end run produced: the
+        // indexer read a decoy seconds after it was planted, because that is
+        // its job.
+        assert!(routine(Some(r"C:\Windows\System32\SearchProtocolHost.exe")));
+        assert!(routine(Some(r"C:\Windows\System32\searchindexer.exe")));
+        assert!(routine(Some(
+            r"C:\ProgramData\Microsoft\Windows Defender\Platform\4.18\MsMpEng.exe"
+        )));
+        assert!(routine(Some(
+            r"C:\Program Files\Microsoft OneDrive\OneDrive.exe"
+        )));
+    }
+
+    #[test]
+    fn anything_else_reading_a_decoy_is_still_reported() {
+        // The signal this whole feature exists for must survive the filter.
+        assert!(!routine(Some(r"C:\Users\me\AppData\Local\Temp\thing.exe")));
+        assert!(!routine(Some(r"C:\Windows\System32\cmd.exe")));
+        assert!(!routine(Some(
+            r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe"
+        )));
+        assert!(!routine(None));
+        // A name that merely ends in something similar must not slip through.
+        assert!(!routine(Some(r"C:\Users\me\notsearchindexer.exe")));
     }
 
     #[test]
