@@ -14,7 +14,7 @@ jobs:
     name: fmt, clippy, test
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -22,7 +22,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -31,16 +31,15 @@ jobs:
       # The shell embeds the built frontend at compile time, so `ui/dist` has to
       # exist before cargo touches the workspace.
       #
-      # Install scripts are ignored by default so a compromised transitive
-      # dependency cannot run code at install time. esbuild is the one exception
-      # that genuinely needs its script: it fetches the platform-native binary
-      # the bundler runs. `npm rebuild` re-runs that one package's install script
-      # and nothing else, which keeps the default-deny posture while letting the
-      # build work. (The previous `npm approve-scripts` is not an npm command and
-      # failed every run.)
+      # Install scripts are ignored so a compromised transitive dependency
+      # cannot run code at install time. Nothing in the tree needs one: Vite 8
+      # bundles with rolldown, whose native binaries arrive as prebuilt
+      # platform packages rather than something fetched by a postinstall. Under
+      # Vite 7 esbuild did need its script, which is why this line used to carry
+      # a `npm rebuild esbuild` after the install.
       - name: Build the frontend
         working-directory: ui
-        run: npm ci --ignore-scripts && npm rebuild esbuild && npm run build
+        run: npm ci --ignore-scripts && npm run build
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -55,7 +54,7 @@ jobs:
     name: licence and advisory audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check

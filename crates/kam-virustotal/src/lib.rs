@@ -207,8 +207,25 @@ pub fn hash_file(path: &str) -> kam_core::Result<String> {
     let mut hasher = Sha256::new();
     // Streamed rather than read whole: these are executables, and some of them
     // are very large.
-    std::io::copy(&mut file, &mut hasher)?;
-    Ok(format!("{:x}", hasher.finalize()))
+    //
+    // Written as an explicit loop rather than `io::copy`, because sha2 0.11's
+    // hasher is no longer an `io::Write`. Same bytes, same order, same digest.
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    // 0.11 hands back an `Array` that no longer implements `LowerHex`, so the
+    // hex is written out a byte at a time. VirusTotal indexes on the lowercase
+    // form, which is what this produces.
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// Parse the file report VirusTotal returns.
