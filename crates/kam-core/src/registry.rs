@@ -191,8 +191,10 @@ impl Key {
         }
 
         let units: Vec<u16> = data
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         let text = from_wide(&units).trim().to_owned();
         (!text.is_empty()).then_some(text)
