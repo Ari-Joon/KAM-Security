@@ -72,7 +72,7 @@ windows = { version = "0.62", features = [
 blake3 = "1"
 
 # VirusTotal indexes files by SHA-256, so blake3 cannot serve here.
-sha2 = "0.10"
+sha2 = "0.11"
 
 # A pure-Rust YARA. The C libyara would drag a build toolchain into every
 # checkout; this needs none. Default features pull in parsers for Mach-O, ELF,
