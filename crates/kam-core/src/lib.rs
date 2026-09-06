@@ -5,6 +5,7 @@
 //! linked by both the agent and (indirectly) the shell, so it stays inert.
 
 pub mod audit;
+pub mod clock;
 pub mod db;
 pub mod env;
 pub mod error;

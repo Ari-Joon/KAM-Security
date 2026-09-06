@@ -397,6 +397,32 @@ documentation, screenshots. Decide on code signing here, not before.
   worked around. Revisit only if it is ever distributed to people who did not
   come looking for the source.
 
+- **A continuous behaviour watcher — added after a real incident.** Decided 6
+  September 2026. Until now the agent did nothing until asked, and that was a
+  deliberate strength. An infostealer changed the calculus: it ran for three
+  minutes, stole browser credentials, and persisted as a hidden scheduled task
+  that relaunched through MSBuild, and none of it was caught until a day later
+  by hand. Defender never flagged it. The at-rest provenance survey would have
+  found the task — but only when someone next opened the window. The gap was
+  time, so the agent now takes the weekly check's cheap snapshot every two
+  minutes and records anything newly appeared that matches a launcher/hidden-
+  task/unsigned-script shape (`kam-scanner::behaviour`, `kam-agent::watch`). It
+  is a snapshot, not an event stream, for exactly the reason the firewall's ETW
+  watcher was deferred: persistence survives to the next snapshot, so a live
+  sink's privileged surface buys little. It never acts — it writes to the audit
+  log and the window, consistent with the rule that circumstantial evidence is
+  presented, never enforced. The cost (one registry read a couple of times a
+  minute) is documented in the README rather than hidden, because the product
+  elsewhere promises no idle CPU and this spends a little of it.
+
+  Three detections were added alongside it: a YARA rule for browser credential
+  theft (the exact store paths and key-unwrapping markers), a YARA rule for a
+  build tool used as a loader (an MSBuild project carrying an inline code task
+  that reflectively loads a payload), and the provenance engine now resolves and
+  judges what a launcher is *told* to run rather than the launcher — because
+  scoring `cmd.exe` as "signed by Microsoft, in System32" while it runs a
+  stealer's script was the exact blindness that let the task look like Windows.
+
 ## 7. Open decisions
 
 - **YARA integration** — Rust bindings vs. bundling `yara.exe`. Spike in Phase 3.

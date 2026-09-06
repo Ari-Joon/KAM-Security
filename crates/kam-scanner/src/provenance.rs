@@ -353,6 +353,38 @@ fn weigh(finding: &mut Finding) {
                     .to_owned(),
             );
         }
+
+        // A hidden scheduled task. Windows hides a handful of its own
+        // maintenance tasks; third-party software that hides is choosing not to
+        // be found in Task Scheduler's list, which is worth saying plainly.
+        if finding.persistence.iter().any(|entry| entry.hidden) {
+            weight += 3;
+            reasons.push(
+                "It starts from a scheduled task that is marked hidden, so it does not show in Task Scheduler."
+                    .to_owned(),
+            );
+        }
+
+        // Started through a launcher: cmd, PowerShell, MSBuild, rundll32. This
+        // is how something arranges to run while the thing Task Manager shows is
+        // a trusted Microsoft program. Ordinary software occasionally does it;
+        // in a writable folder it is the launcher pattern this release was
+        // written after.
+        if let Some(host) = finding
+            .persistence
+            .iter()
+            .find_map(|entry| entry.host.as_deref())
+        {
+            if exposed {
+                weight += 3;
+                reasons.push(format!(
+                    "It does not run directly: {host} is told to run it, which is how something keeps the program Task Manager shows looking like part of Windows."
+                ));
+            } else {
+                weight += 1;
+                reasons.push(format!("It is run by {host} rather than started directly."));
+            }
+        }
     }
 
     // --- where it lives ---------------------------------------------------
@@ -481,10 +513,16 @@ pub fn survey(reporter: &Reporter, user: &UserContext) -> Result<Report, Cancell
     // verified once and presented once, with all its anchors together.
     let mut anchored: BTreeMap<String, (PathBuf, Vec<Entry>)> = BTreeMap::new();
     for entry in &persistence.entries {
-        if let Some(executable) = &entry.executable {
+        // The thing worth judging is what actually runs. For most entries that
+        // is the executable; for one started through a launcher — `cmd.exe /c
+        // script`, `MSBuild.exe project` — it is the payload, and judging the
+        // launcher instead would rate a credential stealer as "signed by
+        // Microsoft, lives in System32" because that describes cmd.exe.
+        if let Some(target) = entry.target() {
+            let target = target.to_path_buf();
             anchored
-                .entry(canonical(executable))
-                .or_insert_with(|| (executable.clone(), Vec::new()))
+                .entry(canonical(&target))
+                .or_insert_with(|| (target, Vec::new()))
                 .1
                 .push(entry.clone());
         }
@@ -619,8 +657,52 @@ mod tests {
             location: "somewhere".to_owned(),
             command: r"C:\somewhere\thing.exe".to_owned(),
             executable: Some(PathBuf::from(r"C:\somewhere\thing.exe")),
+            payload: None,
+            host: None,
+            hidden: false,
             machine_wide: false,
         }
+    }
+
+    /// A hidden scheduled task that runs a script through a launcher, the
+    /// resting shape of the infection this release was written after.
+    fn hidden_launcher(target: &str) -> Entry {
+        Entry {
+            name: "SettingsSync".to_owned(),
+            anchor: Anchor::ScheduledTask,
+            location: r"C:\Windows\System32\Tasks\SettingsSync".to_owned(),
+            command: format!(r#"cmd.exe /c "{target}""#),
+            executable: Some(PathBuf::from(r"C:\Windows\System32\cmd.exe")),
+            payload: Some(PathBuf::from(target)),
+            host: Some("cmd.exe".to_owned()),
+            hidden: true,
+            machine_wide: true,
+        }
+    }
+
+    #[test]
+    fn a_hidden_task_launching_a_script_from_appdata_stands_out() {
+        let finding = finding(
+            Signature::Unsigned,
+            Location::UserWritable,
+            vec![hidden_launcher(
+                r"C:\Users\me\AppData\Local\Microsoft\Windows\Caches\x\launch.cmd",
+            )],
+        );
+        assert_eq!(
+            finding.attention,
+            Attention::Unusual,
+            "hidden task + launcher + unsigned + writable must be the top of the list: {:?}",
+            finding.reasons
+        );
+        assert!(finding
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("hidden")));
+        assert!(finding
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("cmd.exe")));
     }
 
     #[test]

@@ -4,8 +4,11 @@ import ProgressBar from "../components/ProgressBar";
 import { runJob, stopJob, type Progress } from "../lib/jobs";
 import type {
   Anchor,
+  BehaviourReport,
+  Concern,
   DefenderReport,
   Location,
+  Observation,
   ProvenanceReport,
   RuleReport,
   Signature,
@@ -240,6 +243,8 @@ export default function Scanner() {
         </>
       )}
 
+      <BehaviourWatch />
+
       <Provenance />
 
       <section className="panel">
@@ -433,6 +438,148 @@ function signatureLabel(signature: Signature): string {
     case "unknown":
       return "could not be checked";
   }
+}
+
+const OBSERVATION_KINDS: Record<Observation["kind"], string> = {
+  process_start: "a program started",
+  scheduled_task: "a scheduled task appeared",
+  sign_in_entry: "a sign-in entry appeared",
+  startup_folder: "a Startup folder item appeared",
+  service: "a service appeared",
+};
+
+function concernLabel(concern: Concern): string {
+  return concern === "strong" ? "worth a look" : "worth knowing";
+}
+
+/**
+ * What has started itself since the agent started watching.
+ *
+ * This is the half of the scanner that does not wait to be asked. The agent
+ * takes a snapshot of what starts itself every couple of minutes, and anything
+ * that appears in the shape unwanted software uses to run unseen — a hidden
+ * task, a launcher running a script from a writable folder — is written down
+ * here and in the audit log, with the evidence attached. It never acts on what
+ * it finds; it makes sure a person can, before a day has gone by rather than
+ * after.
+ */
+function BehaviourWatch() {
+  const [report, setReport] = useState<BehaviourReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setReport(await api.behaviourEvents());
+      setError(null);
+    } catch (cause) {
+      setError(reason(cause));
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    // The watcher works on its own clock; a slow poll here just keeps the panel
+    // current without asking the agent anything expensive.
+    const timer = setInterval(() => void refresh(), 15000);
+    return () => clearInterval(timer);
+  }, [refresh]);
+
+  const observations = report?.observations ?? [];
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>What has started itself lately</h2>
+        <button onClick={() => void refresh()}>Refresh</button>
+      </div>
+
+      <p className="lede panel-lede">
+        The agent watches what newly registers itself to run at boot and notes
+        anything that appears in the shape unwanted software uses to run unseen:
+        a hidden scheduled task, or a launcher like <code>cmd.exe</code> or{" "}
+        <code>MSBuild.exe</code> running a script from a folder any program can
+        write to. It only ever reads and writes it down. Nothing here is deleted
+        or blocked.
+      </p>
+
+      {error && (
+        <div className="notice notice-down">
+          <strong>The watcher could not be read.</strong>
+          <pre className="error">{error}</pre>
+        </div>
+      )}
+
+      {report && (
+        <p className={report.watching ? "schedule-state on" : "schedule-state"}>
+          {report.watching
+            ? report.since
+              ? `Watching since ${fmtStamp(report.since)}.`
+              : "Watching."
+            : "The watcher is not running."}
+        </p>
+      )}
+
+      {observations.length === 0 ? (
+        <p className="empty">
+          Nothing has started itself in an unusual way since watching began. That
+          is the ordinary result.
+        </p>
+      ) : (
+        <ul className="findings">
+          {observations.map((observation, index) => (
+            <li
+              key={`${observation.subject}-${observation.at}-${index}`}
+              className={`finding finding-${
+                observation.concern === "strong" ? "unusual" : "notable"
+              }`}
+            >
+              <div className="finding-head">
+                <span className="finding-name">{observation.summary}</span>
+                <span
+                  className={`badge attention-${
+                    observation.concern === "strong" ? "unusual" : "notable"
+                  }`}
+                >
+                  {concernLabel(observation.concern)}
+                </span>
+              </div>
+
+              <button
+                className="finding-path"
+                title="Open the containing folder"
+                onClick={() => void api.reveal(observation.subject)}
+              >
+                {observation.subject}
+              </button>
+
+              <ul className="finding-reasons">
+                {observation.evidence.map((why) => (
+                  <li key={why}>{why}</li>
+                ))}
+              </ul>
+
+              <dl className="finding-facts">
+                <div>
+                  <dt>Seen</dt>
+                  <dd>{fmtStamp(observation.at)}</dd>
+                </div>
+                <div>
+                  <dt>Kind</dt>
+                  <dd>{OBSERVATION_KINDS[observation.kind]}</dd>
+                </div>
+              </dl>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+/** A timestamp shown as local time, tolerant of anything odd. */
+function fmtStamp(iso: string): string {
+  const when = new Date(iso);
+  return Number.isNaN(when.getTime()) ? iso : when.toLocaleString();
 }
 
 /**
@@ -705,7 +852,11 @@ function Provenance() {
                     <ul className="finding-anchors">
                       {finding.persistence.map((entry, index) => (
                         <li key={`${entry.location}-${entry.name}-${index}`}>
-                          <span className="anchor-kind">{ANCHOR_LABELS[entry.anchor]}</span>
+                          <span className="anchor-kind">
+                            {ANCHOR_LABELS[entry.anchor]}
+                            {entry.hidden && " (hidden)"}
+                            {entry.host && `, run by ${entry.host}`}
+                          </span>
                           <span className="anchor-where">{entry.location}</span>
                         </li>
                       ))}

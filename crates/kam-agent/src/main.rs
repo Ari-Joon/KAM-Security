@@ -14,6 +14,7 @@ mod check;
 mod dispatch;
 mod server;
 mod service;
+mod watch;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -102,10 +103,21 @@ fn run(mode: Mode) -> kam_core::Result<()> {
         store: server::open_store(false)?,
         jobs: Default::default(),
         quarantine: server::open_quarantine(false)?,
+        behaviour: Default::default(),
     });
+
+    // The behaviour watcher runs in console mode too, so development exercises
+    // the same path the service uses rather than a quieter one.
+    let watcher = watch::spawn(context.behaviour.clone(), false, shutdown.clone());
+
     let listener = PipeListener::new();
     tracing::info!(pipe = kam_ipc::PIPE_NAME, "listening");
-    server::serve(&listener, &context, &shutdown)
+    let outcome = server::serve(&listener, &context, &shutdown);
+
+    if let Some(watcher) = watcher {
+        let _ = watcher.join();
+    }
+    outcome
 }
 
 /// One pass of the weekly check, started by the scheduled task.

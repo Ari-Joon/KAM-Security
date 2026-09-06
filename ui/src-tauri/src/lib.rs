@@ -415,6 +415,34 @@ fn defender_threats() -> Result<Vec<Threat>, String> {
     }
 }
 
+#[derive(serde::Serialize)]
+struct BehaviourReport {
+    observations: Vec<kam_scanner::behaviour::Observation>,
+    watching: bool,
+    since: Option<String>,
+}
+
+/// What the behaviour watcher has seen since the agent started.
+///
+/// Read-only, like everything the watcher exposes: it reports what appeared and
+/// why, and there is deliberately no command that acts on the result.
+#[tauri::command]
+fn behaviour_events() -> Result<BehaviourReport, String> {
+    match kam_ipc::client::call(&Request::GetBehaviourEvents).map_err(|e| e.to_string())? {
+        Response::BehaviourEvents {
+            observations,
+            watching,
+            since,
+        } => Ok(BehaviourReport {
+            observations,
+            watching,
+            since,
+        }),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Judge every executable that starts itself or arrived from outside.
 ///
 /// Read-only by construction: the agent gathers evidence and says what it
@@ -686,6 +714,7 @@ pub fn run() {
             find_duplicates,
             defender_status,
             defender_threats,
+            behaviour_events,
             survey_provenance,
             cancel_job,
             find_remnants,

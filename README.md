@@ -163,7 +163,7 @@ finished software.
 | 0 | Workspace, CI, tooling | Done |
 | 1 | Agent, IPC, audit log, shell | Done |
 | 2 | Storage intelligence | Done |
-| 3 | Scanner | Done |
+| 3 | Scanner | Done, plus a continuous behaviour watcher for what newly starts itself |
 | 4 | Firewall | Rules, connections and one-click block done; ETW watcher deliberately deferred |
 | 5 | Installer, scheduler, polish | Scheduler and cleaning done; **no installer yet** |
 
@@ -189,6 +189,14 @@ bundled adware installers, scareware optimisers, browser hijackers, miners, and
 the fetch-and-run patterns that only exist as text. Rules carry their own
 plain-English explanation, and you can drop your own `.yar` files into
 `%ProgramData%\KAM Security\rules` to have them matched alongside.
+
+Three of those rules exist because of a specific infection, described under
+[Watching what starts itself](#watching-what-starts-itself) below: one for
+browser credential theft (the exact on-disk names of the password, cookie and
+key stores a stealer reads), one for a build tool used as a loader (an MSBuild
+project file carrying inline code that reflectively loads a payload), and the
+provenance engine learned to judge what a launcher is *told* to run rather than
+the launcher itself.
 
 The rule engine runs in the **unprivileged shell**, not in the LocalSystem
 agent. `yara-x` compiles rules to WebAssembly and executes them through a JIT,
@@ -275,6 +283,50 @@ certificate and Microsoft attestation signing. A handful of
 detections against a large majority is the everyday signature of a false
 positive, and the interface says so in as many words rather than colouring it
 red.
+
+## Watching what starts itself
+
+Everything above judges the machine at rest, when someone opens the window and
+asks. That is the wrong shape for one kind of threat, and this section exists
+because of a real one.
+
+A machine this tool runs on was infected by an infostealer, downloaded inside a
+file pretending to be a game update. It ran for about three minutes, copied the
+browser's saved passwords and login cookies, and left behind a **hidden
+scheduled task** that re-launched itself at every sign-in by handing a project
+file to **MSBuild** — a Microsoft-signed build tool that antivirus trusts and
+whose project files it does not read. Windows Defender never flagged any of it.
+A full offline Defender scan eventually removed one dropped file; the task, the
+launcher and the second-stage payload sat untouched until they were taken apart
+by hand.
+
+Two things in that story are the point. The malware ran while nobody was
+looking, and it survived by wearing a trusted program's face. So the agent now
+does one thing without being asked: every couple of minutes it takes the same
+cheap snapshot the weekly check does — the Run keys, the Startup folders, the
+services, the task store — and anything that has newly appeared in the shape
+unwanted software uses to run unseen is written to the audit log and shown in
+**Scanner → What has started itself lately**, with the evidence attached. The
+shapes it knows are the ones that infection used:
+
+- a launcher (`cmd.exe`, `PowerShell`, `MSBuild`, `rundll32`) told to run a
+  script or project from a folder any program can write to
+- a scheduled task marked **hidden**, so it never shows in Task Scheduler
+- a new sign-in or Startup entry pointing at an unsigned script in AppData or
+  Temp
+- an unsigned installer run from Temp claiming a hardware vendor whose real
+  installers are always signed
+
+It never stops, deletes or blocks anything. Killing a process a second late is
+theatre, and acting automatically on circumstantial evidence is the behaviour
+this whole product is an alternative to. What it does is make sure a person can
+see it within the minute rather than after a day — which is the only thing that
+was actually missing the first time.
+
+This is honest about its cost. The rest of the agent makes a point of no
+measurable CPU while idle; the watcher spends a little of that on one registry
+read a couple of times a minute. That trade is written down here rather than
+hidden, and the snapshot is deliberately not a scan.
 
 ## Running it
 

@@ -353,6 +353,7 @@ mod tests {
                 store: Store::open_in_memory().unwrap(),
                 jobs: Default::default(),
                 quarantine: kam_quarantine::Store::open(&quarantine_root).unwrap(),
+                behaviour: Default::default(),
             });
             let outcome = serve(&listener, &context, &loop_shutdown);
             let _ = finished_tx.send(());
@@ -396,6 +397,7 @@ mod tests {
                 store: Store::open_in_memory().unwrap(),
                 jobs: Default::default(),
                 quarantine: kam_quarantine::Store::open(&quarantine_root).unwrap(),
+                behaviour: Default::default(),
             });
             let _ = serve(&listener, &context, &loop_shutdown);
         });

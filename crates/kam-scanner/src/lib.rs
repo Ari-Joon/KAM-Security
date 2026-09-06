@@ -11,6 +11,7 @@
 //!    binary by its history rather than by matching a signature.
 //! 4. **VirusTotal** -- on demand, single file, user-supplied API key.
 
+pub mod behaviour;
 pub mod defender;
 pub mod persistence;
 pub mod provenance;

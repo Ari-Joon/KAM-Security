@@ -32,6 +32,11 @@ pub struct Context {
     /// connection cannot also carry a request to stop. The token is left here
     /// instead, and a second connection sets it.
     pub jobs: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// What the behaviour watcher has seen. The watcher thread writes it; a
+    /// `GetBehaviourEvents` request reads it. Default is an empty log that is
+    /// not watching, which is the correct state when no watcher was started
+    /// (the tests, `--probe`).
+    pub behaviour: crate::watch::Log,
 }
 
 impl Context {
@@ -633,6 +638,18 @@ pub fn handle(
             }
         },
 
+        Request::GetBehaviourEvents => {
+            // Not audited. Reading what the watcher saw is not an action on the
+            // system, and the window polls it; recording every read would bury
+            // the watcher's own findings under entries about looking at them.
+            let (observations, watching, since) = context.behaviour.snapshot();
+            Response::BehaviourEvents {
+                observations,
+                watching,
+                since,
+            }
+        }
+
         Request::NoteUninstallLaunched { name, command } => {
             // Effect::Changed, not Observed: the machine is about to change.
             // The wording says "launched" rather than "uninstalled" because
@@ -987,6 +1004,7 @@ mod tests {
             store: Store::open_in_memory().unwrap(),
             jobs: Default::default(),
             quarantine: kam_quarantine::Store::open(&quarantine_root).unwrap(),
+            behaviour: Default::default(),
         }
     }
 

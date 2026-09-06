@@ -513,6 +513,66 @@ mod tests {
     }
 
     #[test]
+    fn browser_credential_theft_is_recognised_in_a_script() {
+        // The infostealer shape: a script naming several browser credential
+        // stores and the key that decrypts them.
+        let path = sample(
+            "steal.ps1",
+            b"$p = \"$env:LOCALAPPDATA\\Google\\Chrome\\User Data\\Default\\Login Data\"; \
+              $c = \"$env:LOCALAPPDATA\\Google\\Chrome\\User Data\\Default\\Network\\Cookies\"; \
+              $k = Get-Content \"$env:LOCALAPPDATA\\Google\\Chrome\\User Data\\Local State\"",
+        );
+        assert!(scan_one(&engine(), &path).contains(&"browser_credential_theft".to_owned()));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn naming_one_browser_file_once_is_not_theft() {
+        // A backup tool or the browser's own uninstaller might mention one of
+        // these. One is not the set.
+        let path = sample(
+            "backup.ps1",
+            b"Copy-Item \"$env:LOCALAPPDATA\\Google\\Chrome\\User Data\\Default\\Login Data\" $dest",
+        );
+        assert!(
+            !scan_one(&engine(), &path).contains(&"browser_credential_theft".to_owned()),
+            "a single credential-store mention should not be enough"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn an_msbuild_inline_task_loader_is_recognised() {
+        // A project file that carries an inline C# task which reflectively loads
+        // an assembly from a base64 blob: a loader wearing a build file.
+        let path = sample(
+            "NuGetFrameworks.csproj",
+            b"<Project><UsingTask TaskName=\"X\" TaskFactory=\"RoslynCodeTaskFactory\" AssemblyFile=\"y\">\
+              <Task><Code Type=\"Class\" Language=\"cs\">\
+              var a = System.Reflection.Assembly.Load(System.Convert.FromBase64String(blob)); a.EntryPoint.Invoke(null,null);\
+              </Code></Task></UsingTask></Project>",
+        );
+        assert!(scan_one(&engine(), &path).contains(&"build_tool_loader".to_owned()));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn an_ordinary_project_file_is_left_alone() {
+        // A normal csproj describes a build. It must not trip the loader rule.
+        let path = sample(
+            "App.csproj",
+            b"<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework>\
+              </PropertyGroup><ItemGroup><PackageReference Include=\"Serilog\" Version=\"3.1.1\"/></ItemGroup></Project>",
+        );
+        assert!(
+            scan_one(&engine(), &path).is_empty(),
+            "an ordinary project file was flagged: {:?}",
+            scan_one(&engine(), &path)
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn rules_needing_a_real_executable_do_not_fire_on_text() {
         // Several rules are fenced behind `pe.is_pe` so that data files
         // containing these words -- antivirus definitions, blocklists, this

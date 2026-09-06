@@ -356,7 +356,47 @@ export type PersistenceEntry = {
   location: string;
   command: string;
   executable: string | null;
+  /** What a launcher (cmd, MSBuild, rundll32) is told to run, when it is one. */
+  payload: string | null;
+  /** The launcher's name, e.g. "cmd.exe", when the entry runs through one. */
+  host: string | null;
+  /** A scheduled task marked hidden from Task Scheduler's list. */
+  hidden: boolean;
   machine_wide: boolean;
+};
+
+/**
+ * The behaviour watcher's view: startup entries that appeared while the agent
+ * was running, in the shape unwanted software uses to run unseen.
+ *
+ * `concern` is the watcher's own claim. `notable` is unusual and worth a line;
+ * `strong` is a shape with very few innocent explanations. Neither is a verdict,
+ * and the interface must not render either as a red alarm by default.
+ */
+export type Concern = "notable" | "strong";
+
+export type ObservationKind =
+  | "process_start"
+  | "scheduled_task"
+  | "sign_in_entry"
+  | "startup_folder"
+  | "service";
+
+export type Observation = {
+  at: string;
+  kind: ObservationKind;
+  concern: Concern;
+  summary: string;
+  evidence: string[];
+  subject: string;
+  command: string;
+  pid: number | null;
+};
+
+export type BehaviourReport = {
+  observations: Observation[];
+  watching: boolean;
+  since: string | null;
 };
 
 export type Origin = {

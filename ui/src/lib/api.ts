@@ -16,6 +16,7 @@ import type {
   SystemStatus,
   Volume,
   ProvenanceReport,
+  BehaviourReport,
   RuleReport,
   Verdict,
   FirewallReport,
@@ -44,6 +45,7 @@ export const api = {
     invoke<DuplicateReport | null>("find_duplicates", { drive, job }),
   defenderStatus: () => invoke<DefenderReport>("defender_status"),
   defenderThreats: () => invoke<Threat[]>("defender_threats"),
+  behaviourEvents: () => invoke<BehaviourReport>("behaviour_events"),
   provenance: (job: string) =>
     invoke<ProvenanceReport | null>("survey_provenance", { job }),
   cancelJob: (job: string) => invoke<void>("cancel_job", { job }),

@@ -287,3 +287,86 @@ rule fake_system_optimiser
         // that identifies this pattern.
         pe.is_pe and 2 of ($scare*) and any of ($sell*)
 }
+
+rule browser_credential_theft
+{
+    meta:
+        kam_category = "Browser credential theft"
+        kam_confidence = "strong"
+        kam_explains = "This reaches directly for the files a browser keeps saved passwords, cookies and card details in — the login database, the cookie store, and the key that decrypts them. Software that legitimately reads those is the browser itself. Anything else opening them by their exact internal paths is an infostealer collecting what to send off the machine, which is how a single unlucky download turns into a hijacked email, Discord or Instagram account."
+
+    strings:
+        // The exact on-disk names of the credential stores. A program that
+        // names several of these is navigating a browser's private files, not
+        // its own.
+        $login_data = "\\Login Data" ascii wide nocase
+        $web_data = "\\Web Data" ascii wide nocase
+        $cookies_net = "\\Network\\Cookies" ascii wide nocase
+        $local_state = "\\Local State" ascii wide nocase
+        $leveldb = "\\Local Storage\\leveldb" ascii wide nocase
+        $ff_logins = "logins.json" ascii wide nocase
+        $ff_key = "key4.db" ascii wide nocase
+
+        // The two ways the saved-password encryption key is unwrapped: the
+        // older DPAPI blob prefix, and the newer app-bound key.
+        $dpapi = "DPAPI" ascii wide
+        $app_bound = "app_bound_encrypted_key" ascii wide nocase
+        $os_crypt = "os_crypt" ascii wide nocase
+        $encrypted_key = "encrypted_key" ascii wide nocase
+
+        // Where stealers look for browser profiles, and the wallets they take
+        // alongside them.
+        $user_data = "\\User Data\\" ascii wide nocase
+        $wallet = "wallet.dat" ascii wide nocase
+        $metamask = "MetaMask" ascii wide
+
+    condition:
+        // Only for something that runs, and only when it reaches for more than
+        // one of these at once. A single mention is a browser, a backup tool,
+        // or documentation; the whole set together is theft.
+        (pe.is_pe or kam_script) and
+        (
+            (2 of ($login_data, $web_data, $cookies_net, $local_state, $leveldb, $ff_logins, $ff_key)) or
+            (any of ($login_data, $web_data, $ff_logins, $local_state) and any of ($dpapi, $app_bound, $os_crypt, $encrypted_key)) or
+            (any of ($login_data, $cookies_net, $leveldb, $user_data) and any of ($wallet, $metamask))
+        )
+}
+
+rule build_tool_loader
+{
+    meta:
+        kam_category = "Build tool used as a loader"
+        kam_confidence = "strong"
+        kam_explains = "This is a build project file that carries an inline code task — a program embedded inside what should be a description of how to compile software. MSBuild, which is signed by Microsoft and trusted everywhere, will run that code when handed the file, and antivirus does not read project files. It is a known way to run a payload while the only thing on screen is a trusted Microsoft process, and it is exactly how the infection this tool was hardened against stayed hidden."
+
+    strings:
+        // MSBuild's inline-task machinery: a task written in C# compiled and run
+        // at build time. Legitimate but rare, and the load-bearing part of this
+        // technique.
+        $usingtask = "UsingTask" ascii wide nocase
+        $codetaskfactory = "CodeTaskFactory" ascii wide nocase
+        $roslyn = "RoslynCodeTaskFactory" ascii wide nocase
+        $task_code = "<Code" ascii wide nocase
+        $lang_cs = "Language=\"cs\"" ascii wide nocase
+
+        // What that inline code reaches for when it is a loader rather than a
+        // build step: reflective assembly loading and in-memory execution.
+        $assembly_load = "Assembly.Load" ascii wide
+        $from_base64 = "FromBase64String" ascii wide
+        $gzip = "GZipStream" ascii wide
+        $invoke = "Invoke(" ascii wide
+
+    condition:
+        // Fenced to files that MSBuild actually executes: a project or an
+        // imported targets/props file. Without this the rule would match its
+        // own description and any document quoting these API names, since a
+        // project file is neither a PE nor a script in the `kam_script` sense.
+        (
+            kam_ext == "csproj" or kam_ext == "vbproj" or kam_ext == "fsproj" or
+            kam_ext == "proj" or kam_ext == "targets" or kam_ext == "props" or
+            kam_ext == "sln"
+        ) and
+        $usingtask and
+        any of ($codetaskfactory, $roslyn, $task_code, $lang_cs) and
+        any of ($assembly_load, $from_base64, $gzip, $invoke)
+}

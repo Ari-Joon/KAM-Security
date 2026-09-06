@@ -158,10 +158,22 @@ fn serve_until_stopped(shutdown: &Shutdown) -> Result<()> {
         store: server::open_store(true)?,
         jobs: Default::default(),
         quarantine: server::open_quarantine(true)?,
+        behaviour: Default::default(),
     });
+
+    // Start watching what newly starts itself. The handle is joined after the
+    // accept loop returns, so a stop waits for the watcher's current second to
+    // finish rather than leaving a thread running in a stopping process.
+    let watcher = crate::watch::spawn(context.behaviour.clone(), true, shutdown.clone());
+
     let listener = PipeListener::new();
     tracing::info!(pipe = kam_ipc::PIPE_NAME, "listening");
-    server::serve(&listener, &context, shutdown)
+    let outcome = server::serve(&listener, &context, shutdown);
+
+    if let Some(watcher) = watcher {
+        let _ = watcher.join();
+    }
+    outcome
 }
 
 /// `ERROR_SERVICE_EXISTS`. Spelled out rather than pulling the whole `windows`

@@ -16,6 +16,7 @@ use kam_core::Progress;
 use kam_firewall::connections::ConnectionReport;
 use kam_firewall::policy::FirewallReport;
 use kam_quarantine::{Manifest, MoveRecord};
+use kam_scanner::behaviour::Observation;
 use kam_scanner::provenance::Report as ProvenanceReport;
 use kam_scanner::{DefenderStatus, Threat};
 use kam_storage::apps::LocationKind;
@@ -28,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -205,6 +206,11 @@ pub enum Request {
     /// which a service does not have -- but the audit log is the record of what
     /// happened on this machine, and this belongs in it.
     NoteUninstallLaunched { name: String, command: String },
+    /// What the behaviour watcher has seen: startup entries that appeared while
+    /// the agent was running and matched one of the shapes unwanted software
+    /// uses to run unseen. Read-only, and never carries anything the agent acts
+    /// on.
+    GetBehaviourEvents,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,6 +304,15 @@ pub enum Response {
     Acknowledged,
     QuarantineList {
         items: Vec<Manifest>,
+    },
+    /// What the behaviour watcher has recorded, newest first.
+    BehaviourEvents {
+        observations: Vec<Observation>,
+        /// Whether the watcher is running at all. False means the list is a
+        /// history, not a live view.
+        watching: bool,
+        /// When watching began, so "nothing seen" reads as "nothing since".
+        since: Option<String>,
     },
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {
@@ -400,6 +415,11 @@ mod tests {
             items: vec![manifest()],
         });
         round_trip(Response::Connections(Default::default()));
+        round_trip(Response::BehaviourEvents {
+            observations: Vec::new(),
+            watching: true,
+            since: Some("2026-09-06T14:12:02.417Z".to_owned()),
+        });
         round_trip(Response::SystemStatus(SystemStatus {
             protocol_version: PROTOCOL_VERSION,
             agent_version: "0.1.0".to_owned(),
