@@ -5,6 +5,9 @@ import { runJob, stopJob, type Progress } from "../lib/jobs";
 import type {
   Anchor,
   BehaviourReport,
+  ExtensionReport,
+  HardeningMode,
+  HardeningReport,
   Concern,
   DefenderReport,
   Location,
@@ -243,6 +246,10 @@ export default function Scanner() {
         </>
       )}
 
+      <Hardening />
+
+      <Extensions />
+
       <BehaviourWatch />
 
       <Provenance />
@@ -438,6 +445,315 @@ function signatureLabel(signature: Signature): string {
     case "unknown":
       return "could not be checked";
   }
+}
+
+function modeLabel(mode: HardeningMode): string {
+  if (typeof mode === "object") return `an unrecognised value (${mode.unknown})`;
+  switch (mode) {
+    case "block":
+      return "blocking";
+    case "warn":
+      return "warning";
+    case "audit":
+      return "auditing only";
+    default:
+      return "off";
+  }
+}
+
+/** Auditing writes an event and stops nothing, so it is not protection. */
+function isProtecting(mode: HardeningMode): boolean {
+  return mode === "block" || mode === "warn";
+}
+
+/**
+ * Protections Windows already has and leaves switched off.
+ *
+ * Nothing here can be turned on from this window, deliberately. A rule in
+ * blocking mode changes what every program on the machine may do and can stop
+ * software somebody depends on, which is why Microsoft ships them off and
+ * offers an audit mode first. This says what each one would prevent and leaves
+ * the decision where it belongs.
+ */
+function Hardening() {
+  const [report, setReport] = useState<HardeningReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [showAll, setShowAll] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      setReport(await api.hardening());
+      setError(null);
+    } catch (cause) {
+      setError(reason(cause));
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const rules = report?.rules ?? [];
+  const recommended = rules.filter((rule) => rule.recommended);
+  const on = recommended.filter((rule) => isProtecting(rule.mode)).length;
+  const shown = showAll ? rules : recommended;
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>Protections Windows already has</h2>
+        <button onClick={() => void refresh()}>Refresh</button>
+      </div>
+
+      <p className="lede panel-lede">
+        Defender ships a set of Attack Surface Reduction rules — narrow blocks on
+        things malware does and ordinary software almost never does. They are
+        free, already installed, and off by default. This reports which are on
+        and what each one would prevent. It cannot switch them on: a rule in
+        blocking mode changes what every program may do, and that is your
+        decision rather than this window's.
+      </p>
+
+      {error && (
+        <div className="notice notice-down">
+          <strong>The hardening state could not be read.</strong>
+          <pre className="error">{error}</pre>
+        </div>
+      )}
+
+      {report && (
+        <>
+          <div className={on === 0 ? "notice notice-warn" : "notice notice-ok"}>
+            <strong>
+              {on} of {recommended.length}
+            </strong>{" "}
+            recommended rules are switched on.
+            {report.controlled_folder_access && (
+              <>
+                {" "}
+                Controlled Folder Access, which stops unknown programs writing to
+                your documents, is{" "}
+                <strong>
+                  {report.controlled_folder_access.replace(/_/g, " ")}
+                </strong>
+                .
+              </>
+            )}
+          </div>
+
+          <ul className="findings">
+            {shown.map((rule) => (
+              <li
+                key={rule.id}
+                className={`finding finding-${
+                  isProtecting(rule.mode) ? "ordinary" : "notable"
+                }`}
+              >
+                <div className="finding-head">
+                  <span className="finding-name">{rule.name}</span>
+                  <span
+                    className={`badge attention-${
+                      isProtecting(rule.mode) ? "ordinary" : "notable"
+                    }`}
+                  >
+                    {modeLabel(rule.mode)}
+                  </span>
+                </div>
+                <p className="rule-explains">{rule.explains}</p>
+                <p className="footnote">{rule.id}</p>
+              </li>
+            ))}
+          </ul>
+
+          {rules.length > recommended.length && (
+            <button className="link-button" onClick={() => setShowAll(!showAll)}>
+              {showAll
+                ? "Show only the recommended ones"
+                : `Show all ${rules.length} rules`}
+            </button>
+          )}
+
+          <p className="footnote">
+            To turn one on, run PowerShell as administrator with{" "}
+            <code>Add-MpPreference</code>, naming the identifier above. Set it to
+            audit first: that writes an event and blocks nothing, so you can see
+            what a rule would have stopped before it starts stopping it.
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
+
+/**
+ * What is installed in the browsers, and what it is allowed to read.
+ *
+ * An extension that reads every page is a statement about its permissions, not
+ * an accusation: ad blockers and password managers do exactly that by design.
+ * What is worth a second look is one that nobody installed from a store.
+ */
+function Extensions() {
+  const [report, setReport] = useState<ExtensionReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [showAll, setShowAll] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      setReport(await api.browserExtensions());
+      setError(null);
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const all = report?.extensions ?? [];
+  const flagged = all.filter(
+    (extension) => extension.source === "sideloaded" || extension.notes.length > 0,
+  );
+  const shown = showAll ? all : flagged;
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>What your browsers are running</h2>
+        <button onClick={() => void refresh()} disabled={loading}>
+          {loading ? "Reading…" : "Refresh"}
+        </button>
+      </div>
+
+      <p className="lede panel-lede">
+        An extension that can read every page is, in practical terms, a program
+        holding your passwords, your email and your session cookies. It carries
+        no signature to check and starts nothing at boot, so the rest of this
+        tool is structurally blind to it. Nothing here is called malicious —
+        plenty of good extensions need exactly these permissions. What is listed
+        is what each one is allowed to do.
+      </p>
+
+      {error && (
+        <div className="notice notice-down">
+          <strong>The browsers could not be read.</strong>
+          <pre className="error">{error}</pre>
+        </div>
+      )}
+
+      {report && (
+        <>
+          <div className="notice notice-ok">
+            Found <strong>{all.length}</strong>{" "}
+            {all.length === 1 ? "extension" : "extensions"} across{" "}
+            {report.examined.length}{" "}
+            {report.examined.length === 1 ? "profile" : "profiles"}
+            {flagged.length > 0 && (
+              <>
+                , <strong>{flagged.length}</strong> of them with broad permissions
+                or no store behind them
+              </>
+            )}
+            .
+          </div>
+
+          {shown.length === 0 ? (
+            <p className="empty">
+              Nothing installed asks for more than it needs. That is the ordinary
+              result.
+            </p>
+          ) : (
+            <ul className="findings">
+              {shown.map((extension) => (
+                <li
+                  key={`${extension.browser}-${extension.profile}-${extension.id}`}
+                  className={`finding finding-${
+                    extension.source === "sideloaded" ? "unusual" : "notable"
+                  }`}
+                >
+                  <div className="finding-head">
+                    <span className="finding-name">{extension.name}</span>
+                    <span
+                      className={`badge attention-${
+                        extension.source === "sideloaded" ? "unusual" : "notable"
+                      }`}
+                    >
+                      {extension.source === "sideloaded"
+                        ? "not from a store"
+                        : "from a store"}
+                    </span>
+                  </div>
+
+                  <button
+                    className="finding-path"
+                    title="Open the containing folder"
+                    onClick={() => void api.reveal(extension.path)}
+                  >
+                    {extension.browser} · {extension.profile} · {extension.id}
+                  </button>
+
+                  {extension.notes.length > 0 && (
+                    <ul className="finding-reasons">
+                      {extension.notes.map((note) => (
+                        <li key={note}>{note}</li>
+                      ))}
+                    </ul>
+                  )}
+
+                  <dl className="finding-facts">
+                    <div>
+                      <dt>Version</dt>
+                      <dd>{extension.version || "not stated"}</dd>
+                    </div>
+                    {extension.added_days_ago !== null && (
+                      <div>
+                        <dt>Added</dt>
+                        <dd>
+                          {extension.added_days_ago === 0
+                            ? "today"
+                            : extension.added_days_ago === 1
+                              ? "yesterday"
+                              : `${extension.added_days_ago} days ago`}
+                        </dd>
+                      </div>
+                    )}
+                    {extension.hosts.length > 0 && (
+                      <div>
+                        <dt>Sites</dt>
+                        <dd>{extension.hosts.slice(0, 4).join(", ")}</dd>
+                      </div>
+                    )}
+                  </dl>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {all.length > flagged.length && (
+            <button className="link-button" onClick={() => setShowAll(!showAll)}>
+              {showAll
+                ? "Show only the ones worth reading"
+                : `Show all ${all.length} extensions`}
+            </button>
+          )}
+
+          {report.unreadable.length > 0 && (
+            <div className="notice notice-warn">
+              <ul className="concerns">
+                {report.unreadable.map((note) => (
+                  <li key={note}>{note}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </>
+      )}
+    </section>
+  );
 }
 
 const OBSERVATION_KINDS: Record<Observation["kind"], string> = {

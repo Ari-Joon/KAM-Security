@@ -17,6 +17,8 @@ use kam_firewall::connections::ConnectionReport;
 use kam_firewall::policy::FirewallReport;
 use kam_quarantine::{Manifest, MoveRecord};
 use kam_scanner::behaviour::Observation;
+use kam_scanner::extensions::Report as ExtensionReport;
+use kam_scanner::hardening::Report as HardeningReport;
 use kam_scanner::provenance::Report as ProvenanceReport;
 use kam_scanner::{DefenderStatus, Threat};
 use kam_storage::apps::LocationKind;
@@ -29,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -211,6 +213,12 @@ pub enum Request {
     /// uses to run unseen. Read-only, and never carries anything the agent acts
     /// on.
     GetBehaviourEvents,
+    /// Every browser extension installed for the calling user, and what each
+    /// one is allowed to read.
+    GetExtensions,
+    /// Which of Defender's Attack Surface Reduction rules are switched on, and
+    /// whether Controlled Folder Access is protecting anything.
+    GetHardening,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +322,8 @@ pub enum Response {
         /// When watching began, so "nothing seen" reads as "nothing since".
         since: Option<String>,
     },
+    Extensions(ExtensionReport),
+    Hardening(Box<HardeningReport>),
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {
         message: String,
@@ -415,6 +425,8 @@ mod tests {
             items: vec![manifest()],
         });
         round_trip(Response::Connections(Default::default()));
+        round_trip(Response::Extensions(Default::default()));
+        round_trip(Response::Hardening(Default::default()));
         round_trip(Response::BehaviourEvents {
             observations: Vec::new(),
             watching: true,

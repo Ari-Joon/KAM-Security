@@ -13,6 +13,8 @@
 
 pub mod behaviour;
 pub mod defender;
+pub mod extensions;
+pub mod hardening;
 pub mod persistence;
 pub mod provenance;
 pub mod signature;

@@ -17,6 +17,8 @@ import type {
   Volume,
   ProvenanceReport,
   BehaviourReport,
+  ExtensionReport,
+  HardeningReport,
   RuleReport,
   Verdict,
   FirewallReport,
@@ -46,6 +48,8 @@ export const api = {
   defenderStatus: () => invoke<DefenderReport>("defender_status"),
   defenderThreats: () => invoke<Threat[]>("defender_threats"),
   behaviourEvents: () => invoke<BehaviourReport>("behaviour_events"),
+  browserExtensions: () => invoke<ExtensionReport>("browser_extensions"),
+  hardening: () => invoke<HardeningReport>("hardening"),
   provenance: (job: string) =>
     invoke<ProvenanceReport | null>("survey_provenance", { job }),
   cancelJob: (job: string) => invoke<void>("cancel_job", { job }),

@@ -443,6 +443,26 @@ fn behaviour_events() -> Result<BehaviourReport, String> {
     }
 }
 
+/// Every browser extension installed, and what each one may read.
+#[tauri::command]
+fn browser_extensions() -> Result<kam_scanner::extensions::Report, String> {
+    match kam_ipc::client::call(&Request::GetExtensions).map_err(|e| e.to_string())? {
+        Response::Extensions(report) => Ok(report),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Which of Defender's free hardening rules are actually switched on.
+#[tauri::command]
+fn hardening() -> Result<kam_scanner::hardening::Report, String> {
+    match kam_ipc::client::call(&Request::GetHardening).map_err(|e| e.to_string())? {
+        Response::Hardening(report) => Ok(*report),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Judge every executable that starts itself or arrived from outside.
 ///
 /// Read-only by construction: the agent gathers evidence and says what it
@@ -715,6 +735,8 @@ pub fn run() {
             defender_status,
             defender_threats,
             behaviour_events,
+            browser_extensions,
+            hardening,
             survey_provenance,
             cancel_job,
             find_remnants,

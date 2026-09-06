@@ -2757,6 +2757,7 @@ dependencies = [
  "kam-core",
  "kam-storage",
  "serde",
+ "serde_json",
  "tracing",
  "windows 0.62.2",
 ]

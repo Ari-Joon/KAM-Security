@@ -603,3 +603,70 @@ export type Remnants = {
   /** Paths the agent declined to look at, reported rather than dropped. */
   refused: string[];
 };
+
+/**
+ * Browser extensions, and what each one is allowed to read.
+ *
+ * `notes` are the agent's sentences, not the interface's. An extension that
+ * reads every page is stating a fact about its permissions, not an accusation:
+ * ad blockers and password managers legitimately do exactly that.
+ */
+export type ExtensionSource = "store" | "sideloaded";
+
+export type BrowserExtension = {
+  browser: string;
+  profile: string;
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  permissions: string[];
+  hosts: string[];
+  source: ExtensionSource;
+  reads_every_page: boolean;
+  notes: string[];
+  path: string;
+  added_days_ago: number | null;
+};
+
+export type ExtensionReport = {
+  extensions: BrowserExtension[];
+  examined: string[];
+  unreadable: string[];
+};
+
+/**
+ * Defender's free hardening rules, and whether they are doing anything.
+ *
+ * `mode` is what Defender is set to do when the rule matches. Auditing writes
+ * an event and stops nothing, so the interface must not render it as protection.
+ */
+export type HardeningMode =
+  | "off"
+  | "block"
+  | "audit"
+  | "warn"
+  | { unknown: number };
+
+export type HardeningRule = {
+  id: string;
+  name: string;
+  explains: string;
+  mode: HardeningMode;
+  recommended: boolean;
+};
+
+export type FolderAccess =
+  | "off"
+  | "on"
+  | "audit_only"
+  | "block_disk_modification_only"
+  | "audit_disk_modification_only"
+  | "not_configured"
+  | "unreadable";
+
+export type HardeningReport = {
+  rules: HardeningRule[];
+  controlled_folder_access: FolderAccess | null;
+  unreadable: string[];
+};

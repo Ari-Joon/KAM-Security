@@ -650,6 +650,30 @@ pub fn handle(
             }
         }
 
+        Request::GetExtensions => {
+            let report = kam_scanner::extensions::survey(user);
+            // Audited: this is a deliberate examination of somebody's browsers,
+            // which belongs in the history of what was looked at.
+            context.audit(
+                "scanner",
+                "survey_extensions",
+                Effect::Observed,
+                format!(
+                    "read {} browser extensions across {}; {} worth reading",
+                    report.extensions.len(),
+                    report.examined.join(", "),
+                    report.worth_reading().count()
+                ),
+            );
+            Response::Extensions(report)
+        }
+
+        Request::GetHardening => {
+            // Not audited. It reads registry state and changes nothing, and the
+            // window shows it on every visit to the Scanner.
+            Response::Hardening(Box::new(kam_scanner::hardening::survey()))
+        }
+
         Request::NoteUninstallLaunched { name, command } => {
             // Effect::Changed, not Observed: the machine is about to change.
             // The wording says "launched" rather than "uninstalled" because
