@@ -23,9 +23,12 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
+      # Install scripts are ignored so a compromised transitive dependency
+      # cannot run code at install time. Nothing in the tree needs one; see the
+      # matching step in ci.yml.
       - name: Build the frontend
         working-directory: ui
-        run: npm ci --ignore-scripts && npm approve-scripts esbuild && npm run build
+        run: npm ci --ignore-scripts && npm run build
 
       - name: Build the agent
         run: cargo build --release -p kam-agent
