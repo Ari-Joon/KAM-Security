@@ -21,7 +21,7 @@ Create it **empty** — no README, licence or `.gitignore`, since this repo has
 all three and GitHub's versions would conflict.
 
 ```bash
-git remote add origin https://github.com/OWNER/kam-security.git
+git remote add origin https://github.com/Ari-Joon/KAM-Security.git
 ```
 
 ```bash

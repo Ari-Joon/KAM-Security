@@ -13,7 +13,7 @@ edition = "2021"
 rust-version = "1.91"
 authors = ["KAM Security contributors"]
 license = "Apache-2.0"
-repository = "https://github.com/OWNER/kam-security"
+repository = "https://github.com/Ari-Joon/KAM-Security"
 
 [workspace.dependencies]
 # Versions alongside the paths so these are not wildcard dependencies. Nothing
