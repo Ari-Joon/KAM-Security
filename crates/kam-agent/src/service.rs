@@ -17,8 +17,7 @@ use std::time::Duration;
 use kam_core::{Error, Result, SERVICE_NAME};
 use kam_ipc::pipe::PipeListener;
 use windows_service::service::{
-    ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
-    ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
+    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
     ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
@@ -176,9 +175,99 @@ fn serve_until_stopped(shutdown: &Shutdown) -> Result<()> {
     outcome
 }
 
-/// `ERROR_SERVICE_EXISTS`. Spelled out rather than pulling the whole `windows`
-/// crate into the agent for one integer.
+/// `ERROR_SERVICE_EXISTS`.
 const ERROR_SERVICE_EXISTS: i32 = 1073;
+
+/// Tell the service control manager to restart the agent if it ever falls over.
+///
+/// Written against `ChangeServiceConfig2W` directly rather than through
+/// `windows-service`, because that crate's `update_failure_actions` fails here
+/// with a bare "IO error in winapi call" and leaves the service with no recovery
+/// at all — silently, since the failure was treated as a note. Every install
+/// this product has ever done was missing its safety net, which matters more now
+/// that the agent is meant to be always on: a crashed agent stayed crashed until
+/// somebody noticed and rebooted.
+///
+/// The shape is Microsoft's own default for a protected service: two quick
+/// attempts, then a slower one, then leave it alone. A fault that survives three
+/// restarts will not be fixed by a fourth, and a service restarting for ever is
+/// its own kind of problem. The counter resets after a day of staying up.
+fn set_recovery_actions() -> Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Services::{
+        ChangeServiceConfig2W, CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_ACTION,
+        SC_ACTION_RESTART, SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_FAILURE_ACTIONSW,
+    };
+
+    const SC_MANAGER_CONNECT: u32 = 0x0001;
+    // Full access on the service handle rather than the two rights the
+    // documentation names.
+    //
+    // `SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG` is what the documentation
+    // implies is needed, and it is refused with ERROR_ACCESS_DENIED on this
+    // machine while `sc.exe failure` — running as the same administrator, doing
+    // the same thing — succeeds. sc.exe asks for everything, so this does too.
+    const SERVICE_ALL_ACCESS: u32 = 0xF01FF;
+
+    let name: Vec<u16> = SERVICE_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let manager = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT).map_err(
+            |error| Error::Privileged(format!("could not open the service manager: {error}")),
+        )?;
+
+        let service = OpenServiceW(manager, PCWSTR(name.as_ptr()), SERVICE_ALL_ACCESS);
+
+        let outcome = match service {
+            Ok(service) => {
+                // Held in a local so the pointer below stays valid for the call.
+                let mut actions = [
+                    SC_ACTION {
+                        Type: SC_ACTION_RESTART,
+                        Delay: 5_000,
+                    },
+                    SC_ACTION {
+                        Type: SC_ACTION_RESTART,
+                        Delay: 15_000,
+                    },
+                    SC_ACTION {
+                        Type: SC_ACTION_RESTART,
+                        Delay: 60_000,
+                    },
+                ];
+                let failure = SERVICE_FAILURE_ACTIONSW {
+                    dwResetPeriod: 86_400,
+                    // Null means "leave unchanged", which is what is wanted for
+                    // both: there is no reboot message and no command to run.
+                    lpRebootMsg: windows::core::PWSTR::null(),
+                    lpCommand: windows::core::PWSTR::null(),
+                    cActions: actions.len() as u32,
+                    lpsaActions: actions.as_mut_ptr(),
+                };
+
+                let result = ChangeServiceConfig2W(
+                    service,
+                    SERVICE_CONFIG_FAILURE_ACTIONS,
+                    Some(std::ptr::addr_of!(failure).cast()),
+                )
+                .map_err(|error| {
+                    Error::Privileged(format!("could not set the recovery actions: {error}"))
+                });
+                let _ = CloseServiceHandle(service);
+                result
+            }
+            Err(error) => Err(Error::Privileged(format!(
+                "could not open the service to set its recovery actions: {error}"
+            ))),
+        };
+
+        let _ = CloseServiceHandle(manager);
+        outcome
+    }
+}
 
 /// Register the agent with the service control manager. Requires elevation.
 pub fn install() -> Result<()> {
@@ -224,7 +313,18 @@ pub fn install() -> Result<()> {
     // A machine that already has the service is the common case when the start
     // type or image path needs correcting, and refusing there would mean
     // telling people to uninstall a security service to fix its configuration.
-    let service = match manager.create_service(&info, ServiceAccess::CHANGE_CONFIG) {
+    // `QUERY_CONFIG` as well as `CHANGE_CONFIG`, and it is load-bearing.
+    //
+    // Setting the failure actions reads the current ones first, so a handle
+    // that can only write fails the whole call — which is why every install
+    // printed "could not set restart-on-failure (IO error in winapi call)" and
+    // left the service with no recovery at all. The service came back from a
+    // reboot but would have stayed down after a crash, which is precisely the
+    // case the recovery actions exist for.
+    let service = match manager.create_service(
+        &info,
+        ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG,
+    ) {
         Ok(service) => service,
         Err(windows_service::Error::Winapi(error))
             if error.raw_os_error() == Some(ERROR_SERVICE_EXISTS) =>
@@ -252,27 +352,19 @@ pub fn install() -> Result<()> {
     // stays down after one crash is worse than useless: the interface reports
     // everything as unavailable and the machine looks unprotected when the
     // only thing wrong is a process that needs starting again.
-    let restart = |after: Duration| ServiceAction {
-        action_type: ServiceActionType::Restart,
-        delay: after,
-    };
-    if let Err(error) = service.update_failure_actions(ServiceFailureActions {
-        // Two quick attempts, then a longer one, then leave it alone: a fault
-        // that survives three restarts will not be fixed by a fourth, and a
-        // service restarting forever is its own kind of problem.
-        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
-        reboot_msg: None,
-        command: None,
-        actions: Some(vec![
-            restart(Duration::from_secs(5)),
-            restart(Duration::from_secs(15)),
-            restart(Duration::from_secs(60)),
-        ]),
-    }) {
-        // Not fatal. The service is installed and will run; it simply will not
-        // pick itself up automatically, which is worth saying rather than
-        // failing the whole install over.
-        println!("note: could not set restart-on-failure ({error})");
+    //
+    // Loud rather than quiet when it fails. The previous version printed a
+    // one-line note and moved on, and so every install silently had no recovery
+    // at all -- which nobody noticed until the service was expected to be
+    // always on.
+    match set_recovery_actions() {
+        Ok(()) => println!("recovery: restart after 5s, 15s, then 60s"),
+        Err(error) => {
+            println!("WARNING: {error}");
+            println!("WARNING: the agent will NOT restart itself if it crashes.");
+            println!("         Set it by hand with:");
+            println!("           sc failure {SERVICE_NAME} reset= 86400 actions= restart/5000/restart/15000/restart/60000");
+        }
     }
 
     println!("installed {SERVICE_NAME} ({DISPLAY_NAME})");

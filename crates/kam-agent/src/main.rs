@@ -40,17 +40,35 @@ pub enum Mode {
     Uninstall,
     /// Run the weekly check once and exit. What the scheduled task starts.
     Check,
+    /// Report what decoys are planted and what has read one.
+    Canaries,
+    /// Plant the decoys and switch on Windows' auditing of them.
+    CanariesOn,
+    /// Take the decoys away and switch the auditing back off.
+    CanariesOff,
+    /// Report whether the protective work is running.
+    Protection,
+    /// Switch the protective work on.
+    ProtectionOn,
+    /// Switch the protective work off. The service keeps running.
+    ProtectionOff,
 }
 
 const USAGE: &str = "\
 usage: kam-agent <mode>
 
-  --console     run in the foreground for development
-  --service     run under the service control manager (set by --install)
-  --probe       ask a running agent for its status and exit
-  --install     register the service; requires elevation
-  --uninstall   stop and remove the service; requires elevation
-  --check       run the weekly check once and exit";
+  --console       run in the foreground for development
+  --service       run under the service control manager (set by --install)
+  --probe         ask a running agent for its status and exit
+  --install       register the service; requires elevation
+  --uninstall     stop and remove the service; requires elevation
+  --check         run the weekly check once and exit
+  --canaries      report the decoy files and keys, and anything that read one
+  --canaries-on   plant the decoys and record reads of them
+  --canaries-off  remove the decoys and stop recording
+  --protection    report whether the protective work is running
+  --protection-on   switch the protective work on
+  --protection-off  switch it off (the service keeps running)";
 
 fn main() -> ExitCode {
     let mode = match parse_mode() {
@@ -81,6 +99,12 @@ fn run(mode: Mode) -> kam_core::Result<()> {
         Mode::Install => return service::install(),
         Mode::Uninstall => return service::uninstall(),
         Mode::Check => return run_check(),
+        Mode::Canaries => return run_canaries(None),
+        Mode::CanariesOn => return run_canaries(Some(true)),
+        Mode::CanariesOff => return run_canaries(Some(false)),
+        Mode::Protection => return run_protection(None),
+        Mode::ProtectionOn => return run_protection(Some(true)),
+        Mode::ProtectionOff => return run_protection(Some(false)),
         Mode::Console | Mode::Service => {}
     }
 
@@ -168,6 +192,122 @@ fn run_check() -> kam_core::Result<()> {
     Ok(())
 }
 
+/// Report or change whether the protective work is running.
+///
+/// The same thin-client shape as the rest: the agent holds the setting, because
+/// it is the thing that acts on it. Switching it off never stops the service —
+/// something has to remain to switch it back on, and a security tool that can be
+/// silenced through its own interface is one an attacker silences.
+fn run_protection(set: Option<bool>) -> kam_core::Result<()> {
+    let request = match set {
+        Some(enabled) => kam_ipc::Request::SetProtection { enabled },
+        None => kam_ipc::Request::GetProtection,
+    };
+    match kam_ipc::client::call(&request)? {
+        kam_ipc::Response::Protection { enabled } => {
+            if enabled {
+                println!("Protection is ON. The agent is watching.");
+            } else {
+                println!("Protection is OFF. Nothing is being watched.");
+                println!("The service is still running, so this can be switched back on.");
+            }
+            Ok(())
+        }
+        kam_ipc::Response::Error { message } => Err(kam_core::Error::Refused(message)),
+        other => Err(kam_core::Error::Protocol(format!(
+            "the agent answered with {other:?}"
+        ))),
+    }
+}
+
+/// Turn the decoys on or off, or just report on them.
+///
+/// A thin client over the pipe, exactly as `--check` is: the agent does the
+/// work, because planting decoys and changing the machine's audit policy both
+/// need privileges this process does not have when a person runs it by hand.
+///
+/// It exists so the decoys can be driven from a terminal rather than only from
+/// the window -- useful on a machine nobody is sitting at, and useful for
+/// seeing plainly what was turned on.
+fn run_canaries(set: Option<bool>) -> kam_core::Result<()> {
+    if let Some(planted) = set {
+        // Auditing first when switching on, so a decoy is never planted into a
+        // machine that is not recording reads yet; and last when switching off,
+        // so the decoys are gone before the recording stops.
+        if planted {
+            let _ = kam_ipc::client::call(&kam_ipc::Request::SetCanaryAuditing { enabled: true })?;
+        }
+        let _ = kam_ipc::client::call(&kam_ipc::Request::SetCanaries { planted })?;
+        if !planted {
+            let _ = kam_ipc::client::call(&kam_ipc::Request::SetCanaryAuditing { enabled: false })?;
+        }
+    }
+
+    let reply = kam_ipc::client::call(&kam_ipc::Request::GetCanaries)?;
+    let report = match reply {
+        kam_ipc::Response::Canaries(report) => report,
+        kam_ipc::Response::Error { message } => return Err(kam_core::Error::Refused(message)),
+        other => {
+            return Err(kam_core::Error::Protocol(format!(
+                "the agent answered with {other:?}"
+            )))
+        }
+    };
+
+    if report.canaries.is_empty() {
+        println!("No decoys are planted.");
+    } else {
+        let armed = report.canaries.iter().filter(|c| c.armed).count();
+        println!(
+            "{} decoys planted, {armed} of them watched. Windows auditing is {}.",
+            report.canaries.len(),
+            if report.auditing { "on" } else { "OFF" }
+        );
+        for canary in &report.canaries {
+            println!(
+                "  [{}] {} {}",
+                if canary.armed { "watched" } else { "  ---  " },
+                canary.path,
+                canary
+                    .problem
+                    .as_deref()
+                    .map(|problem| format!("({problem})"))
+                    .unwrap_or_default()
+            );
+        }
+        if !report.auditing {
+            println!(
+                "
+Auditing is off, so reading one of these would go unnoticed.                  Turn it on with --canaries-on."
+            );
+        }
+    }
+
+    if report.trips.is_empty() {
+        println!("Nothing has read one.");
+    } else {
+        println!(
+            "
+{} read(s) recorded:",
+            report.trips.len()
+        );
+        for trip in &report.trips {
+            println!(
+                "  {} — {} read by {} (as {})",
+                trip.at,
+                trip.path,
+                trip.process.as_deref().unwrap_or("an unnamed program"),
+                trip.user.as_deref().unwrap_or("an unnamed account")
+            );
+        }
+    }
+
+    for problem in &report.problems {
+        println!("note: {problem}");
+    }
+    Ok(())
+}
+
 fn parse_mode() -> Result<Mode, String> {
     let mut mode = None;
     for argument in std::env::args().skip(1) {
@@ -178,6 +318,12 @@ fn parse_mode() -> Result<Mode, String> {
             "--install" => Mode::Install,
             "--uninstall" => Mode::Uninstall,
             kam_schedule::CHECK_ARGUMENT => Mode::Check,
+            "--canaries" => Mode::Canaries,
+            "--protection" => Mode::Protection,
+            "--protection-on" => Mode::ProtectionOn,
+            "--protection-off" => Mode::ProtectionOff,
+            "--canaries-on" => Mode::CanariesOn,
+            "--canaries-off" => Mode::CanariesOff,
             other => return Err(format!("unrecognised argument: {other}")),
         };
         if mode.is_some_and(|existing| existing != parsed) {

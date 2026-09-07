@@ -66,7 +66,7 @@ mod registry;
 
 pub use audit::{auditing_enabled, set_auditing};
 pub use events::Trip;
-pub use registry::{RegistryDecoy, REGISTRY_DECOYS};
+pub use registry::{RegistryDecoy, REGISTRY_DECOYS, REGISTRY_DECOYS_ENABLED};
 
 /// Written inside every canary. Removal refuses to delete a file without it,
 /// which is what stops this ever removing something of the user's.
@@ -335,7 +335,14 @@ pub fn plant(user: &UserContext) -> Report {
 }
 
 /// Create the registry decoys, with the same rules the files follow.
+///
+/// Held back behind `REGISTRY_DECOYS_ENABLED` while the keys disappear from
+/// everything except the agent that wrote them. See the flag for what was
+/// observed and why claiming them would be worse than not having them.
 fn plant_registry(user: &UserContext, report: &mut Report) {
+    if !REGISTRY_DECOYS_ENABLED {
+        return;
+    }
     for decoy in REGISTRY_DECOYS {
         if registry::exists(user, decoy) && !registry::is_ours(user, decoy) {
             report.problems.push(format!(
@@ -346,9 +353,35 @@ fn plant_registry(user: &UserContext, report: &mut Report) {
         }
         if !registry::exists(user, decoy) {
             if let Err(error) = registry::plant(user, decoy) {
+                tracing::warn!(
+                    key = %registry::display_name(user, decoy),
+                    %error,
+                    "a decoy key could not be planted"
+                );
                 report.problems.push(error.to_string());
                 continue;
             }
+        }
+
+        // Read it back before claiming anything.
+        //
+        // This is not belt and braces, it is the lesson from a real failure: the
+        // create call reported success, nothing was written, and the product
+        // then told its owner that three decoys were planted and watched when
+        // none existed. A security tool claiming protection it does not have is
+        // worse than one with a missing feature, because the person stops
+        // looking. So what is reported is what was read back, not what was
+        // attempted.
+        if !registry::is_ours(user, decoy) {
+            tracing::warn!(
+                key = %registry::display_name(user, decoy),
+                "a decoy key reported itself planted but could not be read back"
+            );
+            report.problems.push(format!(
+                "{} was not created. The decoy is not in place, so nothing is watching it.",
+                registry::display_name(user, decoy)
+            ));
+            continue;
         }
 
         let object = registry::object_name(user, decoy);
@@ -407,6 +440,8 @@ pub fn remove(user: &UserContext) -> (usize, Vec<String>) {
         }
     }
 
+    // Removal is not gated: a machine that was given decoys by an earlier build
+    // must still be able to get rid of them.
     for decoy in REGISTRY_DECOYS {
         if !registry::exists(user, decoy) {
             continue;
@@ -434,11 +469,13 @@ fn watched_names(user: &UserContext) -> Vec<String> {
     // writes into the event depends on the account, and resolving it needs a SID
     // the shell does not have — but every decoy's own name is in the tail, so
     // matching there works whoever is asking.
-    names.extend(
-        REGISTRY_DECOYS
-            .iter()
-            .map(|decoy| decoy.relative.to_lowercase()),
-    );
+    if REGISTRY_DECOYS_ENABLED {
+        names.extend(
+            REGISTRY_DECOYS
+                .iter()
+                .map(|decoy| decoy.relative.to_lowercase()),
+        );
+    }
     names
 }
 
@@ -472,7 +509,7 @@ pub fn status(user: &UserContext) -> Report {
     // Read-only, deliberately. Reporting what is planted must never plant
     // anything: the window polls this every few seconds, and a status call that
     // created keys would put decoys on a machine whose owner never asked.
-    for decoy in REGISTRY_DECOYS {
+    for decoy in REGISTRY_DECOYS.iter().filter(|_| REGISTRY_DECOYS_ENABLED) {
         if !registry::is_ours(user, decoy) {
             continue;
         }
@@ -596,6 +633,11 @@ mod tests {
 
     #[test]
     fn a_file_that_is_not_ours_is_never_overwritten_or_removed() {
+        // Guarded because this plants and removes, which reaches the registry
+        // decoys too. It is about files, but `plant` does both — and leaving it
+        // unguarded made `planting_twice_is_harmless` fail about one run in
+        // three, which is the sort of flake that gets a suite ignored.
+        let _guard = registry::hive_guard();
         // The rule that matters most. These paths are chosen to look like
         // things people really keep, so being wrong here would destroy
         // somebody's actual password vault.
@@ -637,6 +679,7 @@ mod tests {
     #[test]
     #[ignore = "changes the machine's audit policy and writes into the real profile"]
     fn a_read_of_a_real_canary_is_caught_and_names_the_reader() {
+        let _guard = registry::hive_guard();
         // The whole mechanism, end to end, on this machine: plant, arm, switch
         // on auditing, read one, and see it come back with the process named.
         //

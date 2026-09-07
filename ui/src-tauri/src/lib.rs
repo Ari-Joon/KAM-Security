@@ -463,6 +463,30 @@ fn hardening() -> Result<kam_scanner::hardening::Report, String> {
     }
 }
 
+/// Whether the protective work is running.
+#[tauri::command]
+fn protection() -> Result<bool, String> {
+    match kam_ipc::client::call(&Request::GetProtection).map_err(|e| e.to_string())? {
+        Response::Protection { enabled } => Ok(enabled),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Turn the protective work on or off.
+///
+/// The service keeps running either way. That is the point: it has to still be
+/// there to be switched back on, and a security tool that could be shut down
+/// over its own interface is one an attacker shuts down.
+#[tauri::command]
+fn set_protection(enabled: bool) -> Result<bool, String> {
+    match kam_ipc::client::call(&Request::SetProtection { enabled }).map_err(|e| e.to_string())? {
+        Response::Protection { enabled } => Ok(enabled),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// What decoys are planted, and anything that has read one.
 #[tauri::command]
 fn canaries() -> Result<kam_canary::Report, String> {
@@ -772,6 +796,8 @@ pub fn run() {
             behaviour_events,
             browser_extensions,
             hardening,
+            protection,
+            set_protection,
             canaries,
             set_canaries,
             set_canary_auditing,

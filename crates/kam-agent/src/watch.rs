@@ -104,6 +104,14 @@ impl Log {
         }
     }
 
+    /// Whether the watch is currently live.
+    pub fn is_watching(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| inner.watching)
+            .unwrap_or(false)
+    }
+
     /// The observations recorded, newest first, and whether the watch is live.
     pub fn snapshot(&self) -> (Vec<Observation>, bool, Option<String>) {
         match self.inner.lock() {
@@ -227,13 +235,45 @@ fn run(log: Log, running_as_service: bool, shutdown: Shutdown) {
         }
     };
 
-    log.begin();
+    // Deliberately not begun here. Whether the watch is live is decided by the
+    // switch below, and saying "watching" before checking it meant an agent
+    // started with the protection off still reported itself as watching — which
+    // the window shows as "Watching since ...", a sentence that was not true.
     let mut baseline: HashSet<String> = HashSet::new();
     let mut canaries_seen: HashSet<String> = HashSet::new();
     let mut first_pass = true;
     tracing::info!("behaviour watcher started");
 
     loop {
+        // Honour the switch. The service keeps running either way -- it has to,
+        // or there would be nothing left to switch it back on -- but when the
+        // protection is off it stops looking, and the baseline is dropped so
+        // that turning it back on learns the machine as it is now rather than
+        // reporting everything installed in the meantime as a fresh arrival.
+        let protecting = store
+            .as_ref()
+            .is_none_or(|store| store.protection_enabled());
+        if !protecting {
+            // Keyed off what the log says rather than off the baseline, so the
+            // state is right on the very first pass too.
+            if log.is_watching() || !baseline.is_empty() {
+                tracing::info!("protection is off; the watcher is standing down");
+                baseline.clear();
+                canaries_seen.clear();
+                first_pass = true;
+                log.stop();
+            }
+            if wait(&shutdown, store.as_ref(), false) {
+                tracing::info!("behaviour watcher stopped");
+                return;
+            }
+            continue;
+        }
+        if !log.is_watching() {
+            log.begin();
+            tracing::info!("protection is on; the watcher is looking again");
+        }
+
         let mut observations = sweep(&mut baseline, first_pass);
         observations.extend(canary_trips(&mut canaries_seen, first_pass));
         first_pass = false;
@@ -251,18 +291,45 @@ fn run(log: Log, running_as_service: bool, shutdown: Shutdown) {
             log.push(observation);
         }
 
-        // Sleep in short steps so a stop is prompt rather than up to two minutes
-        // late. The accept loop is woken by a pipe poke it cannot miss; this
-        // thread has no such handle, so it checks the flag every second.
-        for _ in 0..INTERVAL.as_secs() {
-            if shutdown.is_signalled() {
-                log.stop();
-                tracing::info!("behaviour watcher stopped");
-                return;
-            }
-            std::thread::sleep(Duration::from_secs(1));
+        if wait(&shutdown, store.as_ref(), true) {
+            log.stop();
+            tracing::info!("behaviour watcher stopped");
+            return;
         }
     }
+}
+
+/// Sleep until the next sweep, a stop, or the switch being flipped.
+///
+/// Returns true when the caller should stop altogether.
+///
+/// Three things have to be able to interrupt the wait, and the reasons differ.
+/// A stop must be prompt or `sc stop` appears to hang. The switch must be prompt
+/// because the window says "nothing is being watched" the moment it is turned
+/// off, and that sentence has to be true when it is written rather than up to
+/// two minutes later. The interval itself is the ordinary case.
+///
+/// The setting is re-read every few seconds rather than every second: it is a
+/// small indexed read, but this is a service that makes a point of costing
+/// nothing while idle, and nobody can tell the difference between one second and
+/// five when flicking a switch.
+fn wait(shutdown: &Shutdown, store: Option<&Store>, protecting_now: bool) -> bool {
+    const CHECK_EVERY: u64 = 5;
+
+    for elapsed in 0..INTERVAL.as_secs() {
+        if shutdown.is_signalled() {
+            return true;
+        }
+        if elapsed % CHECK_EVERY == 0 {
+            if let Some(store) = store {
+                if store.protection_enabled() != protecting_now {
+                    return false;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    false
 }
 
 /// Write one observation into the audit log.

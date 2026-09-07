@@ -674,6 +674,37 @@ pub fn handle(
             Response::Hardening(Box::new(kam_scanner::hardening::survey()))
         }
 
+        Request::GetProtection => Response::Protection {
+            enabled: context.store.protection_enabled(),
+        },
+
+        Request::SetProtection { enabled } => {
+            match context.store.set_protection_enabled(enabled) {
+                Ok(()) => {
+                    // Recorded as a change, both ways. Somebody turning the
+                    // protection off is exactly the entry a person reading this
+                    // log later wants to find.
+                    context.audit(
+                        "protection",
+                        if enabled { "enable" } else { "disable" },
+                        Effect::Changed,
+                        format!(
+                            "the protective work was switched {}",
+                            if enabled { "on" } else { "off" }
+                        ),
+                    );
+                    Response::Protection { enabled }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "could not record the protection setting");
+                    Response::Error {
+                        message: "the setting could not be saved, so nothing was changed"
+                            .to_owned(),
+                    }
+                }
+            }
+        }
+
         Request::GetCanaries => Response::Canaries(Box::new(kam_canary::status(user))),
 
         Request::SetCanaries { planted } => {

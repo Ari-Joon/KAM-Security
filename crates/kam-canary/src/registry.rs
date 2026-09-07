@@ -60,6 +60,38 @@ pub struct RegistryDecoy {
     pub values: &'static [(&'static str, &'static str)],
 }
 
+/// Whether registry decoys are planted at all.
+///
+/// **Off, because the feature does not work and shipping it would be a lie.**
+///
+/// What was observed on 7 September 2026, on a machine where the file canaries
+/// work perfectly:
+///
+/// - The agent creates the keys and every check it makes agrees they are there.
+///   `RegCreateKeyExW` reports success, `RegOpenKeyExW` reopens them, and the
+///   marker value reads back.
+/// - The kernel agrees too: it writes audit events for successful opens of
+///   those exact paths, which it would not do for an object that did not exist.
+/// - Nothing else on the machine can see them. `Test-Path`, `reg.exe` and
+///   .NET's `OpenSubKey` all report the leaf missing — `OpenSubKey` returns
+///   null rather than throwing, so this is genuinely "not found" and not a
+///   permissions problem. The parent key enumerates zero subkeys.
+///
+/// The root cause is not understood. What is understood is the consequence: if
+/// the account's own tools cannot see the key, then an infostealer running as
+/// that account cannot see it either. A decoy nothing can find is never read,
+/// and a canary that is never read is not protection — it is a line in the
+/// interface claiming protection that does not exist, which is worse than the
+/// feature being absent, because it stops somebody looking further.
+///
+/// The code, the tests and the audit plumbing all stay: the registry half of
+/// the audit policy is still switched on, the event matching still handles the
+/// kernel's `\REGISTRY\USER\<sid>\…` naming, and
+/// `planting_through_the_users_hive_round_trips` still covers the agent's path.
+/// Only the planting is held back, behind this one flag, until the disappearing
+/// keys are explained.
+pub const REGISTRY_DECOYS_ENABLED: bool = false;
+
 /// The decoys, and why each path is the one a thief reads.
 ///
 /// The subkey names say what they are. A stealer enumerates every session under
@@ -195,11 +227,15 @@ pub fn plant(user: &UserContext, decoy: &RegistryDecoy) -> Result<()> {
         );
         if status != ERROR_SUCCESS {
             return Err(Error::Privileged(format!(
-                "{} could not be created (error {})",
+                "{} could not be created (Windows error {})",
                 display_name(user, decoy),
                 status.0
             )));
         }
+        tracing::debug!(
+            key = %display_name(user, decoy),
+            "created a decoy key"
+        );
 
         let write = |name: &str, value: &str| {
             let name = wide(name);
@@ -360,6 +396,60 @@ mod tests {
 
         remove(&user, decoy).expect("our own key should be removable");
         assert!(!exists(&user, decoy), "the key survived removal");
+    }
+
+    /// The account's own SID, when the caller supplies it.
+    ///
+    /// There is no API here for "who am I", and the agent never needs one — it
+    /// takes the SID off the pipe. So the test is handed one instead, and skips
+    /// when it is not given.
+    fn test_sid() -> Option<String> {
+        std::env::var("KAM_TEST_SID")
+            .ok()
+            .filter(|sid| !sid.is_empty())
+    }
+
+    #[test]
+    fn planting_through_the_users_hive_round_trips() {
+        // The path the agent actually takes, and the one the other round-trip
+        // test does not cover: the agent runs as LocalSystem and reaches a
+        // person's keys through `HKEY_USERS\<sid>` rather than
+        // `HKEY_CURRENT_USER`, because its own current user is SYSTEM.
+        //
+        // That difference is exactly where a bug hid: everything reported itself
+        // as planted and watched while nothing had been created.
+        let Some(sid) = test_sid() else {
+            println!("KAM_TEST_SID not set; skipping the HKEY_USERS path");
+            return;
+        };
+        let _guard = hive_guard();
+
+        let user = UserContext::new(Some(sid.clone()), r"C:\Users\ignored");
+        let decoy = &REGISTRY_DECOYS[0];
+
+        if exists(&user, decoy) && !is_ours(&user, decoy) {
+            println!("something is already there; skipping");
+            return;
+        }
+
+        plant(&user, decoy).expect("the agent's own path should create the key");
+        assert!(
+            exists(&user, decoy),
+            "plant reported success but {} does not exist",
+            display_name(&user, decoy)
+        );
+        assert!(
+            is_ours(&user, decoy),
+            "the key exists but was not recognised as ours"
+        );
+
+        remove(&user, decoy).expect("our own key should be removable");
+        assert!(!exists(&user, decoy), "the key survived removal");
+        assert!(
+            !is_ours(&user, decoy),
+            "a removed key must not still report as ours -- this is the check \
+             that catches a planting failure being reported as success"
+        );
     }
 
     #[test]

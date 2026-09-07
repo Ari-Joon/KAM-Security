@@ -26,6 +26,15 @@ use windows::Win32::System::EventLog::{
 /// turns over quickly, and a canary that was read will be near the top.
 const MAX_EVENTS: usize = 400;
 
+/// How many reads to hand back, after collapsing the duplicates.
+///
+/// Reading one file produces several 4663 events — Windows writes one per access
+/// right exercised — so a single open of a single decoy can appear four or five
+/// times. Left alone, one afternoon of testing filled the list with four hundred
+/// rows describing about twenty actual reads, which is not a thing anybody can
+/// read.
+const MAX_TRIPS: usize = 50;
+
 /// Windows components whose job is to read every file on the machine.
 ///
 /// This list exists because of what the first end-to-end test actually caught:
@@ -64,7 +73,27 @@ fn routine(process: Option<&str>) -> bool {
         return false;
     };
     let lower = process.to_lowercase().replace('/', "\\");
-    ROUTINE_READERS.iter().any(|known| lower.ends_with(known))
+    ROUTINE_READERS.iter().any(|known| lower.ends_with(known)) || is_ourselves(&lower)
+}
+
+/// Whether the reader was this very program.
+///
+/// It has to be, and finding out the hard way was instructive: checking whether
+/// a decoy is still ours means reading it, that read is audited like any other,
+/// and so the agent reported *itself* rifling through the documents — as a
+/// strong concern, once every two minutes, for ever. A canary that cries wolf
+/// about its own guardian trains somebody to ignore the one alert that matters.
+///
+/// Matched on the full image path rather than the file name, so that something
+/// merely *called* `kam-agent.exe` somewhere else is still reported. If an
+/// attacker can replace the binary at its real installed path then the canaries
+/// are not what stands between you and them.
+fn is_ourselves(lowered_process: &str) -> bool {
+    let Ok(me) = std::env::current_exe() else {
+        return false;
+    };
+    let me = me.to_string_lossy().to_lowercase().replace('/', "\\");
+    !me.is_empty() && lowered_process == me
 }
 
 /// Something read a canary.
@@ -241,7 +270,35 @@ pub fn trips(paths: &[String]) -> Vec<Trip> {
         let _ = EvtClose(results);
     }
 
-    found
+    collapse(found)
+}
+
+/// Collapse the several events one read produces into one row.
+///
+/// Windows writes a 4663 per access right exercised, so opening one decoy once
+/// yields four or five identical-looking events within the same second. The key
+/// here is the second, the file and the program — which keeps two genuinely
+/// separate reads apart while folding one read's worth of noise together.
+fn collapse(trips: Vec<Trip>) -> Vec<Trip> {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept = Vec::new();
+    for trip in trips {
+        // Timestamps are ISO 8601, so truncating at the decimal point is the
+        // whole second without any parsing.
+        let second = trip.at.split('.').next().unwrap_or(&trip.at).to_owned();
+        let key = format!(
+            "{second}\u{0}{}\u{0}{}",
+            trip.path.to_lowercase(),
+            trip.process.as_deref().unwrap_or_default().to_lowercase()
+        );
+        if seen.insert(key) {
+            kept.push(trip);
+            if kept.len() >= MAX_TRIPS {
+                break;
+            }
+        }
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -333,6 +390,27 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_does_not_report_its_own_status_checks() {
+        // Checking a decoy means reading it, and that read is audited like any
+        // other. Without this the product reported itself as a thief every two
+        // minutes.
+        let me = std::env::current_exe().unwrap();
+        assert!(routine(Some(&me.to_string_lossy())));
+        // Upper case, and forward slashes, must not defeat it.
+        assert!(routine(Some(&me.to_string_lossy().to_uppercase())));
+    }
+
+    #[test]
+    fn something_merely_named_like_us_elsewhere_is_still_reported() {
+        // The match is on the whole installed path, not the file name, so a
+        // copy planted somewhere else does not inherit the exemption.
+        assert!(!routine(Some(
+            r"C:\Users\me\AppData\Local\Temp\kam-agent.exe"
+        )));
+        assert!(!routine(Some(r"D:\elsewhere\kam-shell.exe")));
+    }
+
+    #[test]
     fn anything_else_reading_a_decoy_is_still_reported() {
         // The signal this whole feature exists for must survive the filter.
         assert!(!routine(Some(r"C:\Users\me\AppData\Local\Temp\thing.exe")));
@@ -343,6 +421,58 @@ mod tests {
         assert!(!routine(None));
         // A name that merely ends in something similar must not slip through.
         assert!(!routine(Some(r"C:\Users\me\notsearchindexer.exe")));
+    }
+
+    #[test]
+    fn one_read_reported_several_times_collapses_to_one_row() {
+        // What Windows actually writes: several events for one open, differing
+        // only in which access right was exercised.
+        let one = |at: &str, path: &str, process: &str| Trip {
+            at: at.to_owned(),
+            path: path.to_owned(),
+            process: Some(process.to_owned()),
+            process_id: Some("0x1".to_owned()),
+            user: Some("akcar".to_owned()),
+        };
+        let collapsed = collapse(vec![
+            one("2026-09-06T20:41:07.0242280Z", r"C:\decoy", "thief.exe"),
+            one("2026-09-06T20:41:07.0235908Z", r"C:\decoy", "thief.exe"),
+            one("2026-09-06T20:41:07.0229571Z", r"C:\decoy", "thief.exe"),
+        ]);
+        assert_eq!(collapsed.len(), 1, "one read should be one row");
+    }
+
+    #[test]
+    fn two_genuinely_separate_reads_are_both_kept() {
+        // The signal must survive the collapsing: a second read a minute later,
+        // or by a different program, is a different thing worth seeing.
+        let one = |at: &str, process: &str| Trip {
+            at: at.to_owned(),
+            path: r"C:\decoy".to_owned(),
+            process: Some(process.to_owned()),
+            process_id: None,
+            user: None,
+        };
+        let collapsed = collapse(vec![
+            one("2026-09-06T20:41:07.1Z", "thief.exe"),
+            one("2026-09-06T20:42:11.1Z", "thief.exe"),
+            one("2026-09-06T20:41:07.1Z", "other.exe"),
+        ]);
+        assert_eq!(collapsed.len(), 3, "{collapsed:#?}");
+    }
+
+    #[test]
+    fn the_list_stays_short_enough_to_read() {
+        let many: Vec<Trip> = (0..500)
+            .map(|index| Trip {
+                at: format!("2026-09-06T20:41:{:02}.0Z", index % 60),
+                path: format!(r"C:\decoy-{index}"),
+                process: None,
+                process_id: None,
+                user: None,
+            })
+            .collect();
+        assert_eq!(collapse(many).len(), MAX_TRIPS);
     }
 
     #[test]

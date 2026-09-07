@@ -15,7 +15,7 @@ use crate::audit::{AuditLog, Effect, Entry, Record};
 use crate::{Error, Result};
 
 /// Bumped whenever the schema below changes. Stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE audit (
@@ -40,6 +40,25 @@ BEGIN
     SELECT RAISE(ABORT, 'the audit log is append-only');
 END;
 ";
+
+/// Settings, which unlike the audit log are meant to be changed.
+///
+/// A separate table for a reason that is easy to miss: the audit table carries
+/// triggers refusing every UPDATE and DELETE, so it physically cannot hold a
+/// value that changes. Anything mutable needs somewhere else to live.
+const SCHEMA_V2: &str = "
+CREATE TABLE settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+";
+
+/// Whether the protective work is running, as stored in `settings`.
+///
+/// Absent means on. A machine that has never been told otherwise is protected,
+/// which is the only sensible default for a security tool and means an
+/// unreadable or half-written setting cannot quietly leave somebody exposed.
+pub const PROTECTION_SETTING: &str = "protection_enabled";
 
 pub struct Store {
     connection: Mutex<Connection>,
@@ -82,6 +101,46 @@ impl Store {
         Ok(Self {
             connection: Mutex::new(connection),
         })
+    }
+
+    /// Read one setting. `None` when it has never been written.
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare("SELECT value FROM settings WHERE key = ?1")
+            .map_err(to_db_error)?;
+        let mut rows = statement.query(params![key]).map_err(to_db_error)?;
+        match rows.next().map_err(to_db_error)? {
+            Some(row) => Ok(Some(row.get(0).map_err(to_db_error)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Write one setting, replacing any previous value.
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map_err(to_db_error)?;
+        Ok(())
+    }
+
+    /// Whether the protective work is switched on. Defaults to on.
+    pub fn protection_enabled(&self) -> bool {
+        // Any failure reads as "on". Refusing to protect because a setting
+        // could not be read would be the wrong way round.
+        !matches!(
+            self.setting(PROTECTION_SETTING).ok().flatten().as_deref(),
+            Some("off")
+        )
+    }
+
+    pub fn set_protection_enabled(&self, enabled: bool) -> Result<()> {
+        self.set_setting(PROTECTION_SETTING, if enabled { "on" } else { "off" })
     }
 
     /// Most recent entries first. This is what the UI's activity view reads.
@@ -170,6 +229,9 @@ fn migrate(connection: &Connection) -> Result<()> {
     if current < 1 {
         connection.execute_batch(SCHEMA_V1).map_err(to_db_error)?;
     }
+    if current < 2 {
+        connection.execute_batch(SCHEMA_V2).map_err(to_db_error)?;
+    }
 
     connection
         .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -220,6 +282,32 @@ mod tests {
             .execute("UPDATE audit SET detail = 'tampered'", [])
             .is_err());
         assert!(connection.execute("DELETE FROM audit", []).is_err());
+    }
+
+    #[test]
+    fn protection_is_on_until_it_is_switched_off() {
+        // The default matters more than most: a store that has never been
+        // written, or one that cannot be read, must leave the machine protected.
+        let store = Store::open_in_memory().unwrap();
+        assert!(
+            store.protection_enabled(),
+            "a fresh store must be protected"
+        );
+
+        store.set_protection_enabled(false).unwrap();
+        assert!(!store.protection_enabled());
+
+        store.set_protection_enabled(true).unwrap();
+        assert!(store.protection_enabled());
+    }
+
+    #[test]
+    fn a_setting_can_be_rewritten_unlike_an_audit_row() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.setting("thing").unwrap(), None);
+        store.set_setting("thing", "one").unwrap();
+        store.set_setting("thing", "two").unwrap();
+        assert_eq!(store.setting("thing").unwrap().as_deref(), Some("two"));
     }
 
     #[test]

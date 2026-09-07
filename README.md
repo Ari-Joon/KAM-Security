@@ -355,6 +355,33 @@ narrower than it sounds — the subcategory only produces events for objects
 carrying a SACL, and almost nothing on a normal machine does, so five decoys do
 not make a noisy Security log.
 
+### Always on, and one switch to stop it
+
+The agent is a Windows service: automatic start, LocalSystem, and set to restart
+itself 5 seconds, 15 seconds and 60 seconds after a crash. Closing the window
+does not stop it, and neither does signing out. There is nothing to remember to
+launch.
+
+It can be stopped in exactly two places. **Overview → Protection** has a switch,
+and turning it off stops the watching within a few seconds. That does *not* stop
+the service, on purpose twice over: something has to remain running to switch it
+back on, and a security tool that can be silenced through its own interface is
+one an attacker silences. Stopping the service itself takes Task Manager or an
+administrator, which is a deliberate act by somebody already in charge of the
+machine.
+
+The same switch is available headlessly:
+
+```
+kam-agent.exe --protection
+kam-agent.exe --protection-off
+kam-agent.exe --protection-on
+```
+
+The setting is remembered across restarts, and a store that has never been
+written — or cannot be read — reads as *on*. Failing closed is the wrong default
+for a light switch and the right one for this.
+
 ### The registry gets decoys too
 
 Documents are only half of where a thief looks. Several programs people rely on
@@ -377,6 +404,22 @@ somebody's own session, and each is named `KAM-Security-decoy-do-not-use` so tha
 a person who finds one in their own PuTTY list can tell at a glance it is not
 theirs. A stealer enumerates every session under those paths rather than opening
 one by name, so a decoy does not need to deceive anybody to be found.
+
+**This half is switched off, and the reason is worth reading.** On the machine it
+was built on, the agent creates the keys and every check it makes agrees they are
+there: the create call succeeds, the key reopens, the marker value reads back,
+and the kernel writes audit events for successful opens of those exact paths.
+Nothing else on the machine can see them. `reg.exe`, `Test-Path` and .NET's
+`OpenSubKey` all report the leaf missing, and `OpenSubKey` returns null rather
+than throwing, so it is genuinely "not found" rather than a permissions problem.
+
+The cause is not understood. The consequence is: if the account's own tools
+cannot see the key, an infostealer running as that account cannot see it either,
+so the decoy would never be read. A canary that is never read is not protection.
+It is a line in the interface claiming protection that does not exist, which is
+worse than the feature being absent, because it stops somebody looking further.
+So planting is held behind one flag while the disappearing keys are explained.
+The file canaries above are unaffected and verified working.
 
 The rules it holds itself to are worth stating, because the decoy paths are
 deliberately chosen to look like things people really keep:

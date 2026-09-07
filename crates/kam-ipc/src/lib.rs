@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -235,6 +235,16 @@ pub enum Request {
     /// request, it is only ever sent from a deliberate action, and it is
     /// recorded in the audit log both ways.
     SetCanaryAuditing { enabled: bool },
+    /// Whether the protective work is running.
+    GetProtection,
+    /// Turn the protective work on or off.
+    ///
+    /// This does not stop the service. The agent stays registered and running so
+    /// that it can be switched back on from the window; what stops is the
+    /// watching. Stopping the service itself is deliberately not something a
+    /// request can do — a security tool that can be silenced over its own
+    /// interface is one an attacker silences.
+    SetProtection { enabled: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +350,9 @@ pub enum Response {
     },
     Extensions(ExtensionReport),
     Canaries(Box<CanaryReport>),
+    Protection {
+        enabled: bool,
+    },
     Hardening(Box<HardeningReport>),
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {
@@ -444,6 +457,7 @@ mod tests {
         round_trip(Response::Connections(Default::default()));
         round_trip(Response::Extensions(Default::default()));
         round_trip(Response::Canaries(Default::default()));
+        round_trip(Response::Protection { enabled: true });
         round_trip(Response::Hardening(Default::default()));
         round_trip(Response::BehaviourEvents {
             observations: Vec::new(),

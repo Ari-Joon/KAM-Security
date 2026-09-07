@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import * as fmt from "../lib/format";
 import { api, reason } from "../lib/api";
 import type {
@@ -42,6 +42,102 @@ function UsageBar({ used, total }: { used: number; total: number }) {
   );
 }
 
+
+/**
+ * The switch, and the only one there is.
+ *
+ * Protection is on from the moment the agent is installed and stays on across
+ * reboots, crashes and closing this window — the agent is a Windows service, so
+ * it does not depend on anything being open. This is the one place it can be
+ * stopped deliberately.
+ *
+ * Turning it off does **not** stop the service, and that is on purpose twice
+ * over: something has to still be running to switch it back on, and a security
+ * tool that can be shut down through its own interface is one an attacker shuts
+ * down. What stops is the watching. Stopping the service itself needs Task
+ * Manager or an administrator, which is a deliberate act by somebody who is
+ * already in charge of the machine.
+ */
+function Protection() {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setEnabled(await api.protection());
+      setError(null);
+    } catch (cause) {
+      setError(reason(cause));
+      setEnabled(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const timer = setInterval(() => void refresh(), 10000);
+    return () => clearInterval(timer);
+  }, [refresh]);
+
+  async function toggle(next: boolean) {
+    setBusy(true);
+    setError(null);
+    try {
+      setEnabled(await api.setProtection(next));
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>Protection</h2>
+        {enabled !== null && (
+          <button
+            onClick={() => void toggle(!enabled)}
+            disabled={busy}
+            className={enabled ? "ghost" : undefined}
+          >
+            {busy ? "Working…" : enabled ? "Turn protection off" : "Turn protection on"}
+          </button>
+        )}
+      </div>
+
+      {error && (
+        <div className="notice notice-down">
+          <strong>The agent did not answer.</strong>
+          <pre className="error">{error}</pre>
+        </div>
+      )}
+
+      {enabled === true && (
+        <div className="notice notice-ok">
+          <strong>Protection is on.</strong> The agent watches what newly starts
+          itself and reports anything that reads a decoy. It runs as a Windows
+          service, so it keeps working when this window is closed and starts
+          again by itself after a reboot or a crash.
+        </div>
+      )}
+
+      {enabled === false && (
+        <div className="notice notice-warn">
+          <strong>Protection is off.</strong> Nothing is being watched. The agent
+          is still running so you can switch it back on here, but until you do,
+          new startup entries and decoy reads go unnoticed.
+        </div>
+      )}
+
+      <p className="muted small">
+        Turning it off here stops the watching, not the service — something has
+        to stay running to turn it back on. To stop the service itself, use Task
+        Manager or an administrator terminal.
+      </p>
+    </section>
+  );
+}
 
 /**
  * The one thing here that happens without being asked.
@@ -204,6 +300,8 @@ export default function Overview({ status, volumes, entries, onOpenStorage }: Pr
           </p>
         </div>
       </div>
+
+      <Protection />
 
       <div className="stat-row">
         <div className="stat">
