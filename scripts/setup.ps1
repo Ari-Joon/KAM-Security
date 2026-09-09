@@ -101,6 +101,34 @@ if ($Remove) {
 # --- install --------------------------------------------------------------
 Write-Host 'Setting KAM Security up...' -ForegroundColor Cyan
 
+# Secure the folder before registering anything to run out of it.
+#
+# The agent runs as LocalSystem, so whoever can write next to it decides what
+# LocalSystem executes. The default outcome of the obvious action gets this
+# wrong: a folder unzipped into Downloads, the Desktop or anywhere else in a
+# user profile inherits Authenticated Users: Modify, so an ordinary account can
+# replace the agent, or drop a `powershell.exe` beside it for the agent to find
+# ahead of the real one. Neither needs elevation.
+#
+# The agent refuses to register from a folder in that state, so without this the
+# honest outcome would be setup failing on most machines with a message about
+# permissions. Correcting it is better than explaining it: this script already
+# holds the administrator rights required.
+#
+# Well-known SIDs rather than names, because those are localised and this has to
+# work on a machine in any language:
+#   S-1-5-32-544  Administrators      full
+#   S-1-5-18      LocalSystem         full, this is what runs the agent
+#   S-1-5-11      Authenticated Users read and execute, never write
+& icacls $here /inheritance:r /grant:r `
+    '*S-1-5-32-544:(OI)(CI)F' `
+    '*S-1-5-18:(OI)(CI)F' `
+    '*S-1-5-11:(OI)(CI)RX' | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "the install folder could not be secured (icacls exit $LASTEXITCODE); the agent will not run from a folder anybody can write to"
+}
+Write-Host '  install folder secured (administrators only can write)' -ForegroundColor Gray
+
 & $agent --install
 if ($LASTEXITCODE -ne 0) { throw "the service could not be registered (exit $LASTEXITCODE)" }
 Write-Host '  service registered and started' -ForegroundColor Gray

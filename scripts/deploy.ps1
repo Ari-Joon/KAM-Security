@@ -158,8 +158,47 @@ try {
         Say '  set to Automatic, with restart-on-failure.' 'Green'
     }
 
+    # --- lock the install directory -----------------------------------------
+    #
+    # The agent runs as LocalSystem, so anybody who can write next to it can
+    # choose what LocalSystem executes. That is not hypothetical here: a folder
+    # created inside a user profile inherits Authenticated Users: Modify, and
+    # a same-volume move carries the inherited rights along with it, so `dist`
+    # arrived world-writable without anybody choosing it. Adversarial review
+    # replaced a binary in it as a non-administrator to prove the point.
+    #
+    # The agent refuses to register from a directory in that state, which is
+    # the backstop. This is the fix: done here because deploy already runs
+    # elevated, so nobody has to know to do it, and anybody installing from
+    # GitHub gets it without reading the security notes.
+    #
+    # Well-known SIDs rather than names, because "Administrators" is localised
+    # and this has to work on a machine in any language:
+    #   S-1-5-32-544  Administrators      full
+    #   S-1-5-18      LocalSystem         full, this is what runs the agent
+    #   S-1-5-11      Authenticated Users read and execute, never write
+    #
+    # Scoped to `dist` on purpose. Locking the whole repository would make the
+    # source read-only to the person developing it, which is a different thing
+    # from securing what the service executes.
+    $dist = Join-Path $root 'dist'
+    New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+    $writable = (icacls $dist 2>&1 | Select-String -Pattern 'S-1-5-11|Authenticated Users|BUILTIN\\Users' |
+        Select-String -Pattern '\((M|F|W)\)') -ne $null
+    if ($writable) {
+        Say 'The install directory can be written by non-administrators; correcting it...' 'Yellow'
+    }
+    & icacls $dist /inheritance:r /grant:r `
+        '*S-1-5-32-544:(OI)(CI)F' `
+        '*S-1-5-18:(OI)(CI)F' `
+        '*S-1-5-11:(OI)(CI)RX' | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "could not secure $dist (icacls exit $LASTEXITCODE); the agent will refuse to run from it"
+    }
+    Say '  install directory is administrator-writable only.' 'Green'
+
     # --- copy ---------------------------------------------------------------
-    New-Item -ItemType Directory -Force -Path (Join-Path $root 'dist') | Out-Null
     foreach ($name in $binaries) {
         $built = Join-Path $root "target\release\$name"
         $live = Join-Path $root "dist\$name"
