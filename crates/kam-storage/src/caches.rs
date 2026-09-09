@@ -469,15 +469,26 @@ fn ours_to_empty(path: &Path) -> bool {
 ///   access, and that cannot be granted while a handle without delete sharing
 ///   is open. For as long as this value lives, the root cannot be swapped.
 ///
-/// # What this does not cover
+/// # Why enumerating by path below is nonetheless safe
 ///
-/// The root is pinned; its *ancestors* are not. Somebody able to rename a
-/// parent directory and rebuild the chain through a junction could still make
-/// the path resolve elsewhere, because `read_dir` below is still by path.
-/// Closing that needs enumeration relative to this handle, which std cannot do
-/// and which is a larger piece of work than the finding justified. It is
-/// recorded here rather than left implied, because the difference between
-/// "closed" and "narrowed" is exactly the kind of thing that gets forgotten.
+/// The obvious objection is that only the root is pinned, and `read_dir` is
+/// still by path: rename a *parent*, rebuild the chain through a junction, and
+/// the same path resolves somewhere else. That was written here as an open
+/// limitation until adversarial review went and tried it, and it does not work.
+///
+/// Windows refuses to move a directory whose subtree contains an open handle.
+/// Holding this one therefore pins every ancestor too, not just the root —
+/// measured at three levels up, each rename refused, and the full attack
+/// (rename the parent away, rebuild it with the root as a junction to a victim)
+/// refused at its first step. The enforcement is in the filesystem rather than
+/// in `MoveFileExW`, so going below `std` to `NtSetInformationFile` meets the
+/// same sharing violation.
+///
+/// So from the moment this handle is acquired until it is dropped, the whole
+/// path is stable: the root cannot already be a link, because that was checked
+/// on the handle itself, and no part of the path above it can be moved to
+/// redirect it. That is what makes by-path enumeration below correct, and it is
+/// why this does not need the handle-relative enumeration `std` cannot do.
 struct HeldRoot {
     _handle: std::fs::File,
 }
@@ -877,6 +888,49 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Holding the root pins every directory above it too.
+    ///
+    /// This is the property that makes enumerating by path safe, and it is a
+    /// behaviour of Windows rather than of anything written here: a directory
+    /// whose subtree contains an open handle cannot be moved. Without it, the
+    /// obvious attack on `HeldRoot` would be to leave the pinned root alone and
+    /// rename a *parent*, rebuilding the chain through a junction so the same
+    /// path resolves somewhere else.
+    ///
+    /// It is asserted rather than described because the comment on `HeldRoot`
+    /// now depends on it. If a future Windows relaxed this, the code would
+    /// still look correct and would silently stop being so, and this is the
+    /// only thing that would say otherwise.
+    #[test]
+    fn holding_a_root_also_blocks_renaming_its_ancestors() {
+        let base = scratch("held-ancestors");
+        let cache = base.join("a").join("b").join("c").join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+
+        let held = HeldRoot::open(&cache).expect("a real directory opens");
+
+        // Every level between the handle and the scratch root.
+        for ancestor in ["a", r"a\b", r"a\b\c"] {
+            let from = base.join(ancestor);
+            let to = base.join(format!("{}-moved", ancestor.replace('\\', "-")));
+            assert!(
+                std::fs::rename(&from, &to).is_err(),
+                "{} was renamed while a descendant handle was open, so the \
+                 path above a held root is not pinned after all",
+                from.display()
+            );
+        }
+
+        // And the pin is the handle's doing, not something else about the tree.
+        drop(held);
+        assert!(
+            std::fs::rename(base.join("a"), base.join("a-moved")).is_ok(),
+            "the block outlived the handle, which would be a different bug"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The clear never follows a link out of the folder it was given.

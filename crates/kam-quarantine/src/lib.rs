@@ -180,6 +180,27 @@ impl Store {
 
         // Refusing a reparse point matters here: renaming a junction moves the
         // link, and a later restore would put it back somewhere else entirely.
+        //
+        // `is_symlink()` is true only for name-surrogate reparse tags -- symbolic
+        // links and mount points (junctions) -- and those are the only reparse
+        // kinds that redirect this path to a different object elsewhere, which is
+        // the thing that would make a rename move the wrong file. Other reparse
+        // tags (OneDrive and other cloud placeholders, dedup, WCIFS) report
+        // is_symlink() == false, and that is correct to allow here: they mark the
+        // same file under a filter, not a redirection, so renaming one moves that
+        // file and nothing at another path. Do NOT "simplify" this into a general
+        // FILE_ATTRIBUTE_REPARSE_POINT check -- that would refuse ordinary
+        // cloud-backed files a user legitimately asked to quarantine, and the
+        // reverse mistake (believing is_symlink already means "any reparse point")
+        // is how a later change would quietly reopen the redirect it was meant to
+        // stop.
+        //
+        // Measured both ways by adversarial review: a real junction reports
+        // is_dir=false, is_symlink=true, so the guard fires on the redirecting
+        // kind; the `::$INDEX_ALLOCATION` stream spelling reports is_dir=true,
+        // is_symlink=false, because it is the same object under another name
+        // rather than a redirect. That one is caught at the fence by
+        // resolve-then-judge, not here.
         if metadata.file_type().is_symlink() {
             return Err(Error::Refused(format!(
                 "{} is a junction or symbolic link; quarantining it would move \
@@ -197,12 +218,8 @@ impl Store {
             )));
         }
 
-        let id = self.allocate_id();
-        // The id came from `allocate_id`, so this cannot fail; it is still
-        // asked rather than assumed, because the day it can is the day the
-        // format changes under it.
-        let directory = self.item_directory(&id)?;
-        fs::create_dir_all(&directory)?;
+        // Allocating and claiming are one step: see `claim_id`.
+        let (id, directory) = self.claim_id()?;
 
         let manifest = Manifest {
             id: id.clone(),
@@ -482,6 +499,52 @@ impl Store {
 
     /// Timestamp plus a counter, so two items staged in the same second do not
     /// collide and the directory listing sorts chronologically.
+    /// Take the next free id *and* claim it, in one indivisible step.
+    ///
+    /// # Why this is not "find a free one, then create it"
+    ///
+    /// It was, and that is a race. Two takes in the same second both saw
+    /// `<seconds>-0000` unused and both returned it; `create_dir_all` is happy
+    /// to be called twice, so the second `write_manifest` overwrote the first
+    /// and the two payloads landed in one directory. The result is a manifest
+    /// describing one item and a payload that is another — and since restore
+    /// reads that manifest to decide where to put the payload back, the item
+    /// would be restored to the wrong path.
+    ///
+    /// Found by adversarial review while looking at something else. It predates
+    /// the delete buttons, but those made it likelier: holding and immediately
+    /// deleting churns through ids far faster than a person clicking quarantine.
+    ///
+    /// `create_dir` is the fix, because it fails rather than succeeds when the
+    /// directory is already there. Whoever creates it owns the id, and the loser
+    /// of the race takes the next suffix instead of silently sharing.
+    fn claim_id(&self) -> Result<(String, PathBuf)> {
+        let seconds = now_seconds();
+        fs::create_dir_all(&self.root)?;
+
+        for suffix in 0..10_000 {
+            let id = format!("{seconds}-{suffix:04}");
+            let directory = self.root.join(&id);
+            match fs::create_dir(&directory) {
+                Ok(()) => return Ok((id, directory)),
+                // Somebody else has this one. Not an error; take the next.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        // Ten thousand items in one second is not a real workload, so this is
+        // the honest answer rather than a fallback that quietly shares a name.
+        Err(Error::Refused(
+            "the quarantine store has run out of identifiers for this second".to_owned(),
+        ))
+    }
+
+    /// The next free id, without claiming it.
+    ///
+    /// Only for records that are files rather than directories, where the name
+    /// is claimed by the write itself. Anything creating a *directory* must use
+    /// [`Store::claim_id`], or two of them can agree on the same one.
     fn allocate_id(&self) -> String {
         let seconds = now_seconds();
         for suffix in 0..10_000 {
@@ -503,6 +566,76 @@ mod tests {
     ///
     /// The two exist separately so that the rule protecting somebody from their
     /// own mistake cannot be lifted by the code that is meant to enforce it.
+    /// Two takes at the same instant get two ids, not one shared one.
+    ///
+    /// The old allocator asked whether an id was free and then created it, and
+    /// in between another take could ask the same question and get the same
+    /// answer. `create_dir_all` does not object to being called twice, so both
+    /// items landed in one directory, the second manifest overwrote the first,
+    /// and restore would then have put a payload back at the *other* item's
+    /// original path.
+    ///
+    /// This runs the collision on purpose: several threads taking at once,
+    /// which is what the store sees when somebody presses delete down a list.
+    /// It is checked by what came out rather than by timing, so it does not
+    /// depend on winning a race to fail.
+    #[test]
+    fn concurrent_takes_never_share_an_identifier() {
+        let scratch = Scratch::new("concurrent-ids");
+        let store = std::sync::Arc::new(scratch.store());
+
+        // Enough to collide within one second, which is the id's resolution.
+        const TAKES: usize = 24;
+        let mut sources = Vec::new();
+        for index in 0..TAKES {
+            let source = scratch.join(&format!("thing-{index}.bin"));
+            fs::write(&source, vec![index as u8; 32]).unwrap();
+            sources.push(source);
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(TAKES));
+        let mut threads = Vec::new();
+        for source in sources {
+            let store = std::sync::Arc::clone(&store);
+            let barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                // Start together, or they simply queue up and prove nothing.
+                barrier.wait();
+                store.take(&source, 32, "a concurrent test")
+            }));
+        }
+
+        let manifests: Vec<Manifest> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("a take panicked"))
+            .map(|result| result.expect("a take failed"))
+            .collect();
+
+        let mut ids: Vec<&str> = manifests.iter().map(|item| item.id.as_str()).collect();
+        ids.sort_unstable();
+        let unique = ids.len();
+        ids.dedup();
+        assert_eq!(
+            unique,
+            ids.len(),
+            "two takes were given the same identifier"
+        );
+
+        // And every one of them still describes its own file. This is the part
+        // that actually mattered: a shared id meant a manifest pointing at
+        // somebody else's payload.
+        for manifest in &manifests {
+            let stored = store.manifest(&manifest.id).expect("its manifest is there");
+            assert_eq!(
+                stored.original_path, manifest.original_path,
+                "{} describes a different item than the one taken",
+                manifest.id
+            );
+        }
+
+        assert_eq!(store.list().unwrap().len(), TAKES, "items were lost");
+    }
+
     /// An id from a client is not a path fragment until it has been checked.
     ///
     /// Every one of these was demonstrated by adversarial review to escape the
