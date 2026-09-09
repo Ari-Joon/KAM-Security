@@ -249,25 +249,62 @@ pub fn find(
 /// The rule is narrow on purpose: exactly one level below one of the three data
 /// roots, and not a name Windows owns. `C:\Windows`, `C:\ProgramData` itself,
 /// and anything nested deeper are all refused.
+///
+/// # Why it resolves the path before judging it
+///
+/// It used to compare the string it was given, and that was a hole. Windows
+/// will open and rename a directory through its own index stream, so
+/// `%LOCALAPPDATA%\Microsoft::$INDEX_ALLOCATION` names the same object as
+/// `%LOCALAPPDATA%\Microsoft` — but as text it matches neither `microsoft` nor,
+/// once stripped to letters, anything else on the list. Both checks missed it,
+/// the fence returned `Ok`, and `symlink_metadata` reported an ordinary
+/// directory so the reparse-point guard downstream stayed silent. Adversarial
+/// review demonstrated the rename: the real directory moved.
+///
+/// Rejecting that one spelling would have closed that one hole. The 8.3 short
+/// name `MICROS~1` is the same trick with different syntax, and whether it
+/// exists is a per-volume setting on a machine this is meant to run on
+/// unmodified — so the string was never the thing to reason about. Asking the
+/// filesystem what the path points at closes the spellings nobody here has
+/// thought of yet, which is the only version of this that stays closed.
+///
+/// A path that cannot be resolved is refused rather than judged as text.
+/// Something that cannot be located is not something to move as LocalSystem,
+/// and a directory that is not there cannot be a leftover worth reclaiming.
 pub fn check_quarantinable(path: &str, user: &UserContext) -> std::result::Result<(), String> {
-    let normalised_path = path.trim_end_matches(['\\', '/']).replace('/', "\\");
+    let Some(real) = crate::paths::existing_plain(path) else {
+        return Err(format!(
+            "{path} could not be found on disk, so it will not be touched"
+        ));
+    };
+    let real = real.trim_end_matches(['\\', '/']).to_owned();
 
     for (_, root) in crate::apps::data_roots(user) {
-        let root = root.trim_end_matches(['\\', '/']).to_owned();
-        let prefix = format!("{}\\", root.to_lowercase());
-        let lowered = normalised_path.to_lowercase();
-
-        let Some(remainder) = lowered.strip_prefix(&prefix) else {
+        // Resolved against resolved: see `paths::resolved_root` for why
+        // comparing a resolved path to a root's own spelling is wrong. A root
+        // that is not there cannot contain anything, so it is skipped.
+        let Some(root) = crate::paths::resolved_root(&root) else {
             continue;
         };
-        if remainder.is_empty() {
+        if real == root {
             return Err(format!("{path} is a data root itself"));
         }
+
+        let Some(remainder) = real.strip_prefix(&format!("{root}\\")) else {
+            continue;
+        };
         if remainder.contains('\\') {
             return Err(format!(
                 "{path} is nested below a data root; only a directory directly \
                  inside one may be quarantined"
             ));
+        }
+        // Resolving should have removed any stream syntax, and a directory name
+        // legitimately never carries a colon. Refusing rather than trusting that
+        // means the day it does get through, the answer is a refusal and not a
+        // rename.
+        if remainder.contains(':') {
+            return Err(format!("{path} is not a plain directory name"));
         }
         if NEVER_ORPHANS.contains(&remainder)
             || NEVER_ORPHANS.contains(&normalise(remainder).as_str())
@@ -309,6 +346,7 @@ pub fn summarise(orphans: &[Orphan]) -> OrphanSummary {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn claimed_set(names: &[&str]) -> HashSet<String> {
         names.iter().map(|name| normalise(name)).collect()
@@ -372,53 +410,200 @@ mod tests {
         assert!(Confidence::Medium > Confidence::Low);
     }
 
+    /// A throwaway profile, so the fence can be tested against real directories
+    /// without creating anything in the tester's own AppData.
+    ///
+    /// The fence resolves paths on disk now, so it cannot be exercised with
+    /// names that are not there. That is a better test than the one it replaced
+    /// — the old version asserted the fence's opinion of a string, which is
+    /// precisely the thing that turned out not to be worth much.
+    struct Profile {
+        root: std::path::PathBuf,
+    }
+
+    impl Profile {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("kam-orphans-{tag}"));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(root.join("AppData").join("Local")).unwrap();
+            fs::create_dir_all(root.join("AppData").join("Roaming")).unwrap();
+            Self { root }
+        }
+
+        fn user(&self) -> UserContext {
+            UserContext::new(None, &self.root.to_string_lossy())
+        }
+
+        fn local(&self) -> std::path::PathBuf {
+            self.root.join("AppData").join("Local")
+        }
+
+        /// Create a directory under Local AppData and return its path.
+        fn make(&self, relative: &str) -> String {
+            let path = self.local().join(relative);
+            fs::create_dir_all(&path).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for Profile {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[test]
     fn the_fence_allows_a_directory_directly_inside_a_data_root() {
-        let root = std::env::var("LOCALAPPDATA").unwrap();
-        assert!(check_quarantinable(
-            &format!("{root}\\SomeDeadVendor"),
-            &kam_core::UserContext::current()
-        )
-        .is_ok());
-        assert!(check_quarantinable(
-            &format!("{root}/SomeDeadVendor/"),
-            &kam_core::UserContext::current()
-        )
-        .is_ok());
+        let profile = Profile::new("allows");
+        let vendor = profile.make("SomeDeadVendor");
+
+        assert!(check_quarantinable(&vendor, &profile.user()).is_ok());
+        // The same directory spelled differently is still the same directory.
+        assert!(check_quarantinable(&format!("{vendor}\\"), &profile.user()).is_ok());
+        assert!(
+            check_quarantinable(&vendor.replace('\\', "/"), &profile.user()).is_ok(),
+            "forward slashes are separators too"
+        );
+        assert!(
+            check_quarantinable(&format!("\\\\?\\{vendor}"), &profile.user()).is_ok(),
+            "the extended-length form names the same directory"
+        );
     }
 
     #[test]
     fn the_fence_refuses_a_data_root_itself() {
-        let root = std::env::var("ProgramData").unwrap();
-        assert!(check_quarantinable(&root, &kam_core::UserContext::current()).is_err());
-        assert!(
-            check_quarantinable(&format!("{root}\\"), &kam_core::UserContext::current()).is_err()
-        );
+        let profile = Profile::new("root-itself");
+        let root = profile.local().to_string_lossy().into_owned();
+
+        assert!(check_quarantinable(&root, &profile.user()).is_err());
+        assert!(check_quarantinable(&format!("{root}\\"), &profile.user()).is_err());
     }
 
     #[test]
     fn the_fence_refuses_anything_nested_deeper() {
         // One level only. Deeper paths are where a mistake stops being a
         // leftover folder and starts being someone's saved games.
-        let root = std::env::var("LOCALAPPDATA").unwrap();
-        assert!(check_quarantinable(
-            &format!("{root}\\Vendor\\Inner"),
-            &kam_core::UserContext::current()
-        )
-        .is_err());
+        let profile = Profile::new("nested");
+        let inner = profile.make("Vendor\\Inner");
+
+        assert!(check_quarantinable(&inner, &profile.user()).is_err());
     }
 
     #[test]
     fn the_fence_refuses_directories_windows_owns() {
-        let root = std::env::var("LOCALAPPDATA").unwrap();
-        assert!(check_quarantinable(
-            &format!("{root}\\Microsoft"),
-            &kam_core::UserContext::current()
-        )
-        .is_err());
+        let profile = Profile::new("owned");
+
+        for name in ["Microsoft", "Temp", "Packages"] {
+            let path = profile.make(name);
+            assert!(
+                check_quarantinable(&path, &profile.user()).is_err(),
+                "{name} should have been refused"
+            );
+        }
+    }
+
+    /// The deny list is checked against what the path *points at*.
+    ///
+    /// `Microsoft::$INDEX_ALLOCATION` is the directory's own index stream:
+    /// Windows opens it, `symlink_metadata` calls it an ordinary directory, and
+    /// `fs::rename` moves it — but as text it matches nothing on the list, and
+    /// stripping it to letters gives `microsoftindexallocation`, which matches
+    /// nothing either. Both checks missed, and adversarial review moved a real
+    /// directory through it as LocalSystem.
+    ///
+    /// This is the regression test for that. It fails if the fence ever goes
+    /// back to judging the string it was handed.
+    #[test]
+    fn the_fence_sees_through_a_stream_spelling_of_a_protected_name() {
+        let profile = Profile::new("stream-spelling");
+        profile.make("Microsoft");
+
+        let local = profile.local();
+        for spelling in [
+            "Microsoft::$INDEX_ALLOCATION",
+            "microsoft::$index_allocation",
+            "Microsoft::$iNdEx_AlLoCaTiOn",
+        ] {
+            let path = local.join(spelling).to_string_lossy().into_owned();
+
+            // The premise: Windows really does accept this as the directory. If
+            // this ever stops being true the test below proves nothing, so it is
+            // asserted rather than assumed.
+            assert!(
+                fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()),
+                "{spelling} no longer opens the directory; revisit this test"
+            );
+
+            assert!(
+                check_quarantinable(&path, &profile.user()).is_err(),
+                "{spelling} got past the deny list"
+            );
+        }
+    }
+
+    /// The fence judges where a name points, not what it is called.
+    ///
+    /// This is the test with teeth for the resolving step specifically. The
+    /// stream spelling above is also caught by the colon check, so it cannot
+    /// show that resolving does any work; a junction can, because its name
+    /// carries no punctuation to notice and no deny-list entry to match.
+    ///
+    /// `DeadVendor` looks like exactly the sort of leftover this feature exists
+    /// to offer, and points at the directory the deny list is protecting.
+    /// Creating one needs no elevation, which is what makes it worth testing:
+    /// anybody who can write a data root can plant it.
+    #[test]
+    fn the_fence_judges_where_a_link_points_and_not_what_it_is_called() {
+        let profile = Profile::new("junction");
+        let real = profile.make("Microsoft");
+        let link = profile.local().join("DeadVendor");
+
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output();
+        if !made.map(|out| out.status.success()).unwrap_or(false) {
+            // Junctions are unavailable here; the property is untested rather
+            // than disproved, so say nothing either way.
+            return;
+        }
+
+        // The premise, which is the whole trap: by name and by `is_dir` this is
+        // an ordinary directory called DeadVendor.
+        assert!(link.is_dir());
+        let name = link.to_string_lossy().into_owned();
         assert!(
-            check_quarantinable(&format!("{root}\\Temp"), &kam_core::UserContext::current())
-                .is_err()
+            !name[2..].contains(':'),
+            "the point of this one is a name with no stream syntax to spot"
+        );
+
+        assert!(
+            check_quarantinable(&name, &profile.user()).is_err(),
+            "a junction pointing at a protected directory was accepted under its own name"
+        );
+    }
+
+    /// And the protected directory is still there afterwards.
+    ///
+    /// The test above is about the fence; this is about the consequence, which
+    /// is what review actually demonstrated.
+    #[test]
+    fn a_protected_directory_survives_being_named_through_its_index_stream() {
+        let profile = Profile::new("stream-consequence");
+        let real = profile.make("Microsoft");
+        fs::write(std::path::Path::new(&real).join("keep.txt"), b"load bearing").unwrap();
+
+        let sneaky = profile
+            .local()
+            .join("Microsoft::$INDEX_ALLOCATION")
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(check_quarantinable(&sneaky, &profile.user()).is_err());
+        assert!(
+            std::path::Path::new(&real).join("keep.txt").exists(),
+            "the protected directory was reached"
         );
     }
 
@@ -436,6 +621,19 @@ mod tests {
                 "{path} should have been refused"
             );
         }
+    }
+
+    #[test]
+    fn the_fence_refuses_a_directory_that_is_not_there() {
+        // Nothing to reclaim, and nothing whose real identity can be checked.
+        let profile = Profile::new("absent");
+        let absent = profile
+            .local()
+            .join("NeverExisted")
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(check_quarantinable(&absent, &profile.user()).is_err());
     }
 
     #[test]

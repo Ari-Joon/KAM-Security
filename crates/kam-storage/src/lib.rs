@@ -26,6 +26,7 @@ pub mod index;
 pub mod mft;
 pub mod organise;
 pub mod orphans;
+mod paths;
 pub mod provenance;
 pub mod remnants;
 /// Re-exported from the shared crate, where it moved once the scanner

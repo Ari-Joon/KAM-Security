@@ -195,42 +195,6 @@ const PROGRAM: &[&str] = &[
     r"\riot games\",
 ];
 
-/// Reduce a path to the form the ownership rules are written against.
-///
-/// Every rule below reads the path as text, so any way of spelling the same
-/// file that the rules do not recognise is a way past them. Windows accepts
-/// several:
-///
-/// - `\\?\C:\...` — the extended-length form, which skips the Win32 path
-///   parser entirely and is accepted by every file API.
-/// - `\\?\UNC\server\share` — the same for network paths.
-/// - `\??\C:\...` — the object-manager form, which some APIs take.
-/// - Forward slashes, which Windows treats as separators throughout.
-///
-/// The first of these was a real hole and not a theoretical one: with the
-/// extended-length prefix, `C:\Windows\System32\kernel32.dll` was classified
-/// as somewhere unrecognised rather than as Windows, and an explicit choice
-/// would have been allowed to take it. A test now spells that file six ways
-/// and requires all six to come back as Windows.
-fn normalise(path: &str) -> String {
-    let mut text = path.replace('/', "\\");
-
-    // Order matters: the UNC form is a longer prefix of the extended one.
-    for prefix in [r"\\?\UNC\", r"\??\UNC\"] {
-        if let Some(rest) = text.strip_prefix(prefix) {
-            text = format!(r"\\{rest}");
-            return text.to_lowercase();
-        }
-    }
-    for prefix in [r"\\?\", r"\??\", r"\\.\"] {
-        if let Some(rest) = text.strip_prefix(prefix) {
-            text = rest.to_owned();
-            break;
-        }
-    }
-    text.to_lowercase()
-}
-
 /// Work out who owns a copy, from its path alone.
 ///
 /// Path-only on purpose. This runs against the master file table on a whole
@@ -238,7 +202,11 @@ fn normalise(path: &str) -> String {
 /// the disk, and every rule here is one a person could check by reading the
 /// path themselves — which matters for a list whose whole job is to be trusted.
 pub fn owner_of(path: &str, user: &UserContext) -> Owner {
-    let lowered = normalise(path);
+    // Every rule below reads the path as text, so any spelling of the same file
+    // that they do not recognise is a way past them. `plain` is where that
+    // reduction and the list of spellings Windows accepts now live, because the
+    // orphan fence needs the same thing.
+    let lowered = crate::paths::plain(path);
 
     if lowered.contains(r"\$recycle.bin\") {
         return Owner::Deleted;

@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 
+use kam_core::UserContext;
 use serde::{Deserialize, Serialize};
 
 use crate::index::VolumeIndex;
@@ -321,12 +322,25 @@ pub fn find(index: &VolumeIndex, profile: &str) -> (Vec<Proposal>, OrganiseSumma
 }
 
 /// Read the volume's table, then look for loose files on it.
-pub fn survey(drive_letter: char) -> kam_core::Result<(Vec<Proposal>, OrganiseSummary)> {
-    let profile = std::env::var("USERPROFILE")
-        .map_err(|_| kam_core::Error::Privileged("USERPROFILE is not set".to_owned()))?;
+///
+/// The profile comes from the caller's [`UserContext`], not from the
+/// environment. Inside the service the environment's `USERPROFILE` is
+/// LocalSystem's own — `C:\Windows\system32\config\systemprofile` — which is a
+/// real directory that no loose file of anyone's is ever under, so this feature
+/// silently proposed nothing at all for as long as it read that variable.
+pub fn survey(
+    drive_letter: char,
+    user: &UserContext,
+) -> kam_core::Result<(Vec<Proposal>, OrganiseSummary)> {
+    let profile = user.profile().trim_end_matches(['\\', '/']);
+    if profile.is_empty() {
+        return Err(kam_core::Error::Privileged(
+            "there is no user profile to look in".to_owned(),
+        ));
+    }
     let snapshot = crate::mft::read(drive_letter)?;
     let index = VolumeIndex::build(snapshot);
-    Ok(find(&index, profile.trim_end_matches(['\\', '/'])))
+    Ok(find(&index, profile))
 }
 
 /// Decide whether a move may happen at all, from first principles.
@@ -334,17 +348,61 @@ pub fn survey(drive_letter: char) -> kam_core::Result<(Vec<Proposal>, OrganiseSu
 /// The agent re-derives this rather than trusting the proposal it sent, for the
 /// same reason quarantine does: the paths come back as strings from a client,
 /// and the agent is LocalSystem.
-pub fn check_movable(from: &str, to: &str) -> std::result::Result<(), String> {
-    let profile = std::env::var("USERPROFILE").map_err(|_| "no user profile".to_owned())?;
-    let profile_key = profile.to_lowercase();
+///
+/// # Whose user folder
+///
+/// The caller's, taken from [`UserContext`]. This read `USERPROFILE` from the
+/// environment, which inside the service is LocalSystem's profile and not the
+/// profile of the person who asked — the same wrong-principal mistake that made
+/// the agent measure the wrong account's disk everywhere else. Here it failed
+/// closed rather than open: every legitimate move was refused, so the feature
+/// simply did not work under the service.
+///
+/// # Why it resolves before comparing
+///
+/// A confinement rule written against the text is not a confinement rule.
+/// `C:\Users\someone\Downloads\..\..\..\Windows\System32\driver.pdf` starts with
+/// the profile and ends up in `System32`; a junction anywhere in the middle does
+/// the same thing without any punctuation to notice. Both paths are resolved
+/// first, and every rule below — the fence, the off-limits check — is applied to
+/// what came back rather than to what was sent.
+///
+/// The destination usually does not exist yet, which is the point of moving
+/// something there, so it is resolved as far as it goes; see
+/// [`crate::paths::resolved`].
+pub fn check_movable(
+    from: &str,
+    to: &str,
+    user: &UserContext,
+) -> std::result::Result<(), String> {
+    // Resolved against resolved: see `paths::resolved_root`. A profile reached
+    // through a junction — ordinary where folders are redirected — otherwise
+    // never matches the resolved paths below, and every move is refused.
+    let Some(profile) = crate::paths::resolved_root(user.profile()) else {
+        return Err("there is no user folder to confine this to".to_owned());
+    };
+    let profile = profile.trim_end_matches(['\\', '/']);
+    if profile.is_empty() {
+        return Err("there is no user folder to confine this to".to_owned());
+    }
+    // The trailing separator is load-bearing: without it `C:\Users\ann` is a
+    // prefix of `C:\Users\annette`, and the fence lets one account move the
+    // other's files.
+    let fence = format!("{profile}\\");
 
     for path in [from, to] {
-        if !path.to_lowercase().starts_with(&profile_key) {
+        if crate::paths::has_relative_step(path) {
+            return Err(format!("{path} is not a plain path"));
+        }
+        let Some(real) = crate::paths::resolved_plain(path) else {
+            return Err(format!("{path} could not be resolved, so it was left alone"));
+        };
+        if !real.starts_with(&fence) {
             return Err(format!(
                 "{path} is outside your user folder, which is the only place this moves files"
             ));
         }
-        if is_off_limits(path) {
+        if is_off_limits(&real) {
             return Err(format!(
                 "{path} is somewhere software lives, not a document"
             ));
@@ -366,6 +424,62 @@ pub fn check_movable(from: &str, to: &str) -> std::result::Result<(), String> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A throwaway user folder, with the shape the fence expects.
+    ///
+    /// The fence resolves paths on disk, so it cannot be exercised against
+    /// names that are not there — and testing it against the *tester's* real
+    /// profile is what let the wrong-principal bug hide, since under `cargo
+    /// test` the environment's profile and the caller's are the same person.
+    /// They are only different inside the service, which is the one place the
+    /// old tests could not reach.
+    struct Home {
+        root: std::path::PathBuf,
+    }
+
+    impl Home {
+        fn new(tag: &str) -> Self {
+            // Not the temp directory: on Windows that lives under AppData,
+            // which `is_off_limits` refuses — correctly, which is why the
+            // fixture has to move rather than the rule. A folder beside the
+            // tester's own is somewhere the fence has no opinion about.
+            let home = std::env::var("USERPROFILE").unwrap();
+            let root = std::path::PathBuf::from(home).join(format!("kam-organise-{tag}"));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("Downloads")).unwrap();
+            std::fs::create_dir_all(root.join("Documents")).unwrap();
+            Self { root }
+        }
+
+        fn root(&self) -> String {
+            self.root.to_string_lossy().into_owned()
+        }
+
+        fn user(&self) -> UserContext {
+            UserContext::new(None, &self.root())
+        }
+
+        /// A path inside this profile, which need not exist.
+        fn path(&self, relative: &str) -> String {
+            self.root.join(relative).to_string_lossy().into_owned()
+        }
+
+        /// The same, but the file is really there.
+        fn file(&self, relative: &str) -> String {
+            let path = self.root.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, b"a document").unwrap();
+            path.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
 
     #[test]
     fn documents_and_media_are_movable() {
@@ -418,35 +532,126 @@ mod tests {
 
     #[test]
     fn the_fence_refuses_anything_outside_the_user_folder() {
-        let profile = std::env::var("USERPROFILE").unwrap();
-        assert!(
-            check_movable(&format!(r"{profile}\Downloads\a.pdf"), r"C:\Windows\a.pdf").is_err()
-        );
+        let home = Home::new("outside");
+        assert!(check_movable(
+            &home.file("Downloads\\a.pdf"),
+            r"C:\Windows\a.pdf",
+            &home.user()
+        )
+        .is_err());
         assert!(check_movable(
             r"C:\Program Files\Thing\a.pdf",
-            &format!(r"{profile}\Documents\a.pdf")
+            &home.path("Documents\\a.pdf"),
+            &home.user()
         )
         .is_err());
     }
 
     #[test]
     fn the_fence_refuses_executables_even_inside_the_user_folder() {
-        let profile = std::env::var("USERPROFILE").unwrap();
+        let home = Home::new("executables");
         assert!(check_movable(
-            &format!(r"{profile}\Downloads\setup.exe"),
-            &format!(r"{profile}\Documents\setup.exe")
+            &home.file("Downloads\\setup.exe"),
+            &home.path("Documents\\setup.exe"),
+            &home.user()
         )
         .is_err());
     }
 
     #[test]
     fn the_fence_allows_a_document_between_user_folders() {
-        let profile = std::env::var("USERPROFILE").unwrap();
+        let home = Home::new("allows");
         assert!(check_movable(
-            &format!(r"{profile}\Downloads\invoice.pdf"),
-            &format!(r"{profile}\Documents\Invoices\invoice.pdf")
+            &home.file("Downloads\\invoice.pdf"),
+            &home.path("Documents\\Invoices\\invoice.pdf"),
+            &home.user()
         )
         .is_ok());
+    }
+
+    /// The fence confines the *caller*, not whoever the service happens to run
+    /// as.
+    ///
+    /// This read `USERPROFILE` from the environment. Inside the service that is
+    /// `C:\Windows\system32\config\systemprofile`, so the fence confined moves
+    /// to LocalSystem's own profile and refused every real one — the feature
+    /// was inert under the service and nobody noticed, because a fence that
+    /// refuses everything looks exactly like a fence that is working.
+    ///
+    /// A `UserContext` for somebody else must therefore refuse the same paths
+    /// this user's context allows.
+    #[test]
+    fn the_fence_confines_the_caller_and_not_the_running_account() {
+        let home = Home::new("principal");
+        let from = home.file("Downloads\\invoice.pdf");
+        let to = home.path("Documents\\invoice.pdf");
+
+        assert!(check_movable(&from, &to, &home.user()).is_ok());
+
+        // The account the service actually runs as.
+        let system = UserContext::new(
+            None,
+            r"C:\Windows\system32\config\systemprofile",
+        );
+        assert!(
+            check_movable(&from, &to, &system).is_err(),
+            "another account's profile was allowed to confine this move"
+        );
+    }
+
+    /// One profile is not a prefix of another.
+    ///
+    /// `C:\Users\ann` is a text prefix of `C:\Users\annette`, so a fence that
+    /// compares with a bare `starts_with` lets one account move the other's
+    /// files. The separator is what makes it a folder rather than a spelling.
+    #[test]
+    fn a_profile_name_that_starts_with_another_is_still_a_different_person() {
+        let ann = Home::new("ann");
+        let annette = Home::new("annette");
+
+        let theirs = annette.file("Downloads\\private.pdf");
+        assert!(
+            check_movable(&theirs, &annette.path("Documents\\private.pdf"), &ann.user()).is_err(),
+            "one profile reached into another that merely shares its opening letters"
+        );
+    }
+
+    /// A path that starts inside the profile need not stay inside it.
+    ///
+    /// Every rule here used to be applied to the string as sent, and a string
+    /// that begins with the profile can still land anywhere on the disk. The
+    /// escape below goes to a *neighbouring* folder rather than to `Windows`,
+    /// deliberately: a path with `windows` in it is refused by the off-limits
+    /// component check whether anything resolves or not, so aiming there would
+    /// prove nothing about this fence. Nothing on the way to the neighbour is
+    /// off-limits, so the confinement rule is the only thing standing between
+    /// the caller and somebody else's files — which is what it is for.
+    #[test]
+    fn the_fence_refuses_a_path_that_walks_out_of_the_user_folder() {
+        let home = Home::new("traversal");
+        let neighbour = Home::new("traversal-neighbour");
+        let secret = neighbour.file("Documents\\private.pdf");
+        let inside = home.file("Downloads\\a.pdf");
+
+        // Begins with the profile, ends in the neighbour's folder.
+        let escape = format!(
+            "{}\\Downloads\\..\\..\\kam-organise-traversal-neighbour\\Documents\\private.pdf",
+            home.root()
+        );
+        assert!(
+            escape.to_lowercase().starts_with(&home.root().to_lowercase()),
+            "the test input has to look confined, or it proves nothing"
+        );
+
+        assert!(
+            check_movable(&escape, &home.path("Documents\\a.pdf"), &home.user()).is_err(),
+            "a walk out of the user folder was accepted as a source"
+        );
+        assert!(
+            check_movable(&inside, &escape, &home.user()).is_err(),
+            "a walk out of the user folder was accepted as a destination"
+        );
+        assert!(std::path::Path::new(&secret).exists());
     }
 
     #[test]

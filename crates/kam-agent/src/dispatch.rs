@@ -419,7 +419,7 @@ pub fn handle(
                     message: "give a drive letter, such as C:".to_owned(),
                 };
             };
-            match kam_storage::organise::survey(letter.to_ascii_uppercase()) {
+            match kam_storage::organise::survey(letter.to_ascii_uppercase(), user) {
                 Ok((proposals, summary)) => Response::Organise { proposals, summary },
                 Err(error) => {
                     tracing::info!(%error, "could not look for loose files");
@@ -430,7 +430,7 @@ pub fn handle(
             }
         }
 
-        Request::ApplyMove { from, to } => apply_move(&from, &to, context),
+        Request::ApplyMove { from, to } => apply_move(&from, &to, context, user),
 
         Request::UndoMove { id } => match context.quarantine.undo_move(&id) {
             Ok(record) => {
@@ -1078,8 +1078,8 @@ fn scan_path(path: &str, context: &Context) -> Response {
 /// The fence is re-derived here rather than trusted. The proposal came from
 /// this agent, but the paths come back as strings from a client, and a client
 /// is not obliged to send back what it was given.
-fn apply_move(from: &str, to: &str, context: &Context) -> Response {
-    if let Err(refusal) = kam_storage::organise::check_movable(from, to) {
+fn apply_move(from: &str, to: &str, context: &Context, user: &UserContext) -> Response {
+    if let Err(refusal) = kam_storage::organise::check_movable(from, to, user) {
         context.audit(
             "storage",
             "move_file",
@@ -1175,19 +1175,46 @@ mod tests {
     /// `LocalAppData` or `Roaming`, which is exactly the shape of a leftover.
     /// Testing anywhere else would test something the product never does.
     struct Leftover {
+        /// The throwaway profile the fence is told to confine itself to.
+        root: std::path::PathBuf,
+        /// The leftover directory itself, one level inside its Local AppData.
         path: std::path::PathBuf,
     }
 
     impl Leftover {
+        /// A leftover inside a throwaway profile, with the caller to match.
+        ///
+        /// It used to be created in the tester's own `%LOCALAPPDATA%` and
+        /// checked against `UserContext::current()`. That stopped working once
+        /// the fence resolved paths before judging them, and the reason is
+        /// worth recording: when the test suite runs inside a packaged
+        /// application — the desktop app this project is developed in is one —
+        /// Windows redirects newly created directories under Local AppData into
+        /// the package's own store, so the leftover's real path came back as
+        /// `...\AppData\Local\Packages\<package>\LocalCache\Local\<name>` and
+        /// the fence correctly said it was nested too deep.
+        ///
+        /// The service is not packaged and sees no such redirection, so this
+        /// was the test's environment leaking in rather than a fault in the
+        /// fence. A scratch profile outside AppData removes the dependency on
+        /// where the tests happen to run, which the storage tests needed for
+        /// the same reason.
         fn new(tag: &str) -> Self {
-            let base = std::env::var("LOCALAPPDATA").expect("a local app data folder");
-            let path = std::path::PathBuf::from(base)
+            let home = std::env::var("USERPROFILE").expect("a user profile");
+            let root = std::path::PathBuf::from(home)
                 .join(format!("kam-quarantine-test-{}-{tag}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
+            let path = root.join("AppData").join("Local").join("DeadVendor");
+            let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(path.join("cache")).unwrap();
+            std::fs::create_dir_all(root.join("AppData").join("Roaming")).unwrap();
             std::fs::write(path.join("settings.cfg"), b"user settings worth keeping").unwrap();
             std::fs::write(path.join("cache").join("blob.bin"), vec![7_u8; 4096]).unwrap();
-            Self { path }
+            Self { root, path }
+        }
+
+        /// The caller this leftover belongs to.
+        fn user(&self) -> UserContext {
+            UserContext::new(None, &self.root.to_string_lossy())
         }
 
         fn text(&self) -> String {
@@ -1197,7 +1224,7 @@ mod tests {
 
     impl Drop for Leftover {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
+            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
@@ -1531,7 +1558,7 @@ mod tests {
             },
             &context,
             &Reporter::silent(),
-            &UserContext::current(),
+            &leftover.user(),
         );
 
         let Response::Quarantined(manifest) = &taken else {
@@ -1615,7 +1642,7 @@ mod tests {
             },
             &context,
             &Reporter::silent(),
-            &UserContext::current(),
+            &leftover.user(),
         );
         let Response::Quarantined(manifest) = &taken else {
             panic!("expected the item to be quarantined");
