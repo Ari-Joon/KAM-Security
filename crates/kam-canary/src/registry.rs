@@ -452,6 +452,65 @@ mod tests {
         );
     }
 
+    /// Something other than this crate has to be able to see the key.
+    ///
+    /// # Why the test above is not enough
+    ///
+    /// It plants with `plant` and confirms with `exists`, and both are in this
+    /// file. When the two agree, all that proves is that they agree. The
+    /// original bug was precisely that: the key was reported planted and
+    /// watched, every check here said it was there, and `reg.exe`, `Test-Path`
+    /// and `OpenSubKey` all said it did not exist. A decoy nothing else can see
+    /// is never read, and a canary that is never read is a false claim rather
+    /// than a missing feature, which is why the whole feature was switched off
+    /// rather than shipped.
+    ///
+    /// So this one asks a program that shares no code with us. `reg.exe` is the
+    /// same tool a person would check with, which is the point.
+    #[test]
+    fn a_planted_key_is_visible_to_a_tool_that_shares_no_code_with_us() {
+        let Some(sid) = test_sid() else {
+            println!("KAM_TEST_SID not set; skipping the independent check");
+            return;
+        };
+        let _guard = hive_guard();
+
+        let user = UserContext::new(Some(sid.clone()), r"C:\Users\ignored");
+        let decoy = &REGISTRY_DECOYS[0];
+
+        if exists(&user, decoy) && !is_ours(&user, decoy) {
+            println!("something is already there; skipping");
+            return;
+        }
+
+        plant(&user, decoy).expect("the agent's own path should create the key");
+
+        // Ask reg.exe, which knows nothing about any of this.
+        let full = format!(r"HKEY_USERS\{sid}\{}", decoy.relative);
+        let seen = std::process::Command::new("reg.exe")
+            .args(["query", &full, "/v", MARKER_VALUE])
+            .output();
+
+        let verdict = match &seen {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                out.status.success() && text.contains(MARKER)
+            }
+            Err(_) => false,
+        };
+
+        // Clean up before asserting, so a failure does not leave a decoy behind.
+        let _ = remove(&user, decoy);
+
+        assert!(
+            verdict,
+            "we believe {full} is planted, but reg.exe cannot see it. That is \
+             the whole bug this feature was switched off for: a decoy nothing \
+             else can read is never read, and a canary nothing reads is a false \
+             claim. reg.exe said: {seen:?}"
+        );
+    }
+
     #[test]
     fn a_key_without_our_marker_is_never_removed() {
         let _guard = hive_guard();
