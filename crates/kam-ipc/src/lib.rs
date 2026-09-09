@@ -115,6 +115,32 @@ pub enum Request {
     DeleteQuarantined { id: String },
     /// Delete everything currently held. Same rules, once per item.
     EmptyQuarantine,
+    /// Remove a leftover directory permanently, in one step.
+    ///
+    /// # Composed, not new
+    ///
+    /// This is deliberately **not** a "delete this path" primitive. It holds
+    /// the directory through exactly the fence [`Request::QuarantinePath`]
+    /// uses, then deletes it through exactly the one
+    /// [`Request::DeleteQuarantined`] uses. Nothing here can reach a path that
+    /// `QuarantinePath` would have refused, and if the second half fails the
+    /// item is left safely in quarantine and the reply says so.
+    ///
+    /// The reason it exists at all is that reaching permanent deletion by
+    /// quarantining and then emptying is two journeys through the interface for
+    /// one decision, and a person clearing 40 GB of a dead vendor's leftovers
+    /// should not have to make it twice.
+    DeletePath { path: String, reason: String },
+    /// The same, for one copy of a duplicated file.
+    ///
+    /// Separate from [`Request::DeletePath`] because a different fence applies:
+    /// [`Request::QuarantineCopy`]'s, including whether this copy was one the
+    /// product suggested or one the person picked themselves.
+    DeleteCopy {
+        path: String,
+        reason: String,
+        chosen: bool,
+    },
     /// Record that a file's hash was sent to VirusTotal.
     ///
     /// The lookup happens in the window, because the VirusTotal client is

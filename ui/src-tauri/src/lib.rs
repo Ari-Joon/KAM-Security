@@ -179,6 +179,26 @@ fn empty_quarantine() -> Result<Removal, String> {
     finish_removal(kam_ipc::client::call(&Request::EmptyQuarantine))
 }
 
+/// Remove a leftover directory permanently, without holding it first.
+///
+/// The agent still holds it and then deletes it, through both of the fences
+/// those two steps already have; what this saves is the second journey through
+/// the interface, not a safety check. There is no undo, so the view asks first.
+#[tauri::command]
+fn delete_path(path: String, reason: String) -> Result<Removal, String> {
+    finish_removal(kam_ipc::client::call(&Request::DeletePath { path, reason }))
+}
+
+/// The same, for one copy of a duplicated file.
+#[tauri::command]
+fn delete_copy(path: String, reason: String, chosen: bool) -> Result<Removal, String> {
+    finish_removal(kam_ipc::client::call(&Request::DeleteCopy {
+        path,
+        reason,
+        chosen,
+    }))
+}
+
 #[derive(serde::Serialize)]
 struct Removal {
     items: usize,
@@ -849,6 +869,8 @@ pub fn run() {
             restore_quarantined,
             delete_quarantined,
             empty_quarantine,
+            delete_path,
+            delete_copy,
             reveal_in_explorer,
             run_uninstaller,
             protocol_version

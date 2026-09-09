@@ -92,6 +92,18 @@ export const api = {
   restore: (id: string) => invoke<Manifest>("restore_quarantined", { id }),
   deleteQuarantined: (id: string) => invoke<Removal>("delete_quarantined", { id }),
   emptyQuarantine: () => invoke<Removal>("empty_quarantine"),
+  /**
+   * Remove a leftover directory permanently, in one step.
+   *
+   * The agent still holds it and then deletes it, through both fences those
+   * steps already have. What this saves is the second trip through the
+   * interface, not a check. There is no undo: ask first.
+   */
+  deletePath: (path: string, reason: string) =>
+    invoke<Removal>("delete_path", { path, reason }),
+  /** The same, for one copy of a duplicated file. */
+  deleteCopy: (path: string, reason: string, chosen = false) =>
+    invoke<Removal>("delete_copy", { path, reason, chosen }),
   reveal: (path: string) => invoke<void>("reveal_in_explorer", { path }),
   uninstall: (name: string, command: string) =>
     invoke<void>("run_uninstaller", { name, command }),

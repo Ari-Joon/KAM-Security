@@ -78,13 +78,26 @@ const CONFIDENCE_LABEL: Record<Confidence, string> = {
 function OrphanRow({
   orphan,
   onQuarantine,
+  onDelete,
   busy,
 }: {
   orphan: Orphan;
   onQuarantine: (orphan: Orphan) => void;
+  onDelete: (orphan: Orphan) => void;
   busy: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  /**
+   * Whether the delete is one press away.
+   *
+   * Deleting is offered here rather than only from the quarantine list, because
+   * reaching it the other way is two journeys through the interface for one
+   * decision. It is not offered as *easily*: quarantine stays the plain button,
+   * this is the quiet one, and it asks before it acts. The asking is the whole
+   * difference between offering a choice and setting a trap.
+   */
+  const [confirming, setConfirming] = useState(false);
+
   return (
     <li className={`orphan orphan-${orphan.confidence}`}>
       <div className="orphan-main">
@@ -96,13 +109,42 @@ function OrphanRow({
           </span>
           <span className="orphan-size">{fmt.bytes(orphan.bytes)}</span>
         </button>
-        <button
-          className="orphan-action"
-          disabled={busy}
-          onClick={() => onQuarantine(orphan)}
-        >
-          Quarantine
-        </button>
+        {confirming ? (
+          <>
+            <span className="held-warn">Delete for good?</span>
+            <button
+              className="orphan-action danger"
+              disabled={busy}
+              onClick={() => {
+                setConfirming(false);
+                onDelete(orphan);
+              }}
+            >
+              Yes, delete
+            </button>
+            <button className="ghost" onClick={() => setConfirming(false)}>
+              No
+            </button>
+          </>
+        ) : (
+          <>
+            <button
+              className="orphan-action"
+              disabled={busy}
+              onClick={() => onQuarantine(orphan)}
+            >
+              Quarantine
+            </button>
+            <button
+              className="ghost"
+              disabled={busy}
+              title="Remove it permanently instead of holding it for 30 days"
+              onClick={() => setConfirming(true)}
+            >
+              Delete
+            </button>
+          </>
+        )}
       </div>
       {open && (
         <div className="orphan-detail">
@@ -144,6 +186,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const [cleared, setCleared] = useState<Record<string, Cleared>>({});
   /** Which held item is one press from being deleted for good. */
   const [confirming, setConfirming] = useState<string | null>(null);
+  /** The same, for a duplicate copy still out on disk, keyed by its path. */
+  const [confirmingCopy, setConfirmingCopy] = useState<string | null>(null);
   const [emptying, setEmptying] = useState(false);
   /**
    * Which copy of a set the person has chosen to keep, by set.
@@ -380,6 +424,49 @@ export default function Cleanup({ volumes, onChanged }: Props) {
 
 
   /**
+   * Delete one redundant copy permanently, having been asked twice.
+   *
+   * Same fence as holding it, and the same shape as `deleteOrphan`: the agent
+   * holds the copy and then deletes it, so a failure in the second half leaves
+   * it recoverable rather than half gone.
+   */
+  async function removeCopyForGood(path: string, bytes: number, chosen: boolean) {
+    setBusyPath(path);
+    setError(null);
+    try {
+      const removal = await api.deleteCopy(
+        path,
+        chosen
+          ? "you chose which copy to keep, and this was not it"
+          : "a redundant copy of an identical file",
+        chosen,
+      );
+      setNote(
+        removal.items > 0
+          ? `Deleted ${fmt.bytes(removal.bytes_freed || bytes)}: ${path}. This one cannot be undone.`
+          : `${path} could not be deleted, so it is held in quarantine below instead: ` +
+              `${removal.refused[0] ?? "no reason given"}`,
+      );
+      setDuplicates((current) =>
+        current
+          ? current
+              .map((group) => ({
+                ...group,
+                copies: group.copies.filter((copy) => copy.path !== path),
+              }))
+              .filter((group) => group.copies.length > 1)
+          : current,
+      );
+      await loadQuarantine();
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
+      setBusyPath(null);
+      onChanged();
+    }
+  }
+
+  /**
    * Delete one held item for good.
    *
    * The whole point of quarantine is that acting on a suggestion is reversible,
@@ -463,6 +550,49 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     }
   }
 
+  /**
+   * Remove a leftover directory permanently, having been asked twice.
+   *
+   * The agent holds it and then deletes it, so it passes the same fence a
+   * quarantine would and the audit log records both halves. If the deleting
+   * half fails the item is still held, and saying so matters: the person
+   * expects it gone, and finding it in the list below without explanation
+   * would read as the product ignoring them.
+   */
+  async function deleteOrphan(orphan: Orphan) {
+    setBusyPath(orphan.path);
+    setError(null);
+    try {
+      const removal = await api.deletePath(
+        orphan.path,
+        `left behind: ${orphan.reasons[0] ?? "no installed application matches it"}`,
+      );
+      if (removal.items > 0) {
+        setNote(
+          `Deleted ${orphan.name} for good, freeing ` +
+            `${fmt.bytes(removal.bytes_freed || orphan.bytes)}. This one cannot be undone.`,
+        );
+        setOrphans((current) =>
+          current ? current.filter((item) => item.path !== orphan.path) : current,
+        );
+      } else {
+        setNote(
+          `${orphan.name} could not be deleted, so it is being held in ` +
+            `quarantine below instead: ${removal.refused[0] ?? "no reason given"}`,
+        );
+        setOrphans((current) =>
+          current ? current.filter((item) => item.path !== orphan.path) : current,
+        );
+      }
+      await loadQuarantine();
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
+      setBusyPath(null);
+      onChanged();
+    }
+  }
+
   async function restore(id: string) {
     setError(null);
     try {
@@ -485,7 +615,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           <h1>Cleanup</h1>
           <p className="lede">
             Directories left behind by software that is no longer installed.
-            Nothing is deleted — items are moved aside and can be put back.
+            Quarantine is the default and can be put back for 30 days; deleting
+            is offered beside it, asks first, and cannot be undone.
           </p>
         </div>
       </div>
@@ -528,8 +659,16 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             video and archives — never anything that runs.
           </li>
           <li>
-            <strong>Quarantine</strong> is where anything you act on goes. Items
-            are <em>moved</em>, never deleted, and can be put back for 30 days.
+            <strong>Quarantine</strong> is where anything you act on goes by
+            default. Items are <em>moved</em>, not deleted, and can be put back
+            for 30 days.
+          </li>
+          <li>
+            <strong>Delete</strong> sits beside every Quarantine button and does
+            the other thing: the item is held and then removed, in one step,
+            permanently. It asks before it acts, and the log records both
+            halves. Use it when you already know — the 30 days exist for when
+            you do not.
           </li>
         </ol>
         <p className="muted">
@@ -599,6 +738,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                   orphan={orphan}
                   busy={busyPath === orphan.path}
                   onQuarantine={(item) => void quarantine(item)}
+                  onDelete={(item) => void deleteOrphan(item)}
                 />
               ))}
             </ul>
@@ -908,23 +1048,67 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                                             Keep this one instead
                                           </button>
                                         )}
-                                        {keeper && (
-                                          <button
-                                            className="dupe-take"
-                                            disabled={busyPath !== null}
-                                            title={
-                                              ours
-                                                ? "Moved to quarantine, and restorable for 30 days."
-                                                : "This is not a copy we would have offered. It goes to quarantine and comes back with one press for 30 days."
-                                            }
-                                            onClick={(event) => {
-                                              event.stopPropagation();
-                                              void holdCopy(copy.path, group.bytes, !ours);
-                                            }}
-                                          >
-                                            Remove this one
-                                          </button>
-                                        )}
+                                        {keeper &&
+                                          (confirmingCopy === copy.path ? (
+                                            <>
+                                              <span className="held-warn">
+                                                Delete for good?
+                                              </span>
+                                              <button
+                                                className="dupe-take danger"
+                                                disabled={busyPath !== null}
+                                                onClick={(event) => {
+                                                  event.stopPropagation();
+                                                  setConfirmingCopy(null);
+                                                  void removeCopyForGood(
+                                                    copy.path,
+                                                    group.bytes,
+                                                    !ours,
+                                                  );
+                                                }}
+                                              >
+                                                Yes, delete
+                                              </button>
+                                              <button
+                                                className="ghost"
+                                                onClick={(event) => {
+                                                  event.stopPropagation();
+                                                  setConfirmingCopy(null);
+                                                }}
+                                              >
+                                                No
+                                              </button>
+                                            </>
+                                          ) : (
+                                            <>
+                                              <button
+                                                className="dupe-take"
+                                                disabled={busyPath !== null}
+                                                title={
+                                                  ours
+                                                    ? "Moved to quarantine, and restorable for 30 days."
+                                                    : "This is not a copy we would have offered. It goes to quarantine and comes back with one press for 30 days."
+                                                }
+                                                onClick={(event) => {
+                                                  event.stopPropagation();
+                                                  void holdCopy(copy.path, group.bytes, !ours);
+                                                }}
+                                              >
+                                                Remove this one
+                                              </button>
+                                              <button
+                                                className="ghost"
+                                                disabled={busyPath !== null}
+                                                title="Delete this copy permanently instead of holding it for 30 days"
+                                                onClick={(event) => {
+                                                  event.stopPropagation();
+                                                  setConfirmingCopy(copy.path);
+                                                }}
+                                              >
+                                                Delete
+                                              </button>
+                                            </>
+                                          ))}
                                       </>
                                     )}
                                   </span>

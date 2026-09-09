@@ -2686,6 +2686,22 @@ button.ghost {
   white-space: nowrap;
 }
 
+/* The confirming half of a delete.
+
+   Only ever shown after the quiet Delete button has been pressed once, so it
+   is the second of two presses rather than a red button sitting next to a
+   safe one. It borrows the warning colour instead of a solid fill: this is a
+   thing the person asked for, not an alarm. */
+.danger {
+  border-color: rgba(240, 180, 41, 0.45);
+  color: var(--warn);
+}
+
+.danger:hover:not(:disabled) {
+  border-color: var(--warn);
+  background: rgba(240, 180, 41, 0.12);
+}
+
 .confirm {
   margin-top: 14px;
   padding: 12px 14px;
