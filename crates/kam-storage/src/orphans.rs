@@ -592,7 +592,11 @@ mod tests {
     fn a_protected_directory_survives_being_named_through_its_index_stream() {
         let profile = Profile::new("stream-consequence");
         let real = profile.make("Microsoft");
-        fs::write(std::path::Path::new(&real).join("keep.txt"), b"load bearing").unwrap();
+        fs::write(
+            std::path::Path::new(&real).join("keep.txt"),
+            b"load bearing",
+        )
+        .unwrap();
 
         let sneaky = profile
             .local()

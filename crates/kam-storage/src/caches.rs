@@ -422,38 +422,134 @@ pub fn survey(user: &UserContext) -> Vec<Cache> {
     caches
 }
 
-/// Whether a path is a real directory of ours, rather than a link to one.
+/// Whether a path looks like a real directory rather than a link to one.
 ///
 /// `Path::is_dir` follows reparse points, so it answers "yes" for a junction
-/// pointing anywhere at all. Every root in the catalogue is checked with this
-/// instead, because several of them sit in user-writable space: deleting
-/// `%LOCALAPPDATA%\Temp` or a browser cache while it is unlocked and
-/// recreating it as a junction needs no elevation, and the next clear would
-/// have had a LocalSystem service delete whatever it pointed at. Permanently:
-/// this is the path that removes rather than quarantines.
+/// pointing anywhere at all, and the survey would then list somebody else's
+/// files as a cache and offer their size for reclaiming.
 ///
-/// The guard inside `empty` never covered this. It checks the *children* of a
-/// directory, so it protected against a junction planted inside a cache and
-/// not against a cache that was itself one.
+/// # Not a safety guard
+///
+/// This is for *listing*, and nothing more. It resolves the path once and
+/// answers about that moment, which is worth nothing to the code that deletes:
+/// by the time deleting happened the answer could be stale, and adversarial
+/// review demonstrated exactly that. [`HeldRoot`] is what stands between a
+/// name and a deletion. Do not reach for this one there.
 fn ours_to_empty(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|data| data.is_dir() && !data.file_type().is_symlink())
         .unwrap_or(false)
 }
 
-/// Empty one catalogue root, having checked it is really ours.
-fn empty_root(path: &Path, result: &mut Cleared) {
-    if !ours_to_empty(path) {
-        // Said out loud rather than skipped silently: a cache root that has
-        // become a link is not a tidy no-op, it is somebody having put it
-        // there.
-        result.refused.push(format!(
-            "{} is a link rather than a real folder, so it was left alone",
-            path.display()
-        ));
-        return;
+/// A cache root, held open so it cannot become something else.
+///
+/// # Why a handle and not another check
+///
+/// The obvious guard is to ask whether the path is a real directory and then
+/// empty it, and that is what this did. Asking and acting are two separate
+/// resolutions of the same name, and between them the name can be made to mean
+/// something else: several catalogue roots sit in user-writable space, so
+/// renaming `%LOCALAPPDATA%\Temp` aside and dropping a junction in its place
+/// needs no elevation at all. Adversarial review demonstrated the payload —
+/// with the swap landing in that window, `read_dir` follows the junction and
+/// the walk deletes the target's real contents, as LocalSystem, permanently,
+/// because this is the path that removes rather than quarantines.
+///
+/// A narrower window would not have fixed it. The check is retryable, the
+/// attacker controls the location, and losing a race that can be re-run costs
+/// nothing. So the second resolution is removed instead: the root is opened
+/// once, and the handle is held for as long as the walk runs.
+///
+/// Two flags carry the weight:
+///
+/// - `FILE_FLAG_OPEN_REPARSE_POINT` opens the reparse point itself rather than
+///   following it, so a root that is *already* a junction is seen as one.
+/// - The share mode omits `FILE_SHARE_DELETE`, which is what makes this a lock
+///   rather than a faster check. Renaming or deleting a directory needs DELETE
+///   access, and that cannot be granted while a handle without delete sharing
+///   is open. For as long as this value lives, the root cannot be swapped.
+///
+/// # What this does not cover
+///
+/// The root is pinned; its *ancestors* are not. Somebody able to rename a
+/// parent directory and rebuild the chain through a junction could still make
+/// the path resolve elsewhere, because `read_dir` below is still by path.
+/// Closing that needs enumeration relative to this handle, which std cannot do
+/// and which is a larger piece of work than the finding justified. It is
+/// recorded here rather than left implied, because the difference between
+/// "closed" and "narrowed" is exactly the kind of thing that gets forgotten.
+struct HeldRoot {
+    _handle: std::fs::File,
+}
+
+impl HeldRoot {
+    /// Open a catalogue root, or explain why it will not be touched.
+    fn open(path: &Path) -> std::result::Result<Self, String> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // Opening a directory at all needs backup semantics; the rest is
+        // described above.
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|error| format!("{} could not be opened: {error}", path.display()))?;
+
+        let attributes = {
+            use std::os::windows::fs::MetadataExt;
+            handle
+                .metadata()
+                .map_err(|error| format!("{} could not be read: {error}", path.display()))?
+                .file_attributes()
+        };
+
+        // Any reparse tag is refused, not only the redirecting ones. A cache
+        // root is an ordinary directory this product created or Windows did,
+        // and something that has become a reparse point of any kind is not a
+        // thing to empty as LocalSystem on the strength of its name.
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!(
+                "{} is a link rather than a real folder, so it was left alone",
+                path.display()
+            ));
+        }
+        if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(format!(
+                "{} is not a folder, so it was left alone",
+                path.display()
+            ));
+        }
+
+        Ok(Self { _handle: handle })
     }
+}
+
+/// Empty one catalogue root, holding it open for the whole walk.
+fn empty_root(path: &Path, result: &mut Cleared) {
+    // Said out loud rather than skipped silently: a cache root that has become
+    // a link is not a tidy no-op, it is somebody having put it there.
+    let held = match HeldRoot::open(path) {
+        Ok(held) => held,
+        Err(refusal) => {
+            result.refused.push(refusal);
+            return;
+        }
+    };
+
     empty(path, result);
+
+    // Explicit, because the whole point is *when* it is released. Dropping it
+    // early would restore the race this exists to remove, and a lint that
+    // "helpfully" moved it would do exactly that.
+    drop(held);
 }
 
 /// Empty one directory's contents, leaving the directory itself.
@@ -483,6 +579,16 @@ fn empty(path: &Path, result: &mut Cleared) {
         if kind.is_dir() {
             // Measure before removing: afterwards there is nothing to ask.
             let (bytes, files, _) = measure(&target);
+            // `remove_dir_all` will not traverse a reparse point, which matters
+            // more than it looks: a child swapped for a junction *after* the
+            // listing above cached it as a directory arrives here, and what
+            // gets removed is the link rather than whatever it points at.
+            //
+            // That is a property of the standard library since 1.58, when
+            // CVE-2022-21658 was fixed, and not of anything written here. The
+            // workspace pins a far newer toolchain so it holds today; it is
+            // written down because reimplementing this walk by hand, or an
+            // MSRV that somehow went backwards, would lose it silently.
             match std::fs::remove_dir_all(&target) {
                 Ok(()) => {
                     result.bytes_freed += bytes;
@@ -722,6 +828,55 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         std::fs::remove_dir_all(&victim).unwrap();
+    }
+
+    /// While a root is held, it cannot be swapped for anything else.
+    ///
+    /// The test above proves a root that is *already* a junction is refused.
+    /// This proves the harder half: that checking and acting are no longer two
+    /// resolutions with a gap between them.
+    ///
+    /// Adversarial review demonstrated the payload. Verify the root is a real
+    /// directory, swap it for a junction before the walk reads it, and the walk
+    /// deletes the junction target's contents as LocalSystem, permanently. The
+    /// window was microseconds, but the attacker owns the location, the clear
+    /// is user-triggered and retryable, and losing a race you can re-run costs
+    /// nothing.
+    ///
+    /// So the fix is not a smaller window. `HeldRoot` opens the directory
+    /// without sharing delete, and renaming or removing a directory needs
+    /// DELETE access, which cannot be granted while such a handle is open. The
+    /// swap does not lose a race here; it fails.
+    #[test]
+    fn a_held_root_cannot_be_renamed_out_from_under_the_walk() {
+        let root = scratch("held-root");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("junk.tmp"), vec![0_u8; 32]).unwrap();
+
+        let held = HeldRoot::open(&cache).expect("a real directory opens");
+
+        // The swap the attack depends on: move the real root aside so a
+        // junction can take its name. Both halves are refused while it is held.
+        let aside = root.join("cache-aside");
+        assert!(
+            std::fs::rename(&cache, &aside).is_err(),
+            "the held root was renamed, so the swap is still possible"
+        );
+        assert!(
+            std::fs::remove_dir_all(&cache).is_err(),
+            "the held root was removed, so the swap is still possible"
+        );
+
+        // And releasing it gives the rights back, so this is a lock held for a
+        // reason and not an unrelated failure.
+        drop(held);
+        assert!(
+            std::fs::rename(&cache, &aside).is_ok(),
+            "the block outlived the handle, which would be a different bug"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The clear never follows a link out of the folder it was given.

@@ -370,11 +370,7 @@ pub fn survey(
 /// The destination usually does not exist yet, which is the point of moving
 /// something there, so it is resolved as far as it goes; see
 /// [`crate::paths::resolved`].
-pub fn check_movable(
-    from: &str,
-    to: &str,
-    user: &UserContext,
-) -> std::result::Result<(), String> {
+pub fn check_movable(from: &str, to: &str, user: &UserContext) -> std::result::Result<(), String> {
     // Resolved against resolved: see `paths::resolved_root`. A profile reached
     // through a junction — ordinary where folders are redirected — otherwise
     // never matches the resolved paths below, and every move is refused.
@@ -395,7 +391,9 @@ pub fn check_movable(
             return Err(format!("{path} is not a plain path"));
         }
         let Some(real) = crate::paths::resolved_plain(path) else {
-            return Err(format!("{path} could not be resolved, so it was left alone"));
+            return Err(format!(
+                "{path} could not be resolved, so it was left alone"
+            ));
         };
         if !real.starts_with(&fence) {
             return Err(format!(
@@ -589,10 +587,7 @@ mod tests {
         assert!(check_movable(&from, &to, &home.user()).is_ok());
 
         // The account the service actually runs as.
-        let system = UserContext::new(
-            None,
-            r"C:\Windows\system32\config\systemprofile",
-        );
+        let system = UserContext::new(None, r"C:\Windows\system32\config\systemprofile");
         assert!(
             check_movable(&from, &to, &system).is_err(),
             "another account's profile was allowed to confine this move"
@@ -611,7 +606,12 @@ mod tests {
 
         let theirs = annette.file("Downloads\\private.pdf");
         assert!(
-            check_movable(&theirs, &annette.path("Documents\\private.pdf"), &ann.user()).is_err(),
+            check_movable(
+                &theirs,
+                &annette.path("Documents\\private.pdf"),
+                &ann.user()
+            )
+            .is_err(),
             "one profile reached into another that merely shares its opening letters"
         );
     }
@@ -639,7 +639,9 @@ mod tests {
             home.root()
         );
         assert!(
-            escape.to_lowercase().starts_with(&home.root().to_lowercase()),
+            escape
+                .to_lowercase()
+                .starts_with(&home.root().to_lowercase()),
             "the test input has to look confined, or it proves nothing"
         );
 

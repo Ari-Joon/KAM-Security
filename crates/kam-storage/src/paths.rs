@@ -82,17 +82,37 @@ pub(crate) fn has_relative_step(path: &str) -> bool {
 /// appended unchanged. Those trailing components are names in a directory that
 /// has been resolved, so nothing is being taken on trust: a link cannot hide in
 /// a path that is not there yet.
+/// # The one way the appending can go wrong
+///
+/// [`PathBuf::push`] replaces rather than appends when what it is given carries
+/// a root or a drive. A tail component Rust reads as drive-qualified —
+/// `c:evil`, or an extended-length prefix — therefore discards the resolved
+/// ancestor entirely, and what comes back is a bare drive-relative path rather
+/// than either a confined path or `None`.
+///
+/// Adversarial review found this. It is fail-closed with today's two callers,
+/// which compare against a confinement root and refuse anything that does not
+/// start with it, so a returned `c:evil` is refused like any other outsider.
+/// But `c:evil` resolves against the *process's* current directory, which for
+/// the service is System32, and the documented contract above says the failure
+/// mode is `None`. A future caller trusting that — treating not-`None` as
+/// valid, or operating on the returned path rather than the original — would
+/// turn a safe surprise into an unsafe one.
+///
+/// So the result is required to still be under the ancestor it was built from.
+/// If pushing lost it, that is a refusal.
 pub(crate) fn resolved(path: &Path) -> Option<PathBuf> {
     let mut tail: Vec<OsString> = Vec::new();
     let mut current = path;
 
     loop {
         if let Ok(real) = std::fs::canonicalize(current) {
-            let mut out = real;
+            let mut out = real.clone();
             for part in tail.iter().rev() {
                 out.push(part);
             }
-            return Some(out);
+            // Appending must have appended. See above.
+            return out.starts_with(&real).then_some(out);
         }
         // Not there yet: step up and remember the name.
         let parent = current.parent()?;
@@ -168,7 +188,10 @@ mod tests {
 
     #[test]
     fn the_unc_form_keeps_its_double_leading_separator() {
-        assert_eq!(plain(r"\\?\UNC\server\share\a.txt"), r"\\server\share\a.txt");
+        assert_eq!(
+            plain(r"\\?\UNC\server\share\a.txt"),
+            r"\\server\share\a.txt"
+        );
         assert_eq!(plain(r"\??\UNC\server\share"), r"\\server\share");
     }
 
@@ -221,6 +244,40 @@ mod tests {
         let text = plain(&real.to_string_lossy());
         assert!(text.ends_with(r"\not-there\either\a.pdf"), "{text}");
         assert!(text.contains("kam-paths-destination"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A tail component that carries a drive is refused, not obeyed.
+    ///
+    /// `PathBuf::push` replaces rather than appends when given something
+    /// drive-qualified, so these once came back as bare drive-relative paths
+    /// with the resolved ancestor thrown away. Both inputs are the ones
+    /// adversarial review used.
+    #[test]
+    fn a_tail_that_would_discard_the_resolved_ancestor_resolves_to_nothing() {
+        let root = std::env::temp_dir().join("kam-paths-drive-tail");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let real = std::fs::canonicalize(&root).unwrap();
+
+        // Built as text rather than with `join`, because `join` applies the
+        // same replacement itself and would mangle the input before `resolved`
+        // ever saw it. A path arriving from a client is a string.
+        for tail in ["c:evil", r"\Windows\x", "C:/Windows/x", r"\\?\C:\Windows\x"] {
+            let target = format!("{}\\not-there\\{tail}", root.display());
+            let got = resolved(Path::new(&target));
+            assert!(
+                got.as_ref().is_none_or(|out| out.starts_with(&real)),
+                "{tail:?} resolved to {got:?}, which is outside {}",
+                real.display()
+            );
+        }
+
+        // And an ordinary name still works, or the guard is too strict to use.
+        let ordinary = root.join("not-there").join("a.pdf");
+        assert!(resolved(&ordinary).is_some());
 
         let _ = std::fs::remove_dir_all(&root);
     }
