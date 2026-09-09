@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -155,7 +155,19 @@ pub enum Request {
     /// directly inside a data root. This one fences to a *file* in a folder the
     /// person owns, and the agent re-derives that from the path rather than
     /// trusting the list the interface displayed.
-    QuarantineCopy { path: String, reason: String },
+    /// `chosen` is the difference between acting on this product's own
+    /// suggestion and acting on somebody's decision.
+    ///
+    /// A suggestion only ever reaches a copy in a folder the person owns,
+    /// because it came from a classifier. A choice reaches what they picked,
+    /// because they looked at the set. Windows' own files and the servicing
+    /// store are refused either way, and both go to quarantine rather than
+    /// being deleted, which is what makes honouring the second reasonable.
+    QuarantineCopy {
+        path: String,
+        reason: String,
+        chosen: bool,
+    },
     /// Find byte-for-byte duplicate files on `drive`.
     ///
     /// Separate from the survey because it reads file contents rather than the

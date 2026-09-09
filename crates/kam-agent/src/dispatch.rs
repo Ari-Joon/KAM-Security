@@ -407,7 +407,11 @@ pub fn handle(
             }
         },
 
-        Request::QuarantineCopy { path, reason } => quarantine_copy(&path, &reason, context, user),
+        Request::QuarantineCopy {
+            path,
+            reason,
+            chosen,
+        } => quarantine_copy(&path, &reason, chosen, context, user),
 
         Request::FindOrganiseProposals { drive } => {
             let Some(letter) = drive.chars().next().filter(|c| c.is_ascii_alphabetic()) else {
@@ -896,8 +900,19 @@ fn quarantine_path(path: &str, reason: &str, context: &Context, user: &UserConte
 /// here rather than trusted from the list the interface drew. Quarantine rather
 /// than deletion, for the same reason as everywhere else: the copy is held, the
 /// move is recorded, and it goes back with one press if this was wrong.
-fn quarantine_copy(path: &str, reason: &str, context: &Context, user: &UserContext) -> Response {
-    if let Err(refusal) = kam_storage::duplicates::check_removable(path, user) {
+fn quarantine_copy(
+    path: &str,
+    reason: &str,
+    chosen: bool,
+    context: &Context,
+    user: &UserContext,
+) -> Response {
+    let intent = if chosen {
+        kam_storage::duplicates::Intent::Chosen
+    } else {
+        kam_storage::duplicates::Intent::Suggested
+    };
+    if let Err(refusal) = kam_storage::duplicates::check_removable(path, user, intent) {
         context.audit(
             "quarantine",
             "take_copy",
@@ -1370,6 +1385,7 @@ mod tests {
                 Request::QuarantineCopy {
                     path: path.to_owned(),
                     reason: "a test".to_owned(),
+                    chosen: false,
                 },
                 &context,
                 &Reporter::silent(),
@@ -1406,6 +1422,7 @@ mod tests {
             Request::QuarantineCopy {
                 path: path.clone(),
                 reason: "a redundant copy".to_owned(),
+                chosen: false,
             },
             &context,
             &Reporter::silent(),

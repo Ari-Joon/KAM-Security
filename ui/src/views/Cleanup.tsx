@@ -145,6 +145,13 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   /** Which held item is one press from being deleted for good. */
   const [confirming, setConfirming] = useState<string | null>(null);
   const [emptying, setEmptying] = useState(false);
+  /**
+   * Which copy of a set the person has chosen to keep, by set.
+   *
+   * Keyed on the first copy's path, which is stable for as long as the set is
+   * on screen. Absent means they have not chosen and the suggestion stands.
+   */
+  const [keeping, setKeeping] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
 
@@ -279,8 +286,18 @@ export default function Cleanup({ volumes, onChanged }: Props) {
    */
   const shownDuplicates = useMemo(() => {
     if (!duplicates) return [];
+    // "Something can go" used to mean "we would suggest removing one", which
+    // was the same thing when the only removable copy was one in a folder you
+    // own. Now that you can pick, a set is actionable whenever it holds two
+    // copies that are not Windows' own — and hiding those would hide most of
+    // what the comparison finds.
     return onlyActionable
-      ? duplicates.filter((group) => group.verdict === "choose")
+      ? duplicates.filter(
+          (group) =>
+            group.copies.filter(
+              (copy) => copy.owner !== "windows" && copy.owner !== "servicing",
+            ).length > 1,
+        )
       : duplicates;
   }, [duplicates, onlyActionable]);
 
@@ -321,12 +338,23 @@ export default function Cleanup({ volumes, onChanged }: Props) {
    * Quarantine, not deletion. The agent re-derives whether this copy may go
    * before it touches it, so a path from here is a request rather than an
    * instruction, and a mistake costs one press of "put back".
+   *
+   * `chosen` says whose decision this was. Acting on our own suggestion only
+   * ever reaches a copy in a folder you own, because the suggestion came from
+   * a classifier. Acting on your choice reaches what you picked, because you
+   * looked at the set. Windows' own files are refused either way.
    */
-  async function holdCopy(path: string, bytes: number) {
+  async function holdCopy(path: string, bytes: number, chosen: boolean) {
     setBusyPath(path);
     setError(null);
     try {
-      await api.quarantineCopy(path, "a redundant copy of an identical file");
+      await api.quarantineCopy(
+        path,
+        chosen
+          ? "you chose which copy to keep, and this was not it"
+          : "a redundant copy of an identical file",
+        chosen,
+      );
       setNote(
         `Held ${fmt.bytes(bytes)}: ${path}. It is in quarantine below and can be put back for 30 days.`,
       );
@@ -773,7 +801,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                   checked={onlyActionable}
                   onChange={(event) => setOnlyActionable(event.target.checked)}
                 />
-                Only sets where something can go
+                Only sets you can choose between
               </label>
               <span className="muted">
                 {fmt.count(shownDuplicates.length)} of{" "}
@@ -813,41 +841,100 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                       ))}
                     </ul>
 
-                    <ul className="files">
-                      {group.copies.map((copy, index) => (
-                        <FileRow
-                          key={copy.path}
-                          path={copy.path}
-                          bytes={group.bytes}
-                          onReveal={(target) => void reveal(target)}
-                          note={
-                            <span className="dupe-copy-note">
-                              <span
-                                className={`owner owner-${copy.owner}`}
-                                title={OWNER_WHY[copy.owner]}
-                              >
-                                {OWNER_LABEL[copy.owner]}
-                              </span>
-                              {group.suggested_keep === index && (
-                                <span className="owner owner-keep">keep this one</span>
-                              )}
-                              {copy.removable && group.suggested_keep !== index && (
-                                <button
-                                  className="dupe-take"
-                                  disabled={busyPath !== null}
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    void holdCopy(copy.path, group.bytes);
-                                  }}
-                                >
-                                  Hold this copy
-                                </button>
-                              )}
-                            </span>
-                          }
-                        />
-                      ))}
-                    </ul>
+                    {(() => {
+                      // Which copy survives. Our suggestion until somebody
+                      // says otherwise, and then theirs.
+                      const setKey = group.copies[0]?.path ?? "";
+                      const suggested =
+                        group.suggested_keep === null
+                          ? undefined
+                          : group.copies[group.suggested_keep]?.path;
+                      const keeper = keeping[setKey] ?? suggested;
+                      // Windows keeps its own files whatever anybody picks, so
+                      // a set made only of those offers no choice at all.
+                      const choosable = group.copies.filter(
+                        (copy) => copy.owner !== "windows" && copy.owner !== "servicing",
+                      );
+                      const canChoose = choosable.length > 1;
+
+                      return (
+                        <ul className="files">
+                          {group.copies.map((copy) => {
+                            const locked =
+                              copy.owner === "windows" || copy.owner === "servicing";
+                            const isKeeper = keeper === copy.path;
+                            // Removing this was our idea only when it is the
+                            // copy we would have offered anyway.
+                            const ours = copy.removable && suggested === keeper;
+
+                            return (
+                              <FileRow
+                                key={copy.path}
+                                path={copy.path}
+                                bytes={group.bytes}
+                                onReveal={(target) => void reveal(target)}
+                                note={
+                                  <span className="dupe-copy-note">
+                                    <span
+                                      className={`owner owner-${copy.owner}`}
+                                      title={OWNER_WHY[copy.owner]}
+                                    >
+                                      {OWNER_LABEL[copy.owner]}
+                                    </span>
+
+                                    {locked ? (
+                                      <span
+                                        className="owner"
+                                        title="Windows puts these back and removing one breaks an update, so this is refused however it is asked for."
+                                      >
+                                        cannot be removed
+                                      </span>
+                                    ) : isKeeper ? (
+                                      <span className="owner owner-keep">keeping this one</span>
+                                    ) : (
+                                      <>
+                                        {canChoose && (
+                                          <button
+                                            className="dupe-take"
+                                            disabled={busyPath !== null}
+                                            onClick={(event) => {
+                                              event.stopPropagation();
+                                              setKeeping((current) => ({
+                                                ...current,
+                                                [setKey]: copy.path,
+                                              }));
+                                            }}
+                                          >
+                                            Keep this one instead
+                                          </button>
+                                        )}
+                                        {keeper && (
+                                          <button
+                                            className="dupe-take"
+                                            disabled={busyPath !== null}
+                                            title={
+                                              ours
+                                                ? "Moved to quarantine, and restorable for 30 days."
+                                                : "This is not a copy we would have offered. It goes to quarantine and comes back with one press for 30 days."
+                                            }
+                                            onClick={(event) => {
+                                              event.stopPropagation();
+                                              void holdCopy(copy.path, group.bytes, !ours);
+                                            }}
+                                          >
+                                            Remove this one
+                                          </button>
+                                        )}
+                                      </>
+                                    )}
+                                  </span>
+                                }
+                              />
+                            );
+                          })}
+                        </ul>
+                      );
+                    })()}
                   </li>
                 ))}
               </ul>

@@ -267,9 +267,13 @@ fn clear_cache(id: String) -> Result<kam_storage::Cleared, String> {
 /// being wrong about a duplicate costs data, so being wrong here costs a press
 /// of "put back" instead.
 #[tauri::command]
-fn quarantine_copy(path: String, reason: String) -> Result<Manifest, String> {
-    match kam_ipc::client::call(&Request::QuarantineCopy { path, reason })
-        .map_err(|error| error.to_string())?
+fn quarantine_copy(path: String, reason: String, chosen: bool) -> Result<Manifest, String> {
+    match kam_ipc::client::call(&Request::QuarantineCopy {
+        path,
+        reason,
+        chosen,
+    })
+    .map_err(|error| error.to_string())?
     {
         Response::Quarantined(manifest) => Ok(manifest),
         Response::Error { message } => Err(message),

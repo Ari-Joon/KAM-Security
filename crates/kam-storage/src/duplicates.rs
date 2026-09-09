@@ -195,6 +195,42 @@ const PROGRAM: &[&str] = &[
     r"\riot games\",
 ];
 
+/// Reduce a path to the form the ownership rules are written against.
+///
+/// Every rule below reads the path as text, so any way of spelling the same
+/// file that the rules do not recognise is a way past them. Windows accepts
+/// several:
+///
+/// - `\\?\C:\...` — the extended-length form, which skips the Win32 path
+///   parser entirely and is accepted by every file API.
+/// - `\\?\UNC\server\share` — the same for network paths.
+/// - `\??\C:\...` — the object-manager form, which some APIs take.
+/// - Forward slashes, which Windows treats as separators throughout.
+///
+/// The first of these was a real hole and not a theoretical one: with the
+/// extended-length prefix, `C:\Windows\System32\kernel32.dll` was classified
+/// as somewhere unrecognised rather than as Windows, and an explicit choice
+/// would have been allowed to take it. A test now spells that file six ways
+/// and requires all six to come back as Windows.
+fn normalise(path: &str) -> String {
+    let mut text = path.replace('/', "\\");
+
+    // Order matters: the UNC form is a longer prefix of the extended one.
+    for prefix in [r"\\?\UNC\", r"\??\UNC\"] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            text = format!(r"\\{rest}");
+            return text.to_lowercase();
+        }
+    }
+    for prefix in [r"\\?\", r"\??\"] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            text = rest.to_owned();
+            break;
+        }
+    }
+    text.to_lowercase()
+}
+
 /// Work out who owns a copy, from its path alone.
 ///
 /// Path-only on purpose. This runs against the master file table on a whole
@@ -202,7 +238,7 @@ const PROGRAM: &[&str] = &[
 /// the disk, and every rule here is one a person could check by reading the
 /// path themselves — which matters for a list whose whole job is to be trusted.
 pub fn owner_of(path: &str, user: &UserContext) -> Owner {
-    let lowered = path.to_lowercase().replace('/', "\\");
+    let lowered = normalise(path);
 
     if lowered.contains(r"\$recycle.bin\") {
         return Owner::Deleted;
@@ -453,22 +489,97 @@ fn explain(copies: &[FileCopy], verdict: Verdict, spare: usize) -> Vec<String> {
     reasons
 }
 
+/// How firmly somebody has asked for a copy to go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// Acting on this product's own suggestion. Only a copy in a folder the
+    /// person owns qualifies, because the suggestion came from a classifier
+    /// and a classifier can be wrong about somebody's disk.
+    Suggested,
+    /// The person looked at the set, picked which copy to keep, and asked for
+    /// this one to go. They may well be right about a file this product would
+    /// not have offered: their disk, their call.
+    Chosen,
+}
+
 /// Decide whether one copy may be removed at all.
 ///
 /// The agent's fence, and it re-derives the answer rather than trusting the
 /// list the shell was shown. Same shape as the leftover fence: the interface
 /// produces a suggestion from data, and the path that comes back over the pipe
 /// is a string from a client that a LocalSystem process is about to act on.
-pub fn check_removable(path: &str, user: &UserContext) -> std::result::Result<(), String> {
+///
+/// # Why an explicit choice widens it, and how far
+///
+/// Refusing everything except a copy in the person's own folders made the
+/// feature useless for most of what it finds: two programs shipping the same
+/// runtime, a game holding the same asset twice, an archive kept in two places
+/// off the root of a second drive. The classifier declines to guess about
+/// those, correctly. Declining to guess is not the same as forbidding somebody
+/// who knows.
+///
+/// So a chosen copy may be taken where a suggested one may not, with two
+/// limits that hold whatever anybody asks for:
+///
+/// - **Windows' own files and the servicing store are never removed.** Taking
+///   one breaks an update and Windows puts it back, so there is no upside to
+///   weigh against the risk.
+/// - **It is still quarantine, not deletion.** The copy is moved, recorded,
+///   and comes back with one press for thirty days. That is what makes it
+///   reasonable to honour a choice this product would not have made itself.
+pub fn check_removable(
+    path: &str,
+    user: &UserContext,
+    intent: Intent,
+) -> std::result::Result<(), String> {
     let owner = owner_of(path, user);
-    if !owner.removable() {
-        return Err(format!(
-            "{path} is {} -- only a copy in a folder of yours may be removed this way",
-            owner.describes()
-        ));
+    match intent {
+        Intent::Suggested if !owner.removable() => {
+            return Err(format!(
+                "{path} is {} -- only a copy in a folder of yours may be removed this way",
+                owner.describes()
+            ));
+        }
+        Intent::Chosen if matches!(owner, Owner::Windows | Owner::Servicing) => {
+            return Err(format!(
+                "{path} is {}. Windows puts these back and removing one breaks an update, \
+                 so this is refused however it is asked for.",
+                owner.describes()
+            ));
+        }
+        _ => {}
     }
 
+    // Ask the filesystem what this path really is before acting on it.
+    //
+    // Text normalisation handles the ways of *writing* a path; this handles the
+    // ways of *reaching* one — an 8.3 short name like `PROGRA~1`, a junction
+    // part-way along, a `..` that climbs out of a folder the caller was
+    // entitled to. The file has to exist for any of this to be worth doing, so
+    // there is no cost to resolving it first.
+    //
+    // The owner is then re-derived from the resolved path, so a name that
+    // classified as harmless cannot be the one that gets acted on.
     let target = std::path::Path::new(path);
+    if let Ok(resolved) = std::fs::canonicalize(target) {
+        let resolved = resolved.to_string_lossy().into_owned();
+        let real = owner_of(&resolved, user);
+        if matches!(real, Owner::Windows | Owner::Servicing) {
+            return Err(format!(
+                "{path} resolves to {resolved}, which is {}. Windows puts these back \
+                 and removing one breaks an update, so this is refused.",
+                real.describes()
+            ));
+        }
+        if intent == Intent::Suggested && !real.removable() {
+            return Err(format!(
+                "{path} resolves to {resolved}, which is {} -- only a copy in a folder \
+                 of yours may be removed this way",
+                real.describes()
+            ));
+        }
+    }
+
     let metadata = std::fs::symlink_metadata(target)
         .map_err(|error| format!("{path} could not be read: {error}"))?;
     if metadata.is_dir() {
@@ -881,6 +992,85 @@ mod tests {
         assert!(group.suggested_keep.is_none());
     }
 
+    /// A chosen copy may be one we would never have suggested.
+    ///
+    /// The point of the widening: the classifier declines to guess about a
+    /// program's own files, and declining to guess is not the same as
+    /// forbidding somebody who has looked at the set and decided.
+    #[test]
+    fn a_deliberate_choice_reaches_files_a_suggestion_does_not() {
+        let user = someone();
+        // Not a real file, so this stops at the ownership rule either way and
+        // the difference between the two intents is what is being read.
+        let program = r"C:\Program Files\Thing\shared.dll";
+
+        let suggested = check_removable(program, &user, Intent::Suggested).unwrap_err();
+        assert!(
+            suggested.contains("only a copy in a folder of yours"),
+            "unexpected refusal: {suggested}"
+        );
+
+        // Chosen gets past ownership and fails later, on the file not being
+        // there — which is the fence letting it through.
+        let chosen = check_removable(program, &user, Intent::Chosen).unwrap_err();
+        assert!(
+            !chosen.contains("only a copy in a folder of yours"),
+            "an explicit choice was still refused on ownership: {chosen}"
+        );
+    }
+
+    /// Windows' own files are refused however anybody asks.
+    #[test]
+    fn no_intent_reaches_windows_or_the_servicing_store() {
+        let user = someone();
+        for path in [
+            r"C:\Windows\System32\kernel32.dll",
+            r"C:\Windows\WinSxSmd64_something\payload.dll",
+            r"C:\Windows\Installera2b3c.msi",
+            r"C:\ProgramData\Package Cache\{guid}\setup.exe",
+        ] {
+            for intent in [Intent::Suggested, Intent::Chosen] {
+                let refused = check_removable(path, &user, intent);
+                assert!(refused.is_err(), "{path} was allowed with {intent:?}");
+            }
+            // And the chosen refusal explains itself rather than repeating the
+            // ownership line, which would be the wrong reason.
+            let why = check_removable(path, &user, Intent::Chosen).unwrap_err();
+            assert!(
+                why.contains("Windows puts these back"),
+                "unhelpful refusal for {path}: {why}"
+            );
+        }
+    }
+
+    /// The ownership rule reads the path, so the path is where it gets attacked.
+    ///
+    /// Every one of these is a way of writing a file inside `C:\Windows` that
+    /// does not look like it at a glance. If any is classified as anything but
+    /// Windows or servicing, an explicit choice would reach the system files
+    /// that the test above proves are refused.
+    #[test]
+    fn a_windows_path_in_disguise_is_still_a_windows_path() {
+        let user = someone();
+        let disguises = [
+            r"C:\Windows\System32\..\System32\kernel32.dll",
+            r"C:\Windows\.\System32\kernel32.dll",
+            r"C:/Windows/System32/kernel32.dll",
+            r"c:\windows\system32\kernel32.dll",
+            r"C:\WINDOWS\SYSTEM32\KERNEL32.DLL",
+            r"\\?\C:\Windows\System32\kernel32.dll",
+            r"\??\C:\Windows\System32\kernel32.dll",
+            r"\\?\c:/windows/system32/kernel32.dll",
+        ];
+        for path in disguises {
+            let owner = owner_of(path, &user);
+            assert!(
+                matches!(owner, Owner::Windows | Owner::Servicing),
+                "{path} was classified as {owner:?}, which an explicit choice could remove"
+            );
+        }
+    }
+
     #[test]
     fn the_fence_refuses_anything_a_program_or_windows_owns() {
         let user = someone();
@@ -891,7 +1081,7 @@ mod tests {
             r"D:\Games\Unknown\data.bin",
         ] {
             assert!(
-                check_removable(path, &user).is_err(),
+                check_removable(path, &user, Intent::Suggested).is_err(),
                 "{path} should have been refused"
             );
         }
@@ -912,15 +1102,15 @@ mod tests {
         let path = file.to_string_lossy().into_owned();
 
         assert!(
-            check_removable(&path, &user).is_ok(),
+            check_removable(&path, &user, Intent::Suggested).is_ok(),
             "a real file was refused"
         );
         // The folder holding it is not itself a copy of anything.
-        assert!(check_removable(&downloads.to_string_lossy(), &user).is_err());
+        assert!(check_removable(&downloads.to_string_lossy(), &user, Intent::Suggested).is_err());
 
         std::fs::remove_file(&file).unwrap();
         // And once it is gone there is nothing to remove.
-        assert!(check_removable(&path, &user).is_err());
+        assert!(check_removable(&path, &user, Intent::Suggested).is_err());
     }
 
     #[test]
