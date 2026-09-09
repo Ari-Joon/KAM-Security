@@ -381,7 +381,7 @@ fn measure(path: &Path) -> (u64, u64, bool) {
 fn build(entry: &Entry, user: &UserContext) -> Option<Cache> {
     let mut locations = Vec::new();
     for path in (entry.locate)(user) {
-        if !path.is_dir() {
+        if !ours_to_empty(&path) {
             continue;
         }
         let (bytes, files, partial) = measure(&path);
@@ -420,6 +420,40 @@ pub fn survey(user: &UserContext) -> Vec<Cache> {
         .collect();
     caches.sort_by_key(|cache| std::cmp::Reverse(cache.bytes));
     caches
+}
+
+/// Whether a path is a real directory of ours, rather than a link to one.
+///
+/// `Path::is_dir` follows reparse points, so it answers "yes" for a junction
+/// pointing anywhere at all. Every root in the catalogue is checked with this
+/// instead, because several of them sit in user-writable space: deleting
+/// `%LOCALAPPDATA%\Temp` or a browser cache while it is unlocked and
+/// recreating it as a junction needs no elevation, and the next clear would
+/// have had a LocalSystem service delete whatever it pointed at. Permanently:
+/// this is the path that removes rather than quarantines.
+///
+/// The guard inside `empty` never covered this. It checks the *children* of a
+/// directory, so it protected against a junction planted inside a cache and
+/// not against a cache that was itself one.
+fn ours_to_empty(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|data| data.is_dir() && !data.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// Empty one catalogue root, having checked it is really ours.
+fn empty_root(path: &Path, result: &mut Cleared) {
+    if !ours_to_empty(path) {
+        // Said out loud rather than skipped silently: a cache root that has
+        // become a link is not a tidy no-op, it is somebody having put it
+        // there.
+        result.refused.push(format!(
+            "{} is a link rather than a real folder, so it was left alone",
+            path.display()
+        ));
+        return;
+    }
+    empty(path, result);
 }
 
 /// Empty one directory's contents, leaving the directory itself.
@@ -503,8 +537,11 @@ pub fn clear(id: &str, user: &UserContext) -> std::result::Result<Cleared, Strin
     };
 
     for path in (entry.locate)(user) {
-        if path.is_dir() {
-            empty(&path, &mut result);
+        // Not `is_dir`: that follows a reparse point, which is the whole hole.
+        // A root that exists at all is judged; one that does not is simply not
+        // there and needs no comment.
+        if std::fs::symlink_metadata(&path).is_ok() {
+            empty_root(&path, &mut result);
         }
     }
     Ok(result)
@@ -614,6 +651,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A cache root that is a junction is not ours to empty.
+    ///
+    /// Found by adversarial review, and it was a real hole. `clear` gated on
+    /// `Path::is_dir`, which *follows* a reparse point, and `empty` then
+    /// `read_dir`s the same path — which follows it too — and deletes the
+    /// target's children. Those children are ordinary files, so the
+    /// `is_symlink` guard inside `empty` never fired: it only ever protected
+    /// against a junction *inside* a cache, never against a cache root that
+    /// was itself one.
+    ///
+    /// Several catalogue roots sit in user-writable space -- `%LOCALAPPDATA%    /// Temp` and every browser cache. Deleting one while it is unlocked and
+    /// recreating it as a junction needs no elevation at all, and the next
+    /// press of "clear" would have had a LocalSystem service permanently
+    /// delete whatever it pointed at. This is the delete path, so there is no
+    /// quarantine to undo it from.
+    #[test]
+    fn a_cache_root_that_is_a_junction_is_refused_rather_than_followed() {
+        let root = scratch("root-junction");
+        let victim = scratch("root-junction-target");
+        std::fs::write(victim.join("precious.txt"), b"do not delete me").unwrap();
+        std::fs::create_dir(victim.join("nested")).unwrap();
+        std::fs::write(victim.join("nested").join("also.txt"), b"nor me").unwrap();
+
+        // The root has to *be* the junction, so the real directory goes first.
+        let link = root.join("cache");
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&victim)
+            .output();
+        if !made.map(|out| out.status.success()).unwrap_or(false) {
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&victim);
+            return;
+        }
+
+        // What the old code trusted, and why it was wrong: this is true.
+        assert!(
+            link.is_dir(),
+            "is_dir follows the junction, which is the trap"
+        );
+        assert!(
+            !ours_to_empty(&link),
+            "a junction must not be treated as ours"
+        );
+
+        let mut result = Cleared {
+            id: "test".to_owned(),
+            bytes_freed: 0,
+            files_removed: 0,
+            files_in_use: 0,
+            refused: Vec::new(),
+        };
+        empty_root(&link, &mut result);
+
+        assert!(
+            victim.join("precious.txt").exists(),
+            "the clear followed a junction and deleted through it"
+        );
+        assert!(victim.join("nested").join("also.txt").exists());
+        assert_eq!(result.files_removed, 0);
+        assert!(
+            result.refused.iter().any(|why| why.contains("link")),
+            "it should say why it refused: {:?}",
+            result.refused
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&victim).unwrap();
     }
 
     /// The clear never follows a link out of the folder it was given.

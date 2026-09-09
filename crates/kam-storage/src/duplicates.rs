@@ -222,7 +222,7 @@ fn normalise(path: &str) -> String {
             return text.to_lowercase();
         }
     }
-    for prefix in [r"\\?\", r"\??\"] {
+    for prefix in [r"\\?\", r"\??\", r"\\.\"] {
         if let Some(rest) = text.strip_prefix(prefix) {
             text = rest.to_owned();
             break;
