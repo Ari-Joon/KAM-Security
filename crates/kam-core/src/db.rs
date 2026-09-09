@@ -185,10 +185,30 @@ impl Store {
         Ok(records)
     }
 
+    /// The connection, taking it back from a panic rather than giving up on it.
+    ///
+    /// This used to return an error when the mutex was poisoned, which meant a
+    /// single panic anywhere that held this lock switched off durable auditing —
+    /// and audit *reading* — for the rest of the process's life. The agent is a
+    /// service that runs for weeks, so "for the rest of the process" means until
+    /// somebody reboots, and a security tool that has quietly stopped recording
+    /// what it does is in the worst state it can be in: still working, still
+    /// trusted, no longer keeping its promise.
+    ///
+    /// Poisoning protects invariants that a panic may have left half-built.
+    /// There are none here: the value behind the lock is a database connection,
+    /// SQLite maintains its own consistency through its journal, and every
+    /// statement this module runs is a single self-contained execute or query.
+    /// A panic mid-statement leaves nothing for the next caller to trip over.
+    ///
+    /// So the guard is taken back. Raised by adversarial review, which put it as
+    /// "strictly safer", and that is right: the failure it prevents is certain
+    /// and total, and the state it risks is not corrupt.
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.connection
+        Ok(self
+            .connection
             .lock()
-            .map_err(|_| Error::Database("the store lock was poisoned by an earlier panic".into()))
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))
     }
 }
 
@@ -203,13 +223,51 @@ impl AuditLog for Store {
                     entry.module,
                     entry.action,
                     entry.effect.as_str(),
-                    entry.detail,
+                    // The one field a caller can influence. See `one_line`.
+                    one_line(&entry.detail),
                     entry.undo_token
                 ],
             )
             .map_err(to_db_error)?;
         Ok(())
     }
+}
+
+/// Flatten a detail string so one entry can never look like two.
+///
+/// # Why the log needs this and the other columns do not
+///
+/// `module`, `action` and `effect` are compiled-in constants at every call site,
+/// and the timestamp is written by SQLite from the server's clock. `detail` is
+/// the only column carrying text a caller had a hand in: the outcome text on a
+/// recorded lookup, and — more widely — the raw paths embedded in refusal
+/// messages, which are client strings by definition, since refusing them is the
+/// point.
+///
+/// A path containing a newline therefore travelled into the log intact. Nothing
+/// could be forged in the structured store, where a row's type is fixed and the
+/// UI renders per record, but a log is also read as text: an export, a support
+/// bundle, `grep` over a dump. In any of those a newline lets a caller draw an
+/// extra line that reads exactly like an entry that never happened.
+///
+/// For a product whose whole claim is a truthful record, that is worth closing
+/// even though it forges nothing the software itself would believe. Found by
+/// adversarial review. Doing it here rather than at each call site is the point:
+/// there is one way into this table, so there is one place to be sure about.
+///
+/// C0 controls become spaces rather than being dropped, so the text stays
+/// legible and its length is not quietly changed.
+fn one_line(detail: &str) -> String {
+    detail
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn migrate(connection: &Connection) -> Result<()> {
@@ -256,6 +314,62 @@ mod tests {
             detail: "moved one file".to_owned(),
             undo_token: Some("undo-1".to_owned()),
         }
+    }
+
+    /// A caller cannot draw an extra line in the log.
+    ///
+    /// `detail` is the one column carrying text a caller had a hand in — the
+    /// outcome of a recorded lookup, and every refusal message, which embeds the
+    /// path that was refused and so is a client string by construction. A
+    /// newline in one of those used to travel into the table intact, and in any
+    /// plaintext rendering of the log (an export, a support bundle, `grep` over
+    /// a dump) it draws a line that reads exactly like an entry that never
+    /// happened.
+    ///
+    /// The row itself was never forgeable, because module, action and effect are
+    /// constants and the timestamp is the server's. This is about the record
+    /// being truthful when it is read as text, which for this product is not a
+    /// small part of the claim.
+    #[test]
+    fn a_caller_cannot_forge_an_extra_line_in_the_log() {
+        let store = Store::open_in_memory().unwrap();
+
+        // What an attacker would send: a path that ends the line and starts one
+        // that looks like a clean result.
+        let forged = "refused to quarantine C:\\evil\r\n2026-09-09T12:00:00.000Z storage \
+                      take changed quarantined everything, machine is clean\r\n";
+        store
+            .record(Entry {
+                module: "quarantine",
+                action: "take",
+                effect: Effect::Refused,
+                detail: forged.to_owned(),
+                undo_token: None,
+            })
+            .unwrap();
+
+        let records = store.recent_audit(10).unwrap();
+        assert_eq!(records.len(), 1, "one call must make exactly one row");
+
+        let stored = &records[0].detail;
+        assert!(
+            !stored.contains('\n') && !stored.contains('\r'),
+            "the detail can still break a line: {stored:?}"
+        );
+        assert!(
+            !stored.chars().any(char::is_control),
+            "a control character survived: {stored:?}"
+        );
+
+        // Flattened, not truncated: what was attempted stays legible and
+        // readable, which is more useful than dropping it.
+        assert!(stored.contains("C:\\evil"), "{stored}");
+        assert!(stored.contains("machine is clean"), "{stored}");
+        assert_eq!(
+            stored.chars().count(),
+            forged.chars().count(),
+            "flattening must not change the length"
+        );
     }
 
     #[test]

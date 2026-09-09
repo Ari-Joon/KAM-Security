@@ -325,8 +325,17 @@ impl PipeListener {
         }
     }
 
-    /// Block until a client connects, then hand back the connected instance.
-    pub fn accept(&self) -> Result<PipeStream> {
+    /// Create one instance of the pipe, claiming the name if this is the first.
+    ///
+    /// Split out from [`PipeListener::accept`] because the two halves behave
+    /// completely differently: creating an instance succeeds or fails at once,
+    /// while waiting for a client does not return until one turns up. Testing
+    /// the squat protection means testing this half, and testing it through
+    /// `accept` meant a test that *hung* when the protection was missing rather
+    /// than failing -- the create would succeed and the thread would then park
+    /// in `ConnectNamedPipe` forever. A regression test that hangs stalls a
+    /// build instead of reporting anything, which is close to useless.
+    fn create_instance(&self) -> Result<PipeStream> {
         let security = SecurityDescriptor::from_sddl(PIPE_SDDL)?;
         let attributes = security.attributes();
         let path = full_pipe_path(&self.name);
@@ -335,6 +344,9 @@ impl PipeListener {
         // refuse the call outright if the pipe already exists, which is what
         // stops another process getting in first and impersonating the agent --
         // and tells us immediately if one already has.
+        //
+        // The claim is taken here but only *kept* if the create succeeds; see
+        // the failure branch below for why giving it up on failure was a bug.
         let first = self.claim_name.swap(false, AtomicOrdering::SeqCst);
         let open_mode = if first {
             PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
@@ -361,6 +373,25 @@ impl PipeListener {
         if handle.is_invalid() {
             let error = windows::core::Error::from_thread();
             if first {
+                // Put the claim back before returning.
+                //
+                // It used to be given up here, and that quietly disarmed the
+                // protection it exists for. The caller's accept loop logs the
+                // error, waits, and calls again; with the claim already spent,
+                // that next attempt asked for an *ordinary* instance of a name
+                // a squatter was holding. If the squatter's descriptor let
+                // SYSTEM add one, the agent would then serve alongside it, and
+                // a client's request would reach whichever instance Windows
+                // handed it -- which is precisely the impersonation this flag
+                // exists to prevent, arrived at by way of the defence itself.
+                //
+                // Keeping the claim means every retry demands the name outright.
+                // A squatter therefore produces an agent that refuses to serve
+                // and says so on every attempt, rather than one that shares. A
+                // security tool that is loudly not working is a far better
+                // outcome than one that appears to work while something else
+                // answers for it.
+                self.claim_name.store(true, AtomicOrdering::SeqCst);
                 return Err(Error::Refused(format!(
                     "the agent pipe already exists, so something else is already \
                      serving it — refusing to share the name: {error}"
@@ -369,10 +400,15 @@ impl PipeListener {
             return Err(win32(error, "could not create the agent pipe"));
         }
 
-        let stream = PipeStream {
+        Ok(PipeStream {
             handle,
             is_server: true,
-        };
+        })
+    }
+
+    /// Block until a client connects, then hand back the connected instance.
+    pub fn accept(&self) -> Result<PipeStream> {
+        let stream = self.create_instance()?;
 
         // A client that connected between CreateNamedPipeW and ConnectNamedPipe
         // surfaces as ERROR_PIPE_CONNECTED, which is success, not failure.
@@ -425,6 +461,67 @@ mod tests {
 
     fn unique_name(tag: &str) -> String {
         format!("kam-test-{tag}-{}", std::process::id())
+    }
+
+    /// A squatter holding the name never gets the agent as a co-server.
+    ///
+    /// The listener refuses when the name is taken, which was always true for
+    /// the *first* attempt. The bug was what happened next: the claim was spent
+    /// before the attempt rather than after it, so the accept loop's retry --
+    /// which follows every failure, after a short backoff -- asked for an
+    /// ordinary instance of the squatter's pipe instead of demanding the name.
+    /// If the squatter's descriptor allowed SYSTEM to add one, the agent would
+    /// have served alongside it, and a client's request would have reached
+    /// whichever instance Windows chose.
+    ///
+    /// So the assertion is on the *second* call, not the first. Note the
+    /// squatter here is a permissive pipe that would happily accept another
+    /// instance, which is what makes the downgrade observable at all.
+    #[test]
+    fn a_retry_after_a_squatted_name_still_demands_the_name() {
+        let name = unique_name("squat");
+        let path = full_pipe_path(&name);
+
+        // Somebody else gets there first, with a descriptor that would let a
+        // second instance join.
+        let squatter = unsafe {
+            CreateNamedPipeW(
+                PCWSTR(path.as_ptr()),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                MAX_PIPE_INSTANCES,
+                PIPE_BUFFER_BYTES,
+                PIPE_BUFFER_BYTES,
+                PIPE_DEFAULT_TIMEOUT_MS,
+                None,
+            )
+        };
+        assert!(!squatter.is_invalid(), "the test could not squat the name");
+
+        let listener = PipeListener::with_name(name.clone());
+
+        // First attempt: refused, and says why in terms a person can act on.
+        let first = listener.create_instance();
+        assert!(first.is_err(), "the listener joined a squatted name");
+        let complaint = format!("{}", first.unwrap_err());
+        assert!(
+            complaint.contains("already"),
+            "the refusal should name the cause: {complaint}"
+        );
+
+        // The one that mattered. Without the fix this succeeds, because the
+        // claim is gone and an ordinary instance of a permissive pipe is
+        // perfectly creatable -- the agent quietly becomes a co-server.
+        let second = listener.create_instance();
+        assert!(
+            second.is_err(),
+            "the retry created an ordinary instance of a squatted pipe, so the \
+             agent would serve alongside whatever is holding the name"
+        );
+
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(squatter);
+        }
     }
 
     #[test]
