@@ -51,6 +51,8 @@ export const api = {
   behaviourEvents: () => invoke<BehaviourReport>("behaviour_events"),
   browserExtensions: () => invoke<ExtensionReport>("browser_extensions"),
   hardening: () => invoke<HardeningReport>("hardening"),
+  setHardening: (id: string, wanted: "audit" | "block" | "off") =>
+    invoke<HardeningReport>("set_hardening", { id, wanted }),
   protection: () => invoke<boolean>("protection"),
   setProtection: (enabled: boolean) => invoke<boolean>("set_protection", { enabled }),
   canaries: () => invoke<CanaryReport>("canaries"),

@@ -467,6 +467,23 @@ fn hardening() -> Result<kam_scanner::hardening::Report, String> {
     }
 }
 
+/// Turn one hardening protection on, or off.
+///
+/// The agent validates the id against its own catalogue before anything runs,
+/// and answers with a fresh survey rather than an acknowledgement, so what the
+/// window draws afterwards is what Defender actually reports.
+#[tauri::command]
+fn set_hardening(
+    id: String,
+    wanted: kam_scanner::hardening::Wanted,
+) -> Result<kam_scanner::hardening::Report, String> {
+    match kam_ipc::client::call(&Request::SetHardening { id, wanted }).map_err(|e| e.to_string())? {
+        Response::Hardening(report) => Ok(*report),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Whether the protective work is running.
 #[tauri::command]
 fn protection() -> Result<bool, String> {
@@ -800,6 +817,7 @@ pub fn run() {
             behaviour_events,
             browser_extensions,
             hardening,
+            set_hardening,
             protection,
             set_protection,
             canaries,

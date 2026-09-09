@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -232,6 +232,22 @@ pub enum Request {
     /// Which of Defender's Attack Surface Reduction rules are switched on, and
     /// whether Controlled Folder Access is protecting anything.
     GetHardening,
+    /// Turn one hardening protection on, or off, because somebody pressed a
+    /// button having read what it prevents.
+    ///
+    /// `id` is an ASR rule's GUID from the agent's own catalogue, or the one
+    /// switch that can be changed from here. Anything else is refused before a
+    /// process is created: this is the only place the privileged agent starts a
+    /// program, and nothing a caller chooses reaches its arguments.
+    ///
+    /// The reply is a fresh survey rather than an acknowledgement. The cmdlet
+    /// exiting zero is not evidence that anything changed — policy can override
+    /// it and Tamper Protection can refuse — so the state is read back and that
+    /// is what comes home.
+    SetHardening {
+        id: String,
+        wanted: kam_scanner::hardening::Wanted,
+    },
     /// What decoy files are planted, whether Windows is watching them, and
     /// anything that has read one.
     GetCanaries,

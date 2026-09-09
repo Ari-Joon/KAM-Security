@@ -2712,3 +2712,18 @@ button.ghost {
   margin-left: auto;
   padding-right: 10px;
 }
+
+/* The two ways to turn a hardening rule on.
+   Audit leads, because it blocks nothing and is the sensible first move; the
+   one that can actually stop your software is the quieter of the two. */
+.rule-actions {
+  display: flex;
+  gap: 8px;
+  margin: 10px 0 6px;
+  flex-wrap: wrap;
+}
+
+.rule-actions button {
+  font-size: 12px;
+  padding: 4px 11px;
+}

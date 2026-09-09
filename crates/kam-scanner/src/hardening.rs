@@ -392,7 +392,7 @@ fn switches() -> Vec<Switch> {
         "MpEnablePus",
     );
     found.push(Switch {
-        id: "pua-protection".to_owned(),
+        id: PUA_SWITCH.to_owned(),
         name: "Blocking unwanted applications".to_owned(),
         explains: "Defender can block the software that is not quite malware — bundled toolbars, \
                    registry cleaners, driver updaters, the things that arrive alongside something \
@@ -490,6 +490,158 @@ fn switches() -> Vec<Switch> {
     });
 
     found
+}
+
+/// What somebody asked a protection to become.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Wanted {
+    /// Writes an event and blocks nothing. What Microsoft recommends trying
+    /// first, and what this offers first.
+    Audit,
+    /// Actually prevents the behaviour.
+    Block,
+    /// Back to off.
+    Off,
+}
+
+impl Wanted {
+    /// The word Defender's own cmdlets use for an ASR action.
+    fn asr_action(self) -> &'static str {
+        match self {
+            Self::Audit => "AuditMode",
+            Self::Block => "Enabled",
+            Self::Off => "Disabled",
+        }
+    }
+
+    fn pua_action(self) -> &'static str {
+        match self {
+            // PUA blocking has an audit mode of its own, spelled differently.
+            Self::Audit => "AuditMode",
+            Self::Block => "Enabled",
+            Self::Off => "Disabled",
+        }
+    }
+}
+
+/// Turn a protection on, or off, at somebody's explicit request.
+///
+/// # Why this exists after the module said it would not
+///
+/// The header above says this module reads and explains and does not enable,
+/// because a rule in Block mode can stop software the owner depends on and
+/// deciding that for them would be indefensible. The word carrying that
+/// argument is *silently*. Somebody pressing a button having read what the rule
+/// prevents is the informed decision the argument was protecting, not a breach
+/// of it. So: audit is offered first, block is a second press, and both are
+/// reversible from the same panel.
+///
+/// # Why it runs a program instead of writing the registry
+///
+/// Tamper Protection. When it is on — which is the default, and the state this
+/// was written on — Defender ignores writes to its own settings from anywhere
+/// but its own API. A registry write would appear to succeed and change
+/// nothing, which is the exact failure this product exists to avoid.
+///
+/// # What is passed to that program
+///
+/// Nothing a caller chose. `id` is looked up in [`KNOWN`] or is the one
+/// recognised switch name, and what reaches the command line is the catalogue's
+/// own GUID and a fixed word. A request naming anything else is refused before
+/// a process is created. This is the only place in the privileged agent that
+/// starts a program, and that is the reason it is safe to.
+///
+/// # It re-reads rather than reporting success
+///
+/// The cmdlet exiting zero is not evidence. Group policy can override a local
+/// setting the moment it is written, and Tamper Protection can refuse. So the
+/// state is read back from the registry afterwards and *that* is what comes
+/// back — if it did not take, the caller is told it did not take.
+pub fn request(id: &str, wanted: Wanted) -> kam_core::Result<Report> {
+    let known_rule = KNOWN
+        .iter()
+        .find(|(guid, ..)| guid.eq_ignore_ascii_case(id))
+        .map(|(guid, ..)| *guid);
+
+    let arguments: Vec<String> = if let Some(guid) = known_rule {
+        // Remove rather than Add for off: Add with Disabled leaves the rule
+        // configured-and-doing-nothing, which reads as "off" but is a
+        // different thing from never having been set.
+        match wanted {
+            Wanted::Off => vec![
+                "Remove-MpPreference".to_owned(),
+                "-AttackSurfaceReductionRules_Ids".to_owned(),
+                guid.to_owned(),
+            ],
+            _ => vec![
+                "Add-MpPreference".to_owned(),
+                "-AttackSurfaceReductionRules_Ids".to_owned(),
+                guid.to_owned(),
+                "-AttackSurfaceReductionRules_Actions".to_owned(),
+                wanted.asr_action().to_owned(),
+            ],
+        }
+    } else if id == PUA_SWITCH {
+        vec![
+            "Set-MpPreference".to_owned(),
+            "-PUAProtection".to_owned(),
+            wanted.pua_action().to_owned(),
+        ]
+    } else {
+        return Err(kam_core::Error::Refused(format!(
+            "{id} is not a protection this knows how to change"
+        )));
+    };
+
+    run_defender_cmdlet(&arguments)?;
+    Ok(survey())
+}
+
+/// The one switch in [`switches`] that can be changed from here.
+///
+/// The others cannot be, and saying so is more useful than a button that
+/// fails: memory integrity and the driver blocklist need a reboot and a
+/// driver check, and credential memory protection is deliberately not
+/// scriptable.
+pub const PUA_SWITCH: &str = "pua-protection";
+
+/// Run one Defender cmdlet with arguments this module chose.
+fn run_defender_cmdlet(arguments: &[String]) -> kam_core::Result<()> {
+    // No shell, no string interpolation, no profile: arguments are passed as
+    // an array so nothing in them can be read as syntax, and -NonInteractive
+    // means it cannot stop waiting for input inside a service.
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+        ])
+        .arg(arguments.join(" "))
+        .output()
+        .map_err(|error| {
+            kam_core::Error::Privileged(format!("could not run the Defender cmdlet: {error}"))
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    // Defender's refusals are worth passing through verbatim: "Tamper
+    // Protection" or "not supported on this edition" are answers, and
+    // paraphrasing them would lose the only useful part.
+    let complaint = String::from_utf8_lossy(&output.stderr);
+    let complaint = complaint.trim();
+    Err(kam_core::Error::Privileged(if complaint.is_empty() {
+        format!(
+            "Defender refused the change (exit {:?})",
+            output.status.code()
+        )
+    } else {
+        format!("Defender refused the change: {complaint}")
+    }))
 }
 
 /// The machine's hardening posture.
@@ -688,6 +840,79 @@ pub fn survey() -> Report {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Only what the catalogue names ever reaches a command line.
+    ///
+    /// This is the one place the privileged agent starts a program, so the
+    /// argument that makes it safe is that no caller chooses any part of it.
+    /// If that ever stops being true, this is the test that should catch it.
+    #[test]
+    fn a_protection_the_catalogue_does_not_name_is_refused_before_anything_runs() {
+        for id in [
+            "",
+            "not-a-rule",
+            "pua-protection; Remove-MpPreference -ExclusionPath C:\\",
+            "00000000-0000-0000-0000-000000000000",
+            "$(calc)",
+            "../../windows",
+        ] {
+            let refused = request(id, Wanted::Audit);
+            assert!(
+                refused.is_err(),
+                "{id:?} was accepted and would have reached a command line"
+            );
+        }
+    }
+
+    #[test]
+    fn every_catalogued_rule_is_addressable_and_every_action_has_a_word() {
+        // A rule shown in the panel with no way to act on it would be the
+        // complaint this whole change answers.
+        for (guid, ..) in KNOWN {
+            assert!(
+                KNOWN
+                    .iter()
+                    .any(|(known, ..)| known.eq_ignore_ascii_case(guid)),
+                "{guid} is not addressable"
+            );
+        }
+        assert_eq!(Wanted::Audit.asr_action(), "AuditMode");
+        assert_eq!(Wanted::Block.asr_action(), "Enabled");
+        assert_eq!(Wanted::Off.asr_action(), "Disabled");
+    }
+
+    #[test]
+    #[ignore = "changes this machine's Defender settings"]
+    fn a_rule_can_be_put_into_audit_and_taken_back_out() {
+        // Audit blocks nothing, so this is safe to run for real; it is ignored
+        // only because it writes to Defender.
+        let (guid, name, ..) = KNOWN[0];
+        println!("using {name}");
+
+        let before = survey()
+            .rules
+            .iter()
+            .find(|rule| rule.id.eq_ignore_ascii_case(guid))
+            .map(|rule| rule.mode);
+        println!("before: {before:?}");
+
+        let after = request(guid, Wanted::Audit).expect("the change was refused");
+        let observed = after
+            .rules
+            .iter()
+            .find(|rule| rule.id.eq_ignore_ascii_case(guid))
+            .map(|rule| rule.mode);
+        println!("after:  {observed:?}");
+        assert_eq!(observed, Some(Mode::Audit), "the change did not take");
+
+        let back = request(guid, Wanted::Off).expect("could not put it back");
+        let restored = back
+            .rules
+            .iter()
+            .find(|rule| rule.id.eq_ignore_ascii_case(guid))
+            .map(|rule| rule.mode);
+        println!("restored: {restored:?}");
+    }
 
     #[test]
     fn every_switch_is_named_once_and_explains_itself() {

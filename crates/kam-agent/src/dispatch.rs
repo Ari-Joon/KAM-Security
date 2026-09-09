@@ -678,6 +678,34 @@ pub fn handle(
             Response::Hardening(Box::new(kam_scanner::hardening::survey()))
         }
 
+        Request::SetHardening { id, wanted } => {
+            match kam_scanner::hardening::request(&id, wanted) {
+                Ok(report) => {
+                    context.audit(
+                        "scanner",
+                        "set_hardening",
+                        Effect::Changed,
+                        format!("asked Defender to set {id} to {wanted:?}"),
+                    );
+                    Response::Hardening(Box::new(report))
+                }
+                Err(error) => {
+                    // Defender refusing is a real answer and worth recording:
+                    // Tamper Protection and group policy both decline here, and
+                    // a person needs to know which.
+                    context.audit(
+                        "scanner",
+                        "set_hardening",
+                        Effect::Refused,
+                        format!("could not set {id} to {wanted:?}: {error}"),
+                    );
+                    Response::Error {
+                        message: error.to_string(),
+                    }
+                }
+            }
+        }
+
         Request::GetProtection => Response::Protection {
             enabled: context.store.protection_enabled(),
         },

@@ -702,6 +702,38 @@ function Hardening() {
   }, [refresh]);
 
   const rules = report?.rules ?? [];
+  const [changing, setChanging] = useState<string | null>(null);
+  const [refusal, setRefusal] = useState<string | null>(null);
+
+  /**
+   * Ask Defender to change one protection.
+   *
+   * This module spent its life reading and explaining and never enabling,
+   * because a rule in Block mode can stop software somebody depends on and
+   * deciding that for them would be indefensible. The word carrying that
+   * argument was *silently*: pressing a button having read what the rule
+   * prevents is the informed decision the argument was protecting.
+   *
+   * Audit is offered first because it writes an event and blocks nothing, so
+   * you can see what a rule would have stopped before it starts stopping it.
+   *
+   * The reply is a fresh survey, not an acknowledgement. Defender exiting
+   * cleanly is not evidence: policy can override a setting the moment it is
+   * written and Tamper Protection can refuse outright, so what gets drawn is
+   * what Defender reports afterwards.
+   */
+  async function change(id: string, wanted: "audit" | "block" | "off") {
+    setChanging(id);
+    setRefusal(null);
+    try {
+      setReport(await api.setHardening(id, wanted));
+    } catch (cause) {
+      setRefusal(reason(cause));
+    } finally {
+      setChanging(null);
+    }
+  }
+
   const recommended = rules.filter((rule) => rule.recommended);
   const on = recommended.filter((rule) => isProtecting(rule.mode)).length;
   const shown = showAll ? rules : recommended;
@@ -731,6 +763,12 @@ function Hardening() {
 
       {report && (
         <>
+          {refusal && (
+            <div className="notice notice-warn">
+              <strong>Defender declined.</strong> {refusal}
+            </div>
+          )}
+
           <div className={on === 0 ? "notice notice-warn" : "notice notice-ok"}>
             <strong>
               {on} of {recommended.length}
@@ -777,7 +815,29 @@ function Hardening() {
                         </strong>
                       </p>
                     )}
-                    {!on && <p className="footnote">{item.how}</p>}
+                    {!on && item.id === "pua-protection" ? (
+                      <div className="rule-actions">
+                        <button
+                          disabled={changing !== null}
+                          onClick={() => void change(item.id, "block")}
+                        >
+                          {changing === item.id ? "Asking…" : "Turn on"}
+                        </button>
+                      </div>
+                    ) : (
+                      !on && <p className="footnote">{item.how}</p>
+                    )}
+                    {on && item.id === "pua-protection" && (
+                      <div className="rule-actions">
+                        <button
+                          className="ghost"
+                          disabled={changing !== null}
+                          onClick={() => void change(item.id, "off")}
+                        >
+                          {changing === item.id ? "Asking…" : "Turn off"}
+                        </button>
+                      </div>
+                    )}
                   </li>
                 );
               })}
@@ -803,6 +863,35 @@ function Hardening() {
                   </span>
                 </div>
                 <p className="rule-explains">{rule.explains}</p>
+                <div className="rule-actions">
+                  {isProtecting(rule.mode) ? (
+                    <button
+                      className="ghost"
+                      disabled={changing !== null}
+                      onClick={() => void change(rule.id, "off")}
+                    >
+                      {changing === rule.id ? "Asking…" : "Turn off"}
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        disabled={changing !== null}
+                        title="Writes an event and blocks nothing, so you can see what it would have stopped."
+                        onClick={() => void change(rule.id, "audit")}
+                      >
+                        {changing === rule.id ? "Asking…" : "Try in audit mode"}
+                      </button>
+                      <button
+                        className="ghost"
+                        disabled={changing !== null}
+                        title="Actually prevents the behaviour. This can stop software you depend on."
+                        onClick={() => void change(rule.id, "block")}
+                      >
+                        Turn on
+                      </button>
+                    </>
+                  )}
+                </div>
                 <p className="footnote">{rule.id}</p>
               </li>
             ))}
@@ -817,10 +906,12 @@ function Hardening() {
           )}
 
           <p className="footnote">
-            To turn one on, run PowerShell as administrator with{" "}
-            <code>Add-MpPreference</code>, naming the identifier above. Set it to
-            audit first: that writes an event and blocks nothing, so you can see
-            what a rule would have stopped before it starts stopping it.
+            Audit writes an event and blocks nothing, which is the sensible way
+            to try a rule: you see what it would have stopped before it starts
+            stopping it. Every change here goes through Defender's own interface
+            rather than its settings in the registry, because Tamper Protection
+            ignores the second — and what you see afterwards is Defender read
+            back, not the fact that the request did not error.
           </p>
         </>
       )}
