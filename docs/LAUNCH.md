@@ -3,13 +3,10 @@
 Everything here is prepared but not yet done, because it needs a GitHub account
 and decisions only you can make.
 
-## 1. Replace the placeholder owner
+## 1. Replace the placeholder owner ✅ done
 
-Several files reference `OWNER` where your GitHub username belongs:
-
-- `README.md` — badge and release links
-- `Cargo.toml` — `repository` field
-- `.github/ISSUE_TEMPLATE/config.yml` — advisory and README links
+The repository is `Ari-Joon/KAM-Security` and every `OWNER` placeholder has
+been replaced. If one ever comes back with a new file, this finds it:
 
 ```bash
 git grep -l OWNER
