@@ -126,6 +126,19 @@ fn is_movable(name: &str) -> bool {
 }
 
 /// Whether any component of a path is somewhere this must not touch.
+///
+/// # A trap for anyone testing the fence
+///
+/// `appdata` is on the list, and on Windows the temp directory lives *inside*
+/// AppData. So a test that builds its fixture in `std::env::temp_dir()` — which
+/// is the obvious place, and where cargo and most harnesses put things — cannot
+/// ever get a move permitted, because the fixture's own location is off limits.
+///
+/// That is this function being right rather than wrong, so the fixture is what
+/// has to move: somewhere with no off-limits component, such as a folder beside
+/// the tester's own profile or under `C:\Users\Public`. It is written here
+/// because two people hit it independently on the same day, each spending a
+/// while assuming the fence was broken before noticing where they were standing.
 fn is_off_limits(path: &str) -> bool {
     let lowered = path.to_lowercase();
     OFF_LIMITS
