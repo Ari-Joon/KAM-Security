@@ -665,9 +665,31 @@ export type FolderAccess =
   | "not_configured"
   | "unreadable";
 
+export type SwitchState = "on" | "off" | "not_configured" | "unrecognised";
+
+/**
+ * Whether Windows turns a protection on by itself.
+ *
+ * The distinction the panel turns on. A protection that is off because that is
+ * the default is a suggestion; one that is off against the default means
+ * something changed it, which is a different sentence entirely.
+ */
+export type SwitchDefault = "on" | "off" | "varies";
+
+export type HardeningSwitch = {
+  id: string;
+  name: string;
+  explains: string;
+  state: SwitchState | { unrecognised: number };
+  default: SwitchDefault;
+  /** How to turn it on. Nothing here changes it. */
+  how: string;
+};
+
 export type HardeningReport = {
   rules: HardeningRule[];
   controlled_folder_access: FolderAccess | null;
+  switches: HardeningSwitch[];
   unreadable: string[];
 };
 

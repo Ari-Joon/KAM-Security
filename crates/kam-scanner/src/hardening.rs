@@ -279,11 +279,226 @@ impl FolderAccess {
     }
 }
 
+/// A protection that is simply on or off.
+///
+/// Attack Surface Reduction rules have four modes and a catalogue; these have
+/// two states and a reason. They are kept apart from `Rule` because the
+/// difference that matters to a reader is not the shape of the value but
+/// whether Windows ships it on: an ASR rule being off is the default and worth
+/// one quiet line, while Tamper Protection being off means somebody or
+/// something turned it off, and that is a different sentence entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchState {
+    On,
+    Off,
+    /// Nothing written. For most of these that means the Windows default,
+    /// which is why each switch carries what its default actually is.
+    NotConfigured,
+    /// Present, and set to something undocumented.
+    Unrecognised(u32),
+}
+
+impl SwitchState {
+    pub fn label(self) -> String {
+        match self {
+            Self::On => "on".to_owned(),
+            Self::Off => "off".to_owned(),
+            Self::NotConfigured => "not configured".to_owned(),
+            Self::Unrecognised(value) => format!("set to an unrecognised value ({value})"),
+        }
+    }
+}
+
+/// Whether Windows turns this on by itself.
+///
+/// The whole point of the distinction. A protection that is off *because that
+/// is the default* is a suggestion; one that is off *against* the default is a
+/// finding, because something changed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Default_ {
+    /// Windows enables it. Finding it off is a question worth asking.
+    On,
+    /// Windows leaves it off. Finding it off is ordinary.
+    Off,
+    /// Depends on the hardware or the edition, so absence proves nothing.
+    Varies,
+}
+
+/// One on-or-off protection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Switch {
+    /// Stable key, so the interface can order and test against it.
+    pub id: String,
+    pub name: String,
+    /// What it prevents, in words meant for somebody who is not a security
+    /// engineer.
+    pub explains: String,
+    pub state: SwitchState,
+    pub default: Default_,
+    /// How a person turns it on themselves. Nothing here changes it: several of
+    /// these can stop software the owner depends on, and one of them cannot be
+    /// set programmatically at all by design.
+    pub how: String,
+}
+
+impl Switch {
+    pub fn is_protecting(&self) -> bool {
+        self.state == SwitchState::On
+    }
+
+    /// Off when Windows would have had it on. The only case worth alarm.
+    pub fn is_unexpectedly_off(&self) -> bool {
+        self.default == Default_::On && matches!(self.state, SwitchState::Off)
+    }
+}
+
+/// Read one machine-wide DWORD, preferring policy over the local setting.
+fn dword(paths: &[&str], value: &str) -> Option<u32> {
+    for path in paths {
+        if let Some(key) = registry::Key::open(HKEY_LOCAL_MACHINE, path, View::Native) {
+            if let Some(found) = key.dword(value) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// The protections that are a single switch, and what each one is worth.
+fn switches() -> Vec<Switch> {
+    let mut found = Vec::new();
+
+    // Tamper Protection is deliberately absent here.
+    //
+    // It belongs in this list by every argument above, and it is already read
+    // properly in `defender`, from `MSFT_MpComputerStatus.IsTamperProtected`,
+    // which is what Defender itself reports. A registry version was written
+    // here first and was wrong: the widely repeated mapping of 5 for on and 4
+    // for off does not hold, and this machine reports 1 while Defender reports
+    // protected. Two readings of one setting, one of them guessed from an
+    // undocumented value, is how a security tool ends up confidently wrong.
+
+    // Potentially Unwanted Application blocking. Off by default, and aimed at
+    // exactly the band this product's rule engine already targets: bundleware,
+    // "optimisers", browser hijackers. Defender will block them and simply is
+    // not asked to.
+    let pua = dword(
+        &[
+            r"SOFTWARE\Policies\Microsoft\Windows Defender\MpEngine",
+            r"SOFTWARE\Microsoft\Windows Defender\MpEngine",
+        ],
+        "MpEnablePus",
+    );
+    found.push(Switch {
+        id: "pua-protection".to_owned(),
+        name: "Blocking unwanted applications".to_owned(),
+        explains: "Defender can block the software that is not quite malware — bundled toolbars, \
+                   registry cleaners, driver updaters, the things that arrive alongside something \
+                   else. It is off unless asked, and it covers the same ground this program's own \
+                   rules do, from inside the engine."
+            .to_owned(),
+        state: match pua {
+            Some(1) => SwitchState::On,
+            // 2 is audit: it writes an event and allows it, which is not
+            // protection and is not described as such.
+            Some(0) | Some(2) => SwitchState::Off,
+            Some(other) => SwitchState::Unrecognised(other),
+            None => SwitchState::NotConfigured,
+        },
+        default: Default_::Off,
+        how: "PowerShell as administrator: Set-MpPreference -PUAProtection Enabled".to_owned(),
+    });
+
+    // LSA protection. Stops another process reading the memory of the service
+    // that holds signed-in credentials, which is the step between "ran code on
+    // the machine" and "has the password".
+    let lsa = dword(&[r"SYSTEM\CurrentControlSet\Control\Lsa"], "RunAsPPL");
+    found.push(Switch {
+        id: "lsa-protection".to_owned(),
+        name: "Credential memory protection".to_owned(),
+        explains: "Windows keeps the credentials of everyone signed in inside one service. This \
+                   stops other programs reading that service's memory, which is the usual step \
+                   between something running on the machine and something having your password."
+            .to_owned(),
+        state: match lsa {
+            // 1 is enabled, 2 is enabled with a UEFI lock.
+            Some(1) | Some(2) => SwitchState::On,
+            Some(0) => SwitchState::Off,
+            Some(other) => SwitchState::Unrecognised(other),
+            None => SwitchState::NotConfigured,
+        },
+        default: Default_::Varies,
+        how: "Windows Security > Device security > Core isolation, where recent versions of \
+              Windows 11 offer it as Local Security Authority protection."
+            .to_owned(),
+    });
+
+    // Memory integrity. Off on plenty of machines because an old driver blocks
+    // it, so its absence is a question rather than a fault.
+    let hvci = dword(
+        &[
+            r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
+        ],
+        "Enabled",
+    );
+    found.push(Switch {
+        id: "memory-integrity".to_owned(),
+        name: "Memory integrity".to_owned(),
+        explains: "Checks drivers before they are allowed into the kernel, so a malicious or \
+                   tampered driver cannot load. Windows turns it off when an existing driver is \
+                   incompatible, so it being off often means an old driver rather than a decision."
+            .to_owned(),
+        state: match hvci {
+            Some(1) => SwitchState::On,
+            Some(0) => SwitchState::Off,
+            Some(other) => SwitchState::Unrecognised(other),
+            None => SwitchState::NotConfigured,
+        },
+        default: Default_::Varies,
+        how: "Windows Security > Device security > Core isolation > Memory integrity.".to_owned(),
+    });
+
+    // The blocklist of drivers with known holes. Attackers bring a signed,
+    // vulnerable driver with them precisely because it is signed; this is the
+    // list that refuses them.
+    let blocklist = dword(
+        &[r"SYSTEM\CurrentControlSet\Control\CI\Config"],
+        "VulnerableDriverBlocklistEnable",
+    );
+    found.push(Switch {
+        id: "driver-blocklist".to_owned(),
+        name: "Vulnerable driver blocklist".to_owned(),
+        explains: "Microsoft keeps a list of signed drivers with known holes in them. Attackers \
+                   bring one of those along on purpose, because being signed is what gets it \
+                   loaded, and then use its hole to reach the kernel. This is the list that \
+                   refuses them."
+            .to_owned(),
+        state: match blocklist {
+            Some(1) => SwitchState::On,
+            Some(0) => SwitchState::Off,
+            Some(other) => SwitchState::Unrecognised(other),
+            // On by default on Windows 11 and on Windows 10 with memory
+            // integrity, so nothing written is not the same as off.
+            None => SwitchState::NotConfigured,
+        },
+        default: Default_::On,
+        how: "It follows memory integrity on most machines. Windows Security > Device security > \
+              Core isolation."
+            .to_owned(),
+    });
+
+    found
+}
+
 /// The machine's hardening posture.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Report {
     pub rules: Vec<Rule>,
     pub controlled_folder_access: Option<FolderAccess>,
+    /// Protections that are simply on or off.
+    pub switches: Vec<Switch>,
     /// Sources that exist but could not be read, in plain words.
     pub unreadable: Vec<String>,
 }
@@ -335,6 +550,36 @@ impl Report {
             );
         }
 
+        // Something turned these off. Windows would have had them on, so this
+        // is a finding rather than a suggestion, and it is said first and
+        // separately from the list of things that are merely available.
+        for switch in self.switches.iter().filter(|s| s.is_unexpectedly_off()) {
+            concerns.insert(
+                0,
+                format!(
+                    "{} is off, and Windows switches it on by itself. Something changed it.",
+                    switch.name
+                ),
+            );
+        }
+
+        // Everything else worth having and not switched on, named once rather
+        // than one line each: on an untouched machine most of these are off and
+        // always have been, and a list of five complaints about the defaults is
+        // how a tool becomes noise.
+        let available: Vec<&str> = self
+            .switches
+            .iter()
+            .filter(|s| !s.is_protecting() && !s.is_unexpectedly_off())
+            .map(|s| s.name.as_str())
+            .collect();
+        if !available.is_empty() {
+            concerns.push(format!(
+                "Not switched on, and free: {}. Each says what it would prevent.",
+                available.join(", ")
+            ));
+        }
+
         concerns
     }
 }
@@ -367,7 +612,10 @@ fn read_folder_access(path: &str) -> Option<u32> {
 
 /// What is switched on, and what is not.
 pub fn survey() -> Report {
-    let mut report = Report::default();
+    let mut report = Report {
+        switches: switches(),
+        ..Default::default()
+    };
 
     // Policy last, so it overwrites a locally set value for the same rule.
     let mut configured: std::collections::BTreeMap<String, u32> = Default::default();
@@ -442,6 +690,133 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_switch_is_named_once_and_explains_itself() {
+        let found = switches();
+        assert!(!found.is_empty());
+
+        let mut ids: Vec<&str> = found.iter().map(|s| s.id.as_str()).collect();
+        let before = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "two switches share an id");
+
+        for switch in &found {
+            assert!(!switch.name.is_empty(), "{} has no name", switch.id);
+            assert!(
+                switch.explains.len() > 60,
+                "{} does not explain what it prevents",
+                switch.id
+            );
+            assert!(
+                !switch.how.is_empty(),
+                "{} does not say how to turn it on",
+                switch.id
+            );
+        }
+    }
+
+    /// Off by default and off against the default are different sentences.
+    ///
+    /// This is the whole reason `Switch` exists beside `Rule`. Treating them
+    /// the same would either shout about the ordinary state of Windows or stay
+    /// quiet about something having turned a protection off, and the second is
+    /// the one that matters.
+    #[test]
+    fn only_a_protection_windows_would_have_had_on_counts_as_a_finding() {
+        let off_by_design = Switch {
+            id: "x".to_owned(),
+            name: "Something Windows leaves off".to_owned(),
+            explains: "a".repeat(80),
+            state: SwitchState::Off,
+            default: Default_::Off,
+            how: "somewhere".to_owned(),
+        };
+        assert!(!off_by_design.is_unexpectedly_off());
+
+        let turned_off = Switch {
+            default: Default_::On,
+            ..off_by_design.clone()
+        };
+        assert!(turned_off.is_unexpectedly_off());
+
+        // Not configured is not the same as off: for most of these it is the
+        // default, and claiming somebody turned it off would be a lie.
+        let untouched = Switch {
+            state: SwitchState::NotConfigured,
+            ..turned_off.clone()
+        };
+        assert!(!untouched.is_unexpectedly_off());
+    }
+
+    #[test]
+    fn something_having_turned_a_protection_off_is_said_first() {
+        let report = Report {
+            rules: Vec::new(),
+            controlled_folder_access: None,
+            switches: vec![
+                Switch {
+                    id: "available".to_owned(),
+                    name: "Merely available".to_owned(),
+                    explains: "a".repeat(80),
+                    state: SwitchState::Off,
+                    default: Default_::Off,
+                    how: "somewhere".to_owned(),
+                },
+                Switch {
+                    id: "tampered".to_owned(),
+                    name: "Something Windows enables".to_owned(),
+                    explains: "a".repeat(80),
+                    state: SwitchState::Off,
+                    default: Default_::On,
+                    how: "somewhere".to_owned(),
+                },
+            ],
+            unreadable: Vec::new(),
+        };
+
+        let concerns = report.concerns();
+        assert!(
+            concerns[0].contains("Something Windows enables")
+                && concerns[0].contains("Something changed it"),
+            "the finding should lead: {concerns:?}"
+        );
+        assert!(
+            concerns.iter().any(|c| c.contains("Merely available")),
+            "the merely-available ones should still be named once: {concerns:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "reads this machine's real settings"]
+    fn show_this_machine() {
+        let report = survey();
+        println!(
+            "
+--- switches ---"
+        );
+        for switch in &report.switches {
+            println!(
+                "  {:<32} {:<24} default {:?}{}",
+                switch.name,
+                switch.state.label(),
+                switch.default,
+                if switch.is_unexpectedly_off() {
+                    "   <-- something turned this off"
+                } else {
+                    ""
+                }
+            );
+        }
+        println!(
+            "
+--- what it would say ---"
+        );
+        for concern in report.concerns() {
+            println!("  {concern}");
+        }
+    }
+
+    #[test]
     fn every_listed_rule_has_a_real_guid_and_an_explanation() {
         // A rule identified by the wrong GUID would report the wrong thing
         // about somebody's machine, so the shape is checked structurally.
@@ -483,6 +858,7 @@ mod tests {
         // The default state of Windows is every rule off. Saying so once, with
         // what it would buy, is useful; a list of nineteen alarms is not.
         let report = Report {
+            switches: Vec::new(),
             rules: KNOWN
                 .iter()
                 .map(|(id, name, explains, recommended)| Rule {
@@ -508,6 +884,7 @@ mod tests {
     #[test]
     fn a_hardened_machine_says_nothing_about_the_rules() {
         let report = Report {
+            switches: Vec::new(),
             rules: KNOWN
                 .iter()
                 .map(|(id, name, explains, recommended)| Rule {

@@ -749,6 +749,41 @@ function Hardening() {
             )}
           </div>
 
+          {report.switches.length > 0 && (
+            <ul className="findings">
+              {report.switches.map((item) => {
+                const on = item.state === "on";
+                // Off against the Windows default is the only case worth
+                // alarm: something turned it off. Off by default is ordinary,
+                // and drawing it as a problem is how a tool becomes noise.
+                const turnedOff = !on && item.default === "on" && item.state === "off";
+                const tone = on ? "ordinary" : turnedOff ? "unusual" : "notable";
+                return (
+                  <li key={item.id} className={`finding finding-${tone}`}>
+                    <div className="finding-head">
+                      <span className="finding-name">{item.name}</span>
+                      <span className={`badge attention-${tone}`}>
+                        {typeof item.state === "string"
+                          ? item.state.replace(/_/g, " ")
+                          : "unrecognised"}
+                      </span>
+                    </div>
+                    <p className="rule-explains">{item.explains}</p>
+                    {turnedOff && (
+                      <p className="rule-explains">
+                        <strong>
+                          Windows switches this on by itself, so something turned
+                          it off.
+                        </strong>
+                      </p>
+                    )}
+                    {!on && <p className="footnote">{item.how}</p>}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+
           <ul className="findings">
             {shown.map((rule) => (
               <li
