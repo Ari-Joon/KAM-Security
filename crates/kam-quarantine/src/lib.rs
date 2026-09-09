@@ -115,8 +115,57 @@ impl Store {
         &self.root
     }
 
-    fn item_directory(&self, id: &str) -> PathBuf {
-        self.root.join(id)
+    /// Whether an id is one this store issued.
+    ///
+    /// A strict whitelist, not a search for the dangerous shapes. `allocate_id`
+    /// produces `<seconds>-<four digits>` or `<seconds>-overflow` and nothing else,
+    /// so anything that is not exactly that is not ours — and refusing everything
+    /// unfamiliar is the only version of this that stays correct when somebody
+    /// invents a new way to write a path.
+    ///
+    /// No separator, colon or dot can pass, which is what makes the join below
+    /// safe rather than merely usually safe.
+    fn is_issued_id(id: &str) -> bool {
+        let Some((seconds, suffix)) = id.split_once('-') else {
+            return false;
+        };
+        let sane_seconds = !seconds.is_empty()
+            && seconds.len() <= 20
+            && seconds.bytes().all(|byte| byte.is_ascii_digit());
+        let sane_suffix = suffix == "overflow"
+            || (suffix.len() == 4 && suffix.bytes().all(|b| b.is_ascii_digit()));
+        sane_seconds && sane_suffix
+    }
+
+    /// Where an item lives, for an id this store issued.
+    ///
+    /// # Why this validates rather than joining
+    ///
+    /// The id crosses the trust boundary: it arrives from a client, over the pipe,
+    /// into a process running as LocalSystem, and is then used to build a path that
+    /// gets deleted or written through. `Path::join` does not treat it as a name.
+    /// On Windows an absolute id **discards the root entirely** —
+    /// `quarantine.join(r"C:\Users\someone\Documents")` is
+    /// `C:\Users\someone\Documents` — and `..` walks out of the store.
+    ///
+    /// Found by adversarial review, which demonstrated both: two decoy directories
+    /// deleted outside the store, one by an absolute id and one by `..`. The only
+    /// gate was a readable `manifest.json`, which anybody who can write a folder
+    /// can put there.
+    ///
+    /// The deletion was the obvious half. The worse half is [`Store::restore`],
+    /// which reads a payload from this directory and renames it to whatever the
+    /// manifest names as its original path: with a traversal id and a planted
+    /// manifest, that is an arbitrary file write as LocalSystem, which is an
+    /// escalation primitive rather than a nuisance. Both go through here, so one
+    /// guard covers restore, purge, delete and manifest at once.
+    fn item_directory(&self, id: &str) -> Result<PathBuf> {
+        if !Self::is_issued_id(id) {
+            return Err(Error::Refused(format!(
+                "{id} is not an identifier this store issued"
+            )));
+        }
+        Ok(self.root.join(id))
     }
 
     /// Move `path` into quarantine and return its manifest.
@@ -149,7 +198,10 @@ impl Store {
         }
 
         let id = self.allocate_id();
-        let directory = self.item_directory(&id);
+        // The id came from `allocate_id`, so this cannot fail; it is still
+        // asked rather than assumed, because the day it can is the day the
+        // format changes under it.
+        let directory = self.item_directory(&id)?;
         fs::create_dir_all(&directory)?;
 
         let manifest = Manifest {
@@ -204,7 +256,7 @@ impl Store {
             fs::create_dir_all(parent)?;
         }
 
-        let payload = self.item_directory(id).join(PAYLOAD);
+        let payload = self.item_directory(id)?.join(PAYLOAD);
         fs::rename(&payload, &original).map_err(|error| {
             Error::Refused(format!(
                 "{} could not be restored to {}: {error}",
@@ -258,14 +310,14 @@ impl Store {
     /// directory takes only the manifest and frees nothing; reporting the size
     /// it once held would be a lie in a column of real numbers.
     fn remove(&self, id: &str, bytes: u64) -> Result<u64> {
-        let directory = self.item_directory(id);
+        let directory = self.item_directory(id)?;
         let held = directory.join(PAYLOAD).exists();
         fs::remove_dir_all(directory)?;
         Ok(if held { bytes } else { 0 })
     }
 
     pub fn manifest(&self, id: &str) -> Result<Manifest> {
-        let path = self.item_directory(id).join(MANIFEST);
+        let path = self.item_directory(id)?.join(MANIFEST);
         let text = fs::read_to_string(&path)
             .map_err(|error| Error::Refused(format!("no quarantined item {id}: {error}")))?;
         serde_json::from_str(&text)
@@ -421,7 +473,7 @@ impl Store {
     }
 
     fn write_manifest(&self, manifest: &Manifest) -> Result<()> {
-        let path = self.item_directory(&manifest.id).join(MANIFEST);
+        let path = self.item_directory(&manifest.id)?.join(MANIFEST);
         let text = serde_json::to_string_pretty(manifest)
             .map_err(|error| Error::Refused(format!("could not write a manifest: {error}")))?;
         fs::write(path, text)?;
@@ -434,7 +486,7 @@ impl Store {
         let seconds = now_seconds();
         for suffix in 0..10_000 {
             let id = format!("{seconds}-{suffix:04}");
-            if !self.item_directory(&id).exists() {
+            if !self.root.join(&id).exists() {
                 return id;
             }
         }
@@ -451,6 +503,114 @@ mod tests {
     ///
     /// The two exist separately so that the rule protecting somebody from their
     /// own mistake cannot be lifted by the code that is meant to enforce it.
+    /// An id from a client is not a path fragment until it has been checked.
+    ///
+    /// Every one of these was demonstrated by adversarial review to escape the
+    /// store. On Windows an absolute id discards the root entirely, so
+    /// `quarantine.join(absolute)` *is* the absolute path, and `..` walks out.
+    /// The only gate was a readable manifest, which anybody who can write a
+    /// folder can plant.
+    #[test]
+    fn an_id_that_is_not_ours_never_becomes_a_path() {
+        let scratch = Scratch::new("hostile-ids");
+        let store = scratch.store();
+
+        let hostile = [
+            r"C:\Users\akcar\Documents",
+            r"C:\Windows\System32",
+            r"..\victim",
+            r"..\..\anything",
+            r"\\?\C:\Users",
+            r"\\server\share",
+            r"..",
+            r".",
+            r"",
+            r"1757441-0001\..\..",
+            r"1757441-0001/../..",
+            r"not-an-id",
+            r"1757441-00001",
+            r"abcdefg-0001",
+        ];
+
+        for id in hostile {
+            assert!(store.delete_now(id).is_err(), "{id:?} passed delete_now");
+            assert!(store.restore(id).is_err(), "{id:?} passed restore");
+            assert!(store.purge(id).is_err(), "{id:?} passed purge");
+            assert!(store.manifest(id).is_err(), "{id:?} passed manifest");
+        }
+    }
+
+    /// And a directory outside the store survives being named.
+    ///
+    /// The test above is about the guard; this is about the consequence.
+    /// Review deleted two decoy directories this way, one by an absolute id and
+    /// one by `..`, each gated only by a planted manifest.
+    #[test]
+    fn a_directory_outside_the_store_is_not_deleted_however_it_is_named() {
+        let scratch = Scratch::new("escape");
+        let store = scratch.store();
+
+        let victim = scratch.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("precious.txt"), b"do not delete me").unwrap();
+
+        // The manifest has to be there, or this test proves nothing.
+        //
+        // Without the guard, `delete_now` still calls `manifest` first, so a
+        // directory with no manifest is refused for that reason and the test
+        // passes whether the fix exists or not. Planting one is exactly what
+        // the attack requires and exactly what makes this a reproduction: the
+        // manifest gate was never a defence, because anybody who can write a
+        // folder can write a file in it.
+        let planted = Manifest {
+            id: "planted".to_owned(),
+            original_path: victim.join("precious.txt").to_string_lossy().into_owned(),
+            kind: ItemKind::Directory,
+            bytes: 1,
+            quarantined_at: 1,
+            reason: "planted by an attacker".to_owned(),
+            restored: false,
+        };
+        fs::write(victim.join(MANIFEST), serde_json::to_vec(&planted).unwrap()).unwrap();
+
+        let absolute = victim.to_string_lossy().into_owned();
+        assert!(store.delete_now(&absolute).is_err());
+        assert!(store.delete_now(r"..\victim").is_err());
+        assert!(store.restore(&absolute).is_err());
+
+        assert!(
+            victim.join("precious.txt").exists(),
+            "a directory outside the store was reached"
+        );
+    }
+
+    /// The ids the store issues are still accepted, or nothing works.
+    #[test]
+    fn the_ids_this_store_issues_are_accepted() {
+        assert!(Store::is_issued_id("1757441-0001"));
+        assert!(Store::is_issued_id("1757441-9999"));
+        assert!(Store::is_issued_id("1757441-overflow"));
+        assert!(!Store::is_issued_id("1757441"));
+        assert!(!Store::is_issued_id("-0001"));
+
+        // A real round trip, so the whitelist cannot be so strict that the
+        // product stops working.
+        let scratch = Scratch::new("issued");
+        let store = scratch.store();
+        let source = scratch.join("thing.bin");
+        fs::write(&source, vec![1_u8; 64]).unwrap();
+
+        let manifest = store.take(&source, 64, "a test").unwrap();
+        assert!(
+            Store::is_issued_id(&manifest.id),
+            "{} was refused",
+            manifest.id
+        );
+        assert!(store.manifest(&manifest.id).is_ok());
+        store.restore(&manifest.id).unwrap();
+        assert!(source.exists());
+    }
+
     #[test]
     fn an_item_can_be_deleted_on_request_but_not_by_the_clock_alone() {
         let scratch = Scratch::new("delete-now");
