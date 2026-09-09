@@ -606,12 +606,63 @@ pub fn request(id: &str, wanted: Wanted) -> kam_core::Result<Report> {
 /// scriptable.
 pub const PUA_SWITCH: &str = "pua-protection";
 
+/// Where PowerShell is, named absolutely.
+///
+/// `Command::new("powershell.exe")` searches the *launching executable's own
+/// directory* before anything else. For the agent that is its install folder,
+/// and a release unzipped into a writable place — which is the default outcome
+/// of the obvious action — means a planted `powershell.exe` sitting exactly
+/// where the search looks first.
+///
+/// The consequence was user-to-SYSTEM code execution with no pipe involved at
+/// all: drop the file, wait for anybody to press a button on the hardening
+/// panel, and the agent runs it as LocalSystem. The victim's own legitimate
+/// click is the trigger. Found by adversarial review, which built a decoy
+/// `powershell.exe` and confirmed the application directory is searched first
+/// and that the current directory is not.
+///
+/// Naming it absolutely removes the search. The install-time refusal closes
+/// the writable-directory root cause; this closes the class regardless of where
+/// anybody installs it, which is the half that keeps holding if the other is
+/// ever weakened.
+fn powershell() -> std::path::PathBuf {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+    std::path::PathBuf::from(root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
 /// Run one Defender cmdlet with arguments this module chose.
+///
+/// # Why this is not a command injection, said accurately
+///
+/// An earlier version of this comment claimed the arguments were passed as an
+/// array so nothing in them could be read as syntax. That was not true: they
+/// are joined and handed to `-Command`, which is a script. Review caught the
+/// claim rather than a bug, and an inaccurate invariant is worth fixing on its
+/// own, because the next person to add a rule will believe it.
+///
+/// What actually makes this safe is narrower and needs saying plainly: **every
+/// element of `arguments` is a compiled-in constant.** `request` maps the
+/// caller's id to a GUID from [`KNOWN`], or to [`PUA_SWITCH`], or refuses; the
+/// action words come from a fixed enum. No caller data reaches this function,
+/// and the test below asserts that by feeding `request` the shapes an attacker
+/// would try.
+///
+/// If a rule is ever added whose argument carries a path or a number, that
+/// stops being true and this becomes PowerShell injection running as
+/// LocalSystem. At that point this must pass a real argument vector rather than
+/// a joined string, or go through Defender's WMI methods instead.
 fn run_defender_cmdlet(arguments: &[String]) -> kam_core::Result<()> {
-    // No shell, no string interpolation, no profile: arguments are passed as
-    // an array so nothing in them can be read as syntax, and -NonInteractive
-    // means it cannot stop waiting for input inside a service.
-    let output = std::process::Command::new("powershell.exe")
+    let shell = powershell();
+    if !shell.is_file() {
+        return Err(kam_core::Error::Privileged(format!(
+            "{} is not there, so the change cannot be made",
+            shell.display()
+        )));
+    }
+
+    // -NonInteractive so it cannot sit waiting for input inside a service, and
+    // -NoProfile so nothing a person put in their profile runs as LocalSystem.
+    let output = std::process::Command::new(&shell)
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -840,6 +891,84 @@ pub fn survey() -> Report {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// PowerShell is named absolutely, and the name resolves.
+    ///
+    /// `Command::new("powershell.exe")` searches the launching executable's own
+    /// directory first, which for the agent is its install folder. A release
+    /// unzipped into a writable place therefore had a slot where a planted
+    /// `powershell.exe` would be found before the real one, and run as
+    /// LocalSystem the next time anybody pressed a button on this panel.
+    #[test]
+    fn powershell_is_found_by_absolute_path_and_not_by_searching() {
+        let shell = powershell();
+
+        assert!(shell.is_absolute(), "{} is not absolute", shell.display());
+        assert!(
+            shell.is_file(),
+            "{} does not exist, so no change could ever be made",
+            shell.display()
+        );
+
+        // It has to be the real one, under the system directory, not something
+        // that merely ends in the right name.
+        let text = shell.to_string_lossy().to_lowercase();
+        assert!(
+            text.contains(r"\system32\windowspowershell\"),
+            "{} is not the system copy",
+            shell.display()
+        );
+    }
+
+    /// Nothing a caller supplies reaches the command line.
+    ///
+    /// This is the invariant that makes joining the arguments into a `-Command`
+    /// string safe, and it is the one an earlier comment got wrong. It is
+    /// asserted here rather than described, because the day a rule is added
+    /// whose argument carries a path, this stops being true and the failure is
+    /// PowerShell injection running as LocalSystem.
+    #[test]
+    fn nothing_a_caller_writes_can_reach_the_command_line() {
+        // Each of these is refused before any process exists, so none of them
+        // can appear in an argument. `request` returning an error is the
+        // assertion: it never got as far as building a command.
+        for hostile in [
+            "; Start-Process calc",
+            "$(Get-Process)",
+            "`nRemove-Item C:\\ -Recurse",
+            "01443614-cd74-433a-b99e-2ecdc07bfc25 -Whatever",
+            "pua-protection -PUAProtection Disabled",
+            "' ; Set-MpPreference -DisableRealtimeMonitoring $true ; '",
+        ] {
+            assert!(
+                request(hostile, Wanted::Audit).is_err(),
+                "{hostile:?} was not refused, so it would have been joined into a script"
+            );
+        }
+    }
+
+    /// And what a valid id produces is only ever catalogue constants.
+    #[test]
+    fn a_valid_request_carries_only_what_the_catalogue_holds() {
+        let (guid, ..) = KNOWN[0];
+        // Every token that would be built for this request.
+        let expected = [
+            "Add-MpPreference",
+            "-AttackSurfaceReductionRules_Ids",
+            guid,
+            "-AttackSurfaceReductionRules_Actions",
+            "AuditMode",
+        ];
+        for token in expected {
+            assert!(
+                !token.contains(';') && !token.contains('$') && !token.contains('`'),
+                "{token:?} carries PowerShell syntax"
+            );
+        }
+        // The GUID is a GUID, not something shaped like one plus extras.
+        assert_eq!(guid.len(), 36, "{guid} is not a bare GUID");
+        assert!(guid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+    }
 
     /// Only what the catalogue names ever reaches a command line.
     ///
