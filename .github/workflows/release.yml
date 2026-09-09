@@ -44,6 +44,10 @@ jobs:
           Copy-Item target/release/kam-agent.exe dist/
           Copy-Item target/release/kam-shell.exe dist/
           Copy-Item README.md, LICENSE, SECURITY.md dist/
+          # Setup lives beside the binaries so a download is unzip, run,
+          # done. It registers the service and puts a shortcut on the
+          # desktop, and `-Remove` undoes exactly those two things.
+          Copy-Item scripts/setup.ps1 dist/
           # The two binaries must sit in one directory: the agent only serves
           # clients installed alongside it.
           Compress-Archive -Path dist/* -DestinationPath kam-security-windows-x64.zip
@@ -73,17 +77,29 @@ jobs:
           body: |
             ## Install
 
-            Unzip anywhere. **Keep both executables in the same folder** — the
-            agent only serves clients installed alongside it, so separating them
-            stops the shell working.
-
-            Run `kam-shell.exe`. For the fast disk scan, install the agent as a
-            service from an administrator terminal:
+            Unzip anywhere, **keeping every file in one folder** — the agent
+            only serves clients installed alongside it, so separating them stops
+            the shell working. Then right-click `setup.ps1` and choose
+            **Run with PowerShell**, or from a terminal:
 
             ```
-            kam-agent.exe --install
-            sc start KamSecurityAgent
+            powershell -ExecutionPolicy Bypass -File setup.ps1
             ```
+
+            It asks for administrator rights once, registers the service that
+            makes the fast disk scan possible, and puts a shortcut on your
+            desktop. It adds nothing to the run keys and does not open the
+            window at logon.
+
+            To remove all of it:
+
+            ```
+            powershell -ExecutionPolicy Bypass -File setup.ps1 -Remove
+            ```
+
+            You can skip the script entirely and just run `kam-shell.exe`; the
+            disk scan then falls back to walking directories, which works and is
+            slower.
 
             ## These binaries are not signed
 

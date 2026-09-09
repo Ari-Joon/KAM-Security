@@ -420,6 +420,7 @@ mod tests {
     /// graphs drift. Adding either to `kam-scanner` for something that seemed
     /// convenient would quietly undo it, with nothing to show that anything
     /// had changed — so it is asserted rather than trusted.
+
     #[test]
     fn the_rule_engine_never_reaches_the_privileged_agent() {
         let Some(crates) = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent() else {
@@ -448,6 +449,49 @@ mod tests {
                  inside the LocalSystem service. If this is deliberate, the \
                  reasoning in kam-rules and deny.toml no longer holds and both \
                  must be revisited."
+            );
+        }
+    }
+
+    /// The C runtime is linked into the *shipped* binary, not expected to be
+    /// on the machine already.
+    ///
+    /// Without `+crt-static` the agent imports `VCRUNTIME140.dll`, which ships
+    /// with the Visual C++ Redistributable and is absent from a clean Windows
+    /// install. It is present on any machine that has ever installed something
+    /// built with MSVC, which is exactly why this never showed up here: the
+    /// developer's machine has it and a downloader's may not.
+    ///
+    /// The failure it causes is the worst possible first impression for a
+    /// security tool downloaded from GitHub -- the service does not start, the
+    /// window reports the agent is not answering, and the only clue is a
+    /// missing-DLL dialog naming a file nobody has heard of.
+    ///
+    /// It checks the release binary rather than this test binary, because the
+    /// static CRT only takes effect in the profile that ships: a debug test
+    /// executable still imports the dynamic runtime, and asserting on that
+    /// would fail for a reason nobody could act on. Nothing to check yet is not
+    /// a failure -- a release that has never been built cannot be wrong.
+    #[test]
+    fn the_c_runtime_is_linked_into_what_ships() {
+        // From target/debug/deps/ back up to target/, then into release.
+        let Some(release) = std::env::current_exe().ok().and_then(|path| {
+            let target = path.parent()?.parent()?.parent()?;
+            Some(target.join("release").join("kam-agent.exe"))
+        }) else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&release) else {
+            return;
+        };
+
+        // Import names sit in the binary as plain ASCII.
+        let text = String::from_utf8_lossy(&bytes);
+        for wanted in ["VCRUNTIME140.dll", "VCRUNTIME140_1.dll", "MSVCP140.dll"] {
+            assert!(
+                !text.contains(wanted),
+                "{} imports {wanted}: it needs the Visual C++ Redistributable and will not \n                 start on a clean Windows install. Check that .cargo/config.toml \n                 still sets +crt-static for this target.",
+                release.display()
             );
         }
     }

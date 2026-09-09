@@ -1,0 +1,24 @@
+# Link the C runtime into the binaries rather than depending on it.
+#
+# Without this, kam-agent.exe imports VCRUNTIME140.dll, which ships with the
+# Visual C++ Redistributable and is *not* present on a clean Windows install.
+# It is on any machine that has ever installed something built with MSVC, which
+# is why this never showed up in development: the developer's machine has it and
+# a downloader's may not.
+#
+# The failure it causes is the worst possible first impression for a security
+# tool downloaded from GitHub. The service does not start, the window says the
+# agent is not answering, and the only clue is a missing-DLL dialog naming a
+# file the person has never heard of. Nobody debugs that; they delete it.
+#
+# The cost is a slightly larger binary and no ability to service the CRT
+# separately, neither of which matters for a self-contained release that ships
+# as a folder of two executables.
+#
+# Checked by `crt_is_linked_in_rather_than_expected` in kam-agent, which reads
+# the built binary back and fails if the import returns.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
