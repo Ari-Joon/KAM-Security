@@ -14,6 +14,7 @@ mod check;
 mod dispatch;
 mod server;
 mod service;
+mod trust;
 mod watch;
 
 use std::io::{self, Write};

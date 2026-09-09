@@ -271,6 +271,29 @@ fn set_recovery_actions() -> Result<()> {
 
 /// Register the agent with the service control manager. Requires elevation.
 pub fn install() -> Result<()> {
+    // Refuse before doing anything, if the folder this is being installed from
+    // is one other people can write to.
+    //
+    // The agent serves any program sitting in its own directory. That is the
+    // whole trust decision -- no signature, no fixed identity, only location --
+    // so the security of the pipe is exactly the security of this folder's
+    // access control list. Installing into a folder any user can write to hands
+    // them a LocalSystem service, and lets them replace the agent itself.
+    //
+    // It is not an exotic mistake. Unzipping a release into Downloads, or into
+    // a folder made off the root of C:, produces it by default. This machine
+    // had it: `dist\` carried Authenticated Users: Modify, inherited and
+    // carried along by a same-volume move, and a file was written there by a
+    // non-administrator to prove it.
+    //
+    // A refusal rather than a warning, because a warning above a success
+    // message is a warning nobody reads.
+    let directory = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .ok_or_else(|| Error::Privileged("the agent has no directory".to_owned()))?;
+    crate::trust::check_install_directory(&directory)?;
+
     let manager = ServiceManager::local_computer(
         None::<&OsStr>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
