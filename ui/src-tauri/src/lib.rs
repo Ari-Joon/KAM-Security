@@ -8,6 +8,7 @@
 //! Nothing in this process is privileged. It runs as the desktop user and gets
 //! served only because it is installed alongside the agent.
 
+mod recycle;
 mod uninstall;
 
 use kam_core::audit::Record;
@@ -162,6 +163,40 @@ async fn find_duplicates(
 struct DuplicateReport {
     groups: Vec<DuplicateGroup>,
     summary: DuplicateSummary,
+}
+
+/// Send one thing to the Recycle Bin.
+///
+/// Done here rather than through the agent, and that is the point rather than a
+/// convenience: the Recycle Bin is per user, so a LocalSystem delete lands in
+/// SYSTEM's bin where the person cannot see it or get it back. This process
+/// runs as them. See `recycle` for the rest of the reasoning.
+///
+/// `in_bin` is false when the item is gone but did not reach the bin, which
+/// Windows does silently for items too large for it. The window must say so
+/// rather than repeating the reassurance.
+#[tauri::command]
+fn recycle_item(path: String) -> Result<RecycleOutcome, String> {
+    let outcome = recycle::to_recycle_bin(std::path::Path::new(&path))?;
+    Ok(RecycleOutcome {
+        in_bin: outcome.in_bin,
+        warning: outcome.warning,
+    })
+}
+
+/// Whether this account could remove a path itself.
+///
+/// Lets the window offer recycling where it will work and quarantine where it
+/// will not, instead of offering both everywhere and failing half the time.
+#[tauri::command]
+fn can_recycle(path: String) -> bool {
+    recycle::deletable_by_this_account(std::path::Path::new(&path))
+}
+
+#[derive(serde::Serialize)]
+struct RecycleOutcome {
+    in_bin: bool,
+    warning: Option<String>,
 }
 
 /// Delete one quarantined item for good.
@@ -871,6 +906,8 @@ pub fn run() {
             empty_quarantine,
             delete_path,
             delete_copy,
+            recycle_item,
+            can_recycle,
             reveal_in_explorer,
             run_uninstaller,
             protocol_version
