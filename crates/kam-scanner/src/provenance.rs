@@ -631,7 +631,7 @@ pub fn survey(reporter: &Reporter, user: &UserContext) -> Result<Report, Cancell
         examined: findings.len(),
         swept_files,
         findings,
-        unreadable: persistence.unreadable,
+        unreadable: persistence.reasons(),
         swept: folders
             .iter()
             .map(|(folder, _)| folder.display().to_string())

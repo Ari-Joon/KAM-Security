@@ -176,7 +176,7 @@ fn check_startup(findings: &mut Vec<Finding>, user: &UserContext) {
         ));
     }
 
-    for unreadable in survey.unreadable.iter().take(1) {
+    for unreadable in survey.reasons().iter().take(1) {
         findings.push(Finding::note(format!(
             "part of the startup survey could not be read: {unreadable}"
         )));

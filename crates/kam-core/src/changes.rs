@@ -71,6 +71,60 @@ pub struct Sighting {
     pub trust: String,
 }
 
+/// A source that could not be read, and what may not be concluded from that.
+///
+/// # Why this is not just a sentence
+///
+/// It was a sentence. The rule "nothing under an unreadable source may be
+/// reported as vanished" was enforced by testing whether the sentence contained
+/// the kind of thing the source holds, as a substring. The kinds are stored
+/// tokens — `scheduled_task`, `run_key` — and the only such sentence the
+/// product actually produced was "Scheduled tasks could not be read without
+/// administrator rights", which does not contain `scheduled_task`. So the guard
+/// never fired on a real machine, while its test passed against a hand-written
+/// sentence chosen to match.
+///
+/// A safety rule whose wiring depends on the wording of the message it guards
+/// is not a safety rule. The kinds are stated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unreadable {
+    /// The kinds of thing this source holds, as the tokens sightings are
+    /// stored under. Nothing of these kinds may be concluded to have vanished.
+    ///
+    /// Empty means the gap is worth telling a person about but rules nothing
+    /// out — an account that was not examined, for instance, where the kinds
+    /// under it are also covered by other sources that were read.
+    pub kinds: Vec<String>,
+    /// What to tell the person, in their words rather than the machine's.
+    pub what: String,
+}
+
+impl Unreadable {
+    /// A source holding one kind of thing.
+    pub fn of(kind: &str, what: impl Into<String>) -> Self {
+        Self {
+            kinds: vec![kind.to_owned()],
+            what: what.into(),
+        }
+    }
+
+    /// A gap worth naming that does not license any conclusion about a kind.
+    pub fn noted(what: impl Into<String>) -> Self {
+        Self {
+            kinds: Vec::new(),
+            what: what.into(),
+        }
+    }
+
+    /// A source holding several kinds at once, such as one account's hive.
+    pub fn covering(kinds: &[&str], what: impl Into<String>) -> Self {
+        Self {
+            kinds: kinds.iter().map(|kind| (*kind).to_string()).collect(),
+            what: what.into(),
+        }
+    }
+}
+
 /// What happened to one thing between two sweeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -40,23 +40,26 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use kam_core::changes::Sighting;
+use kam_core::changes::{Sighting, Unreadable};
 use kam_scanner::persistence::{self, Anchor, Entry};
 
 /// The name a sighting is filed under for each kind of thing.
 ///
-/// Stable strings rather than the display labels, because these are stored and
-/// compared across versions: changing a label must not make the whole machine
-/// look new.
+/// Delegates to [`Anchor::kind`] rather than repeating the strings. They were
+/// repeated, and the two copies were what let a reader report a source
+/// unreadable under a name the diff never looked up.
 fn kind_of(anchor: Anchor) -> &'static str {
-    match anchor {
-        Anchor::RunKey => "run_key",
-        Anchor::RunOnceKey => "run_once_key",
-        Anchor::StartupFolder => "startup_item",
-        Anchor::Service => "service",
-        Anchor::ScheduledTask => "scheduled_task",
-    }
+    anchor.kind()
 }
+
+/// The kind an account holding administrator rights is filed under.
+///
+/// A constant for the same reason the others are: it is written when the list
+/// of administrators is read and looked up when a failure to read that list is
+/// reported, and those two spellings agreeing is the only thing standing
+/// between a permissions failure and a claim that every administrator has been
+/// removed.
+const ADMINISTRATOR: &str = "administrator";
 
 /// Who vouches for one file, as a phrase that can be stored and compared.
 ///
@@ -123,7 +126,7 @@ fn sighting_of(entry: &Entry, trust: &mut HashMap<PathBuf, String>) -> Sighting 
 /// The second is not an afterthought: `kam-core`'s diff refuses to conclude
 /// anything about a source it was told failed, so getting this wrong in the
 /// optimistic direction is how a panel starts inventing alarms.
-pub fn collect() -> (Vec<Sighting>, Vec<String>) {
+pub fn collect() -> (Vec<Sighting>, Vec<Unreadable>) {
     // A known blind spot, named here rather than left to be discovered.
     //
     // `signed_in_users` enumerates the subkeys of `HKEY_USERS`, and a profile
@@ -158,7 +161,10 @@ pub fn collect() -> (Vec<Sighting>, Vec<String>) {
             // Named rather than swallowed, so nothing concludes an
             // administrator was removed when the truth is nobody looked.
             let mut unreadable = survey.unreadable.clone();
-            unreadable.push(format!("the list of local administrators: {why}"));
+            unreadable.push(Unreadable::of(
+                ADMINISTRATOR,
+                format!("the list of local administrators: {why}"),
+            ));
             return (sightings, unreadable);
         }
     }
@@ -169,7 +175,17 @@ pub fn collect() -> (Vec<Sighting>, Vec<String>) {
     // function: an account whose hive is not loaded is not looked at, and the
     // honest thing is to say so rather than let its absence read as emptiness.
     if let Some(missing) = profiles_not_examined(&users) {
-        unreadable.push(missing);
+        // Covers every per-account kind. An account nobody looked at could
+        // hold any of them, so none of them may be concluded gone on the
+        // strength of not having been seen under it.
+        unreadable.push(Unreadable::covering(
+            &[
+                Anchor::RunKey.kind(),
+                Anchor::RunOnceKey.kind(),
+                Anchor::StartupFolder.kind(),
+            ],
+            missing,
+        ));
     }
 
     (sightings, unreadable)
@@ -295,7 +311,7 @@ fn administrators() -> Result<Vec<Sighting>, String> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|account| Sighting {
-            kind: "administrator".to_owned(),
+            kind: ADMINISTRATOR.to_owned(),
             scope: "machine".to_owned(),
             name: account.to_owned(),
             detail: "can administer this machine".to_owned(),
@@ -355,7 +371,7 @@ mod tests {
         match profiles_not_examined(&examined) {
             Some(note) => {
                 assert!(
-                    unreadable.iter().any(|line| line == &note),
+                    unreadable.iter().any(|source| source.what == note),
                     "an unexamined account was not reported: {unreadable:?}"
                 );
                 assert!(note.contains("not signed in"), "{note}");
@@ -364,7 +380,9 @@ mod tests {
                 // Every profile was covered, which is the ordinary case on a
                 // single-account machine. Nothing to claim either way.
                 assert!(
-                    !unreadable.iter().any(|line| line.contains("not signed in")),
+                    !unreadable
+                        .iter()
+                        .any(|source| source.what.contains("not signed in")),
                     "nothing was missed, so nothing should say it was"
                 );
             }

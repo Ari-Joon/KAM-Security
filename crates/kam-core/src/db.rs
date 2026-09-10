@@ -311,6 +311,10 @@ impl Store {
     /// the person learns the panel invents alarms, and the feature is finished.
     /// So a sighting is only marked vanished when its kind was actually read.
     ///
+    /// Each source states the kinds it holds rather than being matched against
+    /// its own prose. See [`crate::changes::Unreadable`] for the version of
+    /// this that looked correct and did nothing.
+    ///
     /// # Why the first sweep says nothing
     ///
     /// There is nothing to compare against, so everything would be an
@@ -319,7 +323,7 @@ impl Store {
     pub fn sweep(
         &self,
         seen: &[crate::changes::Sighting],
-        unreadable: &[String],
+        unreadable: &[crate::changes::Unreadable],
     ) -> Result<crate::changes::Sweep> {
         use crate::changes::{rank, Change, Difference, FLAPS_BEFORE_RECURRING};
 
@@ -341,11 +345,11 @@ impl Store {
         let baseline = previous_at.is_none();
 
         // Kinds this sweep genuinely looked at. A kind is readable unless a
-        // source that could not be read mentions it.
+        // source that could not be read says it holds that kind.
         let readable = |kind: &str| {
             !unreadable
                 .iter()
-                .any(|source| source.to_lowercase().contains(&kind.to_lowercase()))
+                .any(|source| source.kinds.iter().any(|held| held == kind))
         };
 
         let mut differences = Vec::new();
@@ -568,7 +572,14 @@ impl Store {
         connection
             .execute(
                 "INSERT INTO sweeps (at, unreadable) VALUES (?1, ?2)",
-                params![now, unreadable.join("\n")],
+                params![
+                    now,
+                    unreadable
+                        .iter()
+                        .map(|source| source.what.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ],
             )
             .map_err(to_db_error)?;
 
@@ -630,7 +641,10 @@ impl Store {
 
         Ok(crate::changes::Sweep {
             differences,
-            unreadable: unreadable.to_vec(),
+            unreadable: unreadable
+                .iter()
+                .map(|source| source.what.clone())
+                .collect(),
             baseline,
             previous_at,
             at: now,
@@ -1013,10 +1027,21 @@ mod tests {
             .unwrap();
 
         // The services could not be enumerated this time. The Run key could.
+        //
+        // The wording deliberately does not contain the word "service". It
+        // used to have to: the guard tested whether the kind token appeared as
+        // a substring of this sentence, so it passed here — where the sentence
+        // was written to match — and did nothing at all on a real machine,
+        // where the only message the product produced was "Scheduled tasks
+        // could not be read without administrator rights" and the token it had
+        // to match was `scheduled_task`.
         let sweep = store
             .sweep(
                 &[seen("run_key", "Updater", "C:\\up.exe")],
-                &["the list of services could not be read".to_owned()],
+                &[crate::changes::Unreadable::of(
+                    "service",
+                    "that part of the registry would not open",
+                )],
             )
             .unwrap();
 

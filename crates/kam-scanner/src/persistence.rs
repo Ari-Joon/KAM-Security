@@ -45,7 +45,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use kam_core::registry::{self, View};
+use kam_core::changes::Unreadable;
+use kam_core::registry::{self, Unopened, View};
 use kam_core::UserContext;
 use serde::{Deserialize, Serialize};
 use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, HKEY_USERS};
@@ -76,6 +77,24 @@ impl Anchor {
             Self::RunKey => 3,
             Self::ScheduledTask => 4,
             Self::Service => 5,
+        }
+    }
+
+    /// The token this kind is stored under in the baseline.
+    ///
+    /// Stable across versions and shared with everything that records or
+    /// compares a sighting, because these strings go into the database: two
+    /// copies that drifted apart would make old history unreadable, and a
+    /// mismatch between what a reader reports unreadable and what the diff
+    /// looks up would silently switch off the rule that stops an unread source
+    /// being reported as an empty one.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::RunKey => "run_key",
+            Self::RunOnceKey => "run_once_key",
+            Self::StartupFolder => "startup_item",
+            Self::Service => "service",
+            Self::ScheduledTask => "scheduled_task",
         }
     }
 
@@ -425,7 +444,7 @@ const RUN_KEYS: &[(&str, Anchor)] = &[
     ),
 ];
 
-fn read_run_keys(entries: &mut Vec<Entry>, users: &[UserContext]) {
+fn read_run_keys(survey: &mut Survey, users: &[UserContext]) {
     // Both hives and both views. A 32-bit installer writing to the Run key on a
     // 64-bit machine lands in `WOW6432Node`, and reading only the native view
     // would miss it entirely — which is exactly the kind of blind spot that
@@ -448,21 +467,43 @@ fn read_run_keys(entries: &mut Vec<Entry>, users: &[UserContext]) {
 
     for (hive, prefix, hive_label, machine_wide) in hives {
         for (view, view_label) in views {
-            for (path, anchor) in RUN_KEYS {
-                let Some(key) = registry::Key::open(hive, &format!("{prefix}{path}"), view) else {
-                    continue;
+            for &(path, anchor) in RUN_KEYS {
+                let named = format!("{hive_label}\\{path}{view_label}");
+                let key = match registry::Key::look(hive, &format!("{prefix}{path}"), view) {
+                    Ok(key) => key,
+                    // Absent is ordinary and proves nothing was hidden: most
+                    // machines have no `RunOnce` key at all, and the 32-bit
+                    // view is missing on plenty. Only a key that is there and
+                    // would not open is a gap worth naming.
+                    Err(Unopened::Absent) => continue,
+                    Err(why) => {
+                        survey
+                            .unreadable
+                            .push(Unreadable::of(anchor.kind(), why.describe(&named)));
+                        continue;
+                    }
                 };
-                for name in key.value_names() {
+                let listing = key.values();
+                if !listing.whole {
+                    survey.unreadable.push(Unreadable::of(
+                        anchor.kind(),
+                        format!(
+                            "{named} could not be listed to the end, so it may hold \
+                             entries that are not shown"
+                        ),
+                    ));
+                }
+                for name in listing.names {
                     let Some(command) = key.string(&name) else {
                         continue;
                     };
                     if command.trim().is_empty() {
                         continue;
                     }
-                    entries.push(entry(
+                    survey.entries.push(entry(
                         name,
-                        *anchor,
-                        format!("{hive_label}\\{path}{view_label}"),
+                        anchor,
+                        named.clone(),
                         command,
                         false,
                         machine_wide,
@@ -497,7 +538,7 @@ fn entry(
 }
 
 /// Files sitting in a Startup folder.
-fn read_startup_folders(entries: &mut Vec<Entry>, users: &[UserContext]) {
+fn read_startup_folders(survey: &mut Survey, users: &[UserContext]) {
     let mut folders: Vec<(PathBuf, bool)> = Vec::new();
 
     // Per-user, so it comes from the caller rather than from `%APPDATA%`.
@@ -516,10 +557,37 @@ fn read_startup_folders(entries: &mut Vec<Entry>, users: &[UserContext]) {
     }
 
     for (folder, machine_wide) in folders {
-        let Ok(listing) = std::fs::read_dir(&folder) else {
-            continue;
+        let listing = match std::fs::read_dir(&folder) {
+            Ok(listing) => listing,
+            // No Startup folder is the normal state of a fresh account, and an
+            // empty list is the honest answer to it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                survey.unreadable.push(Unreadable::of(
+                    Anchor::StartupFolder.kind(),
+                    format!("{} could not be read: {error}", folder.display()),
+                ));
+                continue;
+            }
         };
-        for item in listing.flatten() {
+        for item in listing {
+            // `flatten()` was here, which drops a failed entry as silently as
+            // it drops nothing at all. Stopping and saying so is the whole
+            // point of this pass.
+            let item = match item {
+                Ok(item) => item,
+                Err(error) => {
+                    survey.unreadable.push(Unreadable::of(
+                        Anchor::StartupFolder.kind(),
+                        format!(
+                            "{} could not be listed to the end ({error}), so it may \
+                             hold items that are not shown",
+                            folder.display()
+                        ),
+                    ));
+                    break;
+                }
+            };
             let path = item.path();
             let name = path
                 .file_stem()
@@ -552,7 +620,7 @@ fn read_startup_folders(entries: &mut Vec<Entry>, users: &[UserContext]) {
                     | "jse"
                     | "wsf"
             );
-            entries.push(Entry {
+            survey.entries.push(Entry {
                 name,
                 anchor: Anchor::StartupFolder,
                 location: folder.display().to_string(),
@@ -568,18 +636,51 @@ fn read_startup_folders(entries: &mut Vec<Entry>, users: &[UserContext]) {
 }
 
 /// Services that start without being asked.
-fn read_services(entries: &mut Vec<Entry>) {
-    let Some(root) = registry::Key::open(
+fn read_services(survey: &mut Survey) {
+    // The one that mattered most. This was `let Some(root) = open(..) else {
+    // return; }`, pushing nothing and saying nothing, so a single failed open
+    // reported every service on the machine as having vanished at once. Latent
+    // while the agent runs as LocalSystem, and total when it is not.
+    let root = match registry::Key::look(
         HKEY_LOCAL_MACHINE,
         r"SYSTEM\CurrentControlSet\Services",
         View::Native,
-    ) else {
-        return;
+    ) {
+        Ok(root) => root,
+        Err(why) => {
+            survey.unreadable.push(Unreadable::of(
+                Anchor::Service.kind(),
+                why.describe("the list of services"),
+            ));
+            return;
+        }
     };
 
-    for name in root.subkey_names() {
-        let Some(service) = root.child(&name) else {
-            continue;
+    let listing = root.subkeys();
+    if !listing.whole {
+        survey.unreadable.push(Unreadable::of(
+            Anchor::Service.kind(),
+            "the list of services could not be read to the end, so there may be \
+             services that are not shown"
+                .to_owned(),
+        ));
+    }
+
+    // Counted rather than named one by one: a machine where this happens at
+    // all has hundreds, and a list of hundreds tells a person less than a
+    // number does.
+    let mut refused = 0_usize;
+
+    for name in listing.names {
+        let service = match root.look_child(&name) {
+            Ok(service) => service,
+            // Removed between listing it and opening it. That is a race with
+            // an installer, not a gap in what could be read.
+            Err(Unopened::Absent) => continue,
+            Err(_) => {
+                refused += 1;
+                continue;
+            }
         };
 
         // Start: 0 boot, 1 system, 2 automatic, 3 on demand, 4 disabled. Only
@@ -601,7 +702,7 @@ fn read_services(entries: &mut Vec<Entry>) {
             continue;
         };
 
-        entries.push(entry(
+        survey.entries.push(entry(
             service
                 .string("DisplayName")
                 .map(|display| kam_core::mui::resolve(&display, &name))
@@ -611,6 +712,18 @@ fn read_services(entries: &mut Vec<Entry>) {
             image,
             false,
             true,
+        ));
+    }
+
+    if refused > 0 {
+        // Suppresses vanish reporting for every service, not only the ones
+        // that would not open. Deliberately blunt: the alternative is to name
+        // the exact keys and suppress only those, which is more precise and
+        // more machinery, for a case that cannot arise as LocalSystem. If it
+        // starts arising, make it precise rather than making it quieter.
+        survey.unreadable.push(Unreadable::of(
+            Anchor::Service.kind(),
+            format!("{refused} service(s) could not be read, so what they run is not shown"),
         ));
     }
 }
@@ -630,40 +743,103 @@ pub fn task_store() -> Option<PathBuf> {
 /// is.
 fn read_scheduled_tasks(survey: &mut Survey) {
     let Some(store) = task_store() else {
+        survey.unreadable.push(Unreadable::of(
+            Anchor::ScheduledTask.kind(),
+            "Windows did not say where it is installed, so the scheduled tasks \
+             could not be found"
+                .to_owned(),
+        ));
         return;
     };
 
     // The store is readable by administrators only. The agent runs as
     // LocalSystem so this succeeds in service, but it must report the gap
     // rather than return an empty list when it does not.
-    if let Err(error) = std::fs::read_dir(&store) {
-        if error.kind() == std::io::ErrorKind::PermissionDenied {
-            survey
-                .unreadable
-                .push("Scheduled tasks could not be read without administrator rights.".to_owned());
-        }
-        return;
-    }
-
     let mut found = Vec::new();
-    walk_tasks(&store, &store, &mut found, 0);
+    let mut missed = Vec::new();
+    walk_tasks(&store, &store, &mut found, &mut missed, 0);
     survey.entries.extend(found);
+
+    if !missed.is_empty() {
+        let first = missed.first().cloned().unwrap_or_default();
+        let rest = missed.len() - 1;
+        let and_others = if rest > 0 {
+            format!(", and {rest} other place(s)")
+        } else {
+            String::new()
+        };
+        survey.unreadable.push(Unreadable::of(
+            Anchor::ScheduledTask.kind(),
+            format!("part of the scheduled tasks could not be read: {first}{and_others}"),
+        ));
+    }
 }
 
-fn walk_tasks(root: &Path, folder: &Path, entries: &mut Vec<Entry>, depth: usize) {
-    // The task tree is shallow in practice; the bound is here so a link loop
-    // cannot turn this into an unbounded walk.
-    if depth > 8 {
+/// How deep the task tree is followed.
+///
+/// The tree is two or three folders deep in practice. The bound is a backstop
+/// against a cycle, not the loop guard: reparse points are refused outright
+/// below, which is what a cycle would have to be made of.
+const TASK_DEPTH: usize = 8;
+
+fn walk_tasks(
+    root: &Path,
+    folder: &Path,
+    entries: &mut Vec<Entry>,
+    missed: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > TASK_DEPTH {
+        // Said out loud rather than returned quietly. Anyone who can create a
+        // task folder can create nine nested ones, and the version that
+        // returned here made everything below them invisible to the survey and
+        // to the baseline that is built from it — a blind spot that could be
+        // dug by the thing hiding in it.
+        missed.push(format!(
+            "{} is nested deeper than {TASK_DEPTH} folders, so it was not followed",
+            folder.display()
+        ));
         return;
     }
-    let Ok(listing) = std::fs::read_dir(folder) else {
-        return;
+
+    let listing = match std::fs::read_dir(folder) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            missed.push(format!("{} ({error})", folder.display()));
+            return;
+        }
     };
 
-    for item in listing.flatten() {
+    for item in listing {
+        let item = match item {
+            Ok(item) => item,
+            Err(error) => {
+                missed.push(format!("{} ({error})", folder.display()));
+                break;
+            }
+        };
+        // A directory reached through a link is not followed. The scheduler
+        // does not make them, following one can be made to cycle, and a link
+        // pointing outside the store would have the walk reading and
+        // attributing files that are not tasks at all.
+        let kind = match item.file_type() {
+            Ok(kind) => kind,
+            Err(error) => {
+                missed.push(format!("{} ({error})", item.path().display()));
+                continue;
+            }
+        };
+        if kind.is_symlink() {
+            missed.push(format!(
+                "{} is a link, and links are not followed",
+                item.path().display()
+            ));
+            continue;
+        }
         let path = item.path();
-        if path.is_dir() {
-            walk_tasks(root, &path, entries, depth + 1);
+        if kind.is_dir() {
+            walk_tasks(root, &path, entries, missed, depth + 1);
             continue;
         }
         if let Some(entry) = task_entry(root, &path) {
@@ -770,8 +946,14 @@ fn unescape(text: &str) -> String {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Survey {
     pub entries: Vec<Entry>,
-    /// Sources that exist but could not be read, in plain words.
-    pub unreadable: Vec<String>,
+    /// Sources that exist but could not be read.
+    ///
+    /// Each states the kinds of thing it holds as well as what to say about
+    /// it, so that the rule "nothing under an unread source may be reported as
+    /// having vanished" is wired to a token rather than to the wording of a
+    /// sentence. See [`Unreadable`] for the version of that which read
+    /// correctly and did nothing.
+    pub unreadable: Vec<Unreadable>,
 }
 
 impl Survey {
@@ -779,6 +961,14 @@ impl Survey {
     /// the whole picture.
     pub fn complete(&self) -> bool {
         self.unreadable.is_empty()
+    }
+
+    /// What to tell a person about the sources that could not be read.
+    pub fn reasons(&self) -> Vec<String> {
+        self.unreadable
+            .iter()
+            .map(|source| source.what.clone())
+            .collect()
     }
 }
 
@@ -795,9 +985,9 @@ pub fn survey(user: &UserContext) -> Survey {
 /// noticing whoever is asking.
 pub fn survey_for(users: &[UserContext]) -> Survey {
     let mut survey = Survey::default();
-    read_run_keys(&mut survey.entries, users);
-    read_startup_folders(&mut survey.entries, users);
-    read_services(&mut survey.entries);
+    read_run_keys(&mut survey, users);
+    read_startup_folders(&mut survey, users);
+    read_services(&mut survey);
     read_scheduled_tasks(&mut survey);
 
     // Hardest-to-shift first, then alphabetically, so the order is stable
@@ -1044,6 +1234,104 @@ mod tests {
         );
     }
 
+    /// Every source a real survey gives up on names a kind the diff knows.
+    ///
+    /// The rule that stops an unread source being reported as an empty one is
+    /// looked up by kind token. A reader that reports a failure under a name
+    /// nothing looks up switches that rule off silently, which is what the
+    /// prose-matching version did on every machine it ever ran on.
+    #[test]
+    fn a_source_that_could_not_be_read_names_a_kind_that_exists() {
+        let known: Vec<&str> = [
+            Anchor::RunKey,
+            Anchor::RunOnceKey,
+            Anchor::StartupFolder,
+            Anchor::Service,
+            Anchor::ScheduledTask,
+        ]
+        .iter()
+        .map(|anchor| anchor.kind())
+        .collect();
+
+        let survey = survey(&kam_core::UserContext::current());
+        for source in &survey.unreadable {
+            assert!(
+                !source.what.is_empty(),
+                "a gap with nothing to say about it"
+            );
+            for kind in &source.kinds {
+                assert!(
+                    known.contains(&kind.as_str()),
+                    "reported unreadable under a kind nothing looks up: {kind}"
+                );
+            }
+        }
+        println!(
+            "{} source(s) unreadable: {:?}",
+            survey.unreadable.len(),
+            survey.reasons()
+        );
+    }
+
+    /// Services are listed, or the failure to list them is stated.
+    ///
+    /// The outcome being ruled out is the one this pass exists for: no
+    /// services and nothing said, which the diff reads as every service on the
+    /// machine having been removed since last time. The old reader produced
+    /// exactly that from a single failed open.
+    #[test]
+    fn services_are_either_listed_or_the_failure_is_named() {
+        let mut survey = Survey::default();
+        read_services(&mut survey);
+
+        let listed = survey
+            .entries
+            .iter()
+            .filter(|entry| entry.anchor == Anchor::Service)
+            .count();
+        let said = survey
+            .unreadable
+            .iter()
+            .any(|source| source.kinds.iter().any(|k| k == Anchor::Service.kind()));
+
+        assert!(
+            listed > 0 || said,
+            "no services and no explanation, which reads as every service having vanished"
+        );
+        println!("{listed} service(s) listed, failure reported: {said}");
+    }
+
+    /// A task tree nested past the walk's own limit is reported, not dropped.
+    ///
+    /// Anyone who can create a task folder can create nine nested ones. The
+    /// version that returned quietly at the cap made everything below them
+    /// invisible to the survey and to the baseline built from it, which is a
+    /// blind spot that the thing hiding in it could dig for itself.
+    #[test]
+    fn a_task_tree_deeper_than_the_walk_follows_is_reported() {
+        let root = std::env::temp_dir().join(format!("kam-deep-{}", std::process::id()));
+        let mut deep = root.clone();
+        for level in 0..12 {
+            deep = deep.join(format!("level{level}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let mut entries = Vec::new();
+        let mut missed = Vec::new();
+        walk_tasks(&root, &root, &mut entries, &mut missed, 0);
+
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(
+            !missed.is_empty(),
+            "the walk stopped at its depth limit and said nothing"
+        );
+        assert!(
+            missed.iter().any(|note| note.contains("nested deeper")),
+            "the depth limit was not named as the reason: {missed:?}"
+        );
+    }
+
     #[test]
     fn services_outrank_run_once() {
         assert!(Anchor::Service.tenacity() > Anchor::RunOnceKey.tenacity());
@@ -1088,15 +1376,16 @@ mod tests {
             .iter()
             .filter(|e| e.anchor == Anchor::ScheduledTask)
             .count();
-        if survey.complete() {
+        let tasks_reported_unreadable = survey.unreadable.iter().any(|source| {
+            source
+                .kinds
+                .iter()
+                .any(|k| k == Anchor::ScheduledTask.kind())
+        });
+        if !tasks_reported_unreadable {
             assert!(
                 tasks > 0,
                 "the task store was readable but produced no entries"
-            );
-        } else {
-            assert_eq!(
-                tasks, 0,
-                "tasks were read despite being reported unreadable"
             );
         }
         println!("scheduled tasks: {tasks}");
