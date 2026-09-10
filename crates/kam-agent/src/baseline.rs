@@ -155,47 +155,89 @@ pub fn collect() -> (Vec<Sighting>, Vec<Unreadable>) {
         .map(|entry| sighting_of(entry, &mut trust))
         .collect();
 
+    let mut unreadable = survey.unreadable;
+
     match administrators() {
         Ok(accounts) => sightings.extend(accounts),
         Err(why) => {
             // Named rather than swallowed, so nothing concludes an
             // administrator was removed when the truth is nobody looked.
-            let mut unreadable = survey.unreadable.clone();
+            //
+            // This used to `return` here, which skipped the account check
+            // below -- so a failure to read one source switched off the gap
+            // note for three other kinds, on a sweep that had examined only
+            // the account that happened to be signed in. Every Run entry,
+            // RunOnce entry and Startup item belonging to anyone else was then
+            // reported as gone. No source may be silenced by another source
+            // failing, so nothing returns early any more.
             unreadable.push(Unreadable::of(
                 ADMINISTRATOR,
                 format!("the list of local administrators: {why}"),
             ));
-            return (sightings, unreadable);
         }
     }
-
-    let mut unreadable = survey.unreadable;
 
     // Say which accounts were not examined. See the note at the top of this
     // function: an account whose hive is not loaded is not looked at, and the
     // honest thing is to say so rather than let its absence read as emptiness.
     if let Some(missing) = profiles_not_examined(&users) {
-        // Covers every per-account kind. An account nobody looked at could
-        // hold any of them, so none of them may be concluded gone on the
-        // strength of not having been seen under it.
+        // Covers every per-account kind, confined to the accounts in question.
+        //
+        // Confining it is the whole point. Without the scopes this suppressed
+        // three of the five kinds machine-wide, including `HKLM` and
+        // `ProgramData` which were read perfectly — and since the ordinary
+        // two-account family machine has one profile not signed in on nearly
+        // every sweep, that was not an edge case but the common one. Half the
+        // feature, switched off for the life of the machine, behind one polite
+        // sentence.
         unreadable.push(Unreadable::covering(
-            &[
-                Anchor::RunKey.kind(),
-                Anchor::RunOnceKey.kind(),
-                Anchor::StartupFolder.kind(),
-            ],
-            missing,
+            &per_account_kinds(),
+            &missing.places,
+            missing.what,
         ));
     }
 
     (sightings, unreadable)
 }
 
+/// The kinds that live inside one person's account rather than the machine's.
+///
+/// Derived from the anchors rather than typed out, so that adding a per-user
+/// source cannot silently miss the place that decides what an unexamined
+/// account is allowed to say nothing about.
+fn per_account_kinds() -> Vec<&'static str> {
+    [
+        Anchor::RunKey,
+        Anchor::RunOnceKey,
+        Anchor::StartupFolder,
+        Anchor::Service,
+        Anchor::ScheduledTask,
+    ]
+    .into_iter()
+    .filter(|anchor| {
+        match anchor {
+            Anchor::RunKey | Anchor::RunOnceKey | Anchor::StartupFolder => true,
+            // A service lives in `HKLM` and a task in a machine-wide file
+            // store, so neither is hidden by a hive nobody loaded.
+            Anchor::Service | Anchor::ScheduledTask => false,
+        }
+    })
+    .map(Anchor::kind)
+    .collect()
+}
+
+/// An account this sweep did not look at, and where its things would live.
+struct NotExamined {
+    what: String,
+    /// Scope prefixes: the account's hive, and its profile directory.
+    places: Vec<String>,
+}
+
 /// Accounts on this machine that this sweep did not look at.
 ///
 /// `None` when every profile was covered. The comparison is by SID, since a
 /// profile directory's name is not reliably the account's.
-fn profiles_not_examined(examined: &[kam_core::UserContext]) -> Option<String> {
+fn profiles_not_examined(examined: &[kam_core::UserContext]) -> Option<NotExamined> {
     use kam_core::registry::{Key, View};
     use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 
@@ -211,11 +253,14 @@ fn profiles_not_examined(examined: &[kam_core::UserContext]) -> Option<String> {
         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList",
         View::Native,
     ) else {
-        return Some(
-            "the list of accounts on this machine could not be read, so whether \
-             every account was examined is not known"
+        return Some(NotExamined {
+            what: "the list of accounts on this machine could not be read, so whether \
+                   every account was examined is not known"
                 .to_owned(),
-        );
+            // Nothing is known about which accounts were missed, so nothing may
+            // be ruled out: no scopes means every entry of those kinds.
+            places: Vec::new(),
+        });
     };
 
     let looked_at: std::collections::HashSet<&str> = examined
@@ -223,22 +268,56 @@ fn profiles_not_examined(examined: &[kam_core::UserContext]) -> Option<String> {
         .filter_map(kam_core::UserContext::sid)
         .collect();
 
-    let missed = root
-        .subkey_names()
-        .into_iter()
+    let listing = root.subkeys();
+
+    let missed: Vec<String> = listing
+        .names
+        .iter()
         // Real accounts, not the service profiles.
         .filter(|sid| sid.starts_with("S-1-5-21-"))
         .filter(|sid| !looked_at.contains(sid.as_str()))
-        .count();
+        .cloned()
+        .collect();
 
-    (missed > 0).then(|| {
-        format!(
-            "{missed} account{} on this machine {} not signed in, so what starts \
+    if !listing.whole {
+        // The list of accounts was cut short, so which ones were missed is not
+        // known and none of the per-account kinds may be ruled on.
+        return Some(NotExamined {
+            what: "the list of accounts on this machine could not be read in full, \
+                   so whether every account was examined is not known"
+                .to_owned(),
+            places: Vec::new(),
+        });
+    }
+
+    if missed.is_empty() {
+        return None;
+    }
+
+    // Where each unexamined account's things would live: its own hive, and its
+    // own profile directory. Both are prefixes of the scopes those sightings
+    // are filed under, so this gap says nothing about anybody else's.
+    let mut places = Vec::new();
+    for sid in &missed {
+        places.push(format!("HKEY_USERS\\{sid}\\"));
+        if let Some(profile) = root
+            .child(sid)
+            .and_then(|account| account.string("ProfileImagePath"))
+        {
+            places.push(format!("{profile}\\"));
+        }
+    }
+
+    let how_many = missed.len();
+    Some(NotExamined {
+        what: format!(
+            "{how_many} account{} on this machine {} not signed in, so what starts \
              itself under {} was not examined",
-            if missed == 1 { "" } else { "s" },
-            if missed == 1 { "was" } else { "were" },
-            if missed == 1 { "it" } else { "them" }
-        )
+            if how_many == 1 { "" } else { "s" },
+            if how_many == 1 { "was" } else { "were" },
+            if how_many == 1 { "it" } else { "them" }
+        ),
+        places,
     })
 }
 
@@ -262,7 +341,17 @@ fn administrators() -> Result<Vec<Sighting>, String> {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Get-LocalGroupMember -SID S-1-5-32-544 | ForEach-Object { $_.Name }",
+            // `$ErrorActionPreference = 'Stop'` because the exit code is
+            // otherwise a lie. `powershell.exe -Command` returns 0 after a
+            // non-terminating cmdlet error, and `Get-LocalGroupMember` has a
+            // well-known one on this exact group: a member SID that cannot be
+            // resolved to a principal -- a deleted domain account, an Azure AD
+            // account on a hybrid-joined machine, a stale SID from a
+            // decommissioned controller -- writes to the error stream and puts
+            // nothing on stdout. Exit 0, empty output, and every administrator
+            // on the machine reported as gone.
+            "$ErrorActionPreference = 'Stop'; \
+             Get-LocalGroupMember -SID S-1-5-32-544 | ForEach-Object { $_.Name }",
         ])
         .current_dir(
             std::path::PathBuf::from(
@@ -306,7 +395,7 @@ fn administrators() -> Result<Vec<Sighting>, String> {
         .wait_with_output()
         .map_err(|error| error.to_string())?;
 
-    Ok(String::from_utf8_lossy(&output.stdout)
+    let accounts: Vec<Sighting> = String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -322,7 +411,24 @@ fn administrators() -> Result<Vec<Sighting>, String> {
             // somebody about their own account.
             trust: kam_core::changes::NOT_A_FILE.to_owned(),
         })
-        .collect())
+        .collect();
+
+    // The belt to the exit code's braces. Every Windows machine has at least
+    // one member of the Administrators group -- it cannot be emptied, and
+    // Windows refuses to remove the last one -- so nobody in it is not a fact
+    // about the machine, it is a failed read wearing the costume of one.
+    //
+    // The invariant was written down in a test rather than in the function,
+    // and a test only knows about the machine it runs on. It belongs here,
+    // where the empty list would otherwise be returned as an answer and every
+    // administrator reported as having vanished: the highest-consequence kind
+    // recorded, ranked at the top of the panel, on a machine where nothing
+    // happened at all.
+    if accounts.is_empty() {
+        return Err("the group answered with nobody in it".to_owned());
+    }
+
+    Ok(accounts)
 }
 
 #[cfg(test)]
@@ -397,10 +503,27 @@ mod tests {
         match profiles_not_examined(&examined) {
             Some(note) => {
                 assert!(
-                    unreadable.iter().any(|source| source.what == note),
+                    unreadable.iter().any(|source| source.what == note.what),
                     "an unexamined account was not reported: {unreadable:?}"
                 );
-                assert!(note.contains("not signed in"), "{note}");
+                assert!(note.what.contains("not signed in"), "{}", note.what);
+
+                // And it says nothing about anybody else's entries. Without
+                // this the note suppressed run keys, run-once keys and Startup
+                // items machine-wide -- on the ordinary two-account machine,
+                // permanently, including the ones that were read.
+                let source = unreadable
+                    .iter()
+                    .find(|source| source.what == note.what)
+                    .expect("just asserted present");
+                assert!(
+                    !source.covers("run_key", r"hklm\\software\\microsoft"),
+                    "an unexamined account silenced the machine-wide run keys"
+                );
+                assert!(
+                    !source.covers("service", "anything"),
+                    "an unexamined account silenced services, which live in HKLM"
+                );
             }
             None => {
                 // Every profile was covered, which is the ordinary case on a

@@ -344,13 +344,14 @@ impl Store {
             .map_err(to_db_error)?;
         let baseline = previous_at.is_none();
 
-        // Kinds this sweep genuinely looked at. A kind is readable unless a
-        // source that could not be read says it holds that kind.
-        let readable = |kind: &str| {
-            !unreadable
-                .iter()
-                .any(|source| source.kinds.iter().any(|held| held == kind))
-        };
+        // Whether this sweep genuinely looked where this thing lives.
+        //
+        // Asked per sighting rather than per kind. A kind is a very blunt unit
+        // for this: one unreadable service key would otherwise mean no service
+        // anywhere could be reported as gone, which is a switch an attacker can
+        // hold down with a single ACL. See `Unreadable::scopes`.
+        let readable =
+            |kind: &str, scope: &str| !unreadable.iter().any(|source| source.covers(kind, scope));
 
         let mut differences = Vec::new();
         let mut unvouched = Vec::new();
@@ -545,7 +546,7 @@ impl Store {
             }
             // The rule. A source that could not be read this time proves
             // nothing about what is under it.
-            if !readable(&kind) {
+            if !readable(&kind, &scope) {
                 continue;
             }
 
@@ -970,6 +971,83 @@ mod tests {
             .sweep(&[vouched("run_key", "Mystery", "b.exe", "not signed")], &[])
             .unwrap();
         assert!(later.unvouched.is_empty());
+    }
+
+    /// A gap in one place says nothing about the same kind somewhere else.
+    ///
+    /// # The switch this removes
+    ///
+    /// Suppression used to be per kind, so any one unreadable corner silenced
+    /// the whole category. Red priced that out: an attacker with administrator
+    /// rights creates a single junk service key whose permissions deny SYSTEM,
+    /// which never runs and does nothing, and from then on no service on the
+    /// machine can ever be reported as having gone -- so the antivirus service,
+    /// the backup agent and this software's own service can be removed in
+    /// silence, behind one line about one unnamed service.
+    ///
+    /// The task store is worse, because it needs no privilege at all: it
+    /// grants Authenticated Users write, so any process can nest folders past
+    /// the walk's depth limit and switch off vanish reporting for every
+    /// scheduled task on the machine.
+    ///
+    /// And with no attacker in it at all, an ordinary two-account machine has
+    /// one profile not signed in on nearly every sweep, which suppressed three
+    /// of the five kinds permanently.
+    #[test]
+    fn a_gap_in_one_place_does_not_silence_another() {
+        let store = Store::open_in_memory().unwrap();
+        let planted = "hklm\\system\\currentcontrolset\\services\\planted";
+        let real = "hklm\\system\\currentcontrolset\\services\\windefend";
+
+        store
+            .sweep(
+                &[
+                    scoped("service", planted, "Planted", "p.exe"),
+                    scoped("service", real, "WinDefend", "d.exe"),
+                ],
+                &[],
+            )
+            .unwrap();
+
+        // Both are gone from this sweep. The planted key is the one that could
+        // not be read; the real one was read perfectly and is genuinely gone.
+        let sweep = store
+            .sweep(
+                &[],
+                &[crate::changes::Unreadable::covering(
+                    &["service"],
+                    &[planted.to_owned()],
+                    "1 service(s) could not be read",
+                )],
+            )
+            .unwrap();
+
+        let gone: Vec<&str> = sweep
+            .differences
+            .iter()
+            .filter(|one| one.change == crate::changes::Change::Vanished)
+            .map(|one| one.name.as_str())
+            .collect();
+
+        assert!(
+            gone.contains(&"WinDefend"),
+            "a service that was read and is gone was not reported: {gone:?}"
+        );
+        assert!(
+            !gone.contains(&"Planted"),
+            "a service that could not be read was reported as gone: {gone:?}"
+        );
+    }
+
+    /// A sighting with a scope of its own, for the test above.
+    fn scoped(kind: &str, scope: &str, name: &str, detail: &str) -> crate::changes::Sighting {
+        crate::changes::Sighting {
+            kind: kind.to_owned(),
+            scope: scope.to_owned(),
+            name: name.to_owned(),
+            detail: detail.to_owned(),
+            trust: crate::changes::NOT_CHECKED.to_owned(),
+        }
     }
 
     /// The first sweep reports nothing at all.

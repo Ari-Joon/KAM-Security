@@ -92,36 +92,77 @@ pub struct Unreadable {
     /// stored under. Nothing of these kinds may be concluded to have vanished.
     ///
     /// Empty means the gap is worth telling a person about but rules nothing
-    /// out — an account that was not examined, for instance, where the kinds
-    /// under it are also covered by other sources that were read.
+    /// out.
     pub kinds: Vec<String>,
+    /// Which entries of those kinds this covers, as lowercase scope prefixes.
+    ///
+    /// # Why a whole kind is the wrong unit
+    ///
+    /// Empty means every entry of those kinds, and that turns out to be a
+    /// switch rather than a safeguard. One unreadable corner suppressed the
+    /// whole category, so:
+    ///
+    /// - An attacker with administrator rights creates one junk service key
+    ///   with a DACL denying SYSTEM. It never runs and does nothing. From then
+    ///   on no service on the machine can ever be reported as having gone, and
+    ///   they can remove the antivirus, the backup agent and this software's
+    ///   own service in silence.
+    /// - No administrator rights needed for the same trick on tasks: the task
+    ///   store grants Authenticated Users write, so any process can create
+    ///   folders nested past the walk's depth limit and switch off vanish
+    ///   reporting for every scheduled task on the machine.
+    /// - And without any attacker at all, an ordinary two-account family
+    ///   machine has one profile not signed in on nearly every sweep, which
+    ///   suppressed run keys, run-once keys and Startup items — three of the
+    ///   five kinds — permanently, including the machine-wide ones that were
+    ///   read perfectly well.
+    ///
+    /// Naming the place shrinks each of those to the one key or folder it is
+    /// actually about. Matched as a prefix because a scope is a path and the
+    /// thing that could not be read is usually the folder above.
+    pub scopes: Vec<String>,
     /// What to tell the person, in their words rather than the machine's.
     pub what: String,
 }
 
 impl Unreadable {
-    /// A source holding one kind of thing.
+    /// Everything of one kind, everywhere. Use only when that is the truth:
+    /// the enumeration that would have listed them all is the thing that
+    /// failed, so nothing is known about any of them.
     pub fn of(kind: &str, what: impl Into<String>) -> Self {
         Self {
             kinds: vec![kind.to_owned()],
+            scopes: Vec::new(),
             what: what.into(),
         }
     }
 
-    /// A gap worth naming that does not license any conclusion about a kind.
-    pub fn noted(what: impl Into<String>) -> Self {
+    /// One place that could not be read, and only what lives under it.
+    pub fn within(kind: &str, scope: &str, what: impl Into<String>) -> Self {
         Self {
-            kinds: Vec::new(),
+            kinds: vec![kind.to_owned()],
+            scopes: vec![scope.to_lowercase()],
             what: what.into(),
         }
     }
 
-    /// A source holding several kinds at once, such as one account's hive.
-    pub fn covering(kinds: &[&str], what: impl Into<String>) -> Self {
+    /// Several kinds, confined to the places named.
+    pub fn covering(kinds: &[&str], scopes: &[String], what: impl Into<String>) -> Self {
         Self {
             kinds: kinds.iter().map(|kind| (*kind).to_string()).collect(),
+            scopes: scopes.iter().map(|scope| scope.to_lowercase()).collect(),
             what: what.into(),
         }
+    }
+
+    /// Whether this source says anything about one particular sighting.
+    pub fn covers(&self, kind: &str, scope: &str) -> bool {
+        self.kinds.iter().any(|held| held == kind)
+            && (self.scopes.is_empty()
+                || self
+                    .scopes
+                    .iter()
+                    .any(|prefix| scope.starts_with(prefix.as_str())))
     }
 }
 

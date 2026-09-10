@@ -457,18 +457,39 @@ fn read_run_keys(survey: &mut Survey, users: &[UserContext]) {
     let mut hives = vec![(HKEY_LOCAL_MACHINE, String::new(), "HKLM".to_owned(), true)];
     for user in users {
         let (hive, prefix) = user.hive();
+        // Named for the key that was actually opened, and for nothing else.
+        //
+        // This used to read `HKEY_USERS\{sid}` when more than one hive was
+        // loaded and `HKCU` when only one was -- so the label for a given
+        // registry value depended on how many people happened to be signed in.
+        // Since a sighting's identity is `(kind, scope, name)` and scope is
+        // this string, one person signing in renamed every one of the other
+        // person's startup entries: the whole lot reported as vanished, an
+        // equal number reported as appeared, and the pair flipping back when
+        // they signed out. Three flips and they degrade to "comes and goes",
+        // which teaches the panel to be quiet about exactly those entries.
         let label = match user.sid() {
-            Some(sid) if users.len() > 1 => format!("HKEY_USERS\\{sid}"),
-            _ => "HKCU".to_owned(),
+            Some(sid) => format!("HKEY_USERS\\{sid}"),
+            None => "HKCU".to_owned(),
         };
         hives.push((hive, prefix, label, false));
     }
-    let views = [(View::Native, ""), (View::Wow6432, r"\WOW6432Node")];
 
     for (hive, prefix, hive_label, machine_wide) in hives {
-        for (view, view_label) in views {
+        // WOW64 redirection applies to `HKLM\Software`. It does not apply to a
+        // user hive, where both views open the same key -- so reading both
+        // there recorded every per-user entry twice, under two locations, one
+        // of which does not exist. Verified on this machine: the native and
+        // 32-bit views of the per-user Run key return the same seven values.
+        let views: &[View] = if machine_wide {
+            &[View::Native, View::Wow6432]
+        } else {
+            &[View::Native]
+        };
+
+        for &view in views {
             for &(path, anchor) in RUN_KEYS {
-                let named = format!("{hive_label}\\{path}{view_label}");
+                let named = format!("{hive_label}\\{}", shown(path, view));
                 let key = match registry::Key::look(hive, &format!("{prefix}{path}"), view) {
                     Ok(key) => key,
                     // Absent is ordinary and proves nothing was hidden: most
@@ -477,16 +498,19 @@ fn read_run_keys(survey: &mut Survey, users: &[UserContext]) {
                     // would not open is a gap worth naming.
                     Err(Unopened::Absent) => continue,
                     Err(why) => {
-                        survey
-                            .unreadable
-                            .push(Unreadable::of(anchor.kind(), why.describe(&named)));
+                        survey.unreadable.push(Unreadable::within(
+                            anchor.kind(),
+                            &named,
+                            why.describe(&named),
+                        ));
                         continue;
                     }
                 };
                 let listing = key.values();
                 if !listing.whole {
-                    survey.unreadable.push(Unreadable::of(
+                    survey.unreadable.push(Unreadable::within(
                         anchor.kind(),
+                        &named,
                         format!(
                             "{named} could not be listed to the end, so it may hold \
                              entries that are not shown"
@@ -494,8 +518,26 @@ fn read_run_keys(survey: &mut Survey, users: &[UserContext]) {
                     ));
                 }
                 for name in listing.names {
-                    let Some(command) = key.string(&name) else {
-                        continue;
+                    // The name came out of the enumeration, so the value is
+                    // there. `None` therefore means it is not a string, which
+                    // is a fact about it; an error means it would not read,
+                    // which is a gap. Those were the same answer, and the
+                    // reader dropped the entry either way -- so a value that
+                    // grows between the size call and the data call left the
+                    // survey silently and was reported as removed next sweep.
+                    // The writer of a `Run` value is whoever this is looking
+                    // for, so that is a flap they can drive.
+                    let command = match key.read_string(&name) {
+                        Ok(Some(command)) => command,
+                        Ok(None) => continue,
+                        Err(why) => {
+                            survey.unreadable.push(Unreadable::within(
+                                anchor.kind(),
+                                &named,
+                                why.describe(&format!("{named}, value {name}")),
+                            ));
+                            continue;
+                        }
                     };
                     if command.trim().is_empty() {
                         continue;
@@ -511,6 +553,20 @@ fn read_run_keys(survey: &mut Survey, users: &[UserContext]) {
                 }
             }
         }
+    }
+}
+
+/// Where a key really lives, so the location can be pasted into `regedit`.
+///
+/// The redirected view of `HKLM\Software\X` is `HKLM\Software\WOW6432Node\X`,
+/// not `HKLM\Software\X\WOW6432Node`. The second was what this reported, and
+/// it is not a path -- pasting it into `regedit` finds nothing, in a field
+/// whose documented purpose is "exactly where the entry lives, so it can be
+/// found and removed by hand".
+fn shown(path: &str, view: View) -> String {
+    match view {
+        View::Native => path.to_owned(),
+        View::Wow6432 => path.replacen(r"Software\", r"Software\WOW6432Node\", 1),
     }
 }
 
@@ -549,11 +605,21 @@ fn read_startup_folders(survey: &mut Survey, users: &[UserContext]) {
             false,
         ));
     }
-    if let Ok(program_data) = std::env::var("ProgramData") {
-        folders.push((
+    match std::env::var("ProgramData") {
+        Ok(program_data) => folders.push((
             PathBuf::from(program_data).join(r"Microsoft\Windows\Start Menu\Programs\StartUp"),
             true,
-        ));
+        )),
+        // Reported rather than skipped. Without the variable the machine-wide
+        // Startup folder is not read, and every item in it would then be
+        // reported as removed -- the same shape as `task_store` two functions
+        // down, which does say so, and the two should not disagree.
+        Err(_) => survey.unreadable.push(Unreadable::of(
+            Anchor::StartupFolder.kind(),
+            "Windows did not say where the machine-wide Startup folder is, so it \
+             was not read"
+                .to_owned(),
+        )),
     }
 
     for (folder, machine_wide) in folders {
@@ -563,8 +629,9 @@ fn read_startup_folders(survey: &mut Survey, users: &[UserContext]) {
             // empty list is the honest answer to it.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                survey.unreadable.push(Unreadable::of(
+                survey.unreadable.push(Unreadable::within(
                     Anchor::StartupFolder.kind(),
+                    &folder.display().to_string(),
                     format!("{} could not be read: {error}", folder.display()),
                 ));
                 continue;
@@ -577,8 +644,9 @@ fn read_startup_folders(survey: &mut Survey, users: &[UserContext]) {
             let item = match item {
                 Ok(item) => item,
                 Err(error) => {
-                    survey.unreadable.push(Unreadable::of(
+                    survey.unreadable.push(Unreadable::within(
                         Anchor::StartupFolder.kind(),
+                        &folder.display().to_string(),
                         format!(
                             "{} could not be listed to the end ({error}), so it may \
                              hold items that are not shown",
@@ -648,6 +716,8 @@ fn read_services(survey: &mut Survey) {
     ) {
         Ok(root) => root,
         Err(why) => {
+            // The whole kind, correctly: nothing was enumerated, so nothing is
+            // known about any service.
             survey.unreadable.push(Unreadable::of(
                 Anchor::Service.kind(),
                 why.describe("the list of services"),
@@ -658,6 +728,8 @@ fn read_services(survey: &mut Survey) {
 
     let listing = root.subkeys();
     if !listing.whole {
+        // Genuinely the whole kind: the enumeration that would have named them
+        // all is what failed, so there is no telling which are missing.
         survey.unreadable.push(Unreadable::of(
             Anchor::Service.kind(),
             "the list of services could not be read to the end, so there may be \
@@ -666,10 +738,17 @@ fn read_services(survey: &mut Survey) {
         ));
     }
 
-    // Counted rather than named one by one: a machine where this happens at
-    // all has hundreds, and a list of hundreds tells a person less than a
-    // number does.
-    let mut refused = 0_usize;
+    // Named, not just counted. The count is what a person reads; the names are
+    // what stops one unreadable key silencing every service on the machine.
+    //
+    // The first version counted only, and suppressed vanish reporting for the
+    // whole kind on `refused > 0`. Red pointed out what that is worth to an
+    // attacker: one junk service key with a DACL denying SYSTEM, which never
+    // runs and does nothing, and no service can ever be reported as gone
+    // again — after which the antivirus service, the backup agent and this
+    // software's own service can be removed in silence. Display and the rule
+    // are different concerns, so it does both.
+    let mut refused: Vec<String> = Vec::new();
 
     for name in listing.names {
         let service = match root.look_child(&name) {
@@ -678,7 +757,7 @@ fn read_services(survey: &mut Survey) {
             // an installer, not a gap in what could be read.
             Err(Unopened::Absent) => continue,
             Err(_) => {
-                refused += 1;
+                refused.push(format!(r"{SERVICES}\\{name}"));
                 continue;
             }
         };
@@ -698,8 +777,17 @@ fn read_services(survey: &mut Survey) {
             continue;
         }
 
-        let Some(image) = service.string("ImagePath") else {
-            continue;
+        // The key opened, so a failure here is a failure to read a value in a
+        // key that is there -- not a service without an image. `refused`
+        // counted failed key opens only, which left this one level down from
+        // the counter added to catch it.
+        let image = match service.read_string("ImagePath") {
+            Ok(Some(image)) => image,
+            Ok(None) => continue,
+            Err(_) => {
+                refused.push(format!(r"{SERVICES}\\{name}"));
+                continue;
+            }
         };
 
         survey.entries.push(entry(
@@ -715,18 +803,18 @@ fn read_services(survey: &mut Survey) {
         ));
     }
 
-    if refused > 0 {
-        // Suppresses vanish reporting for every service, not only the ones
-        // that would not open. Deliberately blunt: the alternative is to name
-        // the exact keys and suppress only those, which is more precise and
-        // more machinery, for a case that cannot arise as LocalSystem. If it
-        // starts arising, make it precise rather than making it quieter.
-        survey.unreadable.push(Unreadable::of(
-            Anchor::Service.kind(),
-            format!("{refused} service(s) could not be read, so what they run is not shown"),
+    if !refused.is_empty() {
+        let how_many = refused.len();
+        survey.unreadable.push(Unreadable::covering(
+            &[Anchor::Service.kind()],
+            &refused,
+            format!("{how_many} service(s) could not be read, so what they run is not shown"),
         ));
     }
 }
+
+/// Where the service keys live, named once so the reader and the rule agree.
+const SERVICES: &str = r"HKLM\SYSTEM\CurrentControlSet\Services";
 
 /// Where the scheduler keeps its task definitions.
 pub fn task_store() -> Option<PathBuf> {
@@ -761,15 +849,25 @@ fn read_scheduled_tasks(survey: &mut Survey) {
     survey.entries.extend(found);
 
     if !missed.is_empty() {
-        let first = missed.first().cloned().unwrap_or_default();
+        let first = missed
+            .first()
+            .map(|gap| gap.what.clone())
+            .unwrap_or_default();
         let rest = missed.len() - 1;
         let and_others = if rest > 0 {
             format!(", and {rest} other place(s)")
         } else {
             String::new()
         };
-        survey.unreadable.push(Unreadable::of(
-            Anchor::ScheduledTask.kind(),
+        // Confined to the folders that were not walked. Without that, any
+        // process able to create a directory under the task store — which
+        // Authenticated Users can — could nest ten folders deep and switch off
+        // vanish reporting for every scheduled task on the machine, Defender's
+        // own included, at the cost of one note about a folder being too deep.
+        let places: Vec<String> = missed.iter().map(|gap| gap.where_it_is.clone()).collect();
+        survey.unreadable.push(Unreadable::covering(
+            &[Anchor::ScheduledTask.kind()],
+            &places,
             format!("part of the scheduled tasks could not be read: {first}{and_others}"),
         ));
     }
@@ -782,11 +880,21 @@ fn read_scheduled_tasks(survey: &mut Survey) {
 /// below, which is what a cycle would have to be made of.
 const TASK_DEPTH: usize = 8;
 
+/// One place the task walk could not go, and where that place is.
+///
+/// The path is kept apart from the sentence because they are read by different
+/// things: the sentence by a person, the path by the rule that decides which
+/// sightings this gap is allowed to say anything about.
+struct Unwalked {
+    where_it_is: String,
+    what: String,
+}
+
 fn walk_tasks(
     root: &Path,
     folder: &Path,
     entries: &mut Vec<Entry>,
-    missed: &mut Vec<String>,
+    missed: &mut Vec<Unwalked>,
     depth: usize,
 ) {
     if depth > TASK_DEPTH {
@@ -795,10 +903,13 @@ fn walk_tasks(
         // returned here made everything below them invisible to the survey and
         // to the baseline that is built from it — a blind spot that could be
         // dug by the thing hiding in it.
-        missed.push(format!(
-            "{} is nested deeper than {TASK_DEPTH} folders, so it was not followed",
-            folder.display()
-        ));
+        missed.push(Unwalked {
+            where_it_is: folder.display().to_string(),
+            what: format!(
+                "{} is nested deeper than {TASK_DEPTH} folders, so it was not followed",
+                folder.display()
+            ),
+        });
         return;
     }
 
@@ -806,7 +917,10 @@ fn walk_tasks(
         Ok(listing) => listing,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(error) => {
-            missed.push(format!("{} ({error})", folder.display()));
+            missed.push(Unwalked {
+                where_it_is: folder.display().to_string(),
+                what: format!("{} ({error})", folder.display()),
+            });
             return;
         }
     };
@@ -815,7 +929,10 @@ fn walk_tasks(
         let item = match item {
             Ok(item) => item,
             Err(error) => {
-                missed.push(format!("{} ({error})", folder.display()));
+                missed.push(Unwalked {
+                    where_it_is: folder.display().to_string(),
+                    what: format!("{} ({error})", folder.display()),
+                });
                 break;
             }
         };
@@ -826,15 +943,21 @@ fn walk_tasks(
         let kind = match item.file_type() {
             Ok(kind) => kind,
             Err(error) => {
-                missed.push(format!("{} ({error})", item.path().display()));
+                missed.push(Unwalked {
+                    where_it_is: item.path().display().to_string(),
+                    what: format!("{} ({error})", item.path().display()),
+                });
                 continue;
             }
         };
         if kind.is_symlink() {
-            missed.push(format!(
-                "{} is a link, and links are not followed",
-                item.path().display()
-            ));
+            missed.push(Unwalked {
+                where_it_is: item.path().display().to_string(),
+                what: format!(
+                    "{} is a link, and links are not followed",
+                    item.path().display()
+                ),
+            });
             continue;
         }
         let path = item.path();
@@ -842,8 +965,15 @@ fn walk_tasks(
             walk_tasks(root, &path, entries, missed, depth + 1);
             continue;
         }
-        if let Some(entry) = task_entry(root, &path) {
-            entries.push(entry);
+        match task_entry_or(root, &path) {
+            Ok(Some(entry)) => entries.push(entry),
+            // Not a task, or a task nothing triggers. Silent on purpose:
+            // neither is persistence and neither is a gap.
+            Ok(None) => {}
+            Err(error) => missed.push(Unwalked {
+                where_it_is: path.display().to_string(),
+                what: format!("{} ({error})", path.display()),
+            }),
         }
     }
 }
@@ -853,14 +983,39 @@ fn walk_tasks(
 /// `None` for a task that runs only when something asks it to — no trigger is
 /// not persistence — and for files that are not task definitions at all.
 pub fn task_entry(root: &Path, path: &Path) -> Option<Entry> {
-    let xml = read_task(path)?;
+    task_entry_or(root, path).ok().flatten()
+}
+
+/// The same, keeping a failed read apart from a file that is not a task.
+///
+/// `task_entry` collapses the two, and the walk above used it -- so every care
+/// taken over `read_dir`, over directory entries, over links and over depth
+/// ended at a function that dropped a file it could not open as silently as it
+/// dropped one with no trigger.
+///
+/// Both halves of that matter. The scheduler rewrites a task's XML when the
+/// task is updated, and Windows Update and Defender re-register their own
+/// tasks routinely, so a read landing in that window gets a sharing violation:
+/// the task leaves the survey for one sweep and the panel says a Microsoft
+/// maintenance task is gone. And a task file's permissions can be tightened to
+/// deny even SYSTEM, which made such a task invisible to this reader *and*
+/// unreported as a gap -- so it never entered the baseline, and its appearance
+/// could never be reported either.
+fn task_entry_or(root: &Path, path: &Path) -> Result<Option<Entry>, std::io::Error> {
+    let Some(xml) = read_task(path)? else {
+        return Ok(None);
+    };
 
     // A task with no trigger runs only when something asks it to, which is
     // not persistence.
     if !xml.contains("<Triggers>") || xml.contains("<Triggers />") {
-        return None;
+        return Ok(None);
     }
-    let command = unescape(&between(&xml, "<Command>", "</Command>")?);
+    let Some(command) = between(&xml, "<Command>", "</Command>").map(|text| unescape(&text)) else {
+        // No command is not a task that runs anything, which is a fact about
+        // the file rather than a failure to read it.
+        return Ok(None);
+    };
     let arguments = between(&xml, "<Arguments>", "</Arguments>").map(|args| unescape(&args));
     let full = match &arguments {
         Some(args) if !args.is_empty() => format!("{command} {args}"),
@@ -879,14 +1034,14 @@ pub fn task_entry(root: &Path, path: &Path) -> Option<Entry> {
         .display()
         .to_string();
 
-    Some(entry(
+    Ok(Some(entry(
         name,
         Anchor::ScheduledTask,
         path.display().to_string(),
         full,
         hidden,
         true,
-    ))
+    )))
 }
 
 /// Read a task definition, whatever it is encoded as.
@@ -896,8 +1051,8 @@ pub fn task_entry(root: &Path, path: &Path) -> Option<Entry> {
 /// which makes the whole reader silently return nothing: no error, no empty
 /// folder, just a category that quietly never appears. Encoding is checked
 /// here rather than assumed for exactly that reason.
-fn read_task(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
+fn read_task(path: &Path) -> Result<Option<String>, std::io::Error> {
+    let bytes = std::fs::read(path)?;
 
     let text = if bytes.starts_with(&[0xFF, 0xFE]) {
         let units: Vec<u16> = bytes[2..]
@@ -919,7 +1074,7 @@ fn read_task(path: &Path) -> Option<String> {
         String::from_utf8_lossy(&bytes).into_owned()
     };
 
-    Some(text)
+    Ok(Some(text))
 }
 
 fn between(text: &str, open: &str, close: &str) -> Option<String> {
@@ -1327,9 +1482,75 @@ mod tests {
             "the walk stopped at its depth limit and said nothing"
         );
         assert!(
-            missed.iter().any(|note| note.contains("nested deeper")),
-            "the depth limit was not named as the reason: {missed:?}"
+            missed.iter().any(|gap| gap.what.contains("nested deeper")),
+            "the depth limit was not named as the reason: {:?}",
+            missed.iter().map(|gap| &gap.what).collect::<Vec<_>>()
         );
+        assert!(
+            missed
+                .iter()
+                .all(|gap| gap.where_it_is.to_lowercase().contains("kam-deep")),
+            "a gap named somewhere outside the tree it was walking"
+        );
+    }
+
+    /// The same location does not hold the same name twice.
+    ///
+    /// A standing invariant rather than a regression test. It does *not* catch
+    /// the WOW64 duplication that prompted it -- the two copies carried two
+    /// different location strings, so by this test's key they were two
+    /// different things. What caught that is the location test below, because
+    /// the second string named a key that has never existed. Kept because
+    /// collapsing two records onto one identity is the other half of the same
+    /// mistake, and nothing else here would notice it.
+    #[test]
+    fn nothing_is_recorded_twice() {
+        let survey = survey_for(&signed_in_users());
+        let mut seen: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for entry in &survey.entries {
+            *seen
+                .entry((entry.location.to_lowercase(), entry.name.to_lowercase()))
+                .or_default() += 1;
+        }
+        let doubled: Vec<_> = seen.iter().filter(|(_, count)| **count > 1).collect();
+        assert!(
+            doubled.is_empty(),
+            "the same entry was recorded more than once: {doubled:?}"
+        );
+    }
+
+    /// Every registry location named is a key that actually exists.
+    ///
+    /// `Entry::location` is documented as "exactly where the entry lives, so
+    /// it can be found and removed by hand", which is a promise about a string
+    /// a person will paste into `regedit`. The redirected view was reported as
+    /// `...\CurrentVersion\Run\WOW6432Node`, and the real key is
+    /// `...\SOFTWARE\WOW6432Node\Microsoft\...\Run`. Nothing was ever at the
+    /// address this handed out.
+    #[test]
+    fn every_registry_location_named_is_a_key_that_exists() {
+        let survey = survey_for(&signed_in_users());
+        let mut checked = 0;
+        for entry in &survey.entries {
+            let Some((hive, path)) = entry.location.split_once('\\') else {
+                continue;
+            };
+            let root = match hive {
+                "HKLM" => HKEY_LOCAL_MACHINE,
+                "HKEY_USERS" => HKEY_USERS,
+                // A Startup folder or a task file is not addressed this way.
+                _ => continue,
+            };
+            assert!(
+                registry::Key::open(root, path, View::Native).is_some()
+                    || registry::Key::open(root, path, View::Wow6432).is_some(),
+                "an entry claims to live at a key that does not exist: {}",
+                entry.location
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no registry locations were checked at all");
+        println!("{checked} registry locations all resolve");
     }
 
     #[test]

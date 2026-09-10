@@ -12,13 +12,13 @@ use std::os::windows::ffi::OsStringExt;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS,
-    ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR,
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND,
+    ERROR_SUCCESS, WIN32_ERROR,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, HKEY, KEY_READ,
-    KEY_WOW64_32KEY, KEY_WOW64_64KEY, REG_BINARY, REG_DWORD, REG_EXPAND_SZ, REG_SAM_FLAGS, REG_SZ,
-    REG_VALUE_TYPE,
+    RegCloseKey, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegQueryValueExW,
+    HKEY, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, REG_BINARY, REG_DWORD, REG_EXPAND_SZ,
+    REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
 };
 
 /// Which of the two registry views to read.
@@ -108,17 +108,38 @@ impl Unopened {
 /// different things, so they are not allowed to be the same value. The caller
 /// that needs to say "and there may be more" can; the caller that only wants
 /// names still gets names.
+///
+/// `whole` defaults to false, so a `Listing` that nothing filled in claims
+/// nothing. That is the right way round: the cost of wrongly saying "there may
+/// be more" is a line of text, and the cost of wrongly saying "that was all of
+/// them" is reporting things as removed that were never looked at.
 #[derive(Debug, Clone, Default)]
 pub struct Listing {
     pub names: Vec<String>,
-    /// False when enumeration stopped before Windows said there was no more.
+    /// True only when as many entries came back as Windows said there were.
     ///
-    /// This is not hypothetical. Value names run to 16383 characters and the
-    /// buffer here is smaller, so before the retry below, one value with a
-    /// long name ended the enumeration where it stood and everything after it
-    /// vanished from the survey — plantable by anyone who can write a Run key,
-    /// and silent.
+    /// Not "the loop ended tidily". A key can be written to while it is being
+    /// walked, and index-based enumeration is not a snapshot — deleting an
+    /// entry mid-walk makes the following one skip, and the walk still ends
+    /// normally. Counting is what tells those apart.
     pub whole: bool,
+}
+
+/// How much Windows says a key holds, asked before walking it.
+#[derive(Debug, Clone, Copy)]
+struct Shape {
+    subkeys: u32,
+    longest_subkey: u32,
+    values: u32,
+    longest_value: u32,
+}
+
+impl Shape {
+    /// Finish a walk, claiming completeness only if the count agrees.
+    fn finish(self, names: Vec<String>, expected: u32) -> Listing {
+        let whole = names.len() == expected as usize;
+        Listing { names, whole }
+    }
 }
 
 impl Key {
@@ -171,16 +192,21 @@ impl Key {
         self.subkeys().names
     }
 
-    /// Names of every subkey, and whether the enumeration ran to the end.
+    /// Names of every subkey, and whether that is all of them.
     pub fn subkeys(&self) -> Listing {
+        let Some(shape) = self.shape() else {
+            // Nothing is known about how many there should be, so nothing may
+            // be claimed about having got them all.
+            return Listing::default();
+        };
+
         let mut names = Vec::new();
         let mut index = 0_u32;
         loop {
-            // Key names are capped at 255 characters by the registry itself,
-            // so the buffer cannot be too small — but the failure is handled
-            // the same way regardless, because "cannot happen" is how the
-            // value-name truncation below got in.
-            let mut buffer = [0_u16; 256];
+            // Sized from what Windows just said the longest name is, so there
+            // is no buffer to be too small and no reasoning about what length
+            // a name "realistically" has.
+            let mut buffer = vec![0_u16; shape.longest_subkey as usize + 1];
             let mut length = buffer.len() as u32;
             let status: WIN32_ERROR = unsafe {
                 RegEnumKeyExW(
@@ -199,13 +225,7 @@ impl Key {
                     names.push(from_wide(&buffer));
                     index += 1;
                 }
-                ERROR_NO_MORE_ITEMS => return Listing { names, whole: true },
-                _ => {
-                    return Listing {
-                        names,
-                        whole: false,
-                    }
-                }
+                _ => return shape.finish(names, shape.subkeys),
             }
         }
     }
@@ -218,72 +238,98 @@ impl Key {
         self.values().names
     }
 
-    /// Names of every value, and whether the enumeration ran to the end.
+    /// Names of every value, and whether that is all of them.
     ///
-    /// # The buffer that was an exploit
+    /// # Two ways this lied, and why counting fixes both
     ///
-    /// This read into a fixed 1024-character buffer and stopped on any status
-    /// that was not success, with a comment reasoning that no person writes a
-    /// name that long. People do not; the thing this software is looking for
-    /// is not a person. A value name over 1023 characters makes Windows return
-    /// `ERROR_MORE_DATA` without advancing the index, so the old loop ended
-    /// there — and every value after it disappeared from the survey silently.
+    /// It read into a fixed 1024-character buffer and stopped on any status
+    /// that was not success, reasoning that no person writes a value name that
+    /// long. People do not; the thing this software looks for is not a person.
+    /// A name over 1023 characters returns `ERROR_MORE_DATA` without advancing
+    /// the index, so the loop ended there and every value after it disappeared
+    /// from the survey while the list reported itself complete.
     ///
-    /// That is plantable by anything that can write a Run key, and it is worse
-    /// than a blind spot: the entries that vanish from the survey were in the
-    /// baseline, so the next sweep reports the machine's *legitimate* startup
-    /// entries as removed while hiding the one that did it.
+    /// Then, with that fixed by retrying on a bigger buffer, Red demonstrated
+    /// the deeper one: index-based enumeration is not a snapshot. Delete the
+    /// value just read at index 0 and continue at index 1, and the value that
+    /// *was* at index 1 is never returned — the list still ends on
+    /// `ERROR_NO_MORE_ITEMS` and still called itself whole. Anything running as
+    /// the user can write its own `Run` key, so anything running as the user
+    /// could make the machine's real startup entries flap on demand: three
+    /// flaps and they are downgraded to `Recurring`, which is a quiet bucket
+    /// an attacker can then park their own entry in.
     ///
-    /// So a name too long for the buffer is read again with a buffer big
-    /// enough for the largest name the registry permits, and a failure that is
-    /// still not the end of the list is reported as a partial read rather than
-    /// passed off as the whole.
+    /// Asking Windows how many values there are, and comparing, answers both.
+    /// A name cannot be too long for a buffer sized from the reported maximum,
+    /// and a key mutated underneath the walk comes back with the wrong count
+    /// and says so. The retry, the guessed buffer size and the constant for
+    /// the registry's own limit all stop being needed.
     pub fn values(&self) -> Listing {
-        // The registry's own cap on a value name, plus the terminator.
-        const LONGEST: usize = 16384;
+        let Some(shape) = self.shape() else {
+            return Listing::default();
+        };
 
         let mut names = Vec::new();
         let mut index = 0_u32;
         loop {
-            // Small buffer first, since essentially every real name fits it
-            // and this runs once per value on keys with many.
-            let mut buffer = vec![0_u16; 1024];
-            let mut status = self.enumerate_value(index, &mut buffer);
-            if status == ERROR_MORE_DATA {
-                buffer = vec![0_u16; LONGEST];
-                status = self.enumerate_value(index, &mut buffer);
-            }
+            let mut buffer = vec![0_u16; shape.longest_value as usize + 1];
+            let mut length = buffer.len() as u32;
+            let status: WIN32_ERROR = unsafe {
+                RegEnumValueW(
+                    self.0,
+                    index,
+                    Some(windows::core::PWSTR(buffer.as_mut_ptr())),
+                    &mut length,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
             match status {
                 ERROR_SUCCESS => {
                     names.push(from_wide(&buffer));
                     index += 1;
                 }
-                ERROR_NO_MORE_ITEMS => return Listing { names, whole: true },
-                _ => {
-                    return Listing {
-                        names,
-                        whole: false,
-                    }
-                }
+                _ => return shape.finish(names, shape.values),
             }
         }
     }
 
-    /// One `RegEnumValueW` call, so the retry above reads as a retry.
-    fn enumerate_value(&self, index: u32, buffer: &mut [u16]) -> WIN32_ERROR {
-        let mut length = buffer.len() as u32;
-        unsafe {
-            RegEnumValueW(
+    /// What Windows says this key holds, asked before walking it.
+    ///
+    /// `None` when the question could not be answered, which is the only
+    /// honest response to "did you get them all" in that case.
+    fn shape(&self) -> Option<Shape> {
+        let mut subkeys = 0_u32;
+        let mut longest_subkey = 0_u32;
+        let mut values = 0_u32;
+        let mut longest_value = 0_u32;
+        let status = unsafe {
+            RegQueryInfoKeyW(
                 self.0,
-                index,
-                Some(windows::core::PWSTR(buffer.as_mut_ptr())),
-                &mut length,
                 None,
+                None,
+                None,
+                Some(&mut subkeys),
+                Some(&mut longest_subkey),
+                None,
+                Some(&mut values),
+                Some(&mut longest_value),
                 None,
                 None,
                 None,
             )
-        }
+        };
+        (status == ERROR_SUCCESS).then_some(Shape {
+            subkeys,
+            // Both maxima are in characters and exclude the terminator, which
+            // the buffers above add back. The `cb` in the parameter names is
+            // misleading; for the wide entry points these are character counts.
+            longest_subkey,
+            values,
+            longest_value,
+        })
     }
 
     pub fn child(&self, name: &str) -> Option<Self> {
@@ -293,39 +339,74 @@ impl Key {
     /// Read a string value. Empty strings come back as `None`, since an empty
     /// `InstallLocation` is as useless as an absent one.
     pub fn string(&self, value: &str) -> Option<String> {
-        let name = wide(value);
-        let mut kind = REG_VALUE_TYPE::default();
-        let mut size = 0_u32;
+        self.read_string(value).ok().flatten()
+    }
 
-        let status = unsafe {
-            RegQueryValueExW(
-                self.0,
-                PCWSTR(name.as_ptr()),
-                None,
-                Some(&mut kind),
-                None,
-                Some(&mut size),
-            )
-        };
-        if status != ERROR_SUCCESS || (kind != REG_SZ && kind != REG_EXPAND_SZ) || size == 0 {
-            return None;
+    /// The same, keeping a failed read apart from a value that is not there.
+    ///
+    /// Both came back as `None`, and the caller in the startup reader treats
+    /// `None` as "nothing to record" -- so a value that could not be read left
+    /// the survey silently and was reported as removed on the next sweep. The
+    /// reader is looking at the `Run` keys, where the writer of the value is
+    /// whoever is being looked for: alternating one between a short and a long
+    /// string makes a legitimate startup entry come and go on demand.
+    pub fn read_string(&self, value: &str) -> std::result::Result<Option<String>, Unopened> {
+        // Two calls, one for the size and one for the data, so a value that
+        // grows in between returns ERROR_MORE_DATA. Retried rather than
+        // treated as absent, and a retry that keeps losing is a failure that
+        // gets said out loud.
+        for _ in 0..4 {
+            let name = wide(value);
+            let mut kind = REG_VALUE_TYPE::default();
+            let mut size = 0_u32;
+
+            let status = unsafe {
+                RegQueryValueExW(
+                    self.0,
+                    PCWSTR(name.as_ptr()),
+                    None,
+                    Some(&mut kind),
+                    None,
+                    Some(&mut size),
+                )
+            };
+            if status == ERROR_FILE_NOT_FOUND {
+                return Ok(None);
+            }
+            if status != ERROR_SUCCESS {
+                return Err(Unopened::from(status));
+            }
+            // Not a string, which is a fact about the value rather than a
+            // failure to read it.
+            if (kind != REG_SZ && kind != REG_EXPAND_SZ) || size == 0 {
+                return Ok(None);
+            }
+
+            let mut data = vec![0_u8; size as usize];
+            let status = unsafe {
+                RegQueryValueExW(
+                    self.0,
+                    PCWSTR(name.as_ptr()),
+                    None,
+                    None,
+                    Some(data.as_mut_ptr()),
+                    Some(&mut size),
+                )
+            };
+            if status == ERROR_MORE_DATA {
+                continue;
+            }
+            if status != ERROR_SUCCESS {
+                return Err(Unopened::from(status));
+            }
+
+            return Ok(Self::text_of(&data));
         }
+        Err(Unopened::Failed(ERROR_MORE_DATA.0))
+    }
 
-        let mut data = vec![0_u8; size as usize];
-        let status = unsafe {
-            RegQueryValueExW(
-                self.0,
-                PCWSTR(name.as_ptr()),
-                None,
-                None,
-                Some(data.as_mut_ptr()),
-                Some(&mut size),
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return None;
-        }
-
+    /// Decode what a string value's bytes hold.
+    fn text_of(data: &[u8]) -> Option<String> {
         let units: Vec<u16> = data
             .as_chunks::<2>()
             .0
@@ -403,7 +484,13 @@ impl Key {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use windows::core::PWSTR;
+    // Write entry points, used only to plant what these tests then read. The
+    // module itself stays read-only on purpose.
+    use windows::Win32::System::Registry::{
+        RegCreateKeyExW, RegDeleteKeyW, RegSetValueExW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+        KEY_WRITE, REG_OPTION_NON_VOLATILE,
+    };
 
     #[test]
     fn a_well_known_key_opens_and_reads() {
@@ -449,6 +536,85 @@ mod tests {
         }
     }
 
+    /// A scratch key under HKCU that removes itself, for planting into.
+    ///
+    /// Written through the API rather than by shelling out to `reg.exe`. The
+    /// first version of these tests ran `reg.exe` and *returned early* when it
+    /// could not, which is a pass -- so on a runner without System32 on PATH,
+    /// or with the registry-tools policy set, the test proved nothing and
+    /// still went green. A test whose premise cannot be established has
+    /// failed; it has not succeeded.
+    struct Scratch {
+        path: String,
+        // Kept open for writing. Reopening through `Key::look` would hand back
+        // a read-only handle, since that is all this module ever asks for.
+        handle: HKEY,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path = format!(r"Software\KAM Security\test {name} {}", std::process::id());
+            let wide_path = wide(&path);
+            let mut handle = HKEY::default();
+            let status = unsafe {
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    PCWSTR(wide_path.as_ptr()),
+                    None,
+                    PWSTR::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_READ | KEY_WRITE,
+                    None,
+                    &mut handle,
+                    None,
+                )
+            };
+            assert_eq!(status, ERROR_SUCCESS, "could not create {path}");
+            Self { path, handle }
+        }
+
+        fn put(&self, name: &str, data: &str) {
+            let wide_name = wide(name);
+            let bytes: Vec<u8> = wide(data)
+                .iter()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect();
+            let status = unsafe {
+                RegSetValueExW(
+                    self.handle,
+                    PCWSTR(wide_name.as_ptr()),
+                    None,
+                    REG_SZ,
+                    Some(&bytes),
+                )
+            };
+            assert_eq!(
+                status,
+                ERROR_SUCCESS,
+                "could not write a value of {} chars",
+                name.len()
+            );
+        }
+
+        fn read(&self) -> Listing {
+            Key::look(HKEY_CURRENT_USER, &self.path, View::Native)
+                .expect("the scratch key should open")
+                .values()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // Runs even when an assertion fails, so a red test does not leave
+            // keys behind for the next one to trip over.
+            let path = wide(&self.path);
+            unsafe {
+                let _ = RegCloseKey(self.handle);
+                let _ = RegDeleteKeyW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr()));
+            }
+        }
+    }
+
     /// A long value name must not end the enumeration where it stands.
     ///
     /// # Why this is written against the real registry
@@ -469,57 +635,17 @@ mod tests {
     /// writes the name Windows actually has to enumerate.
     #[test]
     fn a_value_name_too_long_for_the_buffer_does_not_end_the_list() {
-        let where_it_goes = r"Software\KAM Security\enumeration test";
+        let scratch = Scratch::new("long name");
         let long_name = "n".repeat(2000);
+        scratch.put(&long_name, "long");
+        scratch.put("after", "short");
 
-        let planted = std::process::Command::new("reg.exe")
-            .args([
-                "add",
-                &format!(r"HKCU\{where_it_goes}"),
-                "/v",
-                &long_name,
-                "/t",
-                "REG_SZ",
-                "/d",
-                "long",
-                "/f",
-            ])
-            .output();
-        let Ok(planted) = planted else {
-            eprintln!("reg.exe would not run; nothing proved");
-            return;
-        };
-        if !planted.status.success() {
-            eprintln!("could not plant the long name; nothing proved");
-            return;
-        }
-
-        let _ = std::process::Command::new("reg.exe")
-            .args([
-                "add",
-                &format!(r"HKCU\{where_it_goes}"),
-                "/v",
-                "after",
-                "/t",
-                "REG_SZ",
-                "/d",
-                "short",
-                "/f",
-            ])
-            .output();
-
-        let listing = Key::open(HKEY_CURRENT_USER, where_it_goes, View::Native)
-            .expect("the key just written should open")
-            .values();
-
-        // Tidy up before asserting, so a failure does not leave the key behind.
-        let _ = std::process::Command::new("reg.exe")
-            .args(["delete", &format!(r"HKCU\{where_it_goes}"), "/f"])
-            .output();
+        let listing = scratch.read();
 
         assert!(
             listing.whole,
-            "the enumeration stopped early and said it was complete"
+            "the enumeration stopped early and said it was complete: {:?}",
+            listing.names.len()
         );
         assert!(
             listing.names.iter().any(|name| name == "after"),
@@ -527,13 +653,53 @@ mod tests {
             listing.names
         );
         assert!(
-            listing.names.iter().any(|name| name.len() == 2000),
+            listing
+                .names
+                .iter()
+                .any(|name| name.chars().count() == 2000),
             "the long name itself was not listed: {:?}",
             listing
                 .names
                 .iter()
-                .map(std::string::String::len)
+                .map(|name| name.chars().count())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// A key written to while it is being walked does not call itself whole.
+    ///
+    /// Red demonstrated the hole this closes: index-based enumeration is not a
+    /// snapshot, so deleting the entry just read makes the next one skip while
+    /// the walk still ends on `ERROR_NO_MORE_ITEMS`. Anything running as the
+    /// user can write its own `Run` key, so anything running as the user could
+    /// make the machine's real startup entries appear to come and go.
+    ///
+    /// This cannot reproduce the race deterministically from one thread, so it
+    /// tests the property that makes the race safe: the count Windows reports
+    /// is what completeness is judged against, and a list short of it is not
+    /// whole.
+    #[test]
+    fn a_short_read_is_not_reported_as_the_whole_list() {
+        let scratch = Scratch::new("counting");
+        for index in 0..4 {
+            scratch.put(&format!("value{index}"), "x");
+        }
+
+        let listing = scratch.read();
+        assert!(listing.whole, "an undisturbed key should read whole");
+        assert_eq!(listing.names.len(), 4);
+
+        // What a skipped entry looks like to the code that decides.
+        let short = Shape {
+            subkeys: 0,
+            longest_subkey: 0,
+            values: 4,
+            longest_value: 16,
+        }
+        .finish(vec!["value0".to_owned(), "value2".to_owned()], 4);
+        assert!(
+            !short.whole,
+            "a list two short of the reported count called itself complete"
         );
     }
 
