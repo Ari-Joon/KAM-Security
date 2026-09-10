@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, reason } from "../lib/api";
 import ConnectionMap, {
   ConnectionLegend,
@@ -207,17 +207,28 @@ const TONE_RANK: Record<Tone, number> = {
  */
 function byPublisher(programs: Program[]): MapGroup[] {
   const groups = new Map<string, MapGroup>();
+  // Share is of everything on screen, so the percentages on the map add to a
+  // hundred and mean "how much of this picture is that".
+  const total = programs.reduce(
+    (sum, program) => sum + program.connections.length,
+    0,
+  );
+  const share = (count: number) =>
+    total > 0 ? Math.max(1, Math.round((count / total) * 100)) : 0;
 
   for (const program of programs) {
     const publisher = program.signer;
     const key = publisher ? `signer:${publisher}` : `alone:${program.key}`;
+    const notes = attention(program);
     const node: MapNode = {
       key: program.key,
       label: program.label,
       bytes: program.connections.length,
       tone: toneOf(program),
       external: program.external,
-      detail: describe(program),
+      share: share(program.connections.length),
+      notes,
+      detail: describe(program, share(program.connections.length)),
     };
 
     let group = groups.get(key);
@@ -228,7 +239,9 @@ function byPublisher(programs: Program[]): MapGroup[] {
         bytes: 0,
         tone: "unknown",
         external: 0,
-        detail: publisher ? `signed by ${publisher}` : describe(program),
+        share: 0,
+        notes: [],
+        detail: publisher ? `signed by ${publisher}` : node.detail,
         children: [],
       };
       groups.set(key, group);
@@ -236,18 +249,114 @@ function byPublisher(programs: Program[]): MapGroup[] {
     group.children.push(node);
     group.bytes += node.bytes;
     group.external += node.external;
-    // A publisher shows its worst program's state, so a single unsigned binary
-    // under an otherwise clean name is not averaged out of sight.
+    // The publisher carries every note any of its programs raised, so a single
+    // unsigned binary under an otherwise clean name is not averaged out of
+    // sight.
+    for (const note of notes) {
+      if (!group.notes.includes(note)) group.notes.push(note);
+    }
     if (TONE_RANK[node.tone] > TONE_RANK[group.tone]) group.tone = node.tone;
+  }
+
+  for (const group of groups.values()) {
+    group.share = share(group.bytes);
+    if (group.children.length > 1) {
+      group.detail =
+        `${group.bytes} sockets across ${group.children.length} programs, ` +
+        `${group.share}% of everything open`;
+    }
   }
 
   return [...groups.values()].sort((a, b) => b.bytes - a.bytes);
 }
 
+/**
+ * Where a program runs from, when that is worth saying.
+ *
+ * A real signal and a cheap one. Software installed properly lives under
+ * Program Files or in Windows; software that arrived some other way tends to
+ * run from a profile folder, and something running from Temp or Downloads got
+ * there without an installer at all. None of those is proof of anything —
+ * plenty of legitimate applications install per-user into AppData, and this
+ * machine has several — which is why it is phrased as a place rather than as a
+ * verdict, and why it is only one line among others.
+ */
+function placeOf(path: string | null): { text: string; notable: boolean } | null {
+  if (!path) return null;
+  const lower = path.toLowerCase();
+  if (lower.includes("\\windows\\") || lower.includes("\\program files")) {
+    return { text: "installed in the usual place", notable: false };
+  }
+  if (lower.includes("\\temp\\") || lower.includes("\\downloads\\")) {
+    return { text: "running from a temporary folder", notable: true };
+  }
+  if (lower.includes("\\appdata\\") || lower.includes("\\users\\")) {
+    return { text: "running from your user folder", notable: true };
+  }
+  return null;
+}
+
+/**
+ * Everything about a program that is worth a reader's attention, most notable
+ * first.
+ *
+ * # Why a list and not a score
+ *
+ * The obvious thing to build here is a number — a risk rating, a percentage of
+ * danger. It would be invented. Nothing on this machine knows whether a program
+ * is dangerous, and turning several checked facts into one number destroys the
+ * only thing that made them useful, which is that a person can look at each one
+ * and disagree.
+ *
+ * So this returns the facts, ordered by how much each one warrants a look, and
+ * the interface shows the count rather than a rating. "Three things worth
+ * noticing" is honest and leads somewhere. "Risk: 73%" is neither.
+ */
+function attention(program: Program): string[] {
+  const notes: string[] = [];
+
+  if (program.unsigned === true) {
+    notes.push("Nothing signed it, so there is no publisher to hold to it");
+  }
+  if (program.external > 0 && program.unsigned === true) {
+    notes.push(`Unsigned, and connected out to ${program.external} address${program.external === 1 ? "" : "es"}`);
+  }
+  if (program.reachable > 0) {
+    notes.push(
+      `Listening on an address the network can reach, not just this machine`,
+    );
+  }
+
+  // What the file says about itself against who actually signed it. Both are
+  // already read; the disagreement between them is the interesting part and
+  // was being thrown away.
+  if (
+    program.company &&
+    program.signer &&
+    !program.signer.toLowerCase().includes(program.company.toLowerCase().split(/[ ,.]/)[0]) &&
+    !program.company.toLowerCase().includes(program.signer.toLowerCase().split(/[ ,.]/)[0])
+  ) {
+    notes.push(
+      `Says it is from ${program.company}, but ${program.signer} signed it`,
+    );
+  }
+
+  const place = placeOf(program.path);
+  if (place?.notable) {
+    notes.push(place.text[0].toUpperCase() + place.text.slice(1));
+  }
+
+  if (program.unsigned === null) {
+    notes.push("The owning program could not be read, so nothing here is known about it");
+  }
+
+  return notes;
+}
+
 /** One line of plain fact about a program, for a tooltip. */
-function describe(program: Program): string {
+function describe(program: Program, share: number): string {
   const parts = [
-    `${program.connections.length} ${program.connections.length === 1 ? "socket" : "sockets"}`,
+    `${program.connections.length} ${program.connections.length === 1 ? "socket" : "sockets"}, ${share}% of everything open`,
   ];
   if (program.external > 0) parts.push(`${program.external} reaching the internet`);
   if (program.reachable > 0) {
@@ -264,6 +373,8 @@ function describe(program: Program): string {
         ? "could not be identified"
         : "not signed",
   );
+  const place = placeOf(program.path);
+  if (place) parts.push(place.text);
   return parts.join(" · ");
 }
 
@@ -306,15 +417,24 @@ function ProgramGroup({
   busy,
   open,
   onToggle,
+  nodeRef,
+  notes,
 }: {
   program: Program;
   onBlock: (path: string, name: string) => void;
   busy: boolean;
   open: boolean;
   onToggle: () => void;
+  /** Registers the row so a click on the map can scroll to it. */
+  nodeRef: (element: HTMLLIElement | null) => void;
+  /** What warrants a look, most notable first. Empty when nothing does. */
+  notes: string[];
 }) {
   return (
-    <li className={`prog${program.external > 0 ? " prog-external" : ""}`}>
+    <li
+      ref={nodeRef}
+      className={`prog${program.external > 0 ? " prog-external" : ""}`}
+    >
       <div className="prog-head">
         <button className="prog-toggle" onClick={onToggle}>
           <span className="app-caret">{open ? "▾" : "▸"}</span>
@@ -378,6 +498,14 @@ function ProgramGroup({
           <span className="prog-file">{program.file}</span>
         )}
       </div>
+
+      {notes.length > 0 && (
+        <ul className="prog-notes">
+          {notes.map((note) => (
+            <li key={note}>{note}</li>
+          ))}
+        </ul>
+      )}
 
       {open && (
         <div className="prog-detail">
@@ -461,6 +589,21 @@ export default function Firewall() {
   );
   /** One program open at a time, so the list never becomes a wall again. */
   const [expanded, setExpanded] = useState<string | null>(null);
+  /**
+   * Which publisher the map is inside, if any.
+   *
+   * The map drills like the storage one rather than nesting, so this is the
+   * whole of its navigation state: null is the publisher level, a key is that
+   * publisher's programs.
+   */
+  const [inside, setInside] = useState<string | null>(null);
+  /**
+   * The list rows, so a selection can be scrolled to.
+   *
+   * Opening a row several screens below the map is the same as not opening it,
+   * which is what "it just highlights it" meant.
+   */
+  const rows = useRef(new Map<string, HTMLLIElement>());
 
   /**
    * Programs rather than sockets.
@@ -498,6 +641,13 @@ export default function Firewall() {
       }),
     [programs, query, filter],
   );
+
+  /** The map's top level: whatever survived the search and filters, by author. */
+  const publishers = useMemo(() => byPublisher(shown), [shown]);
+  /** The publisher the map is inside, if that publisher is still on screen. */
+  const insideGroup = inside
+    ? (publishers.find((group) => group.key === inside) ?? null)
+    : null;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -716,10 +866,43 @@ export default function Firewall() {
 
         {shown.length > 0 && (
           <>
+            <nav className="crumbs connmap-crumbs">
+              <button
+                className="crumb"
+                disabled={inside === null}
+                onClick={() => setInside(null)}
+              >
+                All publishers
+              </button>
+              {insideGroup && (
+                <button className="crumb" disabled>
+                  {insideGroup.label}
+                </button>
+              )}
+            </nav>
             <ConnectionMap
-              groups={byPublisher(shown)}
+              nodes={insideGroup ? insideGroup.children : publishers}
               selected={expanded}
-              onSelect={(key) => setExpanded(key)}
+              onActivate={(node) => {
+                const group = publishers.find((one) => one.key === node.key);
+                if (group && group.children.length > 1 && inside === null) {
+                  // A publisher with several programs: go in.
+                  setInside(node.key);
+                  return;
+                }
+                // A program: open its row and take the reader to it, because a
+                // row opened several screens below the map is a row that did
+                // not open.
+                const next = expanded === node.key ? null : node.key;
+                setExpanded(next);
+                if (next) {
+                  requestAnimationFrame(() =>
+                    rows.current
+                      .get(next)
+                      ?.scrollIntoView({ behavior: "smooth", block: "center" }),
+                  );
+                }
+              }}
             />
             <ConnectionLegend />
             {live !== null && live.closing > 0 && (
@@ -749,6 +932,11 @@ export default function Firewall() {
             {shown.map((program) => (
               <ProgramGroup
                 key={program.key}
+                nodeRef={(element) => {
+                  if (element) rows.current.set(program.key, element);
+                  else rows.current.delete(program.key);
+                }}
+                notes={attention(program)}
                 program={program}
                 busy={busy}
                 open={expanded === program.key}

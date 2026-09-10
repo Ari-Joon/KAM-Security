@@ -6,61 +6,56 @@ import { squarify } from "../lib/treemap";
  *
  * # Why a map and not more rows
  *
- * The list before this grouped sockets under the program that owned them, which
- * was a real improvement and still not enough: one program is several
- * executables. Steam alone is `steam.exe` and `steamwebhelper.exe`; the browser
- * is one binary with dozens of sockets; the machine has a dozen more. Grouping
- * by executable therefore fragments exactly the things a person thinks of as
- * one program, and no amount of sorting fixes that, because the problem is that
- * a list gives every row the same visual weight whatever it is worth.
+ * The list this sits above groups sockets under the program that owns them,
+ * which was a real improvement and still not enough: one program is several
+ * executables. Steam alone is `steam.exe` and `steamwebhelper.exe`. Grouping by
+ * executable fragments exactly the things a person thinks of as one program,
+ * and no amount of sorting fixes it, because the problem is that a list gives
+ * every row the same visual weight whatever it is worth.
  *
  * Area does not. A publisher with forty sockets is forty times the size of one
  * with a single socket, and that is legible before anything is read.
  *
- * # Two levels, because that is what the data is
+ * # One level at a time, like the storage map
  *
- * Publisher outside, program inside. Steam's two executables sit together
- * inside one Valve block, which is the grouping people actually have in their
- * heads, and the individual programs stay visible inside it rather than being
- * summed away.
+ * The first version drew publishers with their programs nested inside them, and
+ * it was wrong twice over. Visually, small blocks could not hold their children
+ * and the children spilled across their neighbours. And behaviourally, clicking
+ * a block only highlighted it — there was nowhere to go, so the map showed the
+ * shape of the answer and then refused to take you to it.
+ *
+ * So it drills, exactly as the storage map does: publishers first, click one to
+ * see its programs filling the whole map, breadcrumb back out. Nothing is
+ * nested, so nothing can overflow, and every rectangle has the room to say what
+ * it is.
  *
  * # What the colours mean, and what they do not
  *
  * They are not a verdict, and the legend under the map says what each one is in
  * words. Each colour is a *pair of facts this software checked*: whether the
- * program carries a valid signature, and whether it is connected to something
- * outside this machine. Both are verifiable, and neither is an opinion.
+ * program carries a valid signature, and whether it is open to the network —
+ * either reaching out, or listening somewhere the network can reach it. Both
+ * are verifiable and neither is an opinion.
  *
  * So red is not "this is malware". Red is "nothing signed this, and it is open
- * to the network" — the combination worth a look, stated plainly. And
- * grey is not a mild accusation: it means the owning program could not be
- * identified, which is a limitation of the observer, not a property of the
- * observed. Colouring that as a warning would be inventing a finding out of a
- * permissions failure, which is the single failure mode this product exists to
- * avoid.
+ * to the network" — the combination worth a look, stated plainly. And grey is
+ * not a mild accusation: it means the owning program could not be identified,
+ * which is a limitation of the observer rather than a property of the observed.
+ * Colouring that as a warning would be inventing a finding out of a permissions
+ * failure, which is the single failure mode this product exists to avoid.
  */
 
-/**
- * Tones, keyed to what was checked rather than to how alarming it is.
- *
- * "Open to the network" covers both directions, and it has to. A program
- * *reaching out* is the obvious case; a program *listening on an address the
- * network can reach* is the one people least expect to find, and Windows
- * reports it as neither an outbound connection nor anything unusual. Counting
- * only the outbound half meant a service accepting connections from the whole
- * network was coloured as though it were staying put, which was not a
- * presentational choice but a false statement.
- */
+/** Tones, keyed to what was checked rather than to how alarming it is. */
 export type Tone = "quiet" | "normal" | "watch" | "look" | "unknown";
 
 const TONE_COLOUR: Record<Tone, string> = {
-  // Signed, and staying on this machine.
+  // Signed, and only talking to this machine.
   quiet: "#2f7d5b",
-  // Signed, and talking to the internet. Almost everything, and normal.
+  // Signed, and open to the network. Almost everything, and ordinary.
   normal: "#3465de",
-  // Not signed, but not reaching the internet.
+  // Not signed, but only talking to this machine.
   watch: "#a8791f",
-  // Not signed, and reaching the internet.
+  // Not signed, and open to the network.
   look: "#a33b45",
   // The owning program could not be read. Not a finding, and deliberately the
   // dullest colour here rather than a warning one.
@@ -75,22 +70,34 @@ export type MapNode = {
   bytes: number;
   tone: Tone;
   external: number;
+  /** Percentage of every open socket on screen. Adds to a hundred. */
+  share: number;
+  /**
+   * What warrants a look, most notable first, and empty when nothing does.
+   *
+   * Deliberately a list rather than a rating. Nothing here knows whether a
+   * program is dangerous, and collapsing several checked facts into one number
+   * throws away the only thing that made them useful: that a person can read
+   * each one and disagree with it.
+   */
+  notes: string[];
   detail: string;
 };
 
 export type MapGroup = MapNode & { children: MapNode[] };
 
-const LABEL_MIN_WIDTH = 54;
-const LABEL_MIN_HEIGHT = 22;
+const LABEL_MIN_WIDTH = 60;
+const LABEL_MIN_HEIGHT = 24;
 
 export default function ConnectionMap({
-  groups,
+  nodes,
   selected,
-  onSelect,
+  onActivate,
 }: {
-  groups: MapGroup[];
+  nodes: MapNode[];
   selected: string | null;
-  onSelect: (key: string | null) => void;
+  /** A publisher to open, or a program to go to. The view decides which. */
+  onActivate: (node: MapNode) => void;
 }) {
   const container = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
@@ -117,83 +124,57 @@ export default function ConnectionMap({
     return () => observer.disconnect();
   }, []);
 
-  const outer = squarify(
-    [...groups].sort((a, b) => b.bytes - a.bytes),
+  const cells = squarify(
+    [...nodes].sort((a, b) => b.bytes - a.bytes),
     size.width,
     size.height,
   );
 
   return (
     <div className="connmap" ref={container}>
-      {outer.map((cell) => {
-        const group = cell.item;
-        // A publisher with one program is just that program: nesting it would
-        // draw a border around a single cell and say nothing.
-        const inner =
-          group.children.length > 1
-            ? squarify(
-                [...group.children].sort((a, b) => b.bytes - a.bytes),
-                Math.max(0, cell.width - 2),
-                Math.max(0, cell.height - 16),
-              )
-            : [];
-
+      {cells.map((cell) => {
+        const node = cell.item;
+        const deeper = "children" in node && (node as MapGroup).children.length > 1;
         return (
-          <div
-            key={group.key}
-            className="connmap-group"
+          <button
+            key={node.key}
+            className={
+              "connmap-cell" +
+              (selected === node.key ? " connmap-on" : "") +
+              (deeper ? " connmap-deeper" : "")
+            }
             style={{
               left: cell.x,
               top: cell.y,
               width: Math.max(0, cell.width - 2),
               height: Math.max(0, cell.height - 2),
+              background: TONE_COLOUR[node.tone],
             }}
+            onClick={() => onActivate(node)}
+            title={`${node.label}\n${node.detail}${deeper ? "\n\nClick to see its programs" : ""}`}
           >
-            <button
-              className={
-                "connmap-cell" + (selected === group.key ? " connmap-on" : "")
-              }
-              style={{ background: TONE_COLOUR[group.tone] }}
-              onClick={() => onSelect(selected === group.key ? null : group.key)}
-              title={`${group.label}\n${group.detail}`}
-            >
-              {cell.width >= LABEL_MIN_WIDTH && cell.height >= LABEL_MIN_HEIGHT && (
-                <>
-                  <span className="connmap-name">{group.label}</span>
-                  <span className="connmap-count">{group.bytes}</span>
-                </>
-              )}
-            </button>
-
-            {inner.map((child) => (
-              <button
-                key={child.item.key}
-                className={
-                  "connmap-child" +
-                  (selected === child.item.key ? " connmap-on" : "")
-                }
-                style={{
-                  left: child.x + 1,
-                  top: child.y + 15,
-                  width: Math.max(0, child.width - 2),
-                  height: Math.max(0, child.height - 2),
-                  background: TONE_COLOUR[child.item.tone],
-                }}
-                onClick={() =>
-                  onSelect(selected === child.item.key ? null : child.item.key)
-                }
-                title={`${child.item.label}\n${child.item.detail}`}
-              >
-                {child.width >= LABEL_MIN_WIDTH &&
-                  child.height >= LABEL_MIN_HEIGHT && (
-                    <span className="connmap-name">{child.item.label}</span>
-                  )}
-              </button>
-            ))}
-          </div>
+            {cell.width >= LABEL_MIN_WIDTH && cell.height >= LABEL_MIN_HEIGHT && (
+              <>
+                <span className="connmap-name">
+                  {deeper && <span className="connmap-into">▸</span>}
+                  {node.label}
+                </span>
+                {/*
+                  Share of everything open, so a block's size has a number
+                  against it rather than only a comparison with its neighbours.
+                */}
+                <span className="connmap-count">{node.share}%</span>
+                {node.notes.length > 0 && cell.height >= 44 && (
+                  <span className="connmap-notes">
+                    {node.notes.length} to notice
+                  </span>
+                )}
+              </>
+            )}
+          </button>
         );
       })}
-      {outer.length === 0 && (
+      {cells.length === 0 && (
         <p className="treemap-empty">Nothing has a socket open.</p>
       )}
     </div>
@@ -205,8 +186,8 @@ export default function ConnectionMap({
  *
  * Not decoration. A coloured graphic without this is a verdict with no way to
  * check it, which is the thing this product is a reaction against — so the
- * legend says the two facts behind each colour and the map is only honest while
- * it is on screen.
+ * legend states the two facts behind each colour, and the map is only honest
+ * while it is on screen.
  */
 export function ConnectionLegend() {
   const entries: [Tone, string][] = [
