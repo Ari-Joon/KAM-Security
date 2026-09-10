@@ -405,10 +405,19 @@ impl Store {
                             trust: sighting.trust.clone(),
                             was_trusted: None,
                         });
-                    } else if !crate::changes::vouched_for(&sighting.trust) {
+                    } else if !crate::changes::vouched_for(&sighting.trust)
+                        && crate::changes::is_a_file(&sighting.trust)
+                    {
                         // First sweep. This was already here, and nothing
-                        // vouches for it. Not a finding -- see `Sweep::unvouched`
-                        // for why it is said anyway.
+                        // vouches for the file behind it. Not a finding -- see
+                        // `Sweep::unvouched` for why it is said anyway.
+                        //
+                        // Things that are not files are left out. An
+                        // administrator account has no signature and could not
+                        // have one, so putting somebody's account under a
+                        // heading about nobody vouching for it answers a
+                        // question that was never asked, in a tone that reads
+                        // as an accusation.
                         unvouched.push(Difference {
                             at: now.clone(),
                             change: Change::Appeared,
@@ -921,6 +930,7 @@ mod tests {
                     vouched("service", "Ordinary", "a.exe", "signed by Somebody Ltd"),
                     vouched("run_key", "Mystery", "b.exe", "not signed"),
                     vouched("run_key", "Opaque", "c.exe", "could not be checked"),
+                    vouched("administrator", "Ari", "can administer", "not a file"),
                 ],
                 &[],
             )
@@ -945,6 +955,13 @@ mod tests {
         assert!(
             !named.contains(&"Ordinary"),
             "something with a valid signature is not on this list: {named:?}"
+        );
+        // An account is not a file. Nobody signed it, nobody failed to sign
+        // it, and listing a person's own account under a heading about nothing
+        // vouching for it answers a question that was never asked.
+        assert!(
+            !named.contains(&"Ari"),
+            "an account was listed as unvouched for: {named:?}"
         );
 
         // And a later sweep does not repeat it: this is a caveat on the

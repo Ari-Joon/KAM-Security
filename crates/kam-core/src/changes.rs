@@ -272,6 +272,20 @@ pub fn vouched_for(trust: &str) -> bool {
     trust.starts_with(SIGNED_BY)
 }
 
+/// Whether the question of who vouches for this was ever a sensible one.
+///
+/// An administrator account is not a file. No signature is missing from it and
+/// none could be, so recording it as unexamined and then listing it under a
+/// heading about nobody vouching for it is a category error — and one that
+/// reads as an accusation against the person whose name is on the account.
+///
+/// Kept separate from [`NOT_CHECKED`] rather than folded into it, because that
+/// phrase means something real about a file that could not be opened, and that
+/// gap should still be said.
+pub fn is_a_file(trust: &str) -> bool {
+    trust != NOT_A_FILE
+}
+
 /// The prefix a valid signature is recorded under, with the signer after it.
 ///
 /// A constant because it is stored: changing the wording would make every
@@ -281,6 +295,14 @@ pub const SIGNED_BY: &str = "signed by ";
 
 /// What is recorded for a file carrying no signature at all.
 pub const NOT_SIGNED: &str = "not signed";
+
+/// What is recorded for something that is not a file, so nothing could sign it.
+///
+/// An account, a group membership: things whose identity is not a thing on
+/// disk. Distinct from [`NOT_CHECKED`] because that phrase is about a file
+/// that exists and could not be read, which is a gap worth reporting, while
+/// this is a question that was never applicable.
+pub const NOT_A_FILE: &str = "not a file";
 
 /// What is recorded when the file could not be examined.
 ///

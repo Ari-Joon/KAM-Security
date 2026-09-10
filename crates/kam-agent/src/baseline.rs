@@ -315,10 +315,12 @@ fn administrators() -> Result<Vec<Sighting>, String> {
             scope: "machine".to_owned(),
             name: account.to_owned(),
             detail: "can administer this machine".to_owned(),
-            // An account is not a file, so nothing signs it. Recorded as
-            // unchecked rather than unsigned: the distinction is that one is
-            // a fact and the other is a category error.
-            trust: kam_core::changes::NOT_CHECKED.to_owned(),
+            // An account is not a file, so nothing signs it and nothing
+            // failed to. Recorded as neither signed nor unexamined: those are
+            // both statements about a file, and applying either here is a
+            // category error that the caveat list would then repeat back to
+            // somebody about their own account.
+            trust: kam_core::changes::NOT_A_FILE.to_owned(),
         })
         .collect())
 }
@@ -337,6 +339,30 @@ mod tests {
             "nothing at all was found to compare, which cannot be right on a \
              running machine (unreadable: {unreadable:?})"
         );
+
+        // How many things a first run would have to caveat. Printed rather
+        // than asserted: the number is the point, because the panel that lists
+        // them is only worth having if a person can read it. A machine where
+        // most of the startup surface is unsigned would need that panel
+        // designed differently, and nobody would find that out from a green
+        // test.
+        let mut unvouched = 0;
+        let mut unchecked = 0;
+        let mut signed = 0;
+        for sighting in &sightings {
+            if kam_core::changes::vouched_for(&sighting.trust) {
+                signed += 1;
+            } else if sighting.trust == kam_core::changes::NOT_CHECKED {
+                unchecked += 1;
+            } else if kam_core::changes::is_a_file(&sighting.trust) {
+                unvouched += 1;
+            }
+        }
+        println!(
+            "{} sightings: {signed} signed, {unvouched} unsigned, {unchecked} unreadable",
+            sightings.len()
+        );
+        println!("unreadable sources: {:?}", unreadable);
 
         // The identity has to be complete, or two different things collapse
         // into one and a change between them is invisible.
