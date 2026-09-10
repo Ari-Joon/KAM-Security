@@ -125,6 +125,22 @@ CREATE INDEX sweeps_at_idx ON sweeps (at DESC);
 /// unreadable or half-written setting cannot quietly leave somebody exposed.
 pub const PROTECTION_SETTING: &str = "protection_enabled";
 
+/// One row of the baseline, as stored.
+///
+/// A named struct rather than an eight-wide tuple: the fields are all strings
+/// and integers, and getting two of them the wrong way round would compile
+/// perfectly and quietly compare the wrong things.
+struct Recorded {
+    kind: String,
+    scope: String,
+    name: String,
+    detail: String,
+    first_seen: String,
+    last_seen: String,
+    times_seen: i64,
+    flaps: i64,
+}
+
 pub struct Store {
     connection: Mutex<Connection>,
 }
@@ -397,25 +413,35 @@ impl Store {
                    FROM sightings WHERE present = 1",
             )
             .map_err(to_db_error)?;
-        let candidates: Vec<(String, String, String, String, String, String, i64, i64)> = gone
+        let candidates: Vec<Recorded> = gone
             .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                ))
+                Ok(Recorded {
+                    kind: row.get(0)?,
+                    scope: row.get(1)?,
+                    name: row.get(2)?,
+                    detail: row.get(3)?,
+                    first_seen: row.get(4)?,
+                    last_seen: row.get(5)?,
+                    times_seen: row.get(6)?,
+                    flaps: row.get(7)?,
+                })
             })
             .map_err(to_db_error)?
             .filter_map(std::result::Result::ok)
             .collect();
         drop(gone);
 
-        for (kind, scope, name, detail, first_seen, last_seen, times_seen, flaps) in candidates {
+        for Recorded {
+            kind,
+            scope,
+            name,
+            detail,
+            first_seen,
+            last_seen,
+            times_seen,
+            flaps,
+        } in candidates
+        {
             let still_here = seen
                 .iter()
                 .any(|one| one.kind == kind && one.scope == scope && one.name == name);
@@ -597,7 +623,10 @@ fn to_db_error(error: rusqlite::Error) -> Error {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+// `expect_used` alongside the other two, matching every other test module in
+// the project. A test that says what it expected to find reads better on
+// failure than one that only says it unwrapped a None.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
