@@ -158,11 +158,7 @@ impl Unreadable {
     /// Whether this source says anything about one particular sighting.
     pub fn covers(&self, kind: &str, scope: &str) -> bool {
         self.kinds.iter().any(|held| held == kind)
-            && (self.scopes.is_empty()
-                || self
-                    .scopes
-                    .iter()
-                    .any(|prefix| scope.starts_with(prefix.as_str())))
+            && (self.scopes.is_empty() || self.scopes.iter().any(|prefix| under(scope, prefix)))
     }
 }
 
@@ -291,6 +287,28 @@ pub struct Sweep {
     pub unvouched: Vec<Difference>,
 }
 
+/// Whether one scope lies inside another, as paths rather than as text.
+///
+/// A plain `starts_with` is wrong here, and wrong in the dangerous direction. A
+/// service named `Foo` and a service named `FooBar` are two services, and the
+/// scopes are the key paths, so a gap naming `...\Services\Foo` would silence
+/// `FooBar` as well -- meaning an attacker who could make one service key
+/// unreadable would also silence every service whose name happens to extend
+/// it. The same goes for `C:\Users\Ari` and `C:\Users\Arianna`.
+///
+/// So the prefix has to end where a path component ends: either it already
+/// carries the separator, or what follows it starts with one, or the two are
+/// the same place.
+fn under(scope: &str, prefix: &str) -> bool {
+    if scope == prefix {
+        return true;
+    }
+    let Some(rest) = scope.strip_prefix(prefix) else {
+        return false;
+    };
+    prefix.ends_with(['\\', '/']) || rest.starts_with(['\\', '/'])
+}
+
 /// Appearances and disappearances are worth more attention than either a change
 /// in place or something that flaps.
 pub fn rank(change: Change) -> u8 {
@@ -358,3 +376,58 @@ pub const NOT_CHECKED: &str = "could not be checked";
 /// once is still reported both times. Anti-cheat services on this machine cycle
 /// far past this within a day.
 pub const FLAPS_BEFORE_RECURRING: i64 = 3;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// A gap covers a place, not everything whose name begins the same way.
+    ///
+    /// The prefix match was plain text, and the scopes are paths. A service
+    /// called `Foo` and a service called `FooBar` are two services in two keys,
+    /// so a gap naming the first silenced the second -- which hands anyone who
+    /// can make one service key unreadable a way to silence every service whose
+    /// name happens to extend it. Naming a service `WinDefend` next to a real
+    /// `WinDefendX` is not a difficult attack to arrange; naming a *profile*
+    /// `C:\Users\Ari` next to `C:\Users\Arianna` is not an attack at all,
+    /// just two people.
+    #[test]
+    fn a_gap_stops_at_a_path_component() {
+        let services = r"hklm\system\currentcontrolset\services";
+        let gap = Unreadable::within("service", &format!(r"{services}\foo"), "could not read it");
+
+        assert!(
+            gap.covers("service", &format!(r"{services}\foo")),
+            "the place it names is not covered"
+        );
+        assert!(
+            gap.covers("service", &format!(r"{services}\foo\parameters")),
+            "something inside the place it names is not covered"
+        );
+        assert!(
+            !gap.covers("service", &format!(r"{services}\foobar")),
+            "a different service whose name merely starts the same was silenced"
+        );
+
+        // The same shape for profile directories, where it needs no attacker.
+        let gap = Unreadable::covering(
+            &["startup_item"],
+            &[r"C:\Users\Ari\".to_owned()],
+            "not signed in",
+        );
+        assert!(gap.covers("startup_item", r"c:\users\ari\appdata\roaming"));
+        assert!(
+            !gap.covers("startup_item", r"c:\users\arianna\appdata\roaming"),
+            "one person's unexamined account silenced another person's"
+        );
+    }
+
+    /// A gap that names no place still covers its whole kind.
+    #[test]
+    fn a_gap_with_nowhere_named_covers_everything_of_its_kind() {
+        let gap = Unreadable::of("service", "the list of services could not be read");
+        assert!(gap.covers("service", "anywhere at all"));
+        assert!(!gap.covers("run_key", "anywhere at all"));
+    }
+}

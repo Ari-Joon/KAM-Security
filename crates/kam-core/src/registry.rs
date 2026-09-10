@@ -134,6 +134,13 @@ struct Shape {
     longest_value: u32,
 }
 
+/// How many times a walk is repeated while the count disagrees.
+///
+/// Small on purpose. This is not about being sure, it is about not letting one
+/// concurrent write -- from an installer, or from something that would like the
+/// enumeration to stay incomplete -- decide what the sweep may report.
+const RETRIES: usize = 3;
+
 impl Shape {
     /// Finish a walk, claiming completeness only if the count agrees.
     fn finish(self, names: Vec<String>, expected: u32) -> Listing {
@@ -193,7 +200,26 @@ impl Key {
     }
 
     /// Names of every subkey, and whether that is all of them.
+    ///
+    /// Retried while the count disagrees, because a key written to during the
+    /// walk is usually an installer rather than an adversary -- and because a
+    /// single lost race would otherwise be as good as an attack. A resident
+    /// process that adds and removes a service key during every sweep would
+    /// hold the enumeration permanently incomplete, and an incomplete
+    /// enumeration is the one gap that has to cover the whole kind, since
+    /// there is no telling which entry was missed. Three tries turns "win once"
+    /// into "win three times in a row, every sweep, forever".
     pub fn subkeys(&self) -> Listing {
+        for _ in 0..RETRIES {
+            let listing = self.walk_subkeys();
+            if listing.whole {
+                return listing;
+            }
+        }
+        self.walk_subkeys()
+    }
+
+    fn walk_subkeys(&self) -> Listing {
         let Some(shape) = self.shape() else {
             // Nothing is known about how many there should be, so nothing may
             // be claimed about having got them all.
@@ -265,6 +291,16 @@ impl Key {
     /// and says so. The retry, the guessed buffer size and the constant for
     /// the registry's own limit all stop being needed.
     pub fn values(&self) -> Listing {
+        for _ in 0..RETRIES {
+            let listing = self.walk_values();
+            if listing.whole {
+                return listing;
+            }
+        }
+        self.walk_values()
+    }
+
+    fn walk_values(&self) -> Listing {
         let Some(shape) = self.shape() else {
             return Listing::default();
         };
