@@ -33,6 +33,19 @@
 //! container, and it took somebody checking the two files nobody had thought
 //! to name.
 //!
+//! # Do not try to detect this instead
+//!
+//! The obvious cheaper fix is to delete an unexpected `kam.db-wal` on open. It
+//! is wrong, and wrong in a way that loses data: an unclean shutdown — a crash,
+//! a power cut — legitimately leaves a write-ahead log that SQLite must replay
+//! to recover committed transactions. A planted one and a crash one are both
+//! just a valid WAL sitting beside the database, and nothing about the file
+//! says which it is. Deleting on sight throws away real work; deleting only
+//! "suspicious" ones is a guess an attacker writes around.
+//!
+//! Permissions are the defence precisely because they stop the file being
+//! created at all, which is a question that has an answer.
+//!
 //! # Why the agent does it rather than the installer
 //!
 //! The installer does it too, and should. But the agent runs as LocalSystem

@@ -129,6 +129,28 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host '  install folder secured (administrators only can write)' -ForegroundColor Gray
 
+# The store, for the same reason and a sharper one.
+#
+# The audit log is append-only, enforced by database triggers, and the machine's
+# baseline lives in the same file. Both are defeated by anybody who can create a
+# file in the directory beside it: SQLite keeps its write-ahead log there,
+# deletes it on a clean close, and applies it as raw pages underneath SQL, so a
+# planted one rewrites rows without a statement ever running.
+#
+# ProgramData grants ordinary users create-file by inheritance. The agent locks
+# this at every start, which makes it self-healing; doing it here closes the one
+# window the agent cannot -- between the directory existing and the agent's
+# first run.
+$store = Join-Path $env:ProgramData 'KAM Security'
+if (-not (Test-Path $store)) { New-Item -ItemType Directory -Force -Path $store | Out-Null }
+& icacls $store /inheritance:r /grant:r `
+    '*S-1-5-32-544:(OI)(CI)F' `
+    '*S-1-5-18:(OI)(CI)F' | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "the store could not be secured (icacls exit $LASTEXITCODE); its audit log and baseline could be rewritten"
+}
+Write-Host '  store secured (administrators only can write)' -ForegroundColor Gray
+
 & $agent --install
 if ($LASTEXITCODE -ne 0) { throw "the service could not be registered (exit $LASTEXITCODE)" }
 Write-Host '  service registered and started' -ForegroundColor Gray

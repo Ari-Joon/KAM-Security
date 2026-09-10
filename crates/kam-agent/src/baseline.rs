@@ -81,7 +81,25 @@ fn sighting_of(entry: &Entry) -> Sighting {
 /// anything about a source it was told failed, so getting this wrong in the
 /// optimistic direction is how a panel starts inventing alarms.
 pub fn collect() -> (Vec<Sighting>, Vec<String>) {
-    let survey = persistence::survey_for(&persistence::signed_in_users());
+    // A known blind spot, named here rather than left to be discovered.
+    //
+    // `signed_in_users` enumerates the subkeys of `HKEY_USERS`, and a profile
+    // only has one while its hive is loaded — that is, while somebody is signed
+    // in as them. An account nobody is using at sweep time is therefore not
+    // examined at all, which is worse than a missed comparison: its persistence
+    // never enters the baseline, so its *appearance* can never be a difference
+    // either. It is invisible permanently rather than late.
+    //
+    // Closing it means enumerating every profile from `ProfileList` and loading
+    // each absent hive read-only to read it, then unloading it on every path
+    // including the failing ones. That is a careful operation as LocalSystem
+    // and has not been done yet.
+    //
+    // Until it is, this is reported as an unreadable source below rather than
+    // silently omitted, because a source nobody looked at must not read later
+    // as a source with nothing in it.
+    let users = persistence::signed_in_users();
+    let survey = persistence::survey_for(&users);
     let mut sightings: Vec<Sighting> = survey.entries.iter().map(sighting_of).collect();
 
     match administrators() {
@@ -95,7 +113,54 @@ pub fn collect() -> (Vec<Sighting>, Vec<String>) {
         }
     }
 
-    (sightings, survey.unreadable)
+    let mut unreadable = survey.unreadable;
+
+    // Say which accounts were not examined. See the note at the top of this
+    // function: an account whose hive is not loaded is not looked at, and the
+    // honest thing is to say so rather than let its absence read as emptiness.
+    if let Some(missing) = profiles_not_examined(&users) {
+        unreadable.push(missing);
+    }
+
+    (sightings, unreadable)
+}
+
+/// Accounts on this machine that this sweep did not look at.
+///
+/// `None` when every profile was covered. The comparison is by SID, since a
+/// profile directory's name is not reliably the account's.
+fn profiles_not_examined(examined: &[kam_core::UserContext]) -> Option<String> {
+    use kam_core::registry::{Key, View};
+    use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+
+    let root = Key::open(
+        HKEY_LOCAL_MACHINE,
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList",
+        View::Native,
+    )?;
+
+    let looked_at: std::collections::HashSet<&str> = examined
+        .iter()
+        .filter_map(kam_core::UserContext::sid)
+        .collect();
+
+    let missed = root
+        .subkey_names()
+        .into_iter()
+        // Real accounts, not the service profiles.
+        .filter(|sid| sid.starts_with("S-1-5-21-"))
+        .filter(|sid| !looked_at.contains(sid.as_str()))
+        .count();
+
+    (missed > 0).then(|| {
+        format!(
+            "{missed} account{} on this machine {} not signed in, so what starts \
+             itself under {} was not examined",
+            if missed == 1 { "" } else { "s" },
+            if missed == 1 { "was" } else { "were" },
+            if missed == 1 { "it" } else { "them" }
+        )
+    })
 }
 
 /// Who can administer this machine.
@@ -207,6 +272,36 @@ mod tests {
         assert_eq!(kind_of(Anchor::ScheduledTask), "scheduled_task");
         assert_eq!(kind_of(Anchor::StartupFolder), "startup_item");
         assert_eq!(kind_of(Anchor::RunOnceKey), "run_once_key");
+    }
+
+    /// An account nobody is signed in as is named, not silently skipped.
+    ///
+    /// This is the blind spot, and the rule that makes it survivable is the
+    /// same one the whole feature rests on: a source nobody looked at must not
+    /// read later as a source with nothing in it. If the machine has a second
+    /// account, the sweep says it did not examine it.
+    #[test]
+    fn accounts_that_were_not_examined_are_named() {
+        let examined = persistence::signed_in_users();
+        let (_, unreadable) = collect();
+
+        match profiles_not_examined(&examined) {
+            Some(note) => {
+                assert!(
+                    unreadable.iter().any(|line| line == &note),
+                    "an unexamined account was not reported: {unreadable:?}"
+                );
+                assert!(note.contains("not signed in"), "{note}");
+            }
+            None => {
+                // Every profile was covered, which is the ordinary case on a
+                // single-account machine. Nothing to claim either way.
+                assert!(
+                    !unreadable.iter().any(|line| line.contains("not signed in")),
+                    "nothing was missed, so nothing should say it was"
+                );
+            }
+        }
     }
 
     /// Administrators are read, or the failure is reported as a failure.

@@ -198,6 +198,34 @@ try {
     }
     Say '  install directory is administrator-writable only.' 'Green'
 
+    # --- lock the store, for the same reason and a sharper one ---------------
+    #
+    # The audit log is append-only, enforced by database triggers, and the
+    # baseline of what this machine looks like lives in the same file. Both are
+    # defeated by anybody who can create a file in the directory beside it:
+    # SQLite keeps its write-ahead log there, deletes it on a clean close, and
+    # applies it as raw pages underneath SQL — so a planted one rewrites rows
+    # without a statement ever running and the triggers never fire.
+    #
+    # ProgramData grants ordinary users create-file by inheritance, so a store
+    # directory made with the defaults is open every moment the service is not
+    # running.
+    #
+    # The agent does this too, at every start, which makes it self-healing. It
+    # is done here as well to close the one window the agent cannot: between
+    # the directory first existing and the agent's first run. A directory born
+    # locked has no such window, and after that the agent is the backstop.
+    $store = Join-Path $env:ProgramData 'KAM Security'
+    if (Test-Path $store) {
+        & icacls $store /inheritance:r /grant:r `
+            '*S-1-5-32-544:(OI)(CI)F' `
+            '*S-1-5-18:(OI)(CI)F' | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "could not secure $store (icacls exit $LASTEXITCODE); its audit log and baseline could be rewritten"
+        }
+        Say '  store is administrator-writable only.' 'Green'
+    }
+
     # --- copy ---------------------------------------------------------------
     foreach ($name in $binaries) {
         $built = Join-Path $root "target\release\$name"
