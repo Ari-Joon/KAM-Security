@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { ReactElement } from "react";
 import { api, reason } from "./lib/api";
+import type { Sweep as SweepReport } from "./lib/types";
 import type { AuditRecord, SystemStatus, Volume } from "./lib/types";
 import Overview from "./views/Overview";
 import Storage from "./views/Storage";
@@ -9,6 +10,7 @@ import Applications from "./views/Applications";
 import Cleanup from "./views/Cleanup";
 import Firewall from "./views/Firewall";
 import Scanner from "./views/Scanner";
+import Changes from "./views/Changes";
 import {
   ActivityIcon,
   ApplicationsIcon,
@@ -22,6 +24,7 @@ import "./styles.css";
 
 type Section =
   | "overview"
+  | "changes"
   | "storage"
   | "applications"
   | "cleanup"
@@ -37,6 +40,12 @@ const NAV: {
   Icon: () => ReactElement;
 }[] = [
   { key: "overview", label: "Overview", hint: "Drives and recent events", Icon: OverviewIcon },
+  {
+    key: "changes",
+    label: "Changes",
+    hint: "What is different since last time",
+    Icon: ActivityIcon,
+  },
   { key: "storage", label: "Storage", hint: "Where the space went", Icon: StorageIcon },
   {
     key: "applications",
@@ -72,6 +81,14 @@ function Mark() {
 
 export default function App() {
   const [section, setSection] = useState<Section>("overview");
+  /**
+   * What changed, fetched once and kept.
+   *
+   * Not polled. Each sweep records a new baseline, so asking twice in a row
+   * legitimately reports nothing the second time — a poll would erase the
+   * answer it had just given.
+   */
+  const [sweep, setSweep] = useState<SweepReport | null>(null);
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [volumes, setVolumes] = useState<Volume[]>([]);
   const [entries, setEntries] = useState<AuditRecord[]>([]);
@@ -103,6 +120,23 @@ export default function App() {
     const timer = setInterval(() => void refresh(), 5000);
     return () => clearInterval(timer);
   }, [refresh]);
+
+  // Swept the first time the section is opened, and not again.
+  //
+  // Every sweep records a new baseline, so a poll here would erase the answer
+  // it had just given: the second call would compare the machine against the
+  // state the first call had already recorded and find nothing.
+  useEffect(() => {
+    if (section !== "changes" || sweep !== null) return;
+    api
+      .sweepForChanges()
+      .then(setSweep)
+      .catch(() => {
+        // Left as "looking at the machine" rather than replaced with an
+        // alarm: a sweep that could not run has found nothing, which is not
+        // the same as having found nothing wrong.
+      });
+  }, [section, sweep]);
 
   const connected = status !== null;
   const mismatched =
@@ -201,6 +235,10 @@ export default function App() {
 
         {section === "cleanup" && (
           <Cleanup volumes={volumes} onChanged={() => void refresh()} />
+        )}
+
+        {section === "changes" && (
+          <Changes sweep={sweep} />
         )}
 
         {section === "activity" && <Activity entries={entries} />}

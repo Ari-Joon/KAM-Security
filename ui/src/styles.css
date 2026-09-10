@@ -681,6 +681,17 @@ select {
   opacity: 0.7;
 }
 
+/* A bar per week: how much changed, compared only with this machine's own
+   other weeks. No target, no score, and nothing to be "good" against — the
+   question it answers is "is this week like my other weeks", which is a
+   difference rather than a grade.
+
+   The bars themselves are laid out inline in the component, because their
+   heights and colours are computed from the data. This is only the frame. */
+.changebars {
+  margin-top: 12px;
+}
+
 .connmap-legend {
   list-style: none;
   display: flex;

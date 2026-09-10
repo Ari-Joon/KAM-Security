@@ -1,6 +1,7 @@
 import { useMemo } from "react";
-import ChangeBars, { categoryOf, type Difference } from "../components/ChangeBars";
+import ChangeBars, { categoryOf } from "../components/ChangeBars";
 import * as fmt from "../lib/format";
+import type { ChangeKind, Difference, Sweep } from "../lib/types";
 
 /**
  * What changed on this machine since the last time it was looked at.
@@ -17,17 +18,7 @@ import * as fmt from "../lib/format";
  * carry.
  */
 
-export type Sweep = {
-  differences: Difference[];
-  unreadable: string[];
-  baseline: boolean;
-  previous_at: string | null;
-  at: string;
-  /** Every difference ever noticed, for the weekly bars. */
-  history?: Difference[];
-};
-
-const CHANGE_LABEL: Record<Difference["change"], string> = {
+const CHANGE_LABEL: Record<ChangeKind, string> = {
   appeared: "appeared",
   altered: "changed",
   vanished: "is gone",
@@ -231,7 +222,7 @@ export default function Changes({ sweep }: { sweep: Sweep | null }) {
               and no target — only whether this week looks like the others.
               Colour shows what kind of thing changed, not how serious it was.
             </p>
-            <ChangeBars history={sweep.history ?? []} />
+            <ChangeBars history={sweep.history} />
           </section>
         </>
       )}
