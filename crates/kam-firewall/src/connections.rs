@@ -128,6 +128,11 @@ pub struct ConnectionReport {
     pub external: usize,
     /// Distinct programs holding at least one socket.
     pub programs: usize,
+    /// Sockets left over from connections that have already finished.
+    ///
+    /// Reported as a number and nothing more: they belong to no process, so
+    /// there is nothing to say about them beyond how many there are.
+    pub closing: usize,
 }
 
 /// Ports arrive with their bytes the other way round.
@@ -440,6 +445,30 @@ pub fn survey() -> ConnectionReport {
         connection.unsigned = unsigned;
     }
 
+    // Connections that have already closed, and belong to nobody.
+    //
+    // Windows reports a socket in TIME_WAIT with an owning process id of zero:
+    // the program that opened it has finished with it, and the entry lingers
+    // for a couple of minutes so a late packet cannot be mistaken for part of
+    // the next conversation. There is no owner to attribute it to and never
+    // will be.
+    //
+    // They were being shown as one enormous unidentified program. Measured on
+    // the development machine: 111 of roughly 230 sockets, all transient, all
+    // owned by process zero — nearly half the list, dwarfing everything real in
+    // it, and unattributable by construction rather than by any failure to
+    // look. Anybody reading that screen would have concluded the biggest thing
+    // on their network was something the software could not name.
+    //
+    // Counted and reported, because "some connections are closing" is true and
+    // mildly interesting, and dropping them silently would leave the totals not
+    // adding up.
+    let closing = found
+        .iter()
+        .filter(|connection| connection.process_id == 0)
+        .count();
+    found.retain(|connection| connection.process_id != 0);
+
     // Most interesting first: talking to the internet, then unsigned, then
     // established, then by program so one program's sockets sit together.
     found.sort_by(|a, b| {
@@ -466,6 +495,7 @@ pub fn survey() -> ConnectionReport {
         listening: found.iter().filter(|c| c.state == State::Listening).count(),
         external: found.iter().filter(|c| c.external).count(),
         programs,
+        closing,
         connections: found,
     }
 }

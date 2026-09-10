@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, reason } from "../lib/api";
+import ConnectionMap, {
+  ConnectionLegend,
+  type MapGroup,
+  type MapNode,
+  type Tone,
+} from "../components/ConnectionMap";
 import type {
   Connection,
   ConnectionReport,
@@ -129,6 +135,99 @@ function byProgram(connections: Connection[]): Program[] {
       b.connections.length - a.connections.length ||
       a.label.localeCompare(b.label),
   );
+}
+
+/**
+ * Which of the five stated states a program is in.
+ *
+ * Two checked facts, never an opinion: does it carry a valid signature, and is
+ * it connected to something outside this machine. See `ConnectionMap` for why
+ * the unidentified case is deliberately the dullest colour rather than a
+ * warning one.
+ */
+function toneOf(program: Program): Tone {
+  if (program.unsigned === null) return "unknown";
+  if (program.unsigned) return program.external > 0 ? "look" : "watch";
+  return program.external > 0 ? "normal" : "quiet";
+}
+
+/** How alarming a tone is, only so a publisher can take its worst program's. */
+const TONE_RANK: Record<Tone, number> = {
+  look: 4,
+  watch: 3,
+  normal: 2,
+  quiet: 1,
+  unknown: 0,
+};
+
+/**
+ * Publishers, with their programs inside.
+ *
+ * The grouping people actually have in their heads. Steam is `steam.exe` and
+ * `steamwebhelper.exe`; grouping by executable splits one program into two
+ * rows that sit apart from each other, and this was the specific complaint
+ * that prompted the map. Grouping by *signer* puts them back together, because
+ * the signature is the only thing that genuinely ties two binaries to the same
+ * author.
+ *
+ * Programs nothing signed cannot be grouped that way and are not lumped into
+ * one heap either — a shared "unsigned" block would invent a relationship
+ * between unrelated things. They stand alone.
+ */
+function byPublisher(programs: Program[]): MapGroup[] {
+  const groups = new Map<string, MapGroup>();
+
+  for (const program of programs) {
+    const publisher = program.signer;
+    const key = publisher ? `signer:${publisher}` : `alone:${program.key}`;
+    const node: MapNode = {
+      key: program.key,
+      label: program.label,
+      bytes: program.connections.length,
+      tone: toneOf(program),
+      external: program.external,
+      detail: describe(program),
+    };
+
+    let group = groups.get(key);
+    if (!group) {
+      group = {
+        key,
+        label: publisher ?? program.label,
+        bytes: 0,
+        tone: "unknown",
+        external: 0,
+        detail: publisher ? `signed by ${publisher}` : describe(program),
+        children: [],
+      };
+      groups.set(key, group);
+    }
+    group.children.push(node);
+    group.bytes += node.bytes;
+    group.external += node.external;
+    // A publisher shows its worst program's state, so a single unsigned binary
+    // under an otherwise clean name is not averaged out of sight.
+    if (TONE_RANK[node.tone] > TONE_RANK[group.tone]) group.tone = node.tone;
+  }
+
+  return [...groups.values()].sort((a, b) => b.bytes - a.bytes);
+}
+
+/** One line of plain fact about a program, for a tooltip. */
+function describe(program: Program): string {
+  const parts = [
+    `${program.connections.length} ${program.connections.length === 1 ? "socket" : "sockets"}`,
+  ];
+  if (program.external > 0) parts.push(`${program.external} reaching the internet`);
+  if (program.listening > 0) parts.push(`${program.listening} listening`);
+  parts.push(
+    program.signer
+      ? `signed by ${program.signer}`
+      : program.unsigned === null
+        ? "could not be identified"
+        : "not signed",
+  );
+  return parts.join(" · ");
 }
 
 /** Whether a program matches what someone typed. */
@@ -576,6 +675,26 @@ export default function Firewall() {
               ))}
             </div>
           </div>
+        )}
+
+        {shown.length > 0 && (
+          <>
+            <ConnectionMap
+              groups={byPublisher(shown)}
+              selected={expanded}
+              onSelect={(key) => setExpanded(key)}
+            />
+            <ConnectionLegend />
+            {live !== null && live.closing > 0 && (
+              <p className="muted">
+                {live.closing} more {live.closing === 1 ? "socket is" : "sockets are"}{" "}
+                left over from connections that have already finished. Windows
+                keeps those for a couple of minutes and attributes them to no
+                program, so there is nothing to show about them beyond the
+                number.
+              </p>
+            )}
+          </>
         )}
 
         {live === null ? (

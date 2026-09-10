@@ -579,6 +579,100 @@ select {
   background: var(--surface-2);
 }
 
+/* What is on the network, as area.
+
+   The storage treemap next door colours by rank, because there the question is
+   "what is big". Here the question is "what is this", so colour carries a pair
+   of checked facts instead and the legend below spells both out. Same layout,
+   different meaning, which is why this is its own component rather than a flag
+   on that one. */
+
+.connmap {
+  position: relative;
+  height: 300px;
+  margin-top: 12px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface-2);
+}
+
+.connmap-group {
+  position: absolute;
+}
+
+.connmap-cell,
+.connmap-child {
+  position: absolute;
+  border: none;
+  border-radius: 3px;
+  padding: 3px 6px;
+  overflow: hidden;
+  cursor: pointer;
+  text-align: left;
+  color: #f2f6ff;
+  font: inherit;
+  font-size: 11px;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+/* The publisher fills its whole block; its programs are drawn on top, inset
+   below the publisher's own label strip. */
+.connmap-cell {
+  inset: 0;
+}
+
+.connmap-cell:hover,
+.connmap-child:hover {
+  /* Brightening rather than recolouring: the colour is the meaning here, so
+     hover must not change what a cell appears to be saying. */
+  filter: brightness(1.18);
+}
+
+.connmap-on {
+  outline: 2px solid var(--text);
+  outline-offset: -2px;
+}
+
+.connmap-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.connmap-count {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+  flex: none;
+}
+
+.connmap-legend {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin: 10px 0 0;
+  padding: 0;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+
+.connmap-legend li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.connmap-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex: none;
+}
+
 .treemap-cell {
   position: absolute;
   border-radius: 3px;

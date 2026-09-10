@@ -618,6 +618,8 @@ export type ConnectionReport = {
   listening: number;
   external: number;
   programs: number;
+  /** Sockets left from connections that already finished; no owner. */
+  closing: number;
 };
 
 /** What an uninstaller left behind, and the shortcuts pointing at it. */
