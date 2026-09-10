@@ -33,6 +33,23 @@
 //! container, and it took somebody checking the two files nobody had thought
 //! to name.
 //!
+//! # The agent's own log is inside this, deliberately
+//!
+//! Locking the store means an ordinary account can no longer read
+//! `logs\agent.log`, which is a real cost: the owner of the machine cannot look
+//! at their own security tool's diagnostics without an elevated prompt, and
+//! cannot casually send the file to anybody.
+//!
+//! It stays locked anyway, and the reason is specific rather than a general
+//! preference for tightness. The log names decoy keys when planting one fails,
+//! and decoys are the one thing in this product that is not circumstantial —
+//! their entire value is that nothing on the machine knows they exist. An
+//! attacker who can read this file learns which files and keys to leave alone,
+//! and the canaries stop working without anybody noticing they have.
+//!
+//! So do not carve out a read for `logs` to make support easier. Reading it
+//! needs administrator rights, which is a nuisance with a reason behind it.
+//!
 //! # Do not try to detect this instead
 //!
 //! The obvious cheaper fix is to delete an unexpected `kam.db-wal` on open. It

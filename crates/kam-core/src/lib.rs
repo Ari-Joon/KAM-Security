@@ -4,6 +4,7 @@
 //! Nothing in here is allowed to perform a privileged operation. This crate is
 //! linked by both the agent and (indirectly) the shell, so it stays inert.
 
+pub mod attribution;
 pub mod audit;
 pub mod changes;
 pub mod clock;
