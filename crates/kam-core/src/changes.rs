@@ -56,6 +56,19 @@ pub struct Sighting {
     pub name: String,
     /// What it does, compared so a change in place can be noticed.
     pub detail: String,
+    /// Who vouches for the file this runs, as a short stable phrase.
+    ///
+    /// Compared like everything else, and it closes a hole `detail` cannot: an
+    /// entry that still points at exactly the same path, whose file has been
+    /// replaced. The path has not moved, so nothing else here would notice —
+    /// but a binary that was signed by somebody yesterday and is unsigned today
+    /// is the plainest statement of "this is not the thing it was" that this
+    /// software can make.
+    ///
+    /// Stored in its own column rather than folded into `detail`, so that
+    /// changing how it is phrased does not make every entry on every machine
+    /// read as altered at once.
+    pub trust: String,
 }
 
 /// What happened to one thing between two sweeps.
@@ -131,6 +144,10 @@ pub struct Difference {
     /// When it was last seen present.
     pub last_seen: String,
     pub times_seen: i64,
+    /// Who vouches for it now, and who did before when that has changed.
+    pub trust: String,
+    /// Set only when the trust changed, holding what it used to be.
+    pub was_trusted: Option<String>,
 }
 
 /// What one sweep found, and what it could not look at.
@@ -161,6 +178,22 @@ pub struct Sweep {
     /// weeks". That question needs history, and a table that only remembers
     /// the present cannot answer it.
     pub history: Vec<Difference>,
+    /// Things that were already here when the baseline was first taken, and
+    /// that nothing vouches for.
+    ///
+    /// Only ever populated on the first sweep, and it exists because of an
+    /// unavoidable weakness: a baseline learns whatever is on the machine at
+    /// the moment it is taken. Something unwanted that was already there is
+    /// recorded as ordinary and never reported as having appeared, because it
+    /// did not appear — it was always there.
+    ///
+    /// Nothing can be done about that in general. What can be done is to say
+    /// so: on the first run, everything already present that carries no valid
+    /// signature is listed, not as a finding but as the honest caveat on the
+    /// baseline. "These were here before this software was watching, and
+    /// nobody vouches for them" is a true sentence, and a person can act on it
+    /// where the software cannot.
+    pub unvouched: Vec<Difference>,
 }
 
 /// Appearances and disappearances are worth more attention than either a change
@@ -173,6 +206,34 @@ pub fn rank(change: Change) -> u8 {
         Change::Recurring => 0,
     }
 }
+
+/// Whether a trust phrase means somebody stands behind the file.
+///
+/// Only a valid signature counts. "Not signed" and "could not be read" are both
+/// *not vouched for*, and they are deliberately treated the same here — but they
+/// are not the same claim, and the phrase itself keeps them apart so the
+/// interface can say which one it is. Something unreadable is a gap in what this
+/// software could see; something unsigned is a fact about the file.
+pub fn vouched_for(trust: &str) -> bool {
+    trust.starts_with(SIGNED_BY)
+}
+
+/// The prefix a valid signature is recorded under, with the signer after it.
+///
+/// A constant because it is stored: changing the wording would make every
+/// signed thing on every machine read as newly untrusted, which is the loudest
+/// possible false alarm.
+pub const SIGNED_BY: &str = "signed by ";
+
+/// What is recorded for a file carrying no signature at all.
+pub const NOT_SIGNED: &str = "not signed";
+
+/// What is recorded when the file could not be examined.
+///
+/// Distinct from [`NOT_SIGNED`] on purpose: one is a property of the file, the
+/// other a limit of the observer, and reporting the second as the first would
+/// be inventing a finding out of a permissions failure.
+pub const NOT_CHECKED: &str = "could not be checked";
 
 /// How many times something must come and go before it is called recurring.
 ///

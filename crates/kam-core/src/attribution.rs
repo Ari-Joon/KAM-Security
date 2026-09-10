@@ -271,6 +271,8 @@ mod tests {
             first_seen: String::new(),
             last_seen: String::new(),
             times_seen: 1,
+            trust: "signed by Somebody Ltd".to_owned(),
+            was_trusted: None,
         }
     }
 

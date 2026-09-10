@@ -37,6 +37,9 @@
 //! doing its job. Itemising it produces two dozen rows a month of guaranteed
 //! noise, and a panel that cries wolf monthly is a panel nobody opens.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use kam_core::changes::Sighting;
 use kam_scanner::persistence::{self, Anchor, Entry};
 
@@ -55,8 +58,37 @@ fn kind_of(anchor: Anchor) -> &'static str {
     }
 }
 
+/// Who vouches for one file, as a phrase that can be stored and compared.
+///
+/// Cached by the caller: a machine with three hundred startup entries has far
+/// fewer distinct executables behind them, and verifying a signature means
+/// opening and hashing the file.
+fn trust_in(path: Option<&std::path::Path>) -> String {
+    use kam_core::changes::{NOT_CHECKED, NOT_SIGNED, SIGNED_BY};
+
+    let Some(path) = path else {
+        return NOT_CHECKED.to_owned();
+    };
+    match kam_scanner::signature::of(path) {
+        kam_scanner::signature::Signature::Valid { signer, .. } => format!("{SIGNED_BY}{signer}"),
+        // A signature that does not verify is not a signature. The name is
+        // still worth carrying, because "claimed to be Microsoft and does not
+        // verify" is a much more interesting sentence than "not signed".
+        kam_scanner::signature::Signature::Invalid { signer, .. } => match signer {
+            Some(signer) => format!("{NOT_SIGNED}, but claims to be {signer}"),
+            None => NOT_SIGNED.to_owned(),
+        },
+        kam_scanner::signature::Signature::Unsigned => NOT_SIGNED.to_owned(),
+        // Not the same as unsigned, and kept apart deliberately: this is a
+        // limit of what could be seen, not a property of the file.
+        kam_scanner::signature::Signature::Unknown { .. } => NOT_CHECKED.to_owned(),
+    }
+}
+
 /// What one entry is, as something comparable.
-fn sighting_of(entry: &Entry) -> Sighting {
+fn sighting_of(entry: &Entry, trust: &mut HashMap<PathBuf, String>) -> Sighting {
+    let target = entry.target().map(std::path::Path::to_path_buf);
+
     Sighting {
         kind: kind_of(entry.anchor).to_owned(),
         // The location separates one account's Run key from another's, and one
@@ -67,10 +99,21 @@ fn sighting_of(entry: &Entry) -> Sighting {
         // What it actually runs. A thing still present but now pointing
         // somewhere else is the case a name-only comparison misses entirely,
         // and is exactly what hijacking a legitimate entry looks like.
-        detail: entry
-            .target()
+        detail: target
+            .as_ref()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| entry.command.clone()),
+        // And who vouches for the file at that path, which closes the case the
+        // path alone cannot see: the entry has not moved, but the file it
+        // points at has been replaced. Nothing keeps its standing because it
+        // had it yesterday.
+        trust: match target {
+            Some(path) => trust
+                .entry(path.clone())
+                .or_insert_with(|| trust_in(Some(&path)))
+                .clone(),
+            None => trust_in(None),
+        },
     }
 }
 
@@ -100,7 +143,14 @@ pub fn collect() -> (Vec<Sighting>, Vec<String>) {
     // as a source with nothing in it.
     let users = persistence::signed_in_users();
     let survey = persistence::survey_for(&users);
-    let mut sightings: Vec<Sighting> = survey.entries.iter().map(sighting_of).collect();
+    // Signatures are verified once per distinct executable, not once per
+    // entry: three hundred entries sit behind far fewer files.
+    let mut trust: HashMap<PathBuf, String> = HashMap::new();
+    let mut sightings: Vec<Sighting> = survey
+        .entries
+        .iter()
+        .map(|entry| sighting_of(entry, &mut trust))
+        .collect();
 
     match administrators() {
         Ok(accounts) => sightings.extend(accounts),
@@ -249,6 +299,10 @@ fn administrators() -> Result<Vec<Sighting>, String> {
             scope: "machine".to_owned(),
             name: account.to_owned(),
             detail: "can administer this machine".to_owned(),
+            // An account is not a file, so nothing signs it. Recorded as
+            // unchecked rather than unsigned: the distinction is that one is
+            // a fact and the other is a category error.
+            trust: kam_core::changes::NOT_CHECKED.to_owned(),
         })
         .collect())
 }

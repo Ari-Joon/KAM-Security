@@ -386,6 +386,17 @@ export type Difference = {
   first_seen: string;
   last_seen: string;
   times_seen: number;
+  /**
+   * Who vouches for the file this runs: "signed by X", "not signed", or
+   * "could not be checked".
+   *
+   * The last two are both *not vouched for* and are deliberately different
+   * claims: one is a fact about the file, the other a limit of what could be
+   * seen. Do not collapse them.
+   */
+  trust: string;
+  /** What it used to be, set only when the trust has changed. */
+  was_trusted: string | null;
 };
 
 /** What one sweep found, and what it could not look at. */
@@ -406,6 +417,17 @@ export type Sweep = {
   at: string;
   /** Every difference from the last twelve weeks, newest first. */
   history: Difference[];
+  /**
+   * Things already present when the baseline was first taken that nothing
+   * vouches for. Only ever populated on the first sweep.
+   *
+   * Not findings. A baseline learns whatever is on the machine at the moment
+   * it is taken, so anything unwanted that was already there becomes part of
+   * the furniture and never reports as having appeared. That cannot be fixed
+   * in general; it can be said, and saying it is the difference between a
+   * limitation and a lie.
+   */
+  unvouched: Difference[];
 };
 
 export type Threat = {

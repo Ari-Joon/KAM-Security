@@ -15,7 +15,7 @@ use crate::audit::{AuditLog, Effect, Entry, Record};
 use crate::{Error, Result};
 
 /// Bumped whenever the schema below changes. Stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE audit (
@@ -142,6 +142,16 @@ CREATE TABLE changes (
 CREATE INDEX changes_at_idx ON changes (at DESC);
 ";
 
+/// Who vouches for each thing in the baseline.
+///
+/// Added as its own column rather than folded into `detail`, so that changing
+/// how a signature is phrased does not make every entry on every machine read
+/// as altered at once. Existing rows get an empty string, which compares equal
+/// to nothing and so reports no change until the next sweep fills it in.
+const SCHEMA_V5: &str = "
+ALTER TABLE sightings ADD COLUMN trust TEXT NOT NULL DEFAULT '';
+";
+
 /// Whether the protective work is running, as stored in `settings`.
 ///
 /// Absent means on. A machine that has never been told otherwise is protected,
@@ -163,6 +173,7 @@ struct Recorded {
     last_seen: String,
     times_seen: i64,
     flaps: i64,
+    trust: String,
 }
 
 pub struct Store {
@@ -338,14 +349,23 @@ impl Store {
         };
 
         let mut differences = Vec::new();
+        let mut unvouched = Vec::new();
 
         for sighting in seen {
-            let existing: Option<(String, i64, i64, i64)> = connection
+            let existing: Option<(String, i64, i64, i64, String)> = connection
                 .query_row(
-                    "SELECT detail, times_seen, flaps, present FROM sightings
+                    "SELECT detail, times_seen, flaps, present, trust FROM sightings
                      WHERE kind = ?1 AND scope = ?2 AND name = ?3",
                     params![sighting.kind, sighting.scope, sighting.name],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(to_db_error)?;
@@ -355,14 +375,15 @@ impl Store {
                     connection
                         .execute(
                             "INSERT INTO sightings
-                               (kind, scope, name, detail, first_seen, last_seen)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                               (kind, scope, name, detail, first_seen, last_seen, trust)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
                             params![
                                 sighting.kind,
                                 sighting.scope,
                                 sighting.name,
                                 sighting.detail,
-                                now
+                                now,
+                                sighting.trust
                             ],
                         )
                         .map_err(to_db_error)?;
@@ -377,10 +398,29 @@ impl Store {
                             first_seen: now.clone(),
                             last_seen: now.clone(),
                             times_seen: 1,
+                            trust: sighting.trust.clone(),
+                            was_trusted: None,
+                        });
+                    } else if !crate::changes::vouched_for(&sighting.trust) {
+                        // First sweep. This was already here, and nothing
+                        // vouches for it. Not a finding -- see `Sweep::unvouched`
+                        // for why it is said anyway.
+                        unvouched.push(Difference {
+                            at: now.clone(),
+                            change: Change::Appeared,
+                            kind: sighting.kind.clone(),
+                            scope: sighting.scope.clone(),
+                            name: sighting.name.clone(),
+                            detail: sighting.detail.clone(),
+                            first_seen: now.clone(),
+                            last_seen: now.clone(),
+                            times_seen: 1,
+                            trust: sighting.trust.clone(),
+                            was_trusted: None,
                         });
                     }
                 }
-                Some((detail, times_seen, flaps, present)) => {
+                Some((detail, times_seen, flaps, present, was_trust)) => {
                     // Coming back after having gone is a flap, not a fresh
                     // appearance.
                     let returned = present == 0;
@@ -390,7 +430,7 @@ impl Store {
                             "UPDATE sightings
                                 SET detail = ?4, last_seen = ?5,
                                     times_seen = times_seen + 1,
-                                    flaps = ?6, present = 1
+                                    flaps = ?6, present = 1, trust = ?7
                               WHERE kind = ?1 AND scope = ?2 AND name = ?3",
                             params![
                                 sighting.kind,
@@ -398,7 +438,8 @@ impl Store {
                                 sighting.name,
                                 sighting.detail,
                                 now,
-                                flaps
+                                flaps,
+                                sighting.trust
                             ],
                         )
                         .map_err(to_db_error)?;
@@ -406,11 +447,22 @@ impl Store {
                     if baseline {
                         continue;
                     }
+                    // A trust that was recorded and has since changed. An
+                    // empty stored value means it was recorded before this
+                    // column existed, which is a gap being filled rather than
+                    // anything moving.
+                    let trust_moved = !was_trust.is_empty() && was_trust != sighting.trust;
+
                     let change = if flaps >= FLAPS_BEFORE_RECURRING {
                         Some(Change::Recurring)
                     } else if returned {
                         Some(Change::Appeared)
-                    } else if detail != sighting.detail {
+                    } else if detail != sighting.detail || trust_moved {
+                        // Either it points somewhere else now, or the file it
+                        // points at is not the file it was. The second is the
+                        // case a path comparison cannot see: same entry, same
+                        // path, different binary. Nothing keeps its standing
+                        // just because it had it yesterday.
                         Some(Change::Altered)
                     } else {
                         None
@@ -426,6 +478,8 @@ impl Store {
                             first_seen: String::new(),
                             last_seen: now.clone(),
                             times_seen: times_seen + 1,
+                            trust: sighting.trust.clone(),
+                            was_trusted: trust_moved.then(|| was_trust.clone()),
                         });
                     }
                 }
@@ -435,7 +489,7 @@ impl Store {
         // Anything present last time, not seen now, whose source was readable.
         let mut gone = connection
             .prepare(
-                "SELECT kind, scope, name, detail, first_seen, last_seen, times_seen, flaps
+                "SELECT kind, scope, name, detail, first_seen, last_seen, times_seen, flaps, trust
                    FROM sightings WHERE present = 1",
             )
             .map_err(to_db_error)?;
@@ -450,6 +504,7 @@ impl Store {
                     last_seen: row.get(5)?,
                     times_seen: row.get(6)?,
                     flaps: row.get(7)?,
+                    trust: row.get(8)?,
                 })
             })
             .map_err(to_db_error)?
@@ -466,6 +521,7 @@ impl Store {
             last_seen,
             times_seen,
             flaps,
+            trust,
         } in candidates
         {
             let still_here = seen
@@ -503,6 +559,8 @@ impl Store {
                     first_seen,
                     last_seen,
                     times_seen,
+                    trust,
+                    was_trusted: None,
                 });
             }
         }
@@ -561,6 +619,8 @@ impl Store {
                     first_seen: String::new(),
                     last_seen: String::new(),
                     times_seen: 0,
+                    trust: String::new(),
+                    was_trusted: None,
                 })
             })
             .map_err(to_db_error)?
@@ -575,6 +635,7 @@ impl Store {
             previous_at,
             at: now,
             history,
+            unvouched,
         })
     }
 
@@ -689,6 +750,9 @@ fn migrate(connection: &Connection) -> Result<()> {
     if current < 4 {
         connection.execute_batch(SCHEMA_V4).map_err(to_db_error)?;
     }
+    if current < 5 {
+        connection.execute_batch(SCHEMA_V5).map_err(to_db_error)?;
+    }
 
     connection
         .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -775,12 +839,106 @@ mod tests {
     }
 
     fn seen(kind: &str, name: &str, detail: &str) -> crate::changes::Sighting {
+        vouched(kind, name, detail, "signed by Somebody Ltd")
+    }
+
+    fn vouched(kind: &str, name: &str, detail: &str, trust: &str) -> crate::changes::Sighting {
         crate::changes::Sighting {
             kind: kind.to_owned(),
             scope: "machine".to_owned(),
             name: name.to_owned(),
             detail: detail.to_owned(),
+            trust: trust.to_owned(),
         }
+    }
+
+    /// A file replaced where it stands is noticed, though nothing moved.
+    ///
+    /// The case a path comparison cannot see, and the one that matters most:
+    /// the startup entry is untouched, the path is identical, and the binary at
+    /// the end of it is a different file. Comparing who vouches for it is what
+    /// turns that from invisible into a reported change.
+    ///
+    /// Nothing keeps its standing because it had it yesterday.
+    #[test]
+    fn a_file_swapped_underneath_a_startup_entry_is_noticed() {
+        let store = Store::open_in_memory().unwrap();
+        let path = r"c:\program files\thing\thing.exe";
+
+        store
+            .sweep(
+                &[vouched("run_key", "Thing", path, "signed by Thing Ltd")],
+                &[],
+            )
+            .unwrap();
+
+        // Same entry, same path. Different file.
+        let sweep = store
+            .sweep(&[vouched("run_key", "Thing", path, "not signed")], &[])
+            .unwrap();
+
+        let altered = sweep
+            .differences
+            .iter()
+            .find(|one| one.name == "Thing")
+            .expect("a file swapped in place must be reported");
+        assert_eq!(altered.change, crate::changes::Change::Altered);
+        assert_eq!(altered.trust, "not signed");
+        assert_eq!(
+            altered.was_trusted.as_deref(),
+            Some("signed by Thing Ltd"),
+            "and it says what it used to be, or the reader cannot tell what happened"
+        );
+    }
+
+    /// The first sweep says what was already here that nothing vouches for.
+    ///
+    /// A baseline learns whatever is on the machine when it is taken, so
+    /// anything unwanted that was already present becomes part of the
+    /// furniture. That cannot be fixed in general — but it can be *said*, and
+    /// saying it is the difference between a limitation and a lie.
+    #[test]
+    fn a_first_sweep_names_what_was_already_here_unvouched_for() {
+        let store = Store::open_in_memory().unwrap();
+
+        let sweep = store
+            .sweep(
+                &[
+                    vouched("service", "Ordinary", "a.exe", "signed by Somebody Ltd"),
+                    vouched("run_key", "Mystery", "b.exe", "not signed"),
+                    vouched("run_key", "Opaque", "c.exe", "could not be checked"),
+                ],
+                &[],
+            )
+            .unwrap();
+
+        assert!(sweep.baseline);
+        assert!(
+            sweep.differences.is_empty(),
+            "a baseline still reports no differences"
+        );
+
+        let named: Vec<&str> = sweep
+            .unvouched
+            .iter()
+            .map(|one| one.name.as_str())
+            .collect();
+        assert!(named.contains(&"Mystery"), "{named:?}");
+        assert!(
+            named.contains(&"Opaque"),
+            "unreadable is not vouched for either: {named:?}"
+        );
+        assert!(
+            !named.contains(&"Ordinary"),
+            "something with a valid signature is not on this list: {named:?}"
+        );
+
+        // And a later sweep does not repeat it: this is a caveat on the
+        // baseline, not a standing complaint.
+        let later = store
+            .sweep(&[vouched("run_key", "Mystery", "b.exe", "not signed")], &[])
+            .unwrap();
+        assert!(later.unvouched.is_empty());
     }
 
     /// The first sweep reports nothing at all.
