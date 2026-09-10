@@ -598,6 +598,50 @@ pub fn handle(
             }
         }
 
+        Request::SweepForChanges => {
+            let (seen, unreadable) = crate::baseline::collect();
+            match context.store.sweep(&seen, &unreadable) {
+                Ok(sweep) => {
+                    // Audited as an observation: somebody deliberately asked
+                    // what had changed, and the answer is part of the history
+                    // of what was looked at.
+                    //
+                    // The entry says what could not be checked as well as what
+                    // was found. A sweep that saw less than it wanted to must
+                    // not read later as a clean bill of health.
+                    context.audit(
+                        "changes",
+                        "sweep",
+                        Effect::Observed,
+                        format!(
+                            "compared {} things against the last sweep: {} {}{}",
+                            seen.len(),
+                            sweep.differences.len(),
+                            if sweep.baseline {
+                                "differences (this was the first, so nothing was compared)"
+                            } else if sweep.differences.len() == 1 {
+                                "difference"
+                            } else {
+                                "differences"
+                            },
+                            if sweep.unreadable.is_empty() {
+                                String::new()
+                            } else {
+                                format!("; {} source(s) could not be read", sweep.unreadable.len())
+                            }
+                        ),
+                    );
+                    Response::Changes(sweep)
+                }
+                Err(error) => {
+                    tracing::error!(%error, "could not compare the machine with its history");
+                    Response::Error {
+                        message: format!("what changed could not be worked out: {error}"),
+                    }
+                }
+            }
+        }
+
         Request::RecordLookup { sha256, outcome } => {
             // The one thing in this product that sends anything off the
             // machine, and therefore the one thing most worth writing down.

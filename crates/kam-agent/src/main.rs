@@ -10,6 +10,7 @@
 //! trusted directory and passes the check the shell will later have to pass —
 //! ordinary development exercises that path instead of bypassing it.
 
+mod baseline;
 mod check;
 mod dispatch;
 mod server;

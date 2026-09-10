@@ -194,6 +194,20 @@ async fn defender_scan(
     .await
 }
 
+/// Compare the machine with what it looked like last time.
+///
+/// The only call here that answers what is *different* rather than what is
+/// true. Runs in the agent because the baseline has to live where a non-admin
+/// cannot edit it.
+#[tauri::command]
+fn sweep_for_changes() -> Result<kam_core::changes::Sweep, String> {
+    match kam_ipc::client::call(&Request::SweepForChanges).map_err(|error| error.to_string())? {
+        Response::Changes(sweep) => Ok(sweep),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Send one thing to the Recycle Bin.
 ///
 /// Done here rather than through the agent, and that is the point rather than a
@@ -937,6 +951,7 @@ pub fn run() {
             restore_quarantined,
             delete_quarantined,
             empty_quarantine,
+            sweep_for_changes,
             recycle_item,
             can_recycle,
             reveal_in_explorer,

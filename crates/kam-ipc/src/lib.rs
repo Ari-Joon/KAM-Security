@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -116,6 +116,16 @@ pub enum Request {
     /// Delete everything currently held. Same rules, once per item.
     EmptyQuarantine,
 
+    /// Compare the machine with what it looked like last time.
+    ///
+    /// Every other request here answers what is true now. This is the only one
+    /// that answers what is *different*, which is the question people actually
+    /// have and which Windows will not answer at all.
+    ///
+    /// Runs in the agent because the baseline has to live somewhere a non-admin
+    /// cannot edit: anybody able to mark their own persistence as already-seen
+    /// would silence the feature permanently.
+    SweepForChanges,
     /// Record that a file's hash was sent to VirusTotal.
     ///
     /// The lookup happens in the window, because the VirusTotal client is
@@ -426,6 +436,8 @@ pub enum Response {
     },
     /// What a Defender scan came to.
     DefenderScanned(kam_scanner::defender_scan::ScanOutcome),
+    /// What changed since last time, and what could not be checked.
+    Changes(kam_core::changes::Sweep),
     /// Nothing to return beyond "recorded".
     Acknowledged,
     QuarantineList {

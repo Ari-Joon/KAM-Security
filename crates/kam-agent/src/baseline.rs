@@ -1,0 +1,196 @@
+//! Turning what is on the machine into something that can be compared with
+//! last time.
+//!
+//! The diff itself lives in `kam-core`, deliberately, so it can be tested
+//! against invented sightings with no machine involved. This is the other half:
+//! reading the real sources and expressing them as the identity that diff
+//! compares — `(kind, scope, name)` plus whatever else is worth noticing a
+//! change in.
+//!
+//! # Which sources, and why not more
+//!
+//! Chosen from measured churn on a real machine rather than from a list of
+//! everything readable. The rule was: does a change here mean something, or does
+//! this turn over on its own?
+//!
+//! - **Services, Run keys, Startup folder items, scheduled tasks.** All of them
+//!   things that start themselves, which is the property that makes a change
+//!   worth a person's attention.
+//! - **Local administrators.** The most stable thing on the machine and the
+//!   highest-consequence change on it. Two accounts on the development machine,
+//!   unchanged in the whole history available.
+//!
+//! Deliberately left out: installed applications, because they churn with every
+//! update and an uninstall is not a security event; files anywhere, for the
+//! same reason many times over; and firewall rules, which are genuinely
+//! interesting but whose rate of change nobody has measured yet, and a source
+//! whose churn is unknown is a source that cannot be diffed honestly.
+//!
+//! Microsoft's own scheduled tasks are read and recorded like everything else:
+//! one of them *disappearing* matters, and Defender's own tasks being removed is
+//! a documented step in several ransomware families. Keeping them out of the
+//! itemised list is a display decision and is made in the interface, which is
+//! the only place that knows how much room there is.
+//!
+//! The reason it is a display decision: 233 of them on
+//! the development machine with 22 changing in a month, which is Windows Update
+//! doing its job. Itemising it produces two dozen rows a month of guaranteed
+//! noise, and a panel that cries wolf monthly is a panel nobody opens.
+
+use kam_core::changes::Sighting;
+use kam_scanner::persistence::{self, Anchor, Entry};
+
+/// The name a sighting is filed under for each kind of thing.
+///
+/// Stable strings rather than the display labels, because these are stored and
+/// compared across versions: changing a label must not make the whole machine
+/// look new.
+fn kind_of(anchor: Anchor) -> &'static str {
+    match anchor {
+        Anchor::RunKey => "run_key",
+        Anchor::RunOnceKey => "run_once_key",
+        Anchor::StartupFolder => "startup_item",
+        Anchor::Service => "service",
+        Anchor::ScheduledTask => "scheduled_task",
+    }
+}
+
+/// What one entry is, as something comparable.
+fn sighting_of(entry: &Entry) -> Sighting {
+    Sighting {
+        kind: kind_of(entry.anchor).to_owned(),
+        // The location separates one account's Run key from another's, and one
+        // task folder from another, so two things with the same name in
+        // different places are two things.
+        scope: entry.location.to_lowercase(),
+        name: entry.name.clone(),
+        // What it actually runs. A thing still present but now pointing
+        // somewhere else is the case a name-only comparison misses entirely,
+        // and is exactly what hijacking a legitimate entry looks like.
+        detail: entry
+            .target()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| entry.command.clone()),
+    }
+}
+
+/// Everything on this machine worth comparing with last time.
+///
+/// Returns the sightings and, separately, the sources that could not be read.
+/// The second is not an afterthought: `kam-core`'s diff refuses to conclude
+/// anything about a source it was told failed, so getting this wrong in the
+/// optimistic direction is how a panel starts inventing alarms.
+pub fn collect() -> (Vec<Sighting>, Vec<String>) {
+    let survey = persistence::survey_for(&persistence::signed_in_users());
+    let mut sightings: Vec<Sighting> = survey.entries.iter().map(sighting_of).collect();
+
+    match administrators() {
+        Ok(accounts) => sightings.extend(accounts),
+        Err(why) => {
+            // Named rather than swallowed, so nothing concludes an
+            // administrator was removed when the truth is nobody looked.
+            let mut unreadable = survey.unreadable.clone();
+            unreadable.push(format!("the list of local administrators: {why}"));
+            return (sightings, unreadable);
+        }
+    }
+
+    (sightings, survey.unreadable)
+}
+
+/// Who can administer this machine.
+///
+/// Cheapest signal in the whole feature and the highest consequence: an account
+/// gaining administrator rights is the change that makes every other change
+/// possible, and Windows will not tell anybody it happened.
+fn administrators() -> Result<Vec<Sighting>, String> {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+    let powershell =
+        std::path::PathBuf::from(root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+
+    // Named absolutely, and the command is a compiled-in constant: the same two
+    // rules the hardening module learned the hard way when a bare name was a
+    // user-to-SYSTEM execution path.
+    let output = std::process::Command::new(&powershell)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-LocalGroupMember -SID S-1-5-32-544 | ForEach-Object { $_.Name }",
+        ])
+        .output()
+        .map_err(|error| error.to_string())?;
+
+    if !output.status.success() {
+        return Err("the group could not be read".to_owned());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|account| Sighting {
+            kind: "administrator".to_owned(),
+            scope: "machine".to_owned(),
+            name: account.to_owned(),
+            detail: "can administer this machine".to_owned(),
+        })
+        .collect())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn this_machine_has_a_baseline_worth_comparing() {
+        let (sightings, unreadable) = collect();
+
+        assert!(
+            !sightings.is_empty(),
+            "nothing at all was found to compare, which cannot be right on a \
+             running machine (unreadable: {unreadable:?})"
+        );
+
+        // The identity has to be complete, or two different things collapse
+        // into one and a change between them is invisible.
+        for sighting in &sightings {
+            assert!(!sighting.kind.is_empty());
+            assert!(!sighting.name.is_empty(), "{sighting:?}");
+        }
+    }
+
+    #[test]
+    fn every_kind_has_a_stable_name() {
+        // Stored and compared across versions: if these ever change, every
+        // machine's whole baseline reads as new at once.
+        assert_eq!(kind_of(Anchor::RunKey), "run_key");
+        assert_eq!(kind_of(Anchor::Service), "service");
+        assert_eq!(kind_of(Anchor::ScheduledTask), "scheduled_task");
+        assert_eq!(kind_of(Anchor::StartupFolder), "startup_item");
+        assert_eq!(kind_of(Anchor::RunOnceKey), "run_once_key");
+    }
+
+    /// Administrators are read, or the failure is reported as a failure.
+    ///
+    /// The one outcome that must not happen is an empty list read as "there are
+    /// no administrators", which would report every administrator as having
+    /// vanished the moment the command failed.
+    #[test]
+    fn administrators_are_either_listed_or_the_failure_is_named() {
+        match administrators() {
+            Ok(accounts) => {
+                assert!(
+                    !accounts.is_empty(),
+                    "a successful read returned nobody, which no Windows machine can be"
+                );
+                for account in &accounts {
+                    assert_eq!(account.kind, "administrator");
+                    assert!(!account.name.is_empty());
+                }
+            }
+            Err(why) => assert!(!why.is_empty(), "a failure has to say something"),
+        }
+    }
+}
