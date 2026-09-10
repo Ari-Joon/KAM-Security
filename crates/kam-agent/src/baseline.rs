@@ -110,20 +110,57 @@ fn administrators() -> Result<Vec<Sighting>, String> {
 
     // Named absolutely, and the command is a compiled-in constant: the same two
     // rules the hardening module learned the hard way when a bare name was a
-    // user-to-SYSTEM execution path.
-    let output = std::process::Command::new(&powershell)
+    // user-to-SYSTEM execution path. The working directory is set explicitly for
+    // the same reason it is for Defender's scanner — a child's working directory
+    // takes part in library search and is not a thing to inherit.
+    let mut child = std::process::Command::new(&powershell)
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
             "Get-LocalGroupMember -SID S-1-5-32-544 | ForEach-Object { $_.Name }",
         ])
-        .output()
+        .current_dir(
+            std::path::PathBuf::from(
+                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned()),
+            )
+            .join("System32"),
+        )
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .map_err(|error| error.to_string())?;
 
-    if !output.status.success() {
-        return Err("the group could not be read".to_owned());
+    // Bounded, because this call can block indefinitely.
+    //
+    // `Get-LocalGroupMember` resolves every member, and a member that is a
+    // domain principal sends it to a domain controller. On a machine whose
+    // domain is unreachable — a laptop away from the office, a VPN that is
+    // down — that wait is long and the sweep is holding a thread throughout.
+    // Raised in review; the failure it prevents is the whole feature appearing
+    // to hang rather than anything unsafe.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return Err("the group could not be read".to_owned()),
+            Ok(None) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            // Reported as unreadable, never as an empty list. An empty list
+            // would mark every administrator as having vanished.
+            return Err("the group did not answer in time".to_owned());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| error.to_string())?;
 
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()

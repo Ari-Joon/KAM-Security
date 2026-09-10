@@ -289,6 +289,39 @@ pub fn open_quarantine(running_as_service: bool) -> Result<kam_quarantine::Store
 
 pub fn open_store(running_as_service: bool) -> Result<Store> {
     let path = store_path(running_as_service)?;
+
+    // Before the file is opened, not after.
+    //
+    // The database's own protections are real -- the audit log's triggers, the
+    // baseline's integrity -- and every one of them is defeated by a
+    // write-ahead log planted in the directory beside it, because SQLite
+    // applies a WAL as raw pages beneath SQL. The window for planting one is
+    // exactly the moment before this call, when the service is not running and
+    // the sidecar does not exist. So the directory is closed first.
+    //
+    // Only when running as the service. A development run has its store beside
+    // the build output, where locking a developer out of their own directory
+    // would be officious rather than protective, and where nothing is trusted
+    // anyway.
+    if running_as_service {
+        if let Some(directory) = path.parent() {
+            match crate::store_acl::harden(directory) {
+                Ok(()) => {
+                    tracing::debug!(path = %directory.display(), "store directory secured")
+                }
+                // Loud, and not fatal. An agent that refuses to start leaves
+                // the machine with no protection at all, which is worse than
+                // one running with a store somebody could reach; and the
+                // failure is worth a person's attention either way.
+                Err(error) => tracing::error!(
+                    %error,
+                    path = %directory.display(),
+                    "the store directory could not be secured; its audit log and                      baseline can be rewritten by anybody who can write there"
+                ),
+            }
+        }
+    }
+
     tracing::info!(path = %path.display(), "opening the store");
     Store::open(&path)
 }

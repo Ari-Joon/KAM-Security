@@ -15,6 +15,7 @@ mod check;
 mod dispatch;
 mod server;
 mod service;
+mod store_acl;
 mod trust;
 mod watch;
 
