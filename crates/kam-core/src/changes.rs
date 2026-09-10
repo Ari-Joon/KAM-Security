@@ -141,7 +141,7 @@ impl Unreadable {
     pub fn within(kind: &str, scope: &str, what: impl Into<String>) -> Self {
         Self {
             kinds: vec![kind.to_owned()],
-            scopes: vec![scope.to_lowercase()],
+            scopes: vec![as_place(scope)],
             what: what.into(),
         }
     }
@@ -150,7 +150,7 @@ impl Unreadable {
     pub fn covering(kinds: &[&str], scopes: &[String], what: impl Into<String>) -> Self {
         Self {
             kinds: kinds.iter().map(|kind| (*kind).to_string()).collect(),
-            scopes: scopes.iter().map(|scope| scope.to_lowercase()).collect(),
+            scopes: scopes.iter().map(|scope| as_place(scope)).collect(),
             what: what.into(),
         }
     }
@@ -287,6 +287,48 @@ pub struct Sweep {
     pub unvouched: Vec<Difference>,
 }
 
+/// Put a place into the one spelling everything here compares against.
+///
+/// # Why this exists rather than a note asking people to be careful
+///
+/// A gap is built in one file and compared against a scope built in another,
+/// and neither knows about the other. That held for exactly one commit. The
+/// service reader wrote its place as `format!(r"{SERVICES}\\{name}")` — a *raw*
+/// string, where `\\` is two characters and not an escape — while the sighting
+/// four lines below used one. The scope could never match, so `covers` returned
+/// false for every service, so the rule did nothing: a service that could not
+/// be read was still reported as gone, which is worse than the blunt
+/// suppression it replaced and looked correct in every test.
+///
+/// The lesson is not "be careful with backslashes". It is that a safety rule
+/// must not depend on two authors spelling a path the same way. So the spelling
+/// is taken away from them: lowercased, forward slashes folded to back ones,
+/// runs of separators collapsed, and any trailing separator dropped so that
+/// `under` decides where a component ends rather than the punctuation deciding
+/// for it.
+fn as_place(scope: &str) -> String {
+    let mut out = String::with_capacity(scope.len());
+    let mut last_was_separator = false;
+    for character in scope.chars() {
+        if character == '\\' || character == '/' {
+            // A run of separators is one separator. Two in a row is always a
+            // mistake in a string that was built by joining pieces.
+            if !last_was_separator {
+                out.push('\\');
+            }
+            last_was_separator = true;
+        } else {
+            out.extend(character.to_lowercase());
+            last_was_separator = false;
+        }
+    }
+    // Trailing separators say nothing: `under` already stops at a component.
+    while out.ends_with('\\') {
+        out.pop();
+    }
+    out
+}
+
 /// Whether one scope lies inside another, as paths rather than as text.
 ///
 /// A plain `starts_with` is wrong here, and wrong in the dangerous direction. A
@@ -300,13 +342,16 @@ pub struct Sweep {
 /// carries the separator, or what follows it starts with one, or the two are
 /// the same place.
 fn under(scope: &str, prefix: &str) -> bool {
+    // Both sides through the same spelling, so a scope that arrived with a
+    // doubled separator or a trailing one is compared as the place it means.
+    let scope = as_place(scope);
     if scope == prefix {
         return true;
     }
     let Some(rest) = scope.strip_prefix(prefix) else {
         return false;
     };
-    prefix.ends_with(['\\', '/']) || rest.starts_with(['\\', '/'])
+    rest.starts_with('\\')
 }
 
 /// Appearances and disappearances are worth more attention than either a change
@@ -421,6 +466,37 @@ mod tests {
             !gap.covers("startup_item", r"c:\users\arianna\appdata\roaming"),
             "one person's unexamined account silenced another person's"
         );
+    }
+
+    /// However a place was spelled, it means the same place.
+    ///
+    /// This is the test for the fix to a bug that every other test passed
+    /// through. A gap for a service was written into a raw string as
+    /// `{SERVICES}` followed by two backslash characters and the name, while
+    /// the sighting used one -- so the gap covered nothing, and a service that
+    /// could not be read was reported as gone anyway. Two files, two authors,
+    /// one punctuation mark, and a safety rule that silently did nothing.
+    ///
+    /// The spelling is no longer anybody's to get right.
+    #[test]
+    fn a_place_means_the_same_place_however_it_was_written() {
+        let scope = r"hklm\system\currentcontrolset\services\windefend";
+
+        for spelling in [
+            r"HKLM\SYSTEM\CurrentControlSet\Services\WinDefend",
+            // The bug: a doubled separator from a raw-string join.
+            r"HKLM\SYSTEM\CurrentControlSet\\Services\WinDefend",
+            // A trailing separator, which `ProfileImagePath` sometimes carries.
+            r"HKLM\SYSTEM\CurrentControlSet\Services\WinDefend\",
+            // Forward slashes, which Windows accepts in plenty of places.
+            "HKLM/SYSTEM/CurrentControlSet/Services/WinDefend",
+        ] {
+            let gap = Unreadable::within("service", spelling, "could not read it");
+            assert!(
+                gap.covers("service", scope),
+                "a gap written as {spelling:?} did not cover the key it names"
+            );
+        }
     }
 
     /// A gap that names no place still covers its whole kind.

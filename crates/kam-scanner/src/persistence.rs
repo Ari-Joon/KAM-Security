@@ -529,6 +529,27 @@ fn read_run_keys(survey: &mut Survey, users: &[UserContext]) {
                     // for, so that is a flap they can drive.
                     let command = match key.read_string(&name) {
                         Ok(Some(command)) => command,
+                        // The enumeration produced this name, so a value that
+                        // is not there under it is a contradiction rather than
+                        // an absence -- and the way to arrange that
+                        // contradiction is a NUL in the name, which no
+                        // installer writes and Registry Editor will not show.
+                        // The entry is unreadable through every
+                        // NUL-terminated entry point there is, so the honest
+                        // report is that it exists and could not be read.
+                        Ok(None) if registry::is_hidden_name(&name) => {
+                            survey.unreadable.push(Unreadable::within(
+                                anchor.kind(),
+                                &named,
+                                format!(
+                                    "{named} holds an entry whose name contains a \
+                                     character that hides it from Registry Editor, \
+                                     so what it runs could not be read"
+                                ),
+                            ));
+                            continue;
+                        }
+                        // Not a string, which is a fact about the value.
                         Ok(None) => continue,
                         Err(why) => {
                             survey.unreadable.push(Unreadable::within(
@@ -753,19 +774,40 @@ fn read_services(survey: &mut Survey) {
     for name in listing.names {
         let service = match root.look_child(&name) {
             Ok(service) => service,
-            // Removed between listing it and opening it. That is a race with
-            // an installer, not a gap in what could be read.
+            // A name the enumeration produced that will not open under
+            // that name. Ordinarily a race with an installer removing the
+            // service, which is not a gap. A name carrying a NUL is not that:
+            // it cannot be opened through any NUL-terminated entry point, so
+            // the key stays invisible to this reader for as long as it exists
+            // and would never enter the baseline at all.
+            Err(Unopened::Absent) if registry::is_hidden_name(&name) => {
+                refused.push(format!(r"{SERVICES}\{name}"));
+                continue;
+            }
             Err(Unopened::Absent) => continue,
             Err(_) => {
-                refused.push(format!(r"{SERVICES}\\{name}"));
+                refused.push(format!(r"{SERVICES}\{name}"));
                 continue;
             }
         };
 
         // Start: 0 boot, 1 system, 2 automatic, 3 on demand, 4 disabled. Only
         // the first three run without someone asking, and 0 and 1 are drivers.
-        let Some(start) = service.dword("Start") else {
-            continue;
+        //
+        // Most keys under `Services` are not services: performance counter
+        // registrations, protocol stubs, driver placeholders. They have no
+        // `Start` at all, and that absence is the ordinary case rather than
+        // anything to report -- 55 of them on the machine this was written on,
+        // every one of which the first version of this named as a gap.
+        //
+        // A refusal is different, and is a gap.
+        let start = match service.read_dword("Start") {
+            Ok(Some(start)) => start,
+            Ok(None) => continue,
+            Err(_) => {
+                refused.push(format!(r"{SERVICES}\{name}"));
+                continue;
+            }
         };
         if start > 2 {
             continue;
@@ -773,8 +815,13 @@ fn read_services(survey: &mut Survey) {
 
         // Type 1 and 2 are kernel and file-system drivers, which are a separate
         // subject and would swamp the list.
-        if service.dword("Type").is_some_and(|kind| kind < 0x10) {
-            continue;
+        match service.read_dword("Type") {
+            Ok(Some(kind)) if kind < 0x10 => continue,
+            Ok(_) => {}
+            Err(_) => {
+                refused.push(format!(r"{SERVICES}\{name}"));
+                continue;
+            }
         }
 
         // The key opened, so a failure here is a failure to read a value in a
@@ -783,9 +830,19 @@ fn read_services(survey: &mut Survey) {
         // the counter added to catch it.
         let image = match service.read_string("ImagePath") {
             Ok(Some(image)) => image,
-            Ok(None) => continue,
+            // A service set to start itself with nothing to run is a
+            // contradiction rather than an ordinary absence: the SCM keeps a
+            // running service's configuration cached, so removing or retyping
+            // `ImagePath` after it starts hides it from this reader without
+            // stopping it. Reached only after `Start` said it starts itself,
+            // which is what makes the absence worth reporting here and not two
+            // values earlier.
+            Ok(None) => {
+                refused.push(format!(r"{SERVICES}\{name}"));
+                continue;
+            }
             Err(_) => {
-                refused.push(format!(r"{SERVICES}\\{name}"));
+                refused.push(format!(r"{SERVICES}\{name}"));
                 continue;
             }
         };
@@ -1551,6 +1608,42 @@ mod tests {
         }
         assert!(checked > 0, "no registry locations were checked at all");
         println!("{checked} registry locations all resolve");
+    }
+
+    /// Every place a gap names is spelled the way a scope is spelled.
+    ///
+    /// The kinds a gap names were already checked. The *places* were not, and
+    /// the places are strings built in one file and compared against strings
+    /// built in another. The service reader wrote its place with a doubled
+    /// separator -- a raw string, where two backslashes are two characters and
+    /// not an escape -- so the scope could never match the sighting four lines
+    /// below it. The gap was recorded and the sentence was shown, while the
+    /// rule it exists to trigger did nothing: a service that could not be read
+    /// was still reported as gone.
+    ///
+    /// `Unreadable` now normalises what it is given, so this checks the
+    /// normaliser is actually being reached from every construction site here.
+    #[test]
+    fn every_place_a_gap_names_is_spelled_like_a_scope() {
+        let survey = survey_for(&signed_in_users());
+        for source in &survey.unreadable {
+            for place in &source.scopes {
+                assert!(
+                    !place.contains(r"\\"),
+                    "a place carries an empty path component, so it can match \
+                     nothing: {place:?}"
+                );
+                assert!(
+                    !place.ends_with('\\'),
+                    "a place carries a trailing separator: {place:?}"
+                );
+                assert_eq!(
+                    place.to_lowercase(),
+                    *place,
+                    "a place was not lowercased, and scopes are"
+                );
+            }
+        }
     }
 
     #[test]

@@ -64,6 +64,38 @@ fn from_wide(buffer: &[u16]) -> String {
         .into_owned()
 }
 
+/// Decode an enumerated name using the length Windows reported.
+///
+/// # A name that hides inside another name
+///
+/// [`from_wide`] stops at the first NUL, which is right for a value read back
+/// as text and wrong for a name that came out of an enumeration. `NtSetValueKey`
+/// and `NtCreateKey` take counted strings rather than NUL-terminated ones, so a
+/// name may contain a NUL — and needs no privilege at all on `HKCU`. It is the
+/// Poweliks technique, aimed at the very key the startup reader walks.
+///
+/// Decoded to the first NUL, `Updater` and `Updater␀evil` are the same string.
+/// Two values collapse to one name, the count still agrees, and the walk
+/// reports `whole: true` — an affirmative claim to have read the key to the
+/// end, covering the entry it did not report. Reading the returned length keeps
+/// them apart, after which the name simply cannot be looked up through the
+/// NUL-terminated Win32 entry points, and the caller has to say so rather than
+/// treat it as a value that is not there.
+fn exactly(buffer: &[u16], length: u32) -> String {
+    let end = (length as usize).min(buffer.len());
+    OsString::from_wide(&buffer[..end])
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Whether a name holds a character that hides it from Registry Editor.
+///
+/// Worth telling a person in as many words: no installer produces one, and
+/// nothing in Windows' own interface will show it to them.
+pub fn is_hidden_name(name: &str) -> bool {
+    name.contains('\0')
+}
+
 /// Why a key could not be opened.
 ///
 /// The distinction is the whole point. A key that is not there and a key this
@@ -248,7 +280,7 @@ impl Key {
             };
             match status {
                 ERROR_SUCCESS => {
-                    names.push(from_wide(&buffer));
+                    names.push(exactly(&buffer, length));
                     index += 1;
                 }
                 _ => return shape.finish(names, shape.subkeys),
@@ -324,7 +356,7 @@ impl Key {
             };
             match status {
                 ERROR_SUCCESS => {
-                    names.push(from_wide(&buffer));
+                    names.push(exactly(&buffer, length));
                     index += 1;
                 }
                 _ => return shape.finish(names, shape.values),
@@ -497,6 +529,19 @@ impl Key {
     }
 
     pub fn dword(&self, value: &str) -> Option<u32> {
+        self.read_dword(value).ok().flatten()
+    }
+
+    /// The same, keeping a failed read apart from a value that is not there.
+    ///
+    /// The two are not close in meaning and are very different in frequency.
+    /// Most keys under `Services` are not services at all -- performance
+    /// counter registrations, protocol stubs, driver placeholders -- and have
+    /// no `Start` value whatsoever. On this machine 55 of them, so treating a
+    /// missing value as a failed read named 55 perfectly ordinary keys as gaps
+    /// and suppressed vanish reporting across all of them. Absence here is the
+    /// common case and says nothing; only a refusal is worth reporting.
+    pub fn read_dword(&self, value: &str) -> std::result::Result<Option<u32>, Unopened> {
         let name = wide(value);
         let mut kind = REG_VALUE_TYPE::default();
         let mut data = 0_u32;
@@ -512,7 +557,13 @@ impl Key {
                 Some(&mut size),
             )
         };
-        (status == ERROR_SUCCESS && kind == REG_DWORD).then_some(data)
+        match status {
+            ERROR_SUCCESS if kind == REG_DWORD => Ok(Some(data)),
+            // There, and not a number. A fact about the value.
+            ERROR_SUCCESS => Ok(None),
+            ERROR_FILE_NOT_FOUND => Ok(None),
+            other => Err(Unopened::from(other)),
+        }
     }
 }
 
@@ -554,6 +605,40 @@ mod tests {
             View::Native
         )
         .is_none());
+    }
+
+    /// A name with a NUL in it is not the name up to the NUL.
+    ///
+    /// `NtSetValueKey` takes a counted string, so a value name may contain a
+    /// NUL, and writing one to `HKCU` needs no privilege at all. Decoded to the
+    /// first NUL, `Updater` and `Updater` followed by NUL and `evil` are the
+    /// same string: two values collapse to one name, the count still agrees,
+    /// and the walk reports `whole: true` -- an affirmative claim to have read
+    /// the whole key, covering the entry it did not report.
+    ///
+    /// Tested at the decode rather than by planting one, because the decode is
+    /// what was wrong, and a test needing `ntdll` to set itself up is a test
+    /// that quietly stops running.
+    #[test]
+    fn a_name_holding_a_nul_is_not_truncated_at_it() {
+        // As `RegEnumValueW` fills a buffer: the characters, then whatever was
+        // already in it.
+        let mut buffer = vec![0_u16; 32];
+        for (slot, unit) in buffer.iter_mut().zip("Updater\0evil".encode_utf16()) {
+            *slot = unit;
+        }
+
+        assert_eq!(exactly(&buffer, 12), "Updater\0evil");
+        assert_ne!(
+            exactly(&buffer, 12),
+            "Updater",
+            "the hidden half of the name was dropped"
+        );
+        assert!(is_hidden_name(&exactly(&buffer, 12)));
+
+        // An ordinary name is unaffected.
+        assert_eq!(exactly(&buffer, 7), "Updater");
+        assert!(!is_hidden_name("Updater"));
     }
 
     #[test]

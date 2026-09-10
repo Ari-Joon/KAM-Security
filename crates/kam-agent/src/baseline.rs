@@ -275,6 +275,15 @@ fn profiles_not_examined(examined: &[kam_core::UserContext]) -> Option<NotExamin
         .iter()
         // Real accounts, not the service profiles.
         .filter(|sid| sid.starts_with("S-1-5-21-"))
+        // And not the wreckage of a profile that would not load. When one
+        // fails, Windows renames the key to `<SID>.bak` and leaves both in
+        // place indefinitely -- the "signed in with a temporary profile"
+        // state. A real SID never contains a dot, and the `.bak` twin usually
+        // points at the same directory as the live profile, so counting it as
+        // an unexamined account produced a gap covering the *signed-in* user's
+        // Startup folder: their entries could then never be reported as gone,
+        // permanently, on the account most worth watching.
+        .filter(|sid| !sid.contains('.'))
         .filter(|sid| !looked_at.contains(sid.as_str()))
         .cloned()
         .collect();
@@ -297,15 +306,33 @@ fn profiles_not_examined(examined: &[kam_core::UserContext]) -> Option<NotExamin
     // Where each unexamined account's things would live: its own hive, and its
     // own profile directory. Both are prefixes of the scopes those sightings
     // are filed under, so this gap says nothing about anybody else's.
+    //
+    // The profile path comes from `UserContext::for_sid` rather than being
+    // read here, because reading it here got it wrong twice: `ProfileImagePath`
+    // is `REG_EXPAND_SZ` and routinely holds `%SystemDrive%\Users\Name` on an
+    // imaged machine, and it sometimes carries a trailing separator. Either one
+    // makes the prefix match nothing -- so the gap covers nothing, and the
+    // account's Startup items are reported as gone, which is the failure this
+    // whole mechanism exists to prevent. `for_sid` already expands and trims,
+    // and one value read by two functions in two ways is how that happened.
+    let examined_places: std::collections::HashSet<String> = examined
+        .iter()
+        .map(|user| user.profile().to_lowercase())
+        .collect();
+
     let mut places = Vec::new();
     for sid in &missed {
         places.push(format!("HKEY_USERS\\{sid}\\"));
-        if let Some(profile) = root
-            .child(sid)
-            .and_then(|account| account.string("ProfileImagePath"))
-        {
-            places.push(format!("{profile}\\"));
+        let Some(account) = kam_core::UserContext::for_sid(sid) else {
+            continue;
+        };
+        // Never name a directory this sweep read successfully. A profile
+        // shared with an examined account -- which the `.bak` twins above make
+        // real -- would otherwise silence the account that was examined.
+        if examined_places.contains(&account.profile().to_lowercase()) {
+            continue;
         }
+        places.push(format!("{}\\", account.profile()));
     }
 
     let how_many = missed.len();
