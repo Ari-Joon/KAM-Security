@@ -31,8 +31,8 @@ import { squarify } from "../lib/treemap";
  * program carries a valid signature, and whether it is connected to something
  * outside this machine. Both are verifiable, and neither is an opinion.
  *
- * So red is not "this is malware". Red is "nothing signed this, and it is
- * talking to the internet" — the combination worth a look, stated plainly. And
+ * So red is not "this is malware". Red is "nothing signed this, and it is open
+ * to the network" — the combination worth a look, stated plainly. And
  * grey is not a mild accusation: it means the owning program could not be
  * identified, which is a limitation of the observer, not a property of the
  * observed. Colouring that as a warning would be inventing a finding out of a
@@ -40,7 +40,17 @@ import { squarify } from "../lib/treemap";
  * avoid.
  */
 
-/** Tones, keyed to what was checked rather than to how alarming it is. */
+/**
+ * Tones, keyed to what was checked rather than to how alarming it is.
+ *
+ * "Open to the network" covers both directions, and it has to. A program
+ * *reaching out* is the obvious case; a program *listening on an address the
+ * network can reach* is the one people least expect to find, and Windows
+ * reports it as neither an outbound connection nor anything unusual. Counting
+ * only the outbound half meant a service accepting connections from the whole
+ * network was coloured as though it were staying put, which was not a
+ * presentational choice but a false statement.
+ */
 export type Tone = "quiet" | "normal" | "watch" | "look" | "unknown";
 
 const TONE_COLOUR: Record<Tone, string> = {
@@ -200,10 +210,10 @@ export default function ConnectionMap({
  */
 export function ConnectionLegend() {
   const entries: [Tone, string][] = [
-    ["normal", "Signed, reaching the internet"],
-    ["quiet", "Signed, staying on this machine"],
-    ["look", "Not signed, reaching the internet"],
-    ["watch", "Not signed, staying on this machine"],
+    ["normal", "Signed, and open to the network"],
+    ["quiet", "Signed, and only talking to this machine"],
+    ["look", "Not signed, and open to the network"],
+    ["watch", "Not signed, but only talking to this machine"],
     ["unknown", "Could not be identified"],
   ];
   return (

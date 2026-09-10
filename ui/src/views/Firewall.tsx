@@ -84,7 +84,33 @@ type Program = {
   connections: Connection[];
   external: number;
   listening: number;
+  /**
+   * Listening on an address something else on the network can reach.
+   *
+   * Separate from `listening`, and the distinction is the whole point: a socket
+   * bound to `127.0.0.1` can only be reached by this machine, while one bound
+   * to `0.0.0.0` can be reached by anything on the network. Windows reports
+   * both as "listening" and neither as an outbound connection, so without this
+   * a program accepting connections from the whole network looked identical to
+   * one talking to itself — and was being coloured as though it were staying
+   * put. That was not a presentational nicety, it was the map stating something
+   * untrue.
+   */
+  reachable: number;
 };
+
+/** Whether a listening socket can be reached from off this machine. */
+function isReachable(connection: Connection): boolean {
+  if (connection.state !== "listening") return false;
+  const address = connection.local_address;
+  // Loopback only. Everything else — the wildcard `0.0.0.0` and `::`, and any
+  // real interface address — is reachable by something that is not us.
+  return !(
+    address === "127.0.0.1" ||
+    address === "::1" ||
+    address.startsWith("127.")
+  );
+}
 
 /**
  * Collapse a socket list into a program list.
@@ -118,12 +144,14 @@ function byProgram(connections: Connection[]): Program[] {
         connections: [],
         external: 0,
         listening: 0,
+        reachable: 0,
       };
       groups.set(key, program);
     }
     program.connections.push(connection);
     if (connection.external) program.external += 1;
     if (connection.state === "listening") program.listening += 1;
+    if (isReachable(connection)) program.reachable += 1;
   }
 
   // Same order as before, applied to programs: reaching the internet first,
@@ -147,8 +175,11 @@ function byProgram(connections: Connection[]): Program[] {
  */
 function toneOf(program: Program): Tone {
   if (program.unsigned === null) return "unknown";
-  if (program.unsigned) return program.external > 0 ? "look" : "watch";
-  return program.external > 0 ? "normal" : "quiet";
+  // Reaching out, or reachable from outside. Both leave this machine's edge,
+  // and a listener on 0.0.0.0 is the one people least expect to be there.
+  const exposed = program.external > 0 || program.reachable > 0;
+  if (program.unsigned) return exposed ? "look" : "watch";
+  return exposed ? "normal" : "quiet";
 }
 
 /** How alarming a tone is, only so a publisher can take its worst program's. */
@@ -219,7 +250,13 @@ function describe(program: Program): string {
     `${program.connections.length} ${program.connections.length === 1 ? "socket" : "sockets"}`,
   ];
   if (program.external > 0) parts.push(`${program.external} reaching the internet`);
-  if (program.listening > 0) parts.push(`${program.listening} listening`);
+  if (program.reachable > 0) {
+    parts.push(
+      `${program.reachable} listening where the network can reach ${program.reachable === 1 ? "it" : "them"}`,
+    );
+  } else if (program.listening > 0) {
+    parts.push(`${program.listening} listening, on this machine only`);
+  }
   parts.push(
     program.signer
       ? `signed by ${program.signer}`

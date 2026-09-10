@@ -235,8 +235,19 @@ mod tests {
         assert!(to_recycle_bin(&absent).is_err());
     }
 
+    /// Both answers, without asking whether Windows is feeling permissive.
+    ///
+    /// This used to assert that `C:\Windows\System32\kernel32.dll` was not
+    /// deletable, which is true for the account a person actually runs as and
+    /// false on a build agent, where the account is an administrator and can
+    /// genuinely write there. That assertion was about Windows' permissions
+    /// rather than about this function, and it broke the build for a day.
+    ///
+    /// The negative case is now a path whose parent does not exist, which no
+    /// privilege can make writable — a property of the function rather than of
+    /// whoever is running it.
     #[test]
-    fn a_writable_folder_is_deletable_and_a_system_one_is_not() {
+    fn a_writable_folder_is_deletable_and_a_missing_one_is_not() {
         let scratch = std::env::temp_dir().join(format!("kam-writable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).unwrap();
@@ -244,11 +255,14 @@ mod tests {
         std::fs::write(&mine, b"x").unwrap();
 
         assert!(deletable_by_this_account(&mine));
-        // Not writable without elevation, which is the case the window uses to
-        // decide it must offer quarantine instead.
-        assert!(!deletable_by_this_account(Path::new(
-            r"C:\Windows\System32\kernel32.dll"
-        )));
+
+        // No account, however privileged, can write into a directory that is
+        // not there.
+        assert!(!deletable_by_this_account(
+            &scratch.join("no-such-folder").join("thing.txt")
+        ));
+        // Nor into one with no parent at all.
+        assert!(!deletable_by_this_account(Path::new("")));
 
         let _ = std::fs::remove_dir_all(&scratch);
     }
