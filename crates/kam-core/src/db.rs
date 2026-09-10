@@ -9,13 +9,13 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::audit::{AuditLog, Effect, Entry, Record};
 use crate::{Error, Result};
 
 /// Bumped whenever the schema below changes. Stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE audit (
@@ -51,6 +51,71 @@ CREATE TABLE settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+";
+
+/// What the machine looked like last time, so it can be compared with itself.
+///
+/// # Comparing a machine to itself, not to a standard
+///
+/// Every other view here answers *what is true now*. This answers *what changed
+/// since last time*, which is the question people actually have and which
+/// nothing on Windows will tell them.
+///
+/// It is deliberately not a score. A score needs a notion of "correct", which
+/// this software does not have and must not invent — that is the whole business
+/// model of the products this replaces. A machine's own history needs nothing
+/// invented at all: a week with fourteen changes is different from a week with
+/// one, and the reader decides what that means.
+///
+/// # Identity is a name, not an event
+///
+/// A sighting is `(kind, scope, name)`, and it is recorded once however many
+/// times it is seen. Measured on the development machine: the event log holds
+/// 270 service-install events but only 62 distinct service names, and one
+/// anti-cheat accounts for 125 of those events because it reinstalls on every
+/// game launch. Reporting events would bury the two or three names a week that
+/// are genuinely new.
+///
+/// # Why `present` and `checked_at` are separate
+///
+/// The dangerous mistake here is inferring absence from a failed read. If a
+/// source cannot be enumerated for one sweep and everything under it is
+/// therefore reported as having vanished, the panel screams about nothing and is
+/// never trusted again. So a sighting is only ever marked gone by a sweep in
+/// which its source was actually read; see `Store::sweep`.
+///
+/// This table is where the baseline lives, which makes it security-critical: an
+/// attacker who could mark their own persistence as already-seen would silence
+/// the feature permanently. It sits in the same database as the audit log,
+/// which is why that file's permissions matter — SYSTEM and Administrators
+/// write, everybody else read.
+const SCHEMA_V3: &str = "
+CREATE TABLE sightings (
+    kind       TEXT    NOT NULL,
+    scope      TEXT    NOT NULL,
+    name       TEXT    NOT NULL,
+    detail     TEXT    NOT NULL,
+    first_seen TEXT    NOT NULL,
+    last_seen  TEXT    NOT NULL,
+    times_seen INTEGER NOT NULL DEFAULT 1,
+    -- How often this has come back after going away. Anti-cheat services do
+    -- this on every game launch; something that flaps is noted once rather
+    -- than reported every cycle, and never silently dropped.
+    flaps      INTEGER NOT NULL DEFAULT 0,
+    present    INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (kind, scope, name)
+);
+
+CREATE TABLE sweeps (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    at         TEXT    NOT NULL,
+    -- Sources that could not be read this time, one per line. A sweep that
+    -- could not see everything must not be allowed to conclude anything about
+    -- what it could not see.
+    unreadable TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE INDEX sweeps_at_idx ON sweeps (at DESC);
 ";
 
 /// Whether the protective work is running, as stored in `settings`.
@@ -185,6 +250,233 @@ impl Store {
         Ok(records)
     }
 
+    /// Record what the machine looks like now, and say what is different.
+    ///
+    /// # The rule that makes this trustworthy
+    ///
+    /// `unreadable` names the sources this sweep could not enumerate, and
+    /// nothing under those sources is allowed to be concluded missing. Without
+    /// that, a single permissions failure marks every startup entry as gone,
+    /// the person learns the panel invents alarms, and the feature is finished.
+    /// So a sighting is only marked vanished when its kind was actually read.
+    ///
+    /// # Why the first sweep says nothing
+    ///
+    /// There is nothing to compare against, so everything would be an
+    /// "appearance" and the whole machine would be reported as new. A baseline
+    /// records and reports nothing, and says so.
+    pub fn sweep(
+        &self,
+        seen: &[crate::changes::Sighting],
+        unreadable: &[String],
+    ) -> Result<crate::changes::Sweep> {
+        use crate::changes::{rank, Change, Difference, FLAPS_BEFORE_RECURRING};
+
+        let connection = self.lock()?;
+        let now: String = connection
+            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+                row.get(0)
+            })
+            .map_err(to_db_error)?;
+
+        let previous_at: Option<String> = connection
+            .query_row(
+                "SELECT at FROM sweeps ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_db_error)?;
+        let baseline = previous_at.is_none();
+
+        // Kinds this sweep genuinely looked at. A kind is readable unless a
+        // source that could not be read mentions it.
+        let readable = |kind: &str| {
+            !unreadable
+                .iter()
+                .any(|source| source.to_lowercase().contains(&kind.to_lowercase()))
+        };
+
+        let mut differences = Vec::new();
+
+        for sighting in seen {
+            let existing: Option<(String, i64, i64, i64)> = connection
+                .query_row(
+                    "SELECT detail, times_seen, flaps, present FROM sightings
+                     WHERE kind = ?1 AND scope = ?2 AND name = ?3",
+                    params![sighting.kind, sighting.scope, sighting.name],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(to_db_error)?;
+
+            match existing {
+                None => {
+                    connection
+                        .execute(
+                            "INSERT INTO sightings
+                               (kind, scope, name, detail, first_seen, last_seen)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                            params![
+                                sighting.kind,
+                                sighting.scope,
+                                sighting.name,
+                                sighting.detail,
+                                now
+                            ],
+                        )
+                        .map_err(to_db_error)?;
+                    if !baseline {
+                        differences.push(Difference {
+                            change: Change::Appeared,
+                            kind: sighting.kind.clone(),
+                            scope: sighting.scope.clone(),
+                            name: sighting.name.clone(),
+                            detail: sighting.detail.clone(),
+                            first_seen: now.clone(),
+                            last_seen: now.clone(),
+                            times_seen: 1,
+                        });
+                    }
+                }
+                Some((detail, times_seen, flaps, present)) => {
+                    // Coming back after having gone is a flap, not a fresh
+                    // appearance.
+                    let returned = present == 0;
+                    let flaps = if returned { flaps + 1 } else { flaps };
+                    connection
+                        .execute(
+                            "UPDATE sightings
+                                SET detail = ?4, last_seen = ?5,
+                                    times_seen = times_seen + 1,
+                                    flaps = ?6, present = 1
+                              WHERE kind = ?1 AND scope = ?2 AND name = ?3",
+                            params![
+                                sighting.kind,
+                                sighting.scope,
+                                sighting.name,
+                                sighting.detail,
+                                now,
+                                flaps
+                            ],
+                        )
+                        .map_err(to_db_error)?;
+
+                    if baseline {
+                        continue;
+                    }
+                    let change = if flaps >= FLAPS_BEFORE_RECURRING {
+                        Some(Change::Recurring)
+                    } else if returned {
+                        Some(Change::Appeared)
+                    } else if detail != sighting.detail {
+                        Some(Change::Altered)
+                    } else {
+                        None
+                    };
+                    if let Some(change) = change {
+                        differences.push(Difference {
+                            change,
+                            kind: sighting.kind.clone(),
+                            scope: sighting.scope.clone(),
+                            name: sighting.name.clone(),
+                            detail: sighting.detail.clone(),
+                            first_seen: String::new(),
+                            last_seen: now.clone(),
+                            times_seen: times_seen + 1,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Anything present last time, not seen now, whose source was readable.
+        let mut gone = connection
+            .prepare(
+                "SELECT kind, scope, name, detail, first_seen, last_seen, times_seen, flaps
+                   FROM sightings WHERE present = 1",
+            )
+            .map_err(to_db_error)?;
+        let candidates: Vec<(String, String, String, String, String, String, i64, i64)> = gone
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            })
+            .map_err(to_db_error)?
+            .filter_map(std::result::Result::ok)
+            .collect();
+        drop(gone);
+
+        for (kind, scope, name, detail, first_seen, last_seen, times_seen, flaps) in candidates {
+            let still_here = seen
+                .iter()
+                .any(|one| one.kind == kind && one.scope == scope && one.name == name);
+            if still_here {
+                continue;
+            }
+            // The rule. A source that could not be read this time proves
+            // nothing about what is under it.
+            if !readable(&kind) {
+                continue;
+            }
+
+            connection
+                .execute(
+                    "UPDATE sightings SET present = 0
+                      WHERE kind = ?1 AND scope = ?2 AND name = ?3",
+                    params![kind, scope, name],
+                )
+                .map_err(to_db_error)?;
+
+            if !baseline {
+                differences.push(Difference {
+                    change: if flaps >= FLAPS_BEFORE_RECURRING {
+                        Change::Recurring
+                    } else {
+                        Change::Vanished
+                    },
+                    kind,
+                    scope,
+                    name,
+                    detail,
+                    first_seen,
+                    last_seen,
+                    times_seen,
+                });
+            }
+        }
+
+        connection
+            .execute(
+                "INSERT INTO sweeps (at, unreadable) VALUES (?1, ?2)",
+                params![now, unreadable.join("\n")],
+            )
+            .map_err(to_db_error)?;
+
+        differences.sort_by(|a, b| {
+            rank(b.change)
+                .cmp(&rank(a.change))
+                .then_with(|| a.kind.cmp(&b.kind))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        Ok(crate::changes::Sweep {
+            differences,
+            unreadable: unreadable.to_vec(),
+            baseline,
+            previous_at,
+            at: now,
+        })
+    }
+
     /// The connection, taking it back from a panic rather than giving up on it.
     ///
     /// This used to return an error when the mutex was poisoned, which meant a
@@ -290,6 +582,9 @@ fn migrate(connection: &Connection) -> Result<()> {
     if current < 2 {
         connection.execute_batch(SCHEMA_V2).map_err(to_db_error)?;
     }
+    if current < 3 {
+        connection.execute_batch(SCHEMA_V3).map_err(to_db_error)?;
+    }
 
     connection
         .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -370,6 +665,167 @@ mod tests {
             forged.chars().count(),
             "flattening must not change the length"
         );
+    }
+
+    fn seen(kind: &str, name: &str, detail: &str) -> crate::changes::Sighting {
+        crate::changes::Sighting {
+            kind: kind.to_owned(),
+            scope: "machine".to_owned(),
+            name: name.to_owned(),
+            detail: detail.to_owned(),
+        }
+    }
+
+    /// The first sweep reports nothing at all.
+    ///
+    /// Everything on the machine would otherwise be an "appearance", and a
+    /// panel announcing that three hundred things just appeared is both useless
+    /// and false. Claiming findings against an empty baseline is the
+    /// invented-verdict pattern in miniature.
+    #[test]
+    fn a_first_sweep_is_a_baseline_and_finds_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        let sweep = store
+            .sweep(&[seen("service", "Thing", "C:\\thing.exe")], &[])
+            .unwrap();
+
+        assert!(sweep.baseline);
+        assert!(sweep.differences.is_empty(), "{:?}", sweep.differences);
+        assert!(sweep.previous_at.is_none());
+    }
+
+    #[test]
+    fn something_new_appears_and_something_removed_is_gone() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .sweep(&[seen("service", "Old", "C:\\old.exe")], &[])
+            .unwrap();
+
+        let sweep = store
+            .sweep(&[seen("service", "New", "C:\\new.exe")], &[])
+            .unwrap();
+
+        assert!(!sweep.baseline);
+        assert!(sweep.previous_at.is_some(), "the date of the last sweep");
+
+        let appeared = sweep
+            .differences
+            .iter()
+            .find(|d| d.name == "New")
+            .expect("the new one");
+        assert_eq!(appeared.change, crate::changes::Change::Appeared);
+
+        let gone = sweep
+            .differences
+            .iter()
+            .find(|d| d.name == "Old")
+            .expect("the removed one");
+        assert_eq!(gone.change, crate::changes::Change::Vanished);
+        // A disappearance ranks above an appearance: something protective being
+        // removed is at least as strong a signal, and Windows reports it
+        // nowhere.
+        assert_eq!(sweep.differences[0].name, "Old");
+    }
+
+    /// A source that could not be read proves nothing about what is under it.
+    ///
+    /// The failure this prevents: one permissions blip, every service reported
+    /// as removed, and a person who now knows the panel invents alarms. Absence
+    /// of evidence is not evidence of absence — the same error that cost this
+    /// project a day when a teammate's reports were silently undelivered and
+    /// read as idleness.
+    #[test]
+    fn a_source_that_could_not_be_read_concludes_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .sweep(
+                &[
+                    seen("service", "Antivirus", "C:\\av.exe"),
+                    seen("run_key", "Updater", "C:\\up.exe"),
+                ],
+                &[],
+            )
+            .unwrap();
+
+        // The services could not be enumerated this time. The Run key could.
+        let sweep = store
+            .sweep(
+                &[seen("run_key", "Updater", "C:\\up.exe")],
+                &["the list of services could not be read".to_owned()],
+            )
+            .unwrap();
+
+        assert!(
+            !sweep.differences.iter().any(|d| d.name == "Antivirus"),
+            "an unreadable source was reported as having lost something: {:?}",
+            sweep.differences
+        );
+        assert_eq!(sweep.unreadable.len(), 1, "and it says which source");
+
+        // And once it can be read again, the real absence is reported.
+        let sweep = store
+            .sweep(&[seen("run_key", "Updater", "C:\\up.exe")], &[])
+            .unwrap();
+        let gone = sweep
+            .differences
+            .iter()
+            .find(|d| d.name == "Antivirus")
+            .expect("now it is genuinely missing");
+        assert_eq!(gone.change, crate::changes::Change::Vanished);
+    }
+
+    #[test]
+    fn a_thing_that_stays_but_changes_what_it_runs_is_noticed() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .sweep(
+                &[seen("run_key", "Updater", "C:\\Program Files\\up.exe")],
+                &[],
+            )
+            .unwrap();
+
+        let sweep = store
+            .sweep(
+                &[seen("run_key", "Updater", "C:\\Users\\me\\AppData\\up.exe")],
+                &[],
+            )
+            .unwrap();
+
+        let altered = sweep.differences.first().expect("one difference");
+        assert_eq!(altered.change, crate::changes::Change::Altered);
+        assert!(altered.detail.contains("AppData"), "{}", altered.detail);
+    }
+
+    /// Something that comes and goes is noted once, not announced every cycle.
+    ///
+    /// Anti-cheat services reinstall on every game launch — 137 of 270 install
+    /// events on the development machine were one product doing this. Reporting
+    /// each cycle would bury everything else. It is never silently dropped,
+    /// though: a rule that hides flapping is a rule an attacker can use by
+    /// flapping.
+    #[test]
+    fn a_thing_that_comes_and_goes_is_marked_rather_than_repeated() {
+        let store = Store::open_in_memory().unwrap();
+        let present = [seen("service", "AntiCheat", "C:\\ac.exe")];
+
+        store.sweep(&present, &[]).unwrap();
+        // Three full cycles away and back.
+        for _ in 0..3 {
+            store.sweep(&[], &[]).unwrap();
+            store.sweep(&present, &[]).unwrap();
+        }
+
+        let sweep = store.sweep(&present, &[]).unwrap();
+        let note = sweep.differences.iter().find(|d| d.name == "AntiCheat");
+        // Either it is quiet now, or it says it comes and goes. What it must
+        // not do is keep announcing an appearance.
+        if let Some(note) = note {
+            assert_eq!(
+                note.change,
+                crate::changes::Change::Recurring,
+                "a flapping service was announced as though it were new"
+            );
+        }
     }
 
     #[test]
