@@ -70,6 +70,36 @@ fn wide(text: &str) -> Vec<u16> {
         .collect()
 }
 
+/// How many elements of `T` can be read at `value` without leaving `block`.
+///
+/// # Why this exists at all
+///
+/// `VerQueryValueW` hands back a pointer *into* the block along with a length,
+/// and is never told how big the block is — it can only bound itself using the
+/// resource's own header fields, and those were written by whoever wrote the
+/// file. Every one of these files is attacker-chosen and this runs inside a
+/// LocalSystem process, so "the API told me the length" is not a safety
+/// argument, it is a hope.
+///
+/// Adversarial review built a version block by hand with a lying length field
+/// and called the real `VerQueryValueW` on this build of Windows: the honest
+/// length came back clamped, and the oversized lie was rejected. So there is no
+/// live out-of-bounds read here. That is a fact about Windows 11 26200's
+/// implementation, though, not about this code — and the same reasoning
+/// ("the platform validates it") is the one this codebase has refused
+/// everywhere else. So the length is bounded here too, and the OS check becomes
+/// the second line rather than the only one.
+fn fits<T>(block: &[u8], value: *const core::ffi::c_void, count: u32) -> Option<usize> {
+    let start = block.as_ptr() as usize;
+    let offset = (value as usize).checked_sub(start)?;
+    if offset > block.len() {
+        return None;
+    }
+    let remaining = block.len() - offset;
+    let wanted = (count as usize).checked_mul(std::mem::size_of::<T>())?;
+    (wanted <= remaining).then_some(count as usize)
+}
+
 /// Read one string from an already-loaded version block.
 ///
 /// # Safety
@@ -77,6 +107,15 @@ fn wide(text: &str) -> Vec<u16> {
 /// `block` must be the buffer filled by `GetFileVersionInfoW`, and `language`
 /// the eight hex digits of a translation that block actually contains. Both
 /// hold at the single call site below.
+///
+/// # The unit is characters here and bytes below
+///
+/// `VerQueryValueW` reports the length of a **string** value in `u16`
+/// characters, and the length of a **binary** value in bytes. The translation
+/// lookup further down is a binary value and is therefore counted differently.
+/// Confirmed by measurement rather than read from documentation. Writing it
+/// down because the two reads look identical and unifying them would silently
+/// halve or double a bound.
 unsafe fn string_value(block: &[u8], language: &str, name: &str) -> Option<String> {
     let query = wide(&format!(r"\StringFileInfo\{language}\{name}"));
     let mut value: *mut core::ffi::c_void = std::ptr::null_mut();
@@ -94,9 +133,10 @@ unsafe fn string_value(block: &[u8], language: &str, name: &str) -> Option<Strin
         return None;
     }
 
-    // `length` counts characters including the terminator, which is not wanted
-    // in the string itself.
-    let characters = unsafe { std::slice::from_raw_parts(value as *const u16, length as usize) };
+    // Characters, not bytes. See the note above, and `fits` for why the answer
+    // is checked rather than taken.
+    let count = fits::<u16>(block, value, length)?;
+    let characters = unsafe { std::slice::from_raw_parts(value as *const u16, count) };
     let text = String::from_utf16_lossy(characters);
     let text = text.trim_end_matches('\0').trim().to_owned();
     (!text.is_empty()).then_some(text)
@@ -145,7 +185,14 @@ pub fn claims_of(path: &Path) -> Option<Claims> {
             &mut value,
             &mut length,
         );
-        if found.as_bool() && !value.is_null() && length >= 4 {
+        // Bytes here, not characters: this is a binary value, unlike the string
+        // reads above. Two `u16` is four bytes, which is what `length >= 4`
+        // checks, and `fits` re-checks the same span against the block.
+        if found.as_bool()
+            && !value.is_null()
+            && length >= 4
+            && fits::<u16>(&block, value, 2).is_some()
+        {
             let parts = std::slice::from_raw_parts(value as *const u16, 2);
             format!("{:04x}{:04x}", parts[0], parts[1])
         } else {
@@ -186,6 +233,41 @@ mod tests {
             claims.company.as_deref(),
             Some("Microsoft Corporation"),
             "claims: {claims:?}"
+        );
+    }
+
+    /// Nothing is read outside the block, whatever length comes back.
+    ///
+    /// `VerQueryValueW` returns a pointer into the block and a length, and is
+    /// never told how large the block is — it can only bound itself with the
+    /// resource's own header fields, which the file's author wrote. Adversarial
+    /// review established that this build of Windows does validate them, so
+    /// there is no live out-of-bounds read; this pins the bound anyway, because
+    /// "the platform checks it" is the argument this codebase has refused
+    /// everywhere else and a future build is not obliged to keep checking.
+    #[test]
+    fn a_length_that_runs_past_the_block_is_refused() {
+        let block = vec![0_u8; 64];
+        let base = block.as_ptr() as *const core::ffi::c_void;
+
+        // Exactly fits: 32 characters of u16 in 64 bytes.
+        assert_eq!(fits::<u16>(&block, base, 32), Some(32));
+        // One past the end.
+        assert_eq!(fits::<u16>(&block, base, 33), None);
+        // A length that would overflow the multiply rather than merely exceed.
+        assert_eq!(fits::<u16>(&block, base, u32::MAX), None);
+
+        // A pointer partway in still bounds against what is left, not the whole.
+        let middle = unsafe { block.as_ptr().add(60) } as *const core::ffi::c_void;
+        assert_eq!(fits::<u16>(&block, middle, 2), Some(2));
+        assert_eq!(fits::<u16>(&block, middle, 3), None);
+
+        // A pointer outside the block entirely is refused rather than wrapped.
+        let elsewhere = [0_u8; 8];
+        assert_eq!(
+            fits::<u16>(&block, elsewhere.as_ptr() as *const core::ffi::c_void, 1),
+            None,
+            "a pointer from somewhere else was accepted"
         );
     }
 

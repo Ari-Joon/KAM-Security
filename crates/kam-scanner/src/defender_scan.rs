@@ -162,6 +162,21 @@ fn checked_target(path: &str) -> std::result::Result<PathBuf, String> {
     Ok(PathBuf::from(plain))
 }
 
+/// Detections Defender has that it did not have before the scan.
+///
+/// Compared against a list taken beforehand rather than filtered by timestamp,
+/// so no clock and no date format has to be trusted. The key is the name paired
+/// with the detection time: two genuinely separate detections of the same threat
+/// in the same instant would collapse into one, which under-counts a display and
+/// changes nothing about what is reported.
+fn new_detections(known: &std::collections::HashSet<(String, Option<String>)>) -> Vec<Threat> {
+    crate::defender::threats()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|threat| !known.contains(&(threat.name.clone(), threat.detected_at.clone())))
+        .collect()
+}
+
 /// Ask Defender to scan, and report what it found.
 ///
 /// Blocks for as long as the scan runs, which for a full scan is hours, so the
@@ -258,11 +273,21 @@ pub fn run(kind: &ScanKind, cancel: &AtomicBool) -> Result<ScanOutcome> {
     // process printed. A file whose name carries a newline can write a
     // convincing line into that output; it cannot write a row into Defender's
     // own detection history.
-    let found: Vec<Threat> = crate::defender::threats()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|threat| !known.contains(&(threat.name.clone(), threat.detected_at.clone())))
-        .collect();
+    //
+    // Read twice, briefly apart, and only when the first read found nothing.
+    // `MpCmdRun` exiting and the detection appearing in `MSFT_MpThreatDetection`
+    // are not the same instant, and the direction of that race matters: it can
+    // only turn a real detection into an apparent clean result, which is the one
+    // outcome this must not produce. A second look costs a moment on the path
+    // where nothing was found and nothing at all on the path where something
+    // was. Raised in review; the lag is plausible rather than demonstrated,
+    // which is exactly the sort of thing to spend a second on rather than argue
+    // about.
+    let mut found = new_detections(&known);
+    if found.is_empty() {
+        std::thread::sleep(Duration::from_millis(1500));
+        found = new_detections(&known);
+    }
 
     if completed && caveat.is_none() && !found.is_empty() {
         caveat = Some(

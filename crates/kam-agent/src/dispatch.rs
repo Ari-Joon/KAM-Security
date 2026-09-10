@@ -654,7 +654,8 @@ pub fn handle(
                 format!("the window reported sending {path} to the Recycle Bin")
             } else {
                 format!(
-                    "the window reported removing {path}, which did not reach                      the Recycle Bin and cannot be restored from it"
+                    "the window reported removing {path}, which did not reach \
+                     the Recycle Bin and cannot be restored from it"
                 )
             };
             context.audit("cleanup", "recycle", Effect::Changed, detail);
