@@ -93,17 +93,21 @@ export const api = {
   deleteQuarantined: (id: string) => invoke<Removal>("delete_quarantined", { id }),
   emptyQuarantine: () => invoke<Removal>("empty_quarantine"),
   /**
-   * Remove a leftover directory permanently, in one step.
+   * Send something to the Recycle Bin.
    *
-   * The agent still holds it and then deletes it, through both fences those
-   * steps already have. What this saves is the second trip through the
-   * interface, not a check. There is no undo: ask first.
+   * Done in this process rather than by the agent, and that is deliberate: the
+   * Recycle Bin is per user, so a delete performed by the LocalSystem service
+   * would land in SYSTEM's bin where nobody can reach it. Here it goes to the
+   * person's own, and needs no privilege at all.
+   *
+   * `in_bin` is false when the item is gone but never arrived — Windows does
+   * that silently for anything too large for the bin — and `warning` says so in
+   * words. Do not report a recycle without checking it.
    */
-  deletePath: (path: string, reason: string) =>
-    invoke<Removal>("delete_path", { path, reason }),
-  /** The same, for one copy of a duplicated file. */
-  deleteCopy: (path: string, reason: string, chosen = false) =>
-    invoke<Removal>("delete_copy", { path, reason, chosen }),
+  recycleItem: (path: string) =>
+    invoke<{ in_bin: boolean; warning: string | null }>("recycle_item", { path }),
+  /** Whether this account could remove a path itself, without the agent. */
+  canRecycle: (path: string) => invoke<boolean>("can_recycle", { path }),
   reveal: (path: string) => invoke<void>("reveal_in_explorer", { path }),
   uninstall: (name: string, command: string) =>
     invoke<void>("run_uninstaller", { name, command }),

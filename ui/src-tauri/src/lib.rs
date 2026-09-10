@@ -178,6 +178,29 @@ struct DuplicateReport {
 #[tauri::command]
 fn recycle_item(path: String) -> Result<RecycleOutcome, String> {
     let outcome = recycle::to_recycle_bin(std::path::Path::new(&path))?;
+
+    // Recorded after the fact, and only after it worked.
+    //
+    // The agent no longer witnesses this act, so the log would otherwise hold
+    // some removals and not others with nothing marking which. Asking it to
+    // record the report closes that, and the entry it writes says the window
+    // reported it rather than that the agent did it.
+    //
+    // The order matters: a record written first would claim something that had
+    // not happened yet, and a failure between the two would leave a log saying
+    // a file went to the bin when it is still on disk. This way the log can
+    // only ever lag reality, never lead it.
+    //
+    // A failure to record is not a failure to recycle, and reporting it as one
+    // would be a lie in the other direction. It is logged where the developer
+    // can see it and the person is told what actually happened to their file.
+    if let Err(error) = kam_ipc::client::call(&Request::RecordRecycle {
+        path,
+        in_bin: outcome.in_bin,
+    }) {
+        eprintln!("the recycle could not be recorded in the audit log: {error}");
+    }
+
     Ok(RecycleOutcome {
         in_bin: outcome.in_bin,
         warning: outcome.warning,
@@ -212,26 +235,6 @@ fn delete_quarantined(id: String) -> Result<Removal, String> {
 #[tauri::command]
 fn empty_quarantine() -> Result<Removal, String> {
     finish_removal(kam_ipc::client::call(&Request::EmptyQuarantine))
-}
-
-/// Remove a leftover directory permanently, without holding it first.
-///
-/// The agent still holds it and then deletes it, through both of the fences
-/// those two steps already have; what this saves is the second journey through
-/// the interface, not a safety check. There is no undo, so the view asks first.
-#[tauri::command]
-fn delete_path(path: String, reason: String) -> Result<Removal, String> {
-    finish_removal(kam_ipc::client::call(&Request::DeletePath { path, reason }))
-}
-
-/// The same, for one copy of a duplicated file.
-#[tauri::command]
-fn delete_copy(path: String, reason: String, chosen: bool) -> Result<Removal, String> {
-    finish_removal(kam_ipc::client::call(&Request::DeleteCopy {
-        path,
-        reason,
-        chosen,
-    }))
 }
 
 #[derive(serde::Serialize)]
@@ -904,8 +907,6 @@ pub fn run() {
             restore_quarantined,
             delete_quarantined,
             empty_quarantine,
-            delete_path,
-            delete_copy,
             recycle_item,
             can_recycle,
             reveal_in_explorer,

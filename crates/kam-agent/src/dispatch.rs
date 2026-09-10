@@ -632,6 +632,35 @@ pub fn handle(
             Response::Acknowledged
         }
 
+        Request::RecordRecycle { path, in_bin } => {
+            // The window did this one, not the agent, and the entry says so.
+            //
+            // Recycling happens in the window because the Recycle Bin is per
+            // user and a LocalSystem delete lands in SYSTEM's, where nobody can
+            // reach it. The cost is that the privileged process no longer
+            // witnesses the act, so this is a report rather than a record of
+            // something seen. Phrasing it as a report keeps the log honest
+            // about which entries the agent stands behind.
+            //
+            // No fence is re-derived here, and there is deliberately nothing to
+            // fence: this changes only the log. A client that lied would write a
+            // false line about its own files, which it could do by recycling
+            // them for real. The audit value is in the true reports, and there
+            // is no privileged act to protect.
+            //
+            // The sentence is built here rather than accepted, so the only
+            // caller-supplied part is the path, which `record` flattens.
+            let detail = if in_bin {
+                format!("the window reported sending {path} to the Recycle Bin")
+            } else {
+                format!(
+                    "the window reported removing {path}, which did not reach                      the Recycle Bin and cannot be restored from it"
+                )
+            };
+            context.audit("cleanup", "recycle", Effect::Changed, detail);
+            Response::Acknowledged
+        }
+
         Request::GetDefenderThreats => match kam_scanner::defender::threats() {
             Ok(threats) => Response::DefenderThreats { threats },
             Err(error) => {
@@ -826,19 +855,6 @@ pub fn handle(
 
         Request::DeleteQuarantined { id } => delete_quarantined(&[id], context),
 
-        Request::DeletePath { path, reason } => {
-            hold_then_delete(quarantine_path(&path, &reason, context, user), context)
-        }
-
-        Request::DeleteCopy {
-            path,
-            reason,
-            chosen,
-        } => hold_then_delete(
-            quarantine_copy(&path, &reason, chosen, context, user),
-            context,
-        ),
-
         Request::EmptyQuarantine => {
             let held: Vec<String> = match context.quarantine.list() {
                 Ok(items) => items.into_iter().map(|item| item.id).collect(),
@@ -995,30 +1011,6 @@ fn quarantine_copy(
             }
         }
     }
-}
-
-/// Finish a permanent removal that has already passed its fence.
-///
-/// Takes the reply from whichever quarantine path applied and, if the item was
-/// really held, deletes it. Both halves reach the audit log — a `take` with its
-/// undo token, then a `delete` without one — which is the honest record: for a
-/// moment it *was* recoverable, and then the owner's instruction was carried
-/// out.
-///
-/// If the first half refused, that reply is passed through untouched. It has
-/// already been recorded and already says why, and re-wording it here would
-/// only make the same refusal read differently depending on which button was
-/// pressed.
-///
-/// If the second half fails, the item stays in quarantine and the reply carries
-/// the reason in `refused`. That is the safe way round: the caller asked for it
-/// gone and it is instead recoverable, which is a disappointment rather than a
-/// loss.
-fn hold_then_delete(held: Response, context: &Context) -> Response {
-    let Response::Quarantined(manifest) = held else {
-        return held;
-    };
-    delete_quarantined(&[manifest.id], context)
 }
 
 /// Delete quarantined items for good.
@@ -1663,105 +1655,6 @@ mod tests {
             std::fs::read(leftover.path.join("cache").join("blob.bin")).unwrap(),
             vec![7_u8; 4096],
             "the nested file did not survive byte for byte"
-        );
-    }
-
-    /// Deleting a leftover outright removes it and holds nothing.
-    ///
-    /// The point of the composition is that the fence is the quarantine fence,
-    /// so this checks the outcome the person asked for rather than the
-    /// mechanism: the directory is gone from disk, and it is *not* sitting in
-    /// quarantine afterwards. A version that held it and quietly failed to
-    /// delete it would look identical from the outside without the second
-    /// assertion.
-    #[test]
-    fn deleting_a_leftover_removes_it_and_leaves_nothing_held() {
-        let context = context(Mode::Console);
-        let leftover = Leftover::new("delete-outright");
-
-        let deleted = handle(
-            Request::DeletePath {
-                path: leftover.path.display().to_string(),
-                reason: "the owner asked for it gone".to_owned(),
-            },
-            &context,
-            &Reporter::silent(),
-            &leftover.user(),
-        );
-
-        let Response::Deleted {
-            items,
-            bytes_freed,
-            refused,
-        } = &deleted
-        else {
-            panic!("expected a deletion, got {deleted:?}");
-        };
-        assert_eq!(*items, 1, "refused: {refused:?}");
-        assert!(*bytes_freed >= 4096, "size was not measured: {bytes_freed}");
-        assert!(refused.is_empty(), "{refused:?}");
-
-        assert!(!leftover.path.exists(), "the directory is still on disk");
-        assert!(
-            context.quarantine.list().unwrap().is_empty(),
-            "it was held rather than deleted"
-        );
-
-        // Both halves are recorded: for a moment it was recoverable, and then
-        // the instruction was carried out.
-        let entries = context.store.recent_audit(50).unwrap();
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.action == "take" && entry.undo_token.is_some()),
-            "the holding half was not recorded"
-        );
-        let removal = entries
-            .iter()
-            .find(|entry| entry.action == "delete")
-            .expect("the deleting half was not recorded");
-        assert!(
-            removal.undo_token.is_none(),
-            "a deletion must not offer an undo token"
-        );
-    }
-
-    /// A path the fence refuses is refused, and nothing is deleted.
-    ///
-    /// The composition must not become a way around the fence it composes. A
-    /// directory Windows owns is refused for `QuarantinePath`, so it is refused
-    /// here for the same reason and by the same code.
-    #[test]
-    fn deleting_outright_still_obeys_the_quarantine_fence() {
-        let context = context(Mode::Console);
-        let leftover = Leftover::new("delete-fenced");
-
-        // A name on the deny list, planted inside the same throwaway profile.
-        let protected = leftover
-            .root
-            .join("AppData")
-            .join("Local")
-            .join("Microsoft");
-        std::fs::create_dir_all(&protected).unwrap();
-        std::fs::write(protected.join("keep.txt"), b"load bearing").unwrap();
-
-        let reply = handle(
-            Request::DeletePath {
-                path: protected.display().to_string(),
-                reason: "should never happen".to_owned(),
-            },
-            &context,
-            &Reporter::silent(),
-            &leftover.user(),
-        );
-
-        assert!(
-            matches!(reply, Response::Error { .. }),
-            "expected a refusal, got {reply:?}"
-        );
-        assert!(
-            protected.join("keep.txt").exists(),
-            "a directory Windows owns was deleted"
         );
     }
 

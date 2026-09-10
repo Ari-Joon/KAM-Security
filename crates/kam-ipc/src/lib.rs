@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -115,32 +115,7 @@ pub enum Request {
     DeleteQuarantined { id: String },
     /// Delete everything currently held. Same rules, once per item.
     EmptyQuarantine,
-    /// Remove a leftover directory permanently, in one step.
-    ///
-    /// # Composed, not new
-    ///
-    /// This is deliberately **not** a "delete this path" primitive. It holds
-    /// the directory through exactly the fence [`Request::QuarantinePath`]
-    /// uses, then deletes it through exactly the one
-    /// [`Request::DeleteQuarantined`] uses. Nothing here can reach a path that
-    /// `QuarantinePath` would have refused, and if the second half fails the
-    /// item is left safely in quarantine and the reply says so.
-    ///
-    /// The reason it exists at all is that reaching permanent deletion by
-    /// quarantining and then emptying is two journeys through the interface for
-    /// one decision, and a person clearing 40 GB of a dead vendor's leftovers
-    /// should not have to make it twice.
-    DeletePath { path: String, reason: String },
-    /// The same, for one copy of a duplicated file.
-    ///
-    /// Separate from [`Request::DeletePath`] because a different fence applies:
-    /// [`Request::QuarantineCopy`]'s, including whether this copy was one the
-    /// product suggested or one the person picked themselves.
-    DeleteCopy {
-        path: String,
-        reason: String,
-        chosen: bool,
-    },
+
     /// Record that a file's hash was sent to VirusTotal.
     ///
     /// The lookup happens in the window, because the VirusTotal client is
@@ -151,6 +126,42 @@ pub enum Request {
     /// could write free-form entries could write a plausible history of things
     /// that never happened.
     RecordLookup { sha256: String, outcome: String },
+    /// Record that the window sent something to the Recycle Bin.
+    ///
+    /// # Why the window asks instead of the agent doing it
+    ///
+    /// The Recycle Bin is per user, so a delete performed by LocalSystem lands
+    /// in SYSTEM's bin, where the person cannot see it or get it back. The
+    /// window therefore does the recycling itself, as them, needing no
+    /// privilege for something they could have done in Explorer.
+    ///
+    /// That leaves a hole this request exists to close. The audit log is
+    /// written by the agent recording its own acts, so a removal done in the
+    /// window would be absent from it — and a record where some removals appear
+    /// and others do not, with nothing marking which, is worse than the
+    /// privileged path it replaced. Raised in review after the recycling was
+    /// built, which is exactly how a logging gap ships unnoticed: the change
+    /// was correct about privilege, and that made it look finished.
+    ///
+    /// # It says who did it
+    ///
+    /// The entry is phrased as a report from the window, not as something the
+    /// agent carried out, because that is the truth and the two are worth
+    /// different amounts. Everything else in the log was performed by the
+    /// privileged process itself; this was performed by a client and taken on
+    /// trust.
+    ///
+    /// The client supplies a path and a boolean. It does not supply the
+    /// sentence — the agent writes that — so this is narrower than
+    /// [`Request::RecordLookup`], which at least accepts a phrase.
+    RecordRecycle {
+        path: String,
+        /// False when the item is gone but never reached the bin, which Windows
+        /// does silently for anything too large for it. Recorded rather than
+        /// smoothed over: "deleted permanently" and "recoverable" are the two
+        /// facts a person most needs this log to keep straight.
+        in_bin: bool,
+    },
     /// Whether a weekly check is registered, and when it runs.
     GetSchedule,
     /// Register the weekly check, or take it away.

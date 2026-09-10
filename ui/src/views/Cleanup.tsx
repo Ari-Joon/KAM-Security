@@ -87,16 +87,6 @@ function OrphanRow({
   busy: boolean;
 }) {
   const [open, setOpen] = useState(false);
-  /**
-   * Whether the delete is one press away.
-   *
-   * Deleting is offered here rather than only from the quarantine list, because
-   * reaching it the other way is two journeys through the interface for one
-   * decision. It is not offered as *easily*: quarantine stays the plain button,
-   * this is the quiet one, and it asks before it acts. The asking is the whole
-   * difference between offering a choice and setting a trap.
-   */
-  const [confirming, setConfirming] = useState(false);
 
   return (
     <li className={`orphan orphan-${orphan.confidence}`}>
@@ -109,42 +99,28 @@ function OrphanRow({
           </span>
           <span className="orphan-size">{fmt.bytes(orphan.bytes)}</span>
         </button>
-        {confirming ? (
-          <>
-            <span className="held-warn">Delete for good?</span>
-            <button
-              className="orphan-action danger"
-              disabled={busy}
-              onClick={() => {
-                setConfirming(false);
-                onDelete(orphan);
-              }}
-            >
-              Yes, delete
-            </button>
-            <button className="ghost" onClick={() => setConfirming(false)}>
-              No
-            </button>
-          </>
-        ) : (
-          <>
-            <button
-              className="orphan-action"
-              disabled={busy}
-              onClick={() => onQuarantine(orphan)}
-            >
-              Quarantine
-            </button>
-            <button
-              className="ghost"
-              disabled={busy}
-              title="Remove it permanently instead of holding it for 30 days"
-              onClick={() => setConfirming(true)}
-            >
-              Delete
-            </button>
-          </>
-        )}
+        {/*
+          Neither of these is a one-way door, so neither asks twice.
+          A confirmation before a reversible act teaches people to click
+          through confirmations, which is exactly the habit you want them
+          not to have by the time something really is irreversible.
+        */}
+        <button
+          className="orphan-action"
+          disabled={busy}
+          title="Move it aside where this program can put it back for 30 days"
+          onClick={() => onQuarantine(orphan)}
+        >
+          Quarantine
+        </button>
+        <button
+          className="ghost"
+          disabled={busy}
+          title="Send it to the Recycle Bin, where Windows can put it back"
+          onClick={() => onDelete(orphan)}
+        >
+          Recycle Bin
+        </button>
       </div>
       {open && (
         <div className="orphan-detail">
@@ -184,10 +160,16 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const [clearingCache, setClearingCache] = useState<string | null>(null);
   const [openCache, setOpenCache] = useState<string | null>(null);
   const [cleared, setCleared] = useState<Record<string, Cleared>>({});
-  /** Which held item is one press from being deleted for good. */
+  /**
+   * Which held item is one press from being deleted for good.
+   *
+   * Only the quarantine list needs this now. Everything in the lists above is
+   * reversible — quarantine puts it back, the Recycle Bin puts it back — and
+   * confirming a reversible act teaches people to click through confirmations,
+   * which is the habit you least want them to have by the time one is real.
+   * This is the one that is real.
+   */
   const [confirming, setConfirming] = useState<string | null>(null);
-  /** The same, for a duplicate copy still out on disk, keyed by its path. */
-  const [confirmingCopy, setConfirmingCopy] = useState<string | null>(null);
   const [emptying, setEmptying] = useState(false);
   /**
    * Which copy of a set the person has chosen to keep, by set.
@@ -424,28 +406,21 @@ export default function Cleanup({ volumes, onChanged }: Props) {
 
 
   /**
-   * Delete one redundant copy permanently, having been asked twice.
+   * Send one redundant copy to the Recycle Bin.
    *
-   * Same fence as holding it, and the same shape as `deleteOrphan`: the agent
-   * holds the copy and then deletes it, so a failure in the second half leaves
-   * it recoverable rather than half gone.
+   * Same reasoning as `recycleOrphan`: the window does it, so the copy lands in
+   * this person's bin rather than SYSTEM's, and no privilege is involved in
+   * removing a file they own.
    */
-  async function removeCopyForGood(path: string, bytes: number, chosen: boolean) {
+  async function recycleCopy(path: string, bytes: number) {
     setBusyPath(path);
     setError(null);
     try {
-      const removal = await api.deleteCopy(
-        path,
-        chosen
-          ? "you chose which copy to keep, and this was not it"
-          : "a redundant copy of an identical file",
-        chosen,
-      );
+      const outcome = await api.recycleItem(path);
       setNote(
-        removal.items > 0
-          ? `Deleted ${fmt.bytes(removal.bytes_freed || bytes)}: ${path}. This one cannot be undone.`
-          : `${path} could not be deleted, so it is held in quarantine below instead: ` +
-              `${removal.refused[0] ?? "no reason given"}`,
+        outcome.in_bin
+          ? `Sent ${fmt.bytes(bytes)} to the Recycle Bin: ${path}`
+          : (outcome.warning ?? `${path} was removed but did not reach the Recycle Bin.`),
       );
       setDuplicates((current) =>
         current
@@ -457,9 +432,11 @@ export default function Cleanup({ volumes, onChanged }: Props) {
               .filter((group) => group.copies.length > 1)
           : current,
       );
-      await loadQuarantine();
     } catch (cause) {
-      setError(reason(cause));
+      setError(
+        `${reason(cause)} — if this copy is not yours to delete, hold it instead ` +
+          `and it can be put back for 30 days.`,
+      );
     } finally {
       setBusyPath(null);
       onChanged();
@@ -551,42 +528,37 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   }
 
   /**
-   * Remove a leftover directory permanently, having been asked twice.
+   * Send a leftover directory to the Recycle Bin.
    *
-   * The agent holds it and then deletes it, so it passes the same fence a
-   * quarantine would and the audit log records both halves. If the deleting
-   * half fails the item is still held, and saying so matters: the person
-   * expects it gone, and finding it in the list below without explanation
-   * would read as the product ignoring them.
+   * The window does this itself rather than asking the agent, and that is the
+   * point rather than a shortcut: the Recycle Bin is per user, so a delete
+   * performed by a LocalSystem service lands in SYSTEM's bin, somewhere the
+   * person can neither see nor restore from. Doing it here puts it in theirs,
+   * where it comes back with a right-click in a program they already know.
+   *
+   * If it will not go — a path this account cannot write — the answer is
+   * quarantine, never a privileged delete standing in for a recycle.
    */
-  async function deleteOrphan(orphan: Orphan) {
+  async function recycleOrphan(orphan: Orphan) {
     setBusyPath(orphan.path);
     setError(null);
     try {
-      const removal = await api.deletePath(
-        orphan.path,
-        `left behind: ${orphan.reasons[0] ?? "no installed application matches it"}`,
+      const outcome = await api.recycleItem(orphan.path);
+      setNote(
+        outcome.in_bin
+          ? `Sent ${orphan.name} (${fmt.bytes(orphan.bytes)}) to the Recycle Bin. ` +
+              `It is in there until you empty it.`
+          : (outcome.warning ??
+            `${orphan.name} was removed but did not reach the Recycle Bin.`),
       );
-      if (removal.items > 0) {
-        setNote(
-          `Deleted ${orphan.name} for good, freeing ` +
-            `${fmt.bytes(removal.bytes_freed || orphan.bytes)}. This one cannot be undone.`,
-        );
-        setOrphans((current) =>
-          current ? current.filter((item) => item.path !== orphan.path) : current,
-        );
-      } else {
-        setNote(
-          `${orphan.name} could not be deleted, so it is being held in ` +
-            `quarantine below instead: ${removal.refused[0] ?? "no reason given"}`,
-        );
-        setOrphans((current) =>
-          current ? current.filter((item) => item.path !== orphan.path) : current,
-        );
-      }
-      await loadQuarantine();
+      setOrphans((current) =>
+        current ? current.filter((item) => item.path !== orphan.path) : current,
+      );
     } catch (cause) {
-      setError(reason(cause));
+      setError(
+        `${reason(cause)} — if this folder is not yours to delete, quarantine it ` +
+          `instead and it can be put back for 30 days.`,
+      );
     } finally {
       setBusyPath(null);
       onChanged();
@@ -615,8 +587,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           <h1>Cleanup</h1>
           <p className="lede">
             Directories left behind by software that is no longer installed.
-            Quarantine is the default and can be put back for 30 days; deleting
-            is offered beside it, asks first, and cannot be undone.
+            Nothing here is destroyed: quarantine holds it where this program
+            can put it back, the Recycle Bin holds it where Windows can.
           </p>
         </div>
       </div>
@@ -664,11 +636,17 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             for 30 days.
           </li>
           <li>
-            <strong>Delete</strong> sits beside every Quarantine button and does
-            the other thing: the item is held and then removed, in one step,
-            permanently. It asks before it acts, and the log records both
-            halves. Use it when you already know — the 30 days exist for when
-            you do not.
+            <strong>Recycle Bin</strong> sits beside it and does the ordinary
+            thing instead: the item goes where anything you delete in Explorer
+            goes, and comes back the same way. Use it when you would rather not
+            learn a second place things are kept. It is your bin, not the
+            service's, so it appears where you expect — and this program records
+            that it happened without pretending it did it for you.
+          </li>
+          <li>
+            Deleting something so that it is <em>really</em> gone is a separate
+            act, and it lives in the quarantine list below. Nothing on this page
+            destroys anything.
           </li>
         </ol>
         <p className="muted">
@@ -738,7 +716,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                   orphan={orphan}
                   busy={busyPath === orphan.path}
                   onQuarantine={(item) => void quarantine(item)}
-                  onDelete={(item) => void deleteOrphan(item)}
+                  onDelete={(item) => void recycleOrphan(item)}
                 />
               ))}
             </ul>
@@ -1048,38 +1026,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                                             Keep this one instead
                                           </button>
                                         )}
-                                        {keeper &&
-                                          (confirmingCopy === copy.path ? (
-                                            <>
-                                              <span className="held-warn">
-                                                Delete for good?
-                                              </span>
-                                              <button
-                                                className="dupe-take danger"
-                                                disabled={busyPath !== null}
-                                                onClick={(event) => {
-                                                  event.stopPropagation();
-                                                  setConfirmingCopy(null);
-                                                  void removeCopyForGood(
-                                                    copy.path,
-                                                    group.bytes,
-                                                    !ours,
-                                                  );
-                                                }}
-                                              >
-                                                Yes, delete
-                                              </button>
-                                              <button
-                                                className="ghost"
-                                                onClick={(event) => {
-                                                  event.stopPropagation();
-                                                  setConfirmingCopy(null);
-                                                }}
-                                              >
-                                                No
-                                              </button>
-                                            </>
-                                          ) : (
+                                        {keeper && (
                                             <>
                                               <button
                                                 className="dupe-take"
@@ -1099,16 +1046,16 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                                               <button
                                                 className="ghost"
                                                 disabled={busyPath !== null}
-                                                title="Delete this copy permanently instead of holding it for 30 days"
+                                                title="Send this copy to the Recycle Bin, where Windows can put it back"
                                                 onClick={(event) => {
                                                   event.stopPropagation();
-                                                  setConfirmingCopy(copy.path);
+                                                  void recycleCopy(copy.path, group.bytes);
                                                 }}
                                               >
-                                                Delete
+                                                Recycle Bin
                                               </button>
                                             </>
-                                          ))}
+                                          )}
                                       </>
                                     )}
                                   </span>
