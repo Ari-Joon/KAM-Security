@@ -83,6 +83,23 @@ function Row({ item }: { item: Difference }) {
           <span className="action">{CHANGE_LABEL[item.change]}</span>
         </div>
         <div className="detail">{item.detail || <span className="muted">No command recorded.</span>}</div>
+
+        {item.was_trusted ? (
+          /* The case a path comparison cannot see: the entry has not moved and
+             the command is identical, but the file it points at is not the file
+             it was. Said in its own line rather than folded into the metadata,
+             because "was signed by somebody, now nothing vouches for it" is the
+             plainest statement this software is able to make about a thing
+             having been replaced where it stands.
+
+             It is still not a verdict. Software gets re-signed, certificates
+             expire, an installer swaps a binary for a legitimate update. What
+             is shown is what was observed, and the reader decides. */
+          <div className="notice notice-warn" style={{ marginTop: 6 }}>
+            The file behind this was {item.was_trusted}. It is now {item.trust}.
+          </div>
+        ) : null}
+
         <div className="small muted">
           {kind} in {item.scope}
           {item.change === "appeared" ? null : (
@@ -91,6 +108,7 @@ function Row({ item }: { item: Difference }) {
               {item.times_seen > 1 ? ` · seen ${fmt.count(item.times_seen)} times` : null}
             </>
           )}
+          {item.was_trusted ? null : <>{" · "}{item.trust}</>}
         </div>
       </div>
     </li>
@@ -147,16 +165,100 @@ export default function Changes({ sweep }: { sweep: Sweep | null }) {
       {sweep.baseline ? (
         /* Nothing to compare against yet. Reporting findings on a first run
            would mean inventing a past that was never observed. */
-        <section className="panel">
-          <div className="panel-head">
-            <h2>Baseline recorded</h2>
-          </div>
-          <p className="panel-lede">
-            This is the first look, taken {longDate(sweep.at)}. There is nothing
-            to compare it against yet, so nothing is reported. Comparisons begin
-            from the next sweep.
-          </p>
-        </section>
+        <>
+          <section className="panel">
+            <div className="panel-head">
+              <h2>Baseline recorded</h2>
+            </div>
+            <p className="panel-lede">
+              This is the first look, taken {longDate(sweep.at)}. There is
+              nothing to compare it against yet, so nothing is reported.
+              Comparisons begin from the next sweep.
+            </p>
+            {sweep.unreadable.length > 0 ? (
+              <p className="notice notice-warn">
+                Some of what this looks at could not be read, so the baseline
+                does not cover it. Nothing is claimed about it either way.
+              </p>
+            ) : null}
+            {sweep.unreadable.length > 0 ? (
+              <ul className="small muted" style={{ margin: "6px 0 0 18px" }}>
+                {sweep.unreadable.map((reason) => (
+                  <li key={reason}>{reason}</li>
+                ))}
+              </ul>
+            ) : null}
+          </section>
+
+          {sweep.unvouched.length > 0 ? (
+            /* The unavoidable weakness of a baseline, stated rather than
+               hidden: it learns whatever is on the machine at the moment it is
+               taken. Something unwanted that was already here is recorded as
+               ordinary and will never be reported as having appeared, because
+               it did not appear.
+
+               Nothing can be done about that in general. What can be done is to
+               say so. This is not a list of findings and must never read as
+               one — it is the caveat on the baseline, and every ordinary
+               machine has plenty of entries on it. */
+            <section className="panel">
+              <div className="panel-head">
+                <h2>Already here when this started watching</h2>
+                <span className="panel-count">{sweep.unvouched.length}</span>
+              </div>
+              <p className="panel-lede">
+                These were on the machine before the first look, and no valid
+                signature vouches for the files behind them. That is not a
+                finding and none of them is accused of anything: plenty of
+                legitimate software is unsigned, and a great deal of it is
+                older than this program.
+              </p>
+              <p className="panel-lede">
+                It is here because a baseline can only learn what is in front of
+                it. Anything already present was recorded as ordinary and will
+                never be reported as having appeared, because it did not appear.
+                This is the one moment that gap can be named, so it is named.
+                Nothing here has immunity afterwards — if one of these changes
+                later, it is reported like anything else.
+              </p>
+              <ul className="entries">
+                {sweep.unvouched.map((item) => (
+                  <li className="entry" key={`${item.kind}|${item.scope}|${item.name}`}>
+                    <span
+                      aria-hidden
+                      title={categoryOf(item.kind).label}
+                      style={{
+                        width: 9,
+                        height: 9,
+                        borderRadius: 2,
+                        background: categoryOf(item.kind).colour,
+                        flex: "0 0 auto",
+                        marginTop: 6,
+                      }}
+                    />
+                    <div className="entry-body">
+                      <div className="entry-title">
+                        <span className="module">{item.name}</span>
+                        {/* The phrase itself says which of the two this is:
+                            "not signed" is a fact about the file, "could not be
+                            checked" is a limit on what could be seen. They are
+                            not collapsed into one word. */}
+                        <span className="action">{item.trust}</span>
+                      </div>
+                      <div className="detail">
+                        {item.detail || <span className="muted">No command recorded.</span>}
+                      </div>
+                      <div className="small muted">
+                        {KIND_LABEL[item.kind] ?? item.kind.replace(/_/g, " ")} in{" "}
+                        {item.scope}
+                      </div>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ) : null}
+        </>
       ) : (
         <>
           <section className="panel">
@@ -184,10 +286,19 @@ export default function Changes({ sweep }: { sweep: Sweep | null }) {
               /* A source that could not be read concludes nothing about what is
                  under it. Saying so out loud is the difference between an
                  honest gap and a silent one. */
-              <p className="notice notice-warn">
-                Could not check {sweep.unreadable.join(", ")}. Nothing is claimed
-                about {sweep.unreadable.length === 1 ? "it" : "them"} either way.
-              </p>
+              <>
+                <p className="notice notice-warn">
+                  Some of what this looks at could not be read this time, so
+                  nothing under it is reported as having gone. Nothing is
+                  claimed about {sweep.unreadable.length === 1 ? "it" : "them"}{" "}
+                  either way.
+                </p>
+                <ul className="small muted" style={{ margin: "6px 0 0 18px" }}>
+                  {sweep.unreadable.map((reason) => (
+                    <li key={reason}>{reason}</li>
+                  ))}
+                </ul>
+              </>
             ) : null}
 
             {total === 0 ? (
