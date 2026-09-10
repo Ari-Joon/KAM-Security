@@ -582,14 +582,53 @@ mod tests {
         }
     }
 
+    /// A real file on disk that removes itself when the test ends.
+    ///
+    /// The previous version made a `kam-behaviour-<pid>` directory to hold
+    /// these, and each test deleted its own file and left the directory. One
+    /// empty folder per test run, twenty-six of them on the development
+    /// machine before anybody noticed. Small, but this is a program that
+    /// offers to tidy somebody's disk, and leaving litter on it is the one
+    /// kind of bug it cannot afford to have.
+    ///
+    /// Two changes. No directory, because a directory is a second thing that
+    /// has to be removed by somebody and nobody was. And the removal happens
+    /// in `Drop` rather than at the end of each test, because a test that
+    /// fails an assertion never reaches its last line — so the old cleanup was
+    /// skipped exactly when a run left the most behind.
+    struct Scratch(PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     /// A real script on disk, so signature and existence checks behave. Nothing
     /// in it runs.
-    fn scratch(name: &str, body: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kam-behaviour-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(name);
+    fn scratch(name: &str, body: &str) -> Scratch {
+        // Unique per call as well as per process: these tests run in parallel,
+        // and two of them writing the same name would be a race that shows up
+        // as a mystery failure once in a hundred runs.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Still inside the temp folder, which is what the rules under test care
+        // about; the name carries its extension, which is the other thing they
+        // read.
+        let path = std::env::temp_dir().join(format!(
+            "kam-behaviour-{}-{unique}-{name}",
+            std::process::id()
+        ));
         std::fs::write(&path, body).unwrap();
-        path
+        Scratch(path)
     }
 
     #[test]
@@ -609,7 +648,6 @@ mod tests {
             .to_lowercase()
             .contains("nugetframeworks.csproj"));
         assert!(!observation.evidence.is_empty());
-        std::fs::remove_file(&project).ok();
     }
 
     #[test]
@@ -622,7 +660,6 @@ mod tests {
         // Note the script lives in a temp dir, which dropper_place reads as Temp.
         let observation = judge_process(&start("conhost.exe", &command)).expect("must fire");
         assert_eq!(observation.concern, Concern::Strong);
-        std::fs::remove_file(&script).ok();
     }
 
     #[test]
@@ -650,7 +687,6 @@ mod tests {
             if let Some(observation) = observation {
                 assert_ne!(observation.concern, Concern::Strong, "{:?}", observation);
             }
-            std::fs::remove_file(&project).ok();
         }
     }
 
@@ -698,7 +734,6 @@ mod tests {
         assert_eq!(observation.concern, Concern::Strong);
         assert_eq!(observation.kind, Kind::ScheduledTask);
         assert!(observation.summary.to_lowercase().contains("hidden"));
-        std::fs::remove_file(&script).ok();
     }
 
     #[test]
@@ -721,7 +756,6 @@ mod tests {
         if let Some(observation) = observation {
             assert_eq!(observation.concern, Concern::Notable, "{observation:?}");
         }
-        std::fs::remove_file(&program).ok();
     }
 
     #[test]
