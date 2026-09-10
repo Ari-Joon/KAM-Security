@@ -36,6 +36,16 @@ $ErrorActionPreference = 'Continue'
 $root = Split-Path $PSScriptRoot -Parent
 $failures = @()
 
+# Work from the repository, whatever directory this was started from.
+#
+# Missed on the first version, which passed for me only because I happened to
+# be standing in the repository root when I ran it. Started from anywhere else
+# -- an administrator prompt opens in System32, which is exactly where Ari ran
+# it -- cargo cannot find Cargo.toml and every Rust step fails for a reason
+# that has nothing to do with the code. A check that works from one directory
+# and lies from every other is worse than no check.
+Push-Location $root
+
 # The single most important line here. Without it clippy warns and this script
 # would pass while CI failed, which is the exact hole it exists to close.
 $env:RUSTFLAGS = '-D warnings'
@@ -62,6 +72,7 @@ if (-not $SkipFrontend) {
             & npm ci --ignore-scripts
             if ($LASTEXITCODE -eq 0) { & npm run build }
         } finally { Pop-Location }
+        # Back in the repository root, which every cargo step below needs.
     }
 } else {
     Write-Host ''
@@ -91,6 +102,8 @@ if (Get-Command cargo-deny -ErrorAction SilentlyContinue) {
     Write-Host '  CI runs it, so this machine cannot tell you the push will pass.' -ForegroundColor Yellow
     Write-Host '  Install it with:  cargo install --locked cargo-deny' -ForegroundColor Yellow
 }
+
+Pop-Location
 
 Write-Host ''
 if ($failures.Count -gt 0) {
