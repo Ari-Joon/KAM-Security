@@ -26,6 +26,8 @@ import type {
   ConnectionReport,
   Remnants,
   Removal,
+  ScanKind,
+  ScanOutcome,
   Schedule,
 } from "./types";
 
@@ -108,6 +110,17 @@ export const api = {
     invoke<{ in_bin: boolean; warning: string | null }>("recycle_item", { path }),
   /** Whether this account could remove a path itself, without the agent. */
   canRecycle: (path: string) => invoke<boolean>("can_recycle", { path }),
+  /**
+   * Ask Windows Defender to scan.
+   *
+   * Long: a quick scan is minutes, a full scan is hours. Streams progress and
+   * can be stopped, like the duplicate search. Resolves to null when stopped.
+   *
+   * Defender is asked to report rather than to act, so anything in `found` is
+   * still exactly where it was.
+   */
+  defenderScan: (kind: ScanKind, job: string) =>
+    invoke<ScanOutcome | null>("defender_scan", { kind, job }),
   reveal: (path: string) => invoke<void>("reveal_in_explorer", { path }),
   uninstall: (name: string, command: string) =>
     invoke<void>("run_uninstaller", { name, command }),

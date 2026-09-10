@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, reason } from "../lib/api";
 import ProgressBar from "../components/ProgressBar";
-import { runJob, stopJob, type Progress } from "../lib/jobs";
+import { newJobId, runJob, stopJob, type Progress } from "../lib/jobs";
+import * as fmt from "../lib/format";
 import type {
   Anchor,
   BehaviourReport,
@@ -17,6 +18,7 @@ import type {
   RuleReport,
   Signature,
   Verdict,
+  ScanOutcome,
   Threat,
 } from "../lib/types";
 
@@ -247,6 +249,8 @@ export default function Scanner() {
         </>
       )}
 
+      <DefenderScan />
+
       <Canaries />
 
       <Hardening />
@@ -262,7 +266,6 @@ export default function Scanner() {
           <h2>Still to come</h2>
         </div>
         <ul className="planned">
-          <li>Starting and stopping scans, with progress rather than a frozen button.</li>
           <li>
             YARA rules aimed at what Defender tolerates — bundled adware,
             scareware optimisers, browser hijackers.
@@ -448,6 +451,145 @@ function signatureLabel(signature: Signature): string {
     case "unknown":
       return "could not be checked";
   }
+}
+
+/**
+ * Running Windows Defender's own scanner from here.
+ *
+ * This adds no detection. Defender is already installed, already has the
+ * signatures, and is already better at this than anything this project could
+ * write. What it lacks is reach: starting a scan means going and finding
+ * another application, and the results then live somewhere nobody looks.
+ *
+ * Two things this panel must not do. It must not present a scan that was
+ * stopped as though it came back clean, because a scan that did not finish and
+ * found nothing has established nothing. And it must not imply the machine has
+ * been cleaned: Defender is deliberately asked to report rather than to act, so
+ * anything found is still exactly where it was.
+ */
+function DefenderScan() {
+  const [running, setRunning] = useState<null | "quick" | "full">(null);
+  const [job, setJob] = useState<string | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [outcome, setOutcome] = useState<ScanOutcome | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // Defender does not report progress in any form this can read, so the honest
+  // thing to show is how long it has been going rather than a bar that would be
+  // inventing a fraction.
+  useEffect(() => {
+    if (!running) return;
+    setElapsed(0);
+    const started = Date.now();
+    const tick = window.setInterval(
+      () => setElapsed(Math.round((Date.now() - started) / 1000)),
+      1000,
+    );
+    return () => window.clearInterval(tick);
+  }, [running]);
+
+  async function start(which: "quick" | "full") {
+    const id = newJobId();
+    setRunning(which);
+    setJob(id);
+    setOutcome(null);
+    setError(null);
+    try {
+      const result = await api.defenderScan({ kind: which }, id);
+      // Null means stopped, which is not a result and must not be shown as one.
+      setOutcome(result);
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
+      setRunning(null);
+      setJob(null);
+    }
+  }
+
+  async function stop() {
+    if (job) await stopJob(job);
+  }
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>Scan with Defender</h2>
+        {running ? (
+          <button onClick={() => void stop()}>Stop</button>
+        ) : (
+          <div className="panel-actions">
+            <button onClick={() => void start("quick")}>Quick scan</button>
+            <button className="ghost" onClick={() => void start("full")}>
+              Full scan
+            </button>
+          </div>
+        )}
+      </div>
+
+      <p className="muted">
+        This runs Windows Defender, not a scanner of ours — it already has the
+        signatures and is already watching this machine. What it does not have
+        is a way to start it from here and see the answer without going looking.
+        A quick scan takes minutes; a full scan can take hours and can be
+        stopped.
+      </p>
+      <p className="muted">
+        Defender is asked to <strong>report</strong> rather than to remove.
+        Anything it finds stays where it is, and what happens to it is decided
+        here, where it can be undone.
+      </p>
+
+      {error && <p className="error">{error}</p>}
+
+      {running && (
+        <p className="muted">
+          {running === "quick" ? "Quick scan" : "Full scan"} running —{" "}
+          {fmt.duration(elapsed * 1000)} so far. You can leave this page.
+        </p>
+      )}
+
+      {outcome && (
+        <div className="scan-outcome">
+          <p>
+            {outcome.label} {outcome.completed ? "finished" : "was stopped"} after{" "}
+            {fmt.duration(outcome.seconds * 1000)}.
+          </p>
+          {!outcome.completed && (
+            <p className="held-warn">
+              It did not finish, so this says nothing about the parts it never
+              reached.
+            </p>
+          )}
+          {outcome.found.length === 0 ? (
+            <p className="muted">
+              {outcome.completed
+                ? "Defender recorded nothing new."
+                : "Nothing was recorded in the part that ran."}
+            </p>
+          ) : (
+            <>
+              <p>
+                Defender recorded {outcome.found.length}{" "}
+                {outcome.found.length === 1 ? "detection" : "detections"} it did
+                not have before:
+              </p>
+              <ul className="threats">
+                {outcome.found.map((threat) => (
+                  <li key={`${threat.name}-${threat.detected_at ?? ""}`}>
+                    <strong>{threat.name}</strong>
+                    {threat.detected_at && (
+                      <span className="muted"> — {threat.detected_at}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          {outcome.caveat && <p className="muted">{outcome.caveat}</p>}
+        </div>
+      )}
+    </section>
+  );
 }
 
 /**

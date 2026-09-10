@@ -661,6 +661,57 @@ pub fn handle(
             Response::Acknowledged
         }
 
+        Request::DefenderScan { kind, job } => {
+            // Registered like any other long job so it can be stopped: a full
+            // scan runs for hours, and an interface that offers no way out of
+            // that is worse than not offering it.
+            context.register_job(&job, reporter.cancel_token());
+            let outcome = kam_scanner::defender_scan::run(&kind, &reporter.cancel_token());
+            context.finish_job(&job);
+
+            match outcome {
+                Ok(outcome) => {
+                    // Recorded either way, and the entry says whether it
+                    // finished. A scan that was stopped early and found nothing
+                    // has established nothing, and the log should not later read
+                    // as though the machine came back clean.
+                    context.audit(
+                        "defender",
+                        "scan",
+                        Effect::Observed,
+                        format!(
+                            "{} {} in {} seconds; {} new {} recorded by Defender",
+                            outcome.label,
+                            if outcome.completed {
+                                "finished"
+                            } else {
+                                "was stopped before finishing"
+                            },
+                            outcome.seconds,
+                            outcome.found.len(),
+                            if outcome.found.len() == 1 {
+                                "detection"
+                            } else {
+                                "detections"
+                            }
+                        ),
+                    );
+                    Response::DefenderScanned(outcome)
+                }
+                Err(error) => {
+                    context.audit(
+                        "defender",
+                        "scan",
+                        Effect::Refused,
+                        format!("could not run {}: {error}", kind.label()),
+                    );
+                    Response::Error {
+                        message: error.to_string(),
+                    }
+                }
+            }
+        }
+
         Request::GetDefenderThreats => match kam_scanner::defender::threats() {
             Ok(threats) => Response::DefenderThreats { threats },
             Err(error) => {

@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -126,6 +126,31 @@ pub enum Request {
     /// could write free-form entries could write a plausible history of things
     /// that never happened.
     RecordLookup { sha256: String, outcome: String },
+    /// Ask Windows Defender to scan, and bring back what it found.
+    ///
+    /// # This is reach, not detection
+    ///
+    /// KAM does not detect malware and this does not change that. Defender is
+    /// already installed, already has the signatures, and is already better at
+    /// it than anything here could be. What is missing is that starting a scan
+    /// means going and finding another application, and its results then live
+    /// somewhere nobody looks. This starts it and brings the answer back.
+    ///
+    /// # Defender reports; this product acts
+    ///
+    /// The scan runs with remediation switched off, so anything found is still
+    /// where it was and the decision comes back here. That is not tidiness:
+    /// left able to act, Defender follows a link and removes the real file
+    /// somewhere else entirely, outside every fence and every audit entry this
+    /// software has. Destroying things is done by the one path that is fenced
+    /// and recorded, or it is not done.
+    ///
+    /// Long enough to need a job id, like the duplicate search: a full scan runs
+    /// for hours and has to be stoppable.
+    DefenderScan {
+        kind: kam_scanner::defender_scan::ScanKind,
+        job: String,
+    },
     /// Record that the window sent something to the Recycle Bin.
     ///
     /// # Why the window asks instead of the agent doing it
@@ -399,6 +424,8 @@ pub enum Response {
         /// Anything that could not be removed, phrased for a person.
         refused: Vec<String>,
     },
+    /// What a Defender scan came to.
+    DefenderScanned(kam_scanner::defender_scan::ScanOutcome),
     /// Nothing to return beyond "recorded".
     Acknowledged,
     QuarantineList {

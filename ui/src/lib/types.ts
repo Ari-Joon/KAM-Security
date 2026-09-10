@@ -320,6 +320,42 @@ export type DefenderReport = {
   concerns: string[];
 };
 
+/**
+ * A scan KAM asks Windows Defender to run.
+ *
+ * Serialised to match the Rust enum's tag, so the shape matters: `{ kind:
+ * "quick" }`, `{ kind: "full" }`, or `{ kind: "path", path: "C:\..." }`.
+ */
+export type ScanKind =
+  | { kind: "quick" }
+  | { kind: "full" }
+  | { kind: "path"; path: string };
+
+/** What a Defender scan came to. */
+export type ScanOutcome = {
+  label: string;
+  /**
+   * False when it was stopped or timed out.
+   *
+   * Load-bearing: a scan that did not finish and found nothing has not
+   * established that there is nothing, and the panel must not let it read that
+   * way.
+   */
+  completed: boolean;
+  exit_code: number | null;
+  seconds: number;
+  /**
+   * Detections Defender recorded that it did not have before this scan.
+   *
+   * Read from Defender's own records rather than parsed out of its console
+   * output, because a filename containing a line break can write a convincing
+   * "no threats found" line into that output.
+   */
+  found: Threat[];
+  /** Set when the result is worth less than it appears. */
+  caveat: string | null;
+};
+
 export type Threat = {
   name: string;
   severity: number | null;

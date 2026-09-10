@@ -165,6 +165,35 @@ struct DuplicateReport {
     summary: DuplicateSummary,
 }
 
+/// Ask Windows Defender to scan, and bring back what it found.
+///
+/// Runs in the agent because `MpCmdRun` wants to be LocalSystem, and streams
+/// like the duplicate search because a full scan runs for hours and has to be
+/// stoppable from the window that started it.
+///
+/// Defender is asked to *report*, not to act — see the request's own note. So a
+/// result carrying detections is a list of things still sitting where they were,
+/// and the decision about them comes back here.
+#[tauri::command]
+async fn defender_scan(
+    app: tauri::AppHandle,
+    kind: kam_scanner::defender_scan::ScanKind,
+    job: String,
+) -> Result<Option<kam_scanner::defender_scan::ScanOutcome>, String> {
+    stream_job(
+        app,
+        job.clone(),
+        Request::DefenderScan { kind, job },
+        |response| match response {
+            Response::DefenderScanned(outcome) => Ok(Some(outcome)),
+            Response::Stopped => Ok(None),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        },
+    )
+    .await
+}
+
 /// Send one thing to the Recycle Bin.
 ///
 /// Done here rather than through the agent, and that is the point rather than a
@@ -870,6 +899,7 @@ pub fn run() {
             list_applications,
             list_applications_preview,
             find_duplicates,
+            defender_scan,
             defender_status,
             defender_threats,
             behaviour_events,

@@ -13,6 +13,7 @@
 
 pub mod behaviour;
 pub mod defender;
+pub mod defender_scan;
 pub mod extensions;
 pub mod hardening;
 pub mod persistence;
