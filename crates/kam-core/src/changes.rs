@@ -78,6 +78,28 @@ pub enum Change {
 }
 
 impl Change {
+    /// The name this is stored under. Stable across versions: these go into the
+    /// database, so renaming one would make old history unreadable.
+    pub fn stored(self) -> &'static str {
+        match self {
+            Self::Appeared => "appeared",
+            Self::Altered => "altered",
+            Self::Vanished => "vanished",
+            Self::Recurring => "recurring",
+        }
+    }
+
+    /// Read one back. Anything unrecognised is treated as an alteration rather
+    /// than dropped, so a row written by a newer version is still counted.
+    pub fn from_stored(text: &str) -> Self {
+        match text {
+            "appeared" => Self::Appeared,
+            "vanished" => Self::Vanished,
+            "recurring" => Self::Recurring,
+            _ => Self::Altered,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Appeared => "appeared",
@@ -91,6 +113,14 @@ impl Change {
 /// One difference between this sweep and the machine's own history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Difference {
+    /// When this was noticed, which is not when it happened.
+    ///
+    /// The distinction is worth keeping honest about: this software sees a
+    /// difference between two sweeps, so all it can say is that the change was
+    /// there by now and was not there before. Presenting a sweep time as the
+    /// moment something was installed would be inventing a precision nobody
+    /// has.
+    pub at: String,
     pub change: Change,
     pub kind: String,
     pub scope: String,
@@ -123,6 +153,14 @@ pub struct Sweep {
     /// rather than saying "since last week" about eleven days ago.
     pub previous_at: Option<String>,
     pub at: String,
+    /// Every difference from the last twelve weeks, newest first.
+    ///
+    /// Not the same thing as `differences`, which is only this sweep. This is
+    /// what lets the machine be charted against itself: a bar per week whose
+    /// height is how much changed, answering "is this week like my other
+    /// weeks". That question needs history, and a table that only remembers
+    /// the present cannot answer it.
+    pub history: Vec<Difference>,
 }
 
 /// Appearances and disappearances are worth more attention than either a change

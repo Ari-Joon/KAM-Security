@@ -27,6 +27,7 @@ import type {
   Remnants,
   Removal,
   ScanKind,
+  Sweep,
   ScanOutcome,
   Schedule,
 } from "./types";
@@ -110,6 +111,14 @@ export const api = {
     invoke<{ in_bin: boolean; warning: string | null }>("recycle_item", { path }),
   /** Whether this account could remove a path itself, without the agent. */
   canRecycle: (path: string) => invoke<boolean>("can_recycle", { path }),
+  /**
+   * Compare the machine with what it looked like last time.
+   *
+   * The only call here that answers what is *different* rather than what is
+   * true. Each call also records a new baseline, so calling it twice in a row
+   * legitimately reports nothing the second time.
+   */
+  sweepForChanges: () => invoke<Sweep>("sweep_for_changes"),
   /**
    * Ask Windows Defender to scan.
    *

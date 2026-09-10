@@ -15,7 +15,7 @@ use crate::audit::{AuditLog, Effect, Entry, Record};
 use crate::{Error, Result};
 
 /// Bumped whenever the schema below changes. Stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE audit (
@@ -116,6 +116,30 @@ CREATE TABLE sweeps (
 );
 
 CREATE INDEX sweeps_at_idx ON sweeps (at DESC);
+";
+
+/// Every difference, kept so the machine can be charted against itself.
+///
+/// The sightings table holds what is true now; this holds what happened. Both
+/// are needed: a bar per week showing how much changed is the two-second read,
+/// and it cannot be derived from a table that only remembers the present.
+///
+/// Append-only in spirit but not enforced by trigger, unlike the audit log.
+/// That is deliberate rather than an oversight — this is a derived record that
+/// can be rebuilt by sweeping again, where the audit log is the thing being
+/// protected and can never be rebuilt at all.
+const SCHEMA_V4: &str = "
+CREATE TABLE changes (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    at     TEXT NOT NULL,
+    change TEXT NOT NULL,
+    kind   TEXT NOT NULL,
+    scope  TEXT NOT NULL,
+    name   TEXT NOT NULL,
+    detail TEXT NOT NULL
+);
+
+CREATE INDEX changes_at_idx ON changes (at DESC);
 ";
 
 /// Whether the protective work is running, as stored in `settings`.
@@ -344,6 +368,7 @@ impl Store {
                         .map_err(to_db_error)?;
                     if !baseline {
                         differences.push(Difference {
+                            at: now.clone(),
                             change: Change::Appeared,
                             kind: sighting.kind.clone(),
                             scope: sighting.scope.clone(),
@@ -392,6 +417,7 @@ impl Store {
                     };
                     if let Some(change) = change {
                         differences.push(Difference {
+                            at: now.clone(),
                             change,
                             kind: sighting.kind.clone(),
                             scope: sighting.scope.clone(),
@@ -464,6 +490,7 @@ impl Store {
 
             if !baseline {
                 differences.push(Difference {
+                    at: now.clone(),
                     change: if flaps >= FLAPS_BEFORE_RECURRING {
                         Change::Recurring
                     } else {
@@ -494,12 +521,60 @@ impl Store {
                 .then_with(|| a.name.cmp(&b.name))
         });
 
+        // Kept so the machine can be charted against itself later. A sweep that
+        // found nothing still counts as a week with nothing in it, which is the
+        // comparison that makes a busy week legible.
+        for difference in &differences {
+            connection
+                .execute(
+                    "INSERT INTO changes (at, change, kind, scope, name, detail)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        difference.at,
+                        difference.change.stored(),
+                        difference.kind,
+                        difference.scope,
+                        difference.name,
+                        difference.detail
+                    ],
+                )
+                .map_err(to_db_error)?;
+        }
+
+        let mut recent = connection
+            .prepare(
+                "SELECT at, change, kind, scope, name, detail FROM changes
+                  WHERE at >= datetime('now', '-84 days')
+                  ORDER BY at DESC LIMIT 2000",
+            )
+            .map_err(to_db_error)?;
+        let history: Vec<Difference> = recent
+            .query_map([], |row| {
+                let stored: String = row.get(1)?;
+                Ok(Difference {
+                    at: row.get(0)?,
+                    change: Change::from_stored(&stored),
+                    kind: row.get(2)?,
+                    scope: row.get(3)?,
+                    name: row.get(4)?,
+                    detail: row.get(5)?,
+                    first_seen: String::new(),
+                    last_seen: String::new(),
+                    times_seen: 0,
+                })
+            })
+            .map_err(to_db_error)?
+            .filter_map(std::result::Result::ok)
+            .collect();
+        drop(recent);
+
         Ok(crate::changes::Sweep {
             differences,
             unreadable: unreadable.to_vec(),
             baseline,
             previous_at,
             at: now,
+            history,
         })
     }
 
@@ -610,6 +685,9 @@ fn migrate(connection: &Connection) -> Result<()> {
     }
     if current < 3 {
         connection.execute_batch(SCHEMA_V3).map_err(to_db_error)?;
+    }
+    if current < 4 {
+        connection.execute_batch(SCHEMA_V4).map_err(to_db_error)?;
     }
 
     connection
@@ -801,6 +879,63 @@ mod tests {
             .find(|d| d.name == "Antivirus")
             .expect("now it is genuinely missing");
         assert_eq!(gone.change, crate::changes::Change::Vanished);
+    }
+
+    /// History accumulates across sweeps, so the machine can be charted.
+    ///
+    /// The `differences` list is only ever this sweep. Without a separate
+    /// record of what happened, "is this week like my other weeks" cannot be
+    /// asked at all — a table that remembers only the present has no answer to
+    /// a question about the past.
+    #[test]
+    fn what_changed_is_kept_so_the_machine_can_be_charted() {
+        let store = Store::open_in_memory().unwrap();
+        store.sweep(&[seen("service", "One", "a")], &[]).unwrap();
+
+        let first = store
+            .sweep(
+                &[seen("service", "One", "a"), seen("service", "Two", "b")],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(first.differences.len(), 1);
+        assert_eq!(first.history.len(), 1, "the first change is remembered");
+
+        let second = store
+            .sweep(
+                &[
+                    seen("service", "One", "a"),
+                    seen("service", "Two", "b"),
+                    seen("service", "Three", "c"),
+                ],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(second.differences.len(), 1, "only this sweep's change");
+        assert_eq!(
+            second.history.len(),
+            2,
+            "but both changes are in the history"
+        );
+
+        // Newest first, and each carries the date it was noticed so it can be
+        // put in the right week.
+        assert!(second.history.iter().all(|one| !one.at.is_empty()));
+        assert!(second.history[0].at >= second.history[1].at);
+
+        // A sweep that found nothing does not lose the history.
+        let quiet = store
+            .sweep(
+                &[
+                    seen("service", "One", "a"),
+                    seen("service", "Two", "b"),
+                    seen("service", "Three", "c"),
+                ],
+                &[],
+            )
+            .unwrap();
+        assert!(quiet.differences.is_empty(), "a quiet sweep");
+        assert_eq!(quiet.history.len(), 2, "and the past is still there");
     }
 
     #[test]

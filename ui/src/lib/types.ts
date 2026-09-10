@@ -356,6 +356,58 @@ export type ScanOutcome = {
   caveat: string | null;
 };
 
+/** What happened to one thing between two sweeps. */
+export type ChangeKind = "appeared" | "altered" | "vanished" | "recurring";
+
+/** One difference between the machine now and the machine last time. */
+export type Difference = {
+  /**
+   * When it was *noticed*, which is not when it happened.
+   *
+   * All this software can say is that a thing was there by this sweep and not
+   * by the last one. Presenting a sweep time as the moment something was
+   * installed would invent a precision nobody has.
+   */
+  at: string;
+  change: ChangeKind;
+  /**
+   * "service" | "run_key" | "run_once_key" | "startup_item" |
+   * "scheduled_task" | "administrator"
+   *
+   * Stable strings, not display labels: they are stored, so renaming one would
+   * make every machine's history read as new at once.
+   */
+  kind: string;
+  /** Where it lives, lowercased. Separates one account's entries from another's. */
+  scope: string;
+  name: string;
+  /** What it actually runs. */
+  detail: string;
+  first_seen: string;
+  last_seen: string;
+  times_seen: number;
+};
+
+/** What one sweep found, and what it could not look at. */
+export type Sweep = {
+  /** This sweep's differences, most notable first. */
+  differences: Difference[];
+  /**
+   * Sources that could not be read, in plain words.
+   *
+   * Must be shown. A source that was skipped and not mentioned is a lie by
+   * omission in a product whose whole claim is that it says what it did.
+   */
+  unreadable: string[];
+  /** True on the very first sweep, when there was nothing to compare against. */
+  baseline: boolean;
+  /** The real date of the previous sweep. Say this, never "since last week". */
+  previous_at: string | null;
+  at: string;
+  /** Every difference from the last twelve weeks, newest first. */
+  history: Difference[];
+};
+
 export type Threat = {
   name: string;
   severity: number | null;
