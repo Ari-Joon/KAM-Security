@@ -595,6 +595,17 @@ export type Connection = {
   process_id: number;
   image_path: string | null;
   name: string | null;
+  /**
+   * What the file says it is, from its own version resource.
+   *
+   * A claim and not evidence: anybody can type "Google Chrome" into a file's
+   * resources. It is here so a list of forty `svchost.exe` rows can be read at
+   * all. The verified half is `signer`, and the two must never be shown as
+   * equal weight.
+   */
+  description: string | null;
+  /** Who the file says wrote it. Also unverified — compare against `signer`. */
+  company: string | null;
   signer: string | null;
   /** null means the owning program could not be identified — not "unsigned". */
   unsigned: boolean | null;

@@ -13,6 +13,7 @@ pub mod mui;
 pub mod progress;
 pub mod registry;
 pub mod user;
+pub mod version;
 
 pub use db::Store;
 pub use error::{Error, Result};

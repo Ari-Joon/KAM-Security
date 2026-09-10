@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, reason } from "../lib/api";
 import type {
   Connection,
@@ -63,69 +63,222 @@ function Profiles({ profiles }: { profiles: ProfileState[] }) {
   );
 }
 
-function ConnectionRow({
-  connection,
+/** What one program is doing on the network, with all of its sockets. */
+type Program = {
+  /** The image path, or a stand-in key when the owner could not be read. */
+  key: string;
+  path: string | null;
+  /** The best name available: what the file says it is, else its file name. */
+  label: string;
+  /** The file name, kept when the label came from somewhere else. */
+  file: string | null;
+  company: string | null;
+  signer: string | null;
+  unsigned: boolean | null;
+  connections: Connection[];
+  external: number;
+  listening: number;
+};
+
+/**
+ * Collapse a socket list into a program list.
+ *
+ * A real machine has dozens of sockets and a handful of programs, and the flat
+ * list this replaces showed the program's name once per socket — so reading it
+ * meant doing this grouping in your head, over and over, every time the list
+ * refreshed. The information is identical; what changes is how much work it
+ * takes to get at.
+ */
+function byProgram(connections: Connection[]): Program[] {
+  const groups = new Map<string, Program>();
+
+  for (const connection of connections) {
+    // Sockets whose owner could not be read are still worth showing, and are
+    // kept apart by process id rather than merged into one meaningless heap.
+    const key = connection.image_path ?? `pid:${connection.process_id}`;
+    let program = groups.get(key);
+    if (!program) {
+      program = {
+        key,
+        path: connection.image_path,
+        label:
+          connection.description ??
+          connection.name ??
+          `unidentified program (process ${connection.process_id})`,
+        file: connection.name,
+        company: connection.company,
+        signer: connection.signer,
+        unsigned: connection.unsigned,
+        connections: [],
+        external: 0,
+        listening: 0,
+      };
+      groups.set(key, program);
+    }
+    program.connections.push(connection);
+    if (connection.external) program.external += 1;
+    if (connection.state === "listening") program.listening += 1;
+  }
+
+  // Same order as before, applied to programs: reaching the internet first,
+  // then unsigned, then the busiest.
+  return [...groups.values()].sort(
+    (a, b) =>
+      Number(b.external > 0) - Number(a.external > 0) ||
+      Number(b.unsigned === true) - Number(a.unsigned === true) ||
+      b.connections.length - a.connections.length ||
+      a.label.localeCompare(b.label),
+  );
+}
+
+/** Whether a program matches what someone typed. */
+function matches(program: Program, query: string): boolean {
+  if (!query) return true;
+  const needle = query.toLowerCase();
+  const haystack = [
+    program.label,
+    program.file,
+    program.company,
+    program.signer,
+    program.path,
+    ...program.connections.flatMap((connection) => [
+      connection.remote_address,
+      connection.remote_port === null ? null : String(connection.remote_port),
+      String(connection.local_port),
+      connection.protocol,
+    ]),
+  ];
+  return haystack.some((part) => part?.toLowerCase().includes(needle));
+}
+
+function stateLabel(state: Connection["state"]): string {
+  switch (state) {
+    case "established":
+      return "connected";
+    case "listening":
+      return "listening";
+    case "connectionless":
+      return "bound";
+    default:
+      return "opening";
+  }
+}
+
+function ProgramGroup({
+  program,
   onBlock,
   busy,
+  open,
+  onToggle,
 }: {
-  connection: Connection;
+  program: Program;
   onBlock: (path: string, name: string) => void;
   busy: boolean;
+  open: boolean;
+  onToggle: () => void;
 }) {
-  const peer =
-    connection.remote_address === null
-      ? null
-      : `${connection.remote_address}:${connection.remote_port ?? 0}`;
-
   return (
-    <li className={`conn${connection.external ? " conn-external" : ""}`}>
-      <div className="conn-head">
-        <span className="conn-name">{connection.name ?? "unidentified program"}</span>
-        <span className="conn-proto">
-          {connection.protocol} · {connection.state === "established"
-            ? "connected"
-            : connection.state === "listening"
-              ? "listening"
-              : connection.state === "connectionless"
-                ? "bound"
-                : "opening"}
-        </span>
-        {connection.image_path && (
+    <li className={`prog${program.external > 0 ? " prog-external" : ""}`}>
+      <div className="prog-head">
+        <button className="prog-toggle" onClick={onToggle}>
+          <span className="app-caret">{open ? "▾" : "▸"}</span>
+          <span className="prog-label">{program.label}</span>
+          {/*
+            The counts are the summary. Someone scanning this list wants to know
+            which programs are talking to the internet and how much, without
+            opening anything.
+          */}
+          <span className="prog-counts">
+            {program.external > 0 && (
+              <span className="prog-badge prog-badge-external">
+                {program.external} to the internet
+              </span>
+            )}
+            {program.listening > 0 && (
+              <span className="prog-badge">{program.listening} listening</span>
+            )}
+            <span className="prog-badge prog-badge-quiet">
+              {program.connections.length}{" "}
+              {program.connections.length === 1 ? "socket" : "sockets"}
+            </span>
+          </span>
+        </button>
+        {program.path && (
           <button
             className="link-button conn-block"
             disabled={busy}
-            onClick={() =>
-              onBlock(connection.image_path ?? "", connection.name ?? "this program")
-            }
+            onClick={() => onBlock(program.path ?? "", program.label)}
           >
             Block
           </button>
         )}
       </div>
 
-      <div className="conn-detail">
-        {peer ? (
-          <span className="conn-peer">{peer}</span>
-        ) : (
-          <span className="conn-peer">port {connection.local_port}</span>
-        )}
-        <span className="conn-signer">
-          {connection.signer
-            ? connection.signer
-            : connection.unsigned === null
-              ? "could not identify the program"
+      {/*
+        Signed-by is on the collapsed row because it is the one fact here that
+        cannot be forged. The description above it can be typed into a file by
+        anybody, so the two must never look like equal evidence.
+      */}
+      <div className="prog-identity">
+        <span
+          className={
+            program.signer
+              ? "prog-signer"
+              : program.unsigned === null
+                ? "prog-signer prog-signer-unknown"
+                : "prog-signer prog-signer-none"
+          }
+        >
+          {program.signer
+            ? `signed by ${program.signer}`
+            : program.unsigned === null
+              ? "could not be identified"
               : "not signed"}
         </span>
+        {program.company && program.company !== program.signer && (
+          <span className="prog-claim">claims {program.company}</span>
+        )}
+        {program.file && program.file !== program.label && (
+          <span className="prog-file">{program.file}</span>
+        )}
       </div>
 
-      {connection.image_path && (
-        <button
-          className="conn-path"
-          title="Open the containing folder"
-          onClick={() => void api.reveal(connection.image_path ?? "")}
-        >
-          {connection.image_path}
-        </button>
+      {open && (
+        <div className="prog-detail">
+          <ul className="conns">
+            {program.connections.map((connection, index) => {
+              const peer =
+                connection.remote_address === null
+                  ? null
+                  : `${connection.remote_address}:${connection.remote_port ?? 0}`;
+              return (
+                <li
+                  key={`${connection.local_port}-${index}`}
+                  className={`conn${connection.external ? " conn-external" : ""}`}
+                >
+                  <span className="conn-proto">
+                    {connection.protocol} · {stateLabel(connection.state)}
+                  </span>
+                  <span className="conn-peer">
+                    {peer ?? `port ${connection.local_port}`}
+                  </span>
+                  {peer && (
+                    <span className="conn-local">from port {connection.local_port}</span>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+          {program.path && (
+            <button
+              className="conn-path"
+              title="Open the containing folder"
+              onClick={() => void api.reveal(program.path ?? "")}
+            >
+              {program.path}
+            </button>
+          )}
+        </div>
       )}
     </li>
   );
@@ -165,6 +318,50 @@ export default function Firewall() {
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState<{ path: string; name: string } | null>(null);
   const [showAllRules, setShowAllRules] = useState(false);
+  /** Free text, matched against everything on screen and everything under it. */
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<"all" | "external" | "listening" | "unsigned">(
+    "all",
+  );
+  /** One program open at a time, so the list never becomes a wall again. */
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  /**
+   * Programs rather than sockets.
+   *
+   * `connectionless` sockets are left out here as they were before: a bound UDP
+   * socket with no peer is not something a person can act on, and forty of them
+   * bury the rows that are.
+   */
+  const programs = useMemo(
+    () =>
+      byProgram(
+        (live?.connections ?? []).filter(
+          (connection) => connection.state !== "connectionless",
+        ),
+      ),
+    [live],
+  );
+
+  const shown = useMemo(
+    () =>
+      programs.filter((program) => {
+        if (!matches(program, query)) return false;
+        switch (filter) {
+          case "external":
+            return program.external > 0;
+          case "listening":
+            return program.listening > 0;
+          case "unsigned":
+            // Only a real "no signature". Unknown is not a finding, and
+            // sweeping it in here would turn a filter into an accusation.
+            return program.unsigned === true;
+          default:
+            return true;
+        }
+      }),
+    [programs, query, filter],
+  );
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -337,29 +534,74 @@ export default function Firewall() {
       <section className="panel">
         <div className="panel-head">
           <h2>What is connected right now</h2>
+          {programs.length > 0 && (
+            <span className="panel-count">
+              {shown.length === programs.length
+                ? `${programs.length} programs`
+                : `${shown.length} of ${programs.length} programs`}
+            </span>
+          )}
         </div>
         <p className="muted">
-          Every open socket, joined to the program that owns it and to whoever
-          signed that program. Sorted by what is reaching the internet first.
-          Blocking here adds one rule and changes nothing else.
+          Every open socket, grouped by the program that owns it. What a program
+          says it is comes from the file itself and can say anything; who signed
+          it cannot. Blocking here adds one rule and changes nothing else.
         </p>
+
+        {live !== null && live.connections.length > 0 && (
+          <div className="conn-controls">
+            <input
+              className="conn-search"
+              type="search"
+              placeholder="Search program, company, address or port"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+            <div className="conn-filters">
+              {(
+                [
+                  ["all", "All"],
+                  ["external", "Reaching the internet"],
+                  ["listening", "Listening"],
+                  ["unsigned", "Not signed"],
+                ] as const
+              ).map(([value, label]) => (
+                <button
+                  key={value}
+                  className={`chip${filter === value ? " chip-on" : ""}`}
+                  onClick={() => setFilter(value)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {live === null ? (
           <p className="empty">The connection table could not be read.</p>
         ) : live.connections.length === 0 ? (
           <p className="empty">Nothing has a socket open.</p>
+        ) : shown.length === 0 ? (
+          <p className="empty">
+            Nothing matches. {programs.length}{" "}
+            {programs.length === 1 ? "program has" : "programs have"} a socket
+            open.
+          </p>
         ) : (
-          <ul className="conns">
-            {live.connections
-              .filter((connection) => connection.state !== "connectionless")
-              .slice(0, 60)
-              .map((connection, index) => (
-                <ConnectionRow
-                  key={`${connection.process_id}-${connection.local_port}-${index}`}
-                  connection={connection}
-                  busy={busy}
-                  onBlock={(path, name) => setConfirming({ path, name })}
-                />
-              ))}
+          <ul className="progs">
+            {shown.map((program) => (
+              <ProgramGroup
+                key={program.key}
+                program={program}
+                busy={busy}
+                open={expanded === program.key}
+                onToggle={() =>
+                  setExpanded(expanded === program.key ? null : program.key)
+                }
+                onBlock={(path, name) => setConfirming({ path, name })}
+              />
+            ))}
           </ul>
         )}
       </section>

@@ -2038,6 +2038,7 @@ pre.error {
 }
 
 .conns,
+.progs,
 .fw-rules {
   list-style: none;
   margin: 12px 0 0;
@@ -2045,6 +2046,188 @@ pre.error {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* Connections, grouped by the program that owns them.
+
+   The list used to be one row per socket, which meant the program's name
+   appeared once per socket and reading it meant doing the grouping in your
+   head. Same information, arranged so it can be scanned: one row per program,
+   its counts on the right, everything else one press away. */
+
+.conn-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.conn-search {
+  flex: 1 1 260px;
+  min-width: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 6px 10px;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+}
+
+.conn-search:focus {
+  outline: none;
+  border-color: var(--accent-dim);
+}
+
+.conn-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* The filter chips are buttons, unlike the decorative `.chip`, so they need
+   their own resting state rather than inheriting one meant for a label. */
+.conn-filters .chip {
+  margin-left: 0;
+  cursor: pointer;
+  background: transparent;
+  color: var(--text-3);
+  border-color: var(--border);
+}
+
+.conn-filters .chip:hover {
+  border-color: var(--accent-dim);
+  color: var(--accent-soft);
+}
+
+.conn-filters .chip-on {
+  color: var(--accent-soft);
+  border-color: var(--accent);
+  background: rgba(74, 124, 255, 0.10);
+}
+
+.panel-count {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.prog {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: 8px;
+  min-width: 0;
+}
+
+.prog-external {
+  border-left-color: var(--accent);
+}
+
+.prog-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+}
+
+.prog-toggle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.prog-label {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prog-counts {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.prog-badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  border-radius: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.prog-badge-external {
+  color: var(--accent-soft);
+  border-color: var(--accent-dim);
+}
+
+.prog-badge-quiet {
+  border-color: transparent;
+}
+
+/* Who signed it sits under the name, because it is the one line here that
+   cannot be forged. What the file calls itself is a claim and reads as one. */
+.prog-identity {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 0 12px 9px 32px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.prog-signer-none {
+  color: var(--warn);
+}
+
+.prog-signer-unknown {
+  font-style: italic;
+}
+
+.prog-claim::before {
+  content: "· ";
+}
+
+.prog-file {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  opacity: 0.75;
+}
+
+.prog-detail {
+  padding: 0 12px 10px 32px;
+}
+
+.prog-detail .conns {
+  margin-top: 0;
+}
+
+.prog-detail .conn {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: baseline;
+  padding: 6px 10px;
+}
+
+.conn-local {
+  font-size: 11px;
+  color: var(--text-3);
 }
 
 .conn {

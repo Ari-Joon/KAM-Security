@@ -91,6 +91,16 @@ pub struct Connection {
     pub image_path: Option<String>,
     /// Final component, which is what a person recognises.
     pub name: Option<String>,
+    /// What the file says it is, from its own version resource.
+    ///
+    /// A claim, never evidence: the file was written by whoever made it, and
+    /// "Google Chrome" can be typed into a resource by anybody. It is here to
+    /// make a list of forty `svchost.exe` rows readable, which the file name
+    /// alone cannot do. The verified half is `signer`, and an interface showing
+    /// both must not present them as equals.
+    pub description: Option<String>,
+    /// Who the file says wrote it. Also unverified -- compare against `signer`.
+    pub company: Option<String>,
     /// Who signed the program, when Windows accepts the signature.
     pub signer: Option<String>,
     /// `Some(true)` when nothing signed it or the signature does not verify,
@@ -274,6 +284,8 @@ pub fn survey() -> ConnectionReport {
                 process_id: row.dwOwningPid,
                 image_path: None,
                 name: None,
+                description: None,
+                company: None,
                 signer: None,
                 unsigned: None,
             });
@@ -305,6 +317,8 @@ pub fn survey() -> ConnectionReport {
                 process_id: row.dwOwningPid,
                 image_path: None,
                 name: None,
+                description: None,
+                company: None,
                 signer: None,
                 unsigned: None,
             });
@@ -337,6 +351,8 @@ pub fn survey() -> ConnectionReport {
                 process_id: row.dwOwningPid,
                 image_path: None,
                 name: None,
+                description: None,
+                company: None,
                 signer: None,
                 unsigned: None,
             });
@@ -365,6 +381,8 @@ pub fn survey() -> ConnectionReport {
                 process_id: row.dwOwningPid,
                 image_path: None,
                 name: None,
+                description: None,
+                company: None,
                 signer: None,
                 unsigned: None,
             });
@@ -378,6 +396,7 @@ pub fn survey() -> ConnectionReport {
     // socket would turn a snapshot into a stall.
     let mut images: HashMap<u32, Option<String>> = HashMap::new();
     let mut signatures: HashMap<String, (Option<String>, Option<bool>)> = HashMap::new();
+    let mut descriptions: HashMap<String, Option<kam_core::version::Claims>> = HashMap::new();
 
     for connection in &mut found {
         let image = images
@@ -403,6 +422,19 @@ pub fn survey() -> ConnectionReport {
         connection.name = std::path::Path::new(&path)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned());
+        // Cached per path like the signature: a machine with forty sockets
+        // usually has far fewer distinct programs behind them, and reading a
+        // version resource means opening the file.
+        let claims = descriptions
+            .entry(path.clone())
+            .or_insert_with(|| kam_core::version::claims_of(std::path::Path::new(&path)))
+            .clone();
+
+        connection.description = claims
+            .as_ref()
+            .and_then(|claims| claims.best())
+            .map(str::to_owned);
+        connection.company = claims.as_ref().and_then(|claims| claims.company.clone());
         connection.image_path = Some(path);
         connection.signer = signer;
         connection.unsigned = unsigned;
@@ -442,6 +474,62 @@ pub fn survey() -> ConnectionReport {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The list says what programs *are*, not just what their files are called.
+    ///
+    /// The reason this exists: a connection list on a real machine is mostly
+    /// `svchost.exe` over and over, and that tells a person nothing at all. The
+    /// version resource turns those rows into "Host Process for Windows
+    /// Services", which is the difference between a list that can be read and
+    /// one that cannot.
+    ///
+    /// Asserted against this machine rather than a fixture, because the claim
+    /// being made is about real programs. If a future change silently stopped
+    /// reading resources, every row would quietly fall back to a file name and
+    /// nothing else would fail.
+    #[test]
+    fn this_machine_has_connections_that_say_what_they_are() {
+        let report = survey();
+        let identified: Vec<&Connection> = report
+            .connections
+            .iter()
+            .filter(|connection| connection.image_path.is_some())
+            .collect();
+
+        if identified.is_empty() {
+            // Nothing to say. Unprivileged runs can see very little, and an
+            // empty result is not a failure of this code.
+            println!("no connection could be attributed to a program; skipping");
+            return;
+        }
+
+        let described = identified
+            .iter()
+            .filter(|connection| connection.description.is_some())
+            .count();
+
+        assert!(
+            described > 0,
+            "not one of {} identified connections said what it was, so the \
+             version resource is not being read at all",
+            identified.len()
+        );
+
+        // And the description is genuinely more than the file name repeated.
+        let better =
+            identified.iter().any(
+                |connection| match (&connection.description, &connection.name) {
+                    (Some(description), Some(name)) => {
+                        !description.eq_ignore_ascii_case(name) && description.len() > name.len()
+                    }
+                    _ => false,
+                },
+            );
+        assert!(
+            better,
+            "every description was just the file name again, which adds nothing"
+        );
+    }
 
     #[test]
     fn ports_are_read_from_network_order() {
