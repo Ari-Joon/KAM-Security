@@ -133,11 +133,24 @@ fn profiles_not_examined(examined: &[kam_core::UserContext]) -> Option<String> {
     use kam_core::registry::{Key, View};
     use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 
-    let root = Key::open(
+    // A failure to read this is reported, not treated as nothing missing.
+    //
+    // The first version returned `None` here, which the caller reads as "every
+    // account was examined" — a claim nobody had earned. That is precisely the
+    // mistake this whole feature is built to avoid, committed inside the
+    // function written to avoid it: an unreadable source concluding that its
+    // contents are empty.
+    let Some(root) = Key::open(
         HKEY_LOCAL_MACHINE,
         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList",
         View::Native,
-    )?;
+    ) else {
+        return Some(
+            "the list of accounts on this machine could not be read, so whether \
+             every account was examined is not known"
+                .to_owned(),
+        );
+    };
 
     let looked_at: std::collections::HashSet<&str> = examined
         .iter()
