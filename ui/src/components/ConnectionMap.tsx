@@ -46,7 +46,25 @@ import { squarify } from "../lib/treemap";
  */
 
 /** Tones, keyed to what was checked rather than to how alarming it is. */
-export type Tone = "quiet" | "normal" | "watch" | "look" | "unknown";
+export type Tone =
+  | "quiet"
+  | "normal"
+  | "watch"
+  | "look"
+  | "unknown"
+  /**
+   * This program itself.
+   *
+   * Its own colour because it was getting the alarming one. KAM is unsigned and
+   * holds sockets, which is exactly the pair that earns a look — so on its own
+   * screen it drew itself in red, as an unidentified thing worth worrying
+   * about. Nothing about that judgement was wrong; what was wrong is that the
+   * reader had no way to tell it was looking at the program they were using.
+   *
+   * Not an exemption. It still says it is unsigned, in the same words as
+   * anything else, and it is still in the picture taking up its real share.
+   */
+  | "ours";
 
 const TONE_COLOUR: Record<Tone, string> = {
   // Signed, and only talking to this machine.
@@ -57,6 +75,9 @@ const TONE_COLOUR: Record<Tone, string> = {
   watch: "#a8791f",
   // Not signed, and open to the network.
   look: "#a33b45",
+  // This program itself. Distinct from every judgement colour, because it
+  // is not a judgement -- it is the thing drawing the picture, saying so.
+  ours: "#6b5bd6",
   // The owning program could not be read. Not a finding, and deliberately the
   // dullest colour here rather than a warning one.
   unknown: "#3a4459",
@@ -196,6 +217,7 @@ export function ConnectionLegend() {
     ["look", "Not signed, and open to the network"],
     ["watch", "Not signed, but only talking to this machine"],
     ["unknown", "Could not be identified"],
+    ["ours", "KAM Security itself, which is not signed either"],
   ];
   return (
     <ul className="connmap-legend">

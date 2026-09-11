@@ -684,6 +684,8 @@ export type Connection = {
   /** null means the owning program could not be identified — not "unsigned". */
   unsigned: boolean | null;
   external: boolean;
+  /** True when the program holding this socket is part of KAM Security. */
+  ours: boolean;
 };
 
 export type ConnectionReport = {

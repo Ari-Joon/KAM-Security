@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, reason } from "../lib/api";
 import ProgressBar from "../components/ProgressBar";
+import StateGrid, {
+  GridLegend,
+  useGridSelection,
+  type GridTile,
+} from "../components/StateGrid";
 import { newJobId, runJob, stopJob, type Progress } from "../lib/jobs";
 import * as fmt from "../lib/format";
 import type {
@@ -900,6 +905,29 @@ function isProtecting(mode: HardeningMode): boolean {
 }
 
 /**
+ * The four states a protection can be in, and what each colour means.
+ *
+ * Green is not "good" and grey is not "bad". Most of these are off because
+ * Microsoft ships them off, which is ordinary and not a finding — so off is the
+ * dullest colour there is rather than a warning one. The only state that earns
+ * attention is a protection Windows switches on by itself that is now off,
+ * because something on this machine turned it off.
+ */
+const RULE_COLOUR = {
+  on: "#2f7d5b",
+  audit: "#3465de",
+  off: "#6b7280",
+  unexpected: "#a33b45",
+} as const;
+
+const RULE_LEGEND: [string, string][] = [
+  [RULE_COLOUR.on, "On, and blocking"],
+  [RULE_COLOUR.audit, "Auditing only, which records and blocks nothing"],
+  [RULE_COLOUR.off, "Off, which is how Windows ships it"],
+  [RULE_COLOUR.unexpected, "Off, though Windows switches it on by itself"],
+];
+
+/**
  * Protections Windows already has and leaves switched off.
  *
  * Nothing here can be turned on from this window, deliberately. A rule in
@@ -962,6 +990,19 @@ function Hardening() {
   const recommended = rules.filter((rule) => rule.recommended);
   const on = recommended.filter((rule) => isProtecting(rule.mode)).length;
   const shown = showAll ? rules : recommended;
+
+  const tiles: GridTile[] = shown.map((rule) => ({
+    key: rule.id,
+    label: rule.name,
+    state: modeLabel(rule.mode),
+    colour: isProtecting(rule.mode)
+      ? RULE_COLOUR.on
+      : rule.mode === "audit"
+        ? RULE_COLOUR.audit
+        : RULE_COLOUR.off,
+  }));
+  const selection = useGridSelection(tiles);
+  const open = shown.find((rule) => rule.id === selection.selected) ?? null;
 
   return (
     <section className="panel">
@@ -1069,58 +1110,65 @@ function Hardening() {
             </ul>
           )}
 
-          <ul className="findings">
-            {shown.map((rule) => (
-              <li
-                key={rule.id}
-                className={`finding finding-${
-                  isProtecting(rule.mode) ? "ordinary" : "notable"
-                }`}
-              >
-                <div className="finding-head">
-                  <span className="finding-name">{rule.name}</span>
-                  <span
-                    className={`badge attention-${
-                      isProtecting(rule.mode) ? "ordinary" : "notable"
-                    }`}
+          {/*
+            A grid rather than the list this was. Twenty rules stacked
+            vertically is four screens of reading to answer "how much of this is
+            on", which is the question people actually arrive with; as a grid it
+            is one glance. Nothing is hidden — every rule that was a row is a
+            tile, and clicking one shows exactly what the row showed.
+          */}
+          <StateGrid
+            tiles={tiles}
+            selected={selection.selected}
+            onSelect={selection.onSelect}
+            empty="Defender reported no rules."
+          />
+          <GridLegend entries={RULE_LEGEND} />
+
+          {open && (
+            <div className="stategrid-detail">
+              <div className="finding-head">
+                <span className="finding-name">{open.name}</span>
+                <span className="badge">{modeLabel(open.mode)}</span>
+              </div>
+              <p className="rule-explains">{open.explains}</p>
+              {!isProtecting(open.mode) && open.recommended && (
+                <p className="rule-explains">
+                  Recommended by Microsoft, and off on this machine.
+                </p>
+              )}
+              <div className="rule-actions">
+                {isProtecting(open.mode) ? (
+                  <button
+                    className="ghost"
+                    disabled={changing !== null}
+                    onClick={() => void change(open.id, "off")}
                   >
-                    {modeLabel(rule.mode)}
-                  </span>
-                </div>
-                <p className="rule-explains">{rule.explains}</p>
-                <div className="rule-actions">
-                  {isProtecting(rule.mode) ? (
+                    {changing === open.id ? "Asking…" : "Turn off"}
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      disabled={changing !== null}
+                      title="Writes an event and blocks nothing, so you can see what it would have stopped."
+                      onClick={() => void change(open.id, "audit")}
+                    >
+                      {changing === open.id ? "Asking…" : "Try in audit mode"}
+                    </button>
                     <button
                       className="ghost"
                       disabled={changing !== null}
-                      onClick={() => void change(rule.id, "off")}
+                      title="Actually prevents the behaviour. This can stop software you depend on."
+                      onClick={() => void change(open.id, "block")}
                     >
-                      {changing === rule.id ? "Asking…" : "Turn off"}
+                      Turn on
                     </button>
-                  ) : (
-                    <>
-                      <button
-                        disabled={changing !== null}
-                        title="Writes an event and blocks nothing, so you can see what it would have stopped."
-                        onClick={() => void change(rule.id, "audit")}
-                      >
-                        {changing === rule.id ? "Asking…" : "Try in audit mode"}
-                      </button>
-                      <button
-                        className="ghost"
-                        disabled={changing !== null}
-                        title="Actually prevents the behaviour. This can stop software you depend on."
-                        onClick={() => void change(rule.id, "block")}
-                      >
-                        Turn on
-                      </button>
-                    </>
-                  )}
-                </div>
-                <p className="footnote">{rule.id}</p>
-              </li>
-            ))}
-          </ul>
+                  </>
+                )}
+              </div>
+              <p className="footnote">{open.id}</p>
+            </div>
+          )}
 
           {rules.length > recommended.length && (
             <button className="link-button" onClick={() => setShowAll(!showAll)}>

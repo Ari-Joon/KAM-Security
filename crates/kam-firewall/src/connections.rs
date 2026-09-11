@@ -115,6 +115,15 @@ pub struct Connection {
     /// True when the peer is outside this machine and outside private address
     /// ranges — that is, actually on the internet.
     pub external: bool,
+    /// True when the program holding this socket is part of KAM Security.
+    ///
+    /// Not an exemption. This software is unsigned and holds sockets, which is
+    /// exactly the combination the map colours for a look — so it coloured
+    /// itself, in red, on its own screen. The facts do not change; what changes
+    /// is that it says which program it is rather than presenting itself to the
+    /// reader as an unidentified stranger.
+    #[serde(default)]
+    pub ours: bool,
 }
 
 /// A snapshot of the whole table.
@@ -293,6 +302,7 @@ pub fn survey() -> ConnectionReport {
                 company: None,
                 signer: None,
                 unsigned: None,
+                ours: false,
             });
         }
     }
@@ -326,6 +336,7 @@ pub fn survey() -> ConnectionReport {
                 company: None,
                 signer: None,
                 unsigned: None,
+                ours: false,
             });
         }
     }
@@ -360,6 +371,7 @@ pub fn survey() -> ConnectionReport {
                 company: None,
                 signer: None,
                 unsigned: None,
+                ours: false,
             });
         }
     }
@@ -390,6 +402,7 @@ pub fn survey() -> ConnectionReport {
                 company: None,
                 signer: None,
                 unsigned: None,
+                ours: false,
             });
         }
     }
@@ -424,6 +437,7 @@ pub fn survey() -> ConnectionReport {
             })
             .clone();
 
+        connection.ours = kam_core::ourselves::is_ours(std::path::Path::new(&path));
         connection.name = std::path::Path::new(&path)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned());

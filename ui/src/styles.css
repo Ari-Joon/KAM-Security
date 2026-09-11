@@ -3063,3 +3063,93 @@ button.ghost {
   font-size: 12px;
   padding: 4px 11px;
 }
+
+/* A grid of equally sized tiles, coloured by state.
+   Every tile is the same size on purpose: the things shown here have no
+   magnitude, and varying the area would put a number on screen that does not
+   exist. See components/StateGrid.tsx. */
+.stategrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(178px, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.stategrid-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-height: 72px;
+  padding: 9px 11px;
+  text-align: left;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  /* The state colour reads along the top edge rather than flooding the tile.
+     A block of solid colour per tile turns the grid into a traffic-light wall,
+     which is a verdict; an edge is a label. */
+  border-top: 3px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+  transition: border-color 0.1s ease, background 0.1s ease;
+}
+
+.stategrid-tile:hover {
+  background: var(--surface-3);
+}
+
+.stategrid-tile.stategrid-on {
+  background: var(--surface-3);
+  border-color: var(--accent);
+}
+
+.stategrid-name {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text);
+  line-height: 1.3;
+}
+
+.stategrid-state {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.stategrid-notes {
+  font-size: 11px;
+  color: var(--text-2);
+  margin-top: auto;
+}
+
+.stategrid-legend {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin: 10px 0 0;
+  padding: 0;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+
+.stategrid-legend li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.stategrid-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex: none;
+}
+
+.stategrid-detail {
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}

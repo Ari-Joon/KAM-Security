@@ -81,6 +81,8 @@ type Program = {
   company: string | null;
   signer: string | null;
   unsigned: boolean | null;
+  /** True when this is part of KAM Security. */
+  ours: boolean;
   connections: Connection[];
   external: number;
   listening: number;
@@ -141,6 +143,7 @@ function byProgram(connections: Connection[]): Program[] {
         company: connection.company,
         signer: connection.signer,
         unsigned: connection.unsigned,
+        ours: connection.ours,
         connections: [],
         external: 0,
         listening: 0,
@@ -174,6 +177,9 @@ function byProgram(connections: Connection[]): Program[] {
  * warning one.
  */
 function toneOf(program: Program): Tone {
+  // Said before anything else, because everything else here is about a program
+  // the reader has not identified, and this is the one they are looking at.
+  if (program.ours) return "ours";
   if (program.unsigned === null) return "unknown";
   // Reaching out, or reachable from outside. Both leave this machine's edge,
   // and a listener on 0.0.0.0 is the one people least expect to be there.
@@ -189,6 +195,9 @@ const TONE_RANK: Record<Tone, number> = {
   normal: 2,
   quiet: 1,
   unknown: 0,
+  // Never the worst thing in a group, because it is not a thing to be worried
+  // about at all — it is the program drawing the picture.
+  ours: 0,
 };
 
 /**
@@ -314,6 +323,17 @@ function placeOf(path: string | null): { text: string; notable: boolean } | null
  */
 function attention(program: Program): string[] {
   const notes: string[] = [];
+
+  if (program.ours) {
+    // Said in this program's own voice, and said in full. Not being signed is
+    // as true of this software as of anything else here, and leaving it out
+    // would be the one exemption this whole product exists to refuse.
+    notes.push("This is KAM Security itself");
+    if (program.unsigned === true) {
+      notes.push("It is not signed either, which is worth knowing");
+    }
+    return notes;
+  }
 
   if (program.unsigned === true) {
     notes.push("Nothing signed it, so there is no publisher to hold to it");
