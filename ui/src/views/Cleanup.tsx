@@ -3,6 +3,7 @@ import { api, reason } from "../lib/api";
 import ProgressBar from "../components/ProgressBar";
 import { runJob, stopJob, type Progress } from "../lib/jobs";
 import * as fmt from "../lib/format";
+import { useRecyclable } from "../lib/recyclable";
 import FileRow from "../components/FileRow";
 import PathLink from "../components/PathLink";
 import type {
@@ -69,6 +70,19 @@ const OWNER_WHY: Record<Owner, string> = {
   elsewhere: "Somewhere this cannot attribute, so nothing is suggested.",
 };
 
+/**
+ * How many duplicate sets are drawn at once.
+ *
+ * A cap rather than a scroll, because forty sets is already more than anybody
+ * works through in a sitting and the rest are smaller. Named rather than typed
+ * into the `slice` so the counter above the list and the list itself cannot
+ * disagree, which they did.
+ */
+const DUPE_LIMIT = 40;
+
+/** The same, for downloads, which are informational rather than actionable. */
+const DOWNLOAD_LIMIT = 25;
+
 const CONFIDENCE_LABEL: Record<Confidence, string> = {
   high: "Very likely leftover",
   medium: "Possibly leftover",
@@ -80,11 +94,14 @@ function OrphanRow({
   onQuarantine,
   onDelete,
   busy,
+  recyclable,
 }: {
   orphan: Orphan;
   onQuarantine: (orphan: Orphan) => void;
   onDelete: (orphan: Orphan) => void;
   busy: boolean;
+  /** False when this account cannot delete from the folder holding it. */
+  recyclable: boolean;
 }) {
   const [open, setOpen] = useState(false);
 
@@ -113,14 +130,32 @@ function OrphanRow({
         >
           Quarantine
         </button>
-        <button
-          className="ghost"
-          disabled={busy}
-          title="Send it to the Recycle Bin, where Windows can put it back"
-          onClick={() => onDelete(orphan)}
-        >
-          Recycle Bin
-        </button>
+        {/*
+          Offered only where it can work. Leftovers live under `ProgramData`
+          and the `AppData` roots, and an unprivileged account frequently
+          cannot delete from those -- so this button was there, pressed, and
+          failed with a raw error from inside the shell call. Offering an
+          action that cannot work does not teach somebody that the folder is
+          protected; it teaches them the button is unreliable, which is a far
+          more expensive lesson.
+        */}
+        {recyclable ? (
+          <button
+            className="ghost"
+            disabled={busy}
+            title="Send it to the Recycle Bin, where Windows can put it back"
+            onClick={() => onDelete(orphan)}
+          >
+            Recycle Bin
+          </button>
+        ) : (
+          <span
+            className="orphan-note"
+            title="Windows will not let this account delete from the folder holding it, so quarantine is the way to move it aside."
+          >
+            Needs quarantine
+          </span>
+        )}
       </div>
       {open && (
         <div className="orphan-detail">
@@ -613,6 +648,15 @@ export default function Cleanup({ volumes, onChanged }: Props) {
 
   const active = held.filter((item) => !item.restored);
 
+  // Asked once per directory rather than once per file, because the probe
+  // tests the directory: a hundred leftovers usually sit in three or four.
+  const canRecycle = useRecyclable([
+    ...(orphans ?? []).map((orphan) => orphan.path),
+    ...(duplicates ?? []).flatMap((group) =>
+      group.copies.map((copy) => copy.path),
+    ),
+  ]);
+
   return (
     <>
       <div className="view-head">
@@ -697,6 +741,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                   key={orphan.path}
                   orphan={orphan}
                   busy={busyPath === orphan.path}
+                  recyclable={canRecycle(orphan.path)}
                   onQuarantine={(item) => void quarantine(item)}
                   onDelete={(item) => void recycleOrphan(item)}
                 />
@@ -734,6 +779,21 @@ export default function Cleanup({ volumes, onChanged }: Props) {
               {active.length === 1 ? "item" : "items"}, freeing{" "}
               {fmt.bytes(active.reduce((total, item) => total + item.bytes, 0))}?
               This cannot be undone.
+              {held.length > active.length && (
+                <>
+                  {" "}
+                  {/*
+                    The request empties the whole store, restored entries
+                    included. Those hold no files so the figure above is right,
+                    but the count was not -- the dialog quoted the held items
+                    and the result reported a larger number, which reads as the
+                    software having done more than it asked to.
+                  */}
+                  It also clears the record of{" "}
+                  {fmt.count(held.length - active.length)} already put back,
+                  which frees nothing further.
+                </>
+              )}
             </p>
             <div className="confirm-actions">
               <button onClick={() => void emptyAll()} disabled={busyPath !== null}>
@@ -791,7 +851,12 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                   </>
                 ) : (
                   <>
-                    <button onClick={() => void restore(item.id)}>Restore</button>
+                    <button
+                      disabled={busyPath !== null}
+                      onClick={() => void restore(item.id)}
+                    >
+                      Restore
+                    </button>
                     <button
                       className="ghost"
                       onClick={() => setConfirming(item.id)}
@@ -864,8 +929,34 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           </div>
         )}
 
+        {/*
+          The search has a ceiling on how many bytes it will read in full, and
+          when it hits that ceiling it skips whole candidate sets without
+          hashing them. The agent has always reported that as `truncated`, the
+          type has always carried it, and nothing has ever drawn it -- so a run
+          that gave up part-way presented itself as a complete answer, and the
+          empty case below said "No identical files over 8 MB" about a disk it
+          had not finished looking at.
+
+          Same mistake as an unreadable source reporting as an empty one, which
+          is the thing this whole product is built not to do, sitting in the
+          interface rather than in the reader.
+        */}
+        {duplicateSummary?.truncated && (
+          <p className="held-warn">
+            This stopped before it had finished. There is a ceiling on how much
+            it will read in full, and it was reached — so some sets of possible
+            copies were never compared, and anything in them is not below.
+            Narrowing the search to one drive reads less and gets further.
+          </p>
+        )}
+
         {duplicates && duplicates.length === 0 && (
-          <p className="empty">No identical files over 8 MB.</p>
+          <p className="empty">
+            {duplicateSummary?.truncated
+              ? "No identical files were confirmed in the part that was compared."
+              : "No identical files over 8 MB."}
+          </p>
         )}
 
         {duplicates && duplicates.length > 0 && (
@@ -880,7 +971,14 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                 Only sets you can choose between
               </label>
               <span className="muted">
-                {fmt.count(shownDuplicates.length)} of{" "}
+                {/*
+                  This said "N of M shown" while the list below drew at most
+                  forty, so on a machine with more than forty actionable sets
+                  the page stated a number it was not drawing. The cap is real
+                  and worth keeping -- forty sets is already more than anybody
+                  works through in a sitting -- so the cap is what gets said.
+                */}
+                {fmt.count(Math.min(shownDuplicates.length, DUPE_LIMIT))} of{" "}
                 {fmt.count(duplicates.length)} shown
               </span>
             </div>
@@ -892,7 +990,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
               </p>
             ) : (
               <ul className="dupes">
-                {shownDuplicates.slice(0, 40).map((group) => (
+                {shownDuplicates.slice(0, DUPE_LIMIT).map((group) => (
                   <li
                     key={group.copies[0]?.path ?? String(group.bytes)}
                     className={`dupe dupe-${group.verdict}`}
@@ -1016,17 +1114,26 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                                               >
                                                 Remove this one
                                               </button>
-                                              <button
-                                                className="ghost"
-                                                disabled={busyPath !== null}
-                                                title="Send this copy to the Recycle Bin, where Windows can put it back"
-                                                onClick={(event) => {
-                                                  event.stopPropagation();
-                                                  void recycleCopy(copy.path, group.bytes);
-                                                }}
-                                              >
-                                                Recycle Bin
-                                              </button>
+                                              {/* Same reasoning as the
+                                                  leftovers above: a copy under
+                                                  Program Files cannot go to
+                                                  this account's bin, and
+                                                  offering it there only teaches
+                                                  that the button is
+                                                  unreliable. */}
+                                              {canRecycle(copy.path) && (
+                                                <button
+                                                  className="ghost"
+                                                  disabled={busyPath !== null}
+                                                  title="Send this copy to the Recycle Bin, where Windows can put it back"
+                                                  onClick={(event) => {
+                                                    event.stopPropagation();
+                                                    void recycleCopy(copy.path, group.bytes);
+                                                  }}
+                                                >
+                                                  Recycle Bin
+                                                </button>
+                                              )}
                                             </>
                                           )}
                                       </>
@@ -1249,7 +1356,16 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                   </span>
                 </div>
                 <span className="proposal-size">{fmt.bytes(proposal.bytes)}</span>
-                <button onClick={() => void applyMove(proposal)}>Move</button>
+                {/* Guarded like every other acting control here. Without
+                    it a double-click fired two moves, and the second came back
+                    as a refusal from the agent's fence -- which reads as the
+                    move having failed. */}
+                <button
+                  disabled={busyPath !== null}
+                  onClick={() => void applyMove(proposal)}
+                >
+                  Move
+                </button>
               </li>
             ))}
           </ul>
@@ -1275,7 +1391,12 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                       <PathLink path={move.to} className="held-path" />
                       <span className="held-reason">was {move.from}</span>
                     </div>
-                    <button onClick={() => void undoMove(move.id)}>Put back</button>
+                    <button
+                      disabled={busyPath !== null}
+                      onClick={() => void undoMove(move.id)}
+                    >
+                      Put back
+                    </button>
                   </li>
                 ))}
             </ul>
@@ -1305,13 +1426,21 @@ export default function Cleanup({ volumes, onChanged }: Props) {
               </>
             )}
           </p>
+          {downloads.length > DOWNLOAD_LIMIT && (
+            <p className="footnote">
+              {/* Said rather than silently cut. A list that stops without
+                  saying so is a list claiming to be complete. */}
+              Showing the largest {fmt.count(DOWNLOAD_LIMIT)} of{" "}
+              {fmt.count(downloads.length)}.
+            </p>
+          )}
           {downloads.length === 0 ? (
             <p className="empty">
               Nothing over 32 MB carries a download record.
             </p>
           ) : (
             <ul className="files">
-              {downloads.slice(0, 25).map((download) => (
+              {downloads.slice(0, DOWNLOAD_LIMIT).map((download) => (
                 <FileRow
                   key={download.path}
                   path={download.path}

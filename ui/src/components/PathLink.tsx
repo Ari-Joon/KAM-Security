@@ -33,8 +33,18 @@ export default function PathLink({
 
   // Nothing to open: render the text plainly rather than a control that would
   // do nothing when clicked.
+  //
+  // The title comes with it. It was dropped here, and the one caller that
+  // relies on this branch -- the quarantine list, where every row has no
+  // openable path -- passes a title explaining exactly why the path cannot be
+  // opened. So the single place that explained the inert text was the place
+  // that discarded the explanation.
   if (!path) {
-    return <span className={className}>{shown}</span>;
+    return (
+      <span className={className} title={title}>
+        {shown}
+      </span>
+    );
   }
 
   return (
