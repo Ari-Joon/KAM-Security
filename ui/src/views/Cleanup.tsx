@@ -4,6 +4,11 @@ import ProgressBar from "../components/ProgressBar";
 import { runJob, stopJob, type Progress } from "../lib/jobs";
 import * as fmt from "../lib/format";
 import { useRecyclable } from "../lib/recyclable";
+import ReclaimMap, {
+  RECLAIM_LEGEND,
+  type ReclaimNode,
+} from "../components/ReclaimMap";
+import { GridLegend } from "../components/StateGrid";
 import FileRow from "../components/FileRow";
 import PathLink from "../components/PathLink";
 import type {
@@ -218,6 +223,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [explaining, setExplaining] = useState(false);
+  /** The block being looked inside, or null for the whole picture. */
+  const [mapInto, setMapInto] = useState<ReclaimNode | null>(null);
   const [heldError, setHeldError] = useState<string | null>(null);
   const [movesError, setMovesError] = useState<string | null>(null);
 
@@ -648,6 +655,62 @@ export default function Cleanup({ volumes, onChanged }: Props) {
 
   const active = held.filter((item) => !item.restored);
 
+  /**
+   * Everything measured, as one picture with area meaning bytes.
+   *
+   * Built from whatever has actually been measured rather than from what could
+   * be: a category nobody has scanned yet is absent, not drawn as zero. A block
+   * of zero area would be invisible anyway, and a *label* with no block behind
+   * it would suggest the answer is "nothing" when the answer is "not asked".
+   */
+  const reclaim: ReclaimNode[] = [];
+  if (orphans && orphans.length > 0) {
+    reclaim.push({
+      key: "orphans",
+      label: "Leftovers",
+      bytes: orphans.reduce((sum, orphan) => sum + orphan.bytes, 0),
+      // Quarantine is what this page offers first for these, and it is the
+      // reversal that always works -- the Recycle Bin is offered beside it only
+      // where this account could actually use it.
+      reversal: "quarantine",
+      detail: `${fmt.count(orphans.length)} folders no installed program accounts for`,
+      children: orphans.map((orphan) => ({
+        key: orphan.path,
+        label: orphan.name,
+        bytes: orphan.bytes,
+        reversal: "quarantine" as const,
+        detail: CONFIDENCE_LABEL[orphan.confidence].toLowerCase(),
+      })),
+    });
+  }
+  if (caches && caches.length > 0) {
+    reclaim.push({
+      key: "caches",
+      label: "Caches",
+      bytes: caches.reduce((sum, cache) => sum + cache.bytes, 0),
+      // The one category on this page removed outright, which is why it is the
+      // one colour that says so.
+      reversal: "permanent",
+      detail: `${fmt.count(caches.length)} kinds of scratch space`,
+      children: caches.map((cache) => ({
+        key: cache.id,
+        label: cache.name,
+        bytes: cache.bytes,
+        reversal: "permanent" as const,
+        detail: cache.cost || "costs nothing to clear",
+      })),
+    });
+  }
+  if (duplicateSummary && duplicateSummary.reclaimable_bytes > 0) {
+    reclaim.push({
+      key: "duplicates",
+      label: "Duplicate copies",
+      bytes: duplicateSummary.reclaimable_bytes,
+      reversal: "quarantine",
+      detail: `${fmt.count(duplicateSummary.actionable)} sets you can choose between`,
+    });
+  }
+
   // Asked once per directory rather than once per file, because the probe
   // tests the directory: a hundred leftovers usually sit in three or four.
   const canRecycle = useRecyclable([
@@ -724,6 +787,38 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           </div>
         )}
       </section>
+
+      {reclaim.length > 0 && (
+        <section className="panel">
+          <div className="panel-head">
+            <h2>Where the space is</h2>
+            <span className="panel-count">
+              {fmt.bytes(reclaim.reduce((sum, node) => sum + node.bytes, 0))}
+            </span>
+          </div>
+          <p className="panel-lede">
+            Everything measured so far, drawn to scale: a block's area is its
+            size on disk. A list gives a forty-gigabyte item and a
+            four-megabyte item the same row and only ever tells you the order,
+            never the ratio — and the question on a full drive is not what is on
+            it, it is what is worth your time.
+          </p>
+          <ReclaimMap
+            nodes={mapInto ? (mapInto.children ?? []) : reclaim}
+            onOpen={(node) =>
+              node.children && node.children.length > 0
+                ? setMapInto(node)
+                : void reveal(node.key)
+            }
+          />
+          <GridLegend entries={RECLAIM_LEGEND} />
+          {mapInto && (
+            <button className="link-button" onClick={() => setMapInto(null)}>
+              Back to everything
+            </button>
+          )}
+        </section>
+      )}
 
       {orphans && (
         <section className="panel">
