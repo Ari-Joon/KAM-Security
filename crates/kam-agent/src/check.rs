@@ -123,12 +123,13 @@ fn check_space(findings: &mut Vec<Finding>) {
 fn check_startup(findings: &mut Vec<Finding>, user: &UserContext) {
     let survey = kam_scanner::persistence::survey(user);
 
-    // This program's own binary, so its own scheduled check can be told apart
-    // from everybody else's startup entries.
-    let ours = std::env::current_exe()
-        .map(|path| path.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-
+    // This program's own files, so its own entries can be told apart from
+    // everybody else's.
+    //
+    // This used to compare against `current_exe` alone, which is only ever one
+    // of the two binaries this program is made of -- so whichever half was not
+    // running got listed among the unsigned startup entries, and the program
+    // reported part of itself as somebody else's unvouched-for software.
     let mut unsigned = Vec::new();
     let mut ourselves = false;
     for (executable, entries) in kam_scanner::persistence::by_executable(&survey.entries) {
@@ -141,10 +142,10 @@ fn check_startup(findings: &mut Vec<Finding>, user: &UserContext) {
         ) {
             continue;
         }
-        if !ours.is_empty() && path.to_lowercase() == ours {
-            // Not hidden, and not listed among the others either. This binary
-            // is unsigned too, and saying so plainly is better than a weekly
-            // line about an entry the reader put there ten seconds ago.
+        if kam_core::ourselves::is_ours(&executable) {
+            // Not hidden, and not listed among the others either. These files
+            // are unsigned too, and saying so plainly is better than a weekly
+            // line about an entry the reader installed themselves.
             ourselves = true;
             continue;
         }
@@ -172,7 +173,7 @@ fn check_startup(findings: &mut Vec<Finding>, user: &UserContext) {
 
     if ourselves {
         findings.push(Finding::note(
-            "this program's own agent is in that list too, and it is not signed either".to_owned(),
+            "this program starts itself too, and it is not signed either".to_owned(),
         ));
     }
 

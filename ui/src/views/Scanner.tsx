@@ -12,6 +12,7 @@ import type {
   HardeningReport,
   Concern,
   DefenderReport,
+  DefenderStatus,
   Location,
   Observation,
   ProvenanceReport,
@@ -133,6 +134,11 @@ export default function Scanner() {
         </div>
       )}
 
+      {/* Above the tables on purpose. This is the one thing on the page that
+          *does* something rather than reporting something, and it is what
+          somebody opening this view has come to do. */}
+      <DefenderScan status={status ?? null} />
+
       {status && (
         <>
           <section className="panel">
@@ -248,8 +254,6 @@ export default function Scanner() {
           </section>
         </>
       )}
-
-      <DefenderScan />
 
       <Canaries />
 
@@ -467,7 +471,32 @@ function signatureLabel(signature: Signature): string {
  * been cleaned: Defender is deliberately asked to report rather than to act, so
  * anything found is still exactly where it was.
  */
-function DefenderScan() {
+/**
+ * How old a set of definitions is, in words a person uses.
+ *
+ * Shown because it is what makes a scan result mean anything. "Defender found
+ * nothing" is a different sentence depending on whether it was looking with
+ * this morning's definitions or with a set from three weeks ago, and nothing in
+ * Windows' own interface puts the two facts next to each other.
+ */
+function definitionsAge(days: number | null): string {
+  if (days === null) return "of unknown age";
+  if (days <= 0) return "updated today";
+  if (days === 1) return "updated yesterday";
+  if (days < 7) return `updated ${days} days ago`;
+  if (days < 14) return "updated over a week ago";
+  return `updated ${Math.floor(days / 7)} weeks ago`;
+}
+
+/** What each kind of scan actually looks at, so the result can be read. */
+const COVERS: Record<"quick" | "full", string> = {
+  quick:
+    "memory, the places programs start themselves from, and the folders \
+     infections usually land in. Not every file on the disk.",
+  full: "every file on every fixed drive, which is why it takes hours.",
+};
+
+function DefenderScan({ status }: { status: DefenderStatus | null }) {
   const [running, setRunning] = useState<null | "quick" | "full">(null);
   const [job, setJob] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
@@ -539,13 +568,59 @@ function DefenderScan() {
         here, where it can be undone.
       </p>
 
+      {/* What it is looking with. A scan that finds nothing means one thing
+          with this morning's definitions and something much weaker with a set
+          from three weeks ago, and Windows never shows the two together. */}
+      {status && (
+        <div className="scan-definitions">
+          <span className="muted">
+            Looking with definitions{" "}
+            {status.antivirus_signature_version ?? "of unknown version"},{" "}
+            {definitionsAge(status.signature_age_days)}
+            {status.engine_version
+              ? `, engine ${status.engine_version}`
+              : null}
+            .
+          </span>
+          {(status.signature_age_days ?? 0) >= 7 && (
+            <p className="held-warn">
+              Definitions this old are the limit of what the scan can find.
+              Anything newer than them is not being looked for at all.
+            </p>
+          )}
+        </div>
+      )}
+
       {error && <p className="error">{error}</p>}
 
       {running && (
-        <p className="muted">
-          {running === "quick" ? "Quick scan" : "Full scan"} running —{" "}
-          {fmt.duration(elapsed * 1000)} so far. You can leave this page.
-        </p>
+        <div className="scan-running">
+          <p>
+            {running === "quick" ? "Quick scan" : "Full scan"} running —{" "}
+            {fmt.duration(elapsed * 1000)} so far. You can leave this page.
+          </p>
+          <p className="small muted">Covering {COVERS[running]}</p>
+          {/* No bar, and no percentage. Defender publishes neither, so any
+              fraction shown here would be invented — and a progress bar that
+              is making its number up is the single most common small lie in
+              this category of software. */}
+          <p className="small muted">
+            Defender does not publish how far through it is, so this counts
+            time rather than showing a bar it would have to invent.
+          </p>
+          {status && (
+            <p className="small muted">
+              Last {running === "quick" ? "quick" : "full"} scan:{" "}
+              {age(
+                running === "quick"
+                  ? status.last_quick_scan_age_days
+                  : status.last_full_scan_age_days,
+                "never, as far as Defender records",
+              )}
+              .
+            </p>
+          )}
+        </div>
       )}
 
       {outcome && (
@@ -584,6 +659,14 @@ function DefenderScan() {
                 ))}
               </ul>
             </>
+          )}
+          {/* Which definitions the answer came from. Without this, the
+              result is undateable a week later. */}
+          {status?.antivirus_signature_version && (
+            <p className="small muted">
+              Looked with definitions {status.antivirus_signature_version},{" "}
+              {definitionsAge(status.signature_age_days)}.
+            </p>
           )}
           {outcome.caveat && <p className="muted">{outcome.caveat}</p>}
         </div>

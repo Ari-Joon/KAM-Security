@@ -179,6 +179,22 @@ pub struct Finding {
     /// The reasoning, in plain words, in the order it was arrived at. This is
     /// the actual product: a rank with no reasons attached is an accusation.
     pub reasons: Vec<String>,
+    /// True when this file is part of this program.
+    ///
+    /// Every clause of the worst unsigned case is true of this program's own
+    /// agent: nobody signed it, it runs as a service, and on anything but a
+    /// proper install it sits in a folder the user can write to. So it ranked
+    /// itself at the top of the list of programs worth looking at, which is
+    /// funny once and corrosive afterwards -- a security tool that accuses
+    /// itself is teaching the reader that its list is mechanical rather than
+    /// considered.
+    ///
+    /// Marked rather than removed. The facts stay, and are shown as this
+    /// program disclosing its own position; what stops is ranking itself
+    /// against other people's software. See [`kam_core::ourselves`] for why
+    /// exempting yourself from your own checks is otherwise indefensible.
+    #[serde(default)]
+    pub ours: bool,
 }
 
 impl Finding {
@@ -247,6 +263,39 @@ fn arrival(metadata: &std::fs::Metadata, now: u64) -> Option<u64> {
 fn weigh(finding: &mut Finding) {
     let mut weight = 0_u32;
     let mut reasons = Vec::new();
+
+    if finding.ours {
+        // Said in full, and said first. An unsigned service running as
+        // LocalSystem out of a directory somebody can write to is a real
+        // weakness of this install -- anyone who can write there owns the
+        // machine -- and it would be absurd for the one program on the machine
+        // whose job is to say such things to leave its own out.
+        //
+        // What it does not do is compete with the rest of the list for the
+        // reader's attention, because "this is the software you are currently
+        // looking at" is not a finding.
+        finding
+            .reasons
+            .push("This is part of KAM Security itself.".to_owned());
+        match &finding.signature {
+            Signature::Valid { signer, .. } => finding.reasons.push(format!("Signed by {signer}.")),
+            _ => finding.reasons.push(
+                "It is not signed, which is worth knowing about a program \
+                       that runs as the system account."
+                    .to_owned(),
+            ),
+        }
+        if finding.location == Location::UserWritable {
+            finding.reasons.push(
+                "It is installed in a folder that programs running as you can write to, \
+                 so anything running as you could replace it. Installing under \
+                 Program Files is what stops that."
+                    .to_owned(),
+            );
+        }
+        finding.attention = Attention::Ordinary;
+        return;
+    }
 
     let persists = finding.persists();
     let external = finding
@@ -440,6 +489,7 @@ fn examine(path: &Path, anchored: &[Entry], now: u64) -> Option<Finding> {
         signature: signature::of(path),
         location: Location::of(path),
         persistence: anchored.to_vec(),
+        ours: kam_core::ourselves::is_ours(path),
         path: text,
         attention: Attention::Ordinary,
         reasons: Vec::new(),
@@ -657,6 +707,7 @@ mod tests {
             location,
             attention: Attention::Ordinary,
             reasons: Vec::new(),
+            ours: false,
         };
         weigh(&mut finding);
         finding

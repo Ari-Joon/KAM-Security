@@ -12,6 +12,7 @@ pub mod db;
 pub mod env;
 pub mod error;
 pub mod mui;
+pub mod ourselves;
 pub mod progress;
 pub mod registry;
 pub mod user;
