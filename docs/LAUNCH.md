@@ -50,10 +50,13 @@ badge at the top of the README is a bad first impression.
 - **Branch protection** on `main`: require CI to pass. Worth it even solo — it
   stops a broken push landing on the branch strangers clone.
 
-## 6. Screenshots
+## 6. Screenshots ✅ done
 
-The README currently has none, and for a desktop application that is the single
-biggest thing missing. Capture at 1280×800 with the window maximised:
+Overview, Storage, Applications, Scanner, Firewall and Cleanup are in
+`docs/images/` and shown near the top of the README. Retake them when a page
+changes visibly. The original brief, for reference:
+
+Capture at 1280×800 with the window maximised:
 
 1. **Overview** with real drives — the first impression.
 2. **Storage** after a scan of `C:\`, treemap filled. This is the screenshot

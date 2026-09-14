@@ -44,8 +44,35 @@ presenting circumstantial evidence as a verdict is the whole business model of
 the software this replaces.
 
 <p align="center">
-  <img src="docs/images/overview.png" width="900" alt="The Overview: drives, and the weekly check that is off until you turn it on">
+  <img src="docs/images/overview.png" width="900" alt="The Overview: protection on, running as a Windows service, and the drives it can see">
 </p>
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/storage.png" alt="Storage: 818 GB across 1.5 million files measured from the master file table in 1.6 seconds, drawn as a treemap"></td>
+    <td width="50%"><img src="docs/images/applications.png" alt="Applications: 484 GB actually used against the 55.5 GB Control Panel claims, sorted by real size"></td>
+  </tr>
+  <tr>
+    <td><b>Storage</b> — a whole drive read from the master file table in under two seconds, drawn to scale.</td>
+    <td><b>Applications</b> — what each program really occupies, against what its installer claimed.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/firewall.png" alt="Firewall: every profile on, 690 rules, and every open connection grouped by the publisher that signed the program"></td>
+    <td><img src="docs/images/scanner.png" alt="Scanner: Defender's own protections read from Defender, with a quick or full scan started from here"></td>
+  </tr>
+  <tr>
+    <td><b>Firewall</b> — every open socket, grouped by who signed the program holding it.</td>
+    <td><b>Scanner</b> — Defender's real state, and a scan that reports rather than acts.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/cleanup.png" alt="Cleanup: leftovers, a thirty-day quarantine, byte-for-byte duplicates, caches and loose files"></td>
+    <td><img src="docs/images/overview-activity.png" alt="The weekly check registered for Monday at 09:00, and the audit log of recent activity"></td>
+  </tr>
+  <tr>
+    <td><b>Cleanup</b> — nothing destroyed: quarantine for thirty days, or the Recycle Bin.</td>
+    <td><b>Weekly check and audit log</b> — state read in seconds, and every action written down.</td>
+  </tr>
+</table>
 
 ## Reading a terabyte in two seconds
 
