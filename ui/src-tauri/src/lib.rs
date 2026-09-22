@@ -10,6 +10,7 @@
 
 pub mod consent;
 mod recycle;
+mod startup;
 mod uninstall;
 mod update;
 
@@ -22,7 +23,7 @@ use kam_storage::{
     AppFootprint, Download, DownloadSummary, DuplicateGroup, DuplicateSummary, FootprintSummary,
     OrganiseSummary, Orphan, OrphanSummary, Proposal, Scan, Volume,
 };
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 /// Turn a response into the value a command promised, or a message for the UI.
 ///
@@ -903,6 +904,21 @@ fn protocol_version() -> u32 {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Whether this launch turned starting at sign-in on by default.
+struct FirstRun(bool);
+
+/// Whether KAM Security starts when this person signs in.
+#[tauri::command]
+fn start_at_sign_in(first_run: tauri::State<'_, FirstRun>) -> startup::StartState {
+    startup::state(first_run.0)
+}
+
+/// Turn starting at sign-in on or off.
+#[tauri::command]
+fn set_start_at_sign_in(enabled: bool) -> Result<startup::StartState, String> {
+    startup::set(enabled)
+}
+
 /// Whether a newer release has been published. See `update.rs`.
 ///
 /// Off the interface thread: it waits on the network for up to twenty seconds,
@@ -947,11 +963,26 @@ pub fn run() {
         // the notification area shows two icons — which is exactly how the bug
         // was reported. Two shells also means two pipe clients competing for
         // the agent's connection slots for no benefit whatever.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            tray::show_window(app);
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // A second start from the sign-in entry (after an update, say)
+            // should not open the window; any other second start is somebody
+            // clicking the shortcut, and should.
+            if !argv.iter().any(|arg| arg == startup::BACKGROUND) {
+                tray::show_window(app);
+            }
         }))
         .setup(|app| {
             tray::install(app.handle())?;
+            app.manage(FirstRun(startup::apply_first_run_default()));
+
+            // Started at sign-in: the icon only, no window, which is what makes
+            // being there from sign-in cost nothing. Otherwise open the window
+            // as usual. It is not created from the configuration, so that a
+            // background start never builds a WebView just to destroy it.
+            let background = std::env::args().any(|arg| arg == startup::BACKGROUND);
+            if !background {
+                tray::show_window(app.handle());
+            }
             Ok(())
         })
         .on_window_event(tray::on_window_event)
@@ -1009,7 +1040,9 @@ pub fn run() {
             run_uninstaller,
             protocol_version,
             check_for_update,
-            open_release_page
+            open_release_page,
+            start_at_sign_in,
+            set_start_at_sign_in
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| {

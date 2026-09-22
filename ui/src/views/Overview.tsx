@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import * as fmt from "../lib/format";
 import { api, reason } from "../lib/api";
 import type {
+  StartState,
   AuditRecord,
   CheckFinding,
   Schedule,
@@ -63,6 +64,28 @@ function Protection() {
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Kept apart from `error`, which is about reading the state. A declined
+  // permission prompt is not the agent failing to answer, and headlining it
+  // that way would misdescribe what happened.
+  const [refused, setRefused] = useState<string | null>(null);
+  const [start, setStart] = useState<StartState | null>(null);
+  const [startError, setStartError] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .startAtSignIn()
+      .then(setStart)
+      .catch((cause) => setStartError(reason(cause)));
+  }, []);
+
+  async function changeStart(next: boolean) {
+    setStartError(null);
+    try {
+      setStart(await api.setStartAtSignIn(next));
+    } catch (cause) {
+      setStartError(reason(cause));
+    }
+  }
 
   const refresh = useCallback(async () => {
     try {
@@ -82,13 +105,15 @@ function Protection() {
 
   async function toggle(next: boolean) {
     setBusy(true);
-    setError(null);
+    setRefused(null);
     try {
       setEnabled(await api.setProtection(next));
     } catch (cause) {
-      setError(reason(cause));
+      setRefused(reason(cause));
     } finally {
       setBusy(false);
+      // Whatever happened, show what is true now rather than what was asked.
+      void refresh();
     }
   }
 
@@ -114,12 +139,19 @@ function Protection() {
         </div>
       )}
 
+      {refused && (
+        <div className="notice notice-warn">
+          <strong>Nothing was changed.</strong> {refused}
+        </div>
+      )}
+
       {enabled === true && (
         <div className="notice notice-ok">
           <strong>Protection is on.</strong> The agent watches what newly starts
-          itself and reports anything that reads a decoy. It runs as a Windows
-          service, so it keeps working when this window is closed and starts
-          again by itself after a reboot or a crash.
+          itself, and reports anything that reads one of the decoy files if you
+          have planted them (Scanner, Decoy files). It runs as a Windows service,
+          so it keeps working when this window is closed and starts again by
+          itself after a reboot or a crash.
         </div>
       )}
 
@@ -132,10 +164,39 @@ function Protection() {
       )}
 
       <p className="muted small">
-        Turning it off here stops the watching, not the service — something has
-        to stay running to turn it back on. To stop the service itself, use Task
-        Manager or an administrator terminal.
+        Turning it on or off asks Windows for permission first, the same as
+        changing a protection in Windows Security, so nothing running on this
+        machine can switch it off without you agreeing. Turning it off stops the
+        watching, not the service: something has to stay running to turn it back
+        on.
       </p>
+
+      <div className="startup-row">
+        <label className="small">
+          <input
+            type="checkbox"
+            checked={start?.enabled ?? false}
+            disabled={start === null}
+            onChange={(event) => void changeStart(event.target.checked)}
+          />{" "}
+          Start KAM Security when I sign in, in the notification area
+        </label>
+        {start?.turned_on_now && (
+          <p className="small muted">
+            Turned on the first time KAM Security ran, so its icon is by the
+            clock from the moment you sign in. Closing the window leaves it
+            there; the protection itself runs in the background service either
+            way. Untick this if you would rather start it yourself.
+          </p>
+        )}
+        {start?.points_elsewhere && (
+          <p className="small held-warn">
+            An entry named KAM Security starts something other than this copy,
+            probably an older installation. Ticking the box points it here.
+          </p>
+        )}
+        {startError && <p className="small held-warn">{startError}</p>}
+      </div>
     </section>
   );
 }

@@ -3169,3 +3169,11 @@ button.ghost {
   border: 1px solid var(--border);
   border-radius: 6px;
 }
+
+/* The start-at-sign-in switch, set apart from the protection switch above it:
+   one is about the watching, the other about where the icon lives. */
+.startup-row {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}

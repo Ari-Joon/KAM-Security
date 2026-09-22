@@ -26,9 +26,12 @@
 //!    A tray icon that wakes every few seconds to refresh a tooltip nobody is
 //!    reading is precisely the waste this project exists to be an alternative
 //!    to.
-//! 3. **It is off unless asked for.** Nothing is added to the run keys — this
-//!    product reports on what starts itself at boot, and quietly adding itself
-//!    to that list while doing so would be grotesque.
+//! 3. **It starts at sign-in, and says so.** The owner decided the icon
+//!    should be there from the moment anyone signs in, so the program adds
+//!    itself to the person's own `Run` key the first time it runs. Never
+//!    quietly: the Overview states it beside the switch that turns it off, and
+//!    the entry shows in this program's own list of what starts itself, named
+//!    as KAM Security. See `startup.rs`.
 
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -86,7 +89,16 @@ fn protection_summary() -> String {
 pub fn install(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open KAM Security", true, None::<&str>)?;
     let status = MenuItem::with_id(app, "status", "Checking…", false, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    // Closing the icon does not switch protection off: that is the service,
+    // which keeps running. The label says so, because "Quit" on a security
+    // product reads as "stop protecting me".
+    let quit = MenuItem::with_id(
+        app,
+        "quit",
+        "Close the icon (protection keeps running)",
+        true,
+        None::<&str>,
+    )?;
     let separator = PredefinedMenuItem::separator(app)?;
 
     let menu = Menu::with_items(app, &[&status, &separator, &open, &quit])?;
@@ -117,8 +129,15 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 // The one moment somebody could be about to read the status,
                 // and so the only moment worth spending anything to produce
                 // it. Everything else here is idle.
+                //
+                // Asked on its own thread. It waits on the agent, and the
+                // icon's event loop is also the window's: a slow answer here
+                // used to freeze both for as long as it took.
                 TrayIconEvent::Enter { .. } => {
-                    let _ = status_item.set_text(protection_summary());
+                    let item = status_item.clone();
+                    std::thread::spawn(move || {
+                        let _ = item.set_text(protection_summary());
+                    });
                 }
                 _ => {}
             }

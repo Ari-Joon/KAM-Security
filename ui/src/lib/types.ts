@@ -875,3 +875,12 @@ export type UpdateCheck = {
   /** Why the answer is incomplete. Null means the answer is the whole answer. */
   problem: string | null;
 };
+
+/** Whether KAM Security starts when this person signs in. See startup.rs. */
+export type StartState = {
+  enabled: boolean;
+  /** An entry named "KAM Security" exists but starts something else. */
+  points_elsewhere: boolean;
+  /** This launch turned it on by default, so say so once. */
+  turned_on_now: boolean;
+};

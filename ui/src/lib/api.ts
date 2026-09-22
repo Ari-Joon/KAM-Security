@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppFootprint,
+  StartState,
   UpdateCheck,
   ApplicationReport,
   Cache,
@@ -136,6 +137,9 @@ export const api = {
     invoke<void>("run_uninstaller", { name, command }),
   protocolVersion: () => invoke<number>("protocol_version"),
   checkForUpdate: () => invoke<UpdateCheck>("check_for_update"),
+  startAtSignIn: () => invoke<StartState>("start_at_sign_in"),
+  setStartAtSignIn: (enabled: boolean) =>
+    invoke<StartState>("set_start_at_sign_in", { enabled }),
   openReleasePage: (url: string) => invoke<void>("open_release_page", { url }),
 };
 
