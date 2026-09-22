@@ -40,7 +40,7 @@
 //!
 //! The last two are why this file is longer than "run a command".
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -169,12 +169,62 @@ fn checked_target(path: &str) -> std::result::Result<PathBuf, String> {
 /// with the detection time: two genuinely separate detections of the same threat
 /// in the same instant would collapse into one, which under-counts a display and
 /// changes nothing about what is reported.
-fn new_detections(known: &std::collections::HashSet<(String, Option<String>)>) -> Vec<Threat> {
-    crate::defender::threats()
-        .unwrap_or_default()
+/// Detections Defender has recorded that were not in `known`.
+///
+/// An error rather than an empty list when the history cannot be read: an
+/// unreadable history after a scan is not a clean result, and must not be
+/// shown as one.
+fn new_detections(
+    known: &std::collections::HashSet<(String, Option<String>)>,
+) -> Result<Vec<Threat>> {
+    Ok(crate::defender::threats()?
         .into_iter()
         .filter(|threat| !known.contains(&(threat.name.clone(), threat.detected_at.clone())))
-        .collect()
+        .collect())
+}
+
+/// The arguments for one scan, built only from constants and, for a single
+/// path, that path already resolved and checked.
+///
+/// # Quick and full scans behave exactly as Windows Security's own
+///
+/// `-DisableRemediation` is, in `MpCmdRun`'s own words, "valid only for custom
+/// scan". It was passed to quick and full scans as well, where Defender does
+/// not honour it as documented, and where it can also keep what was found out
+/// of the detection history this reads afterwards. So a scan started here could
+/// report "nothing new" about something Defender had found.
+///
+/// A quick or full scan started here is now the same scan as the button in
+/// Windows Security: Defender deals with what it finds the way it is configured
+/// to, usually by quarantining it where Windows Security can restore it, and
+/// records it in its history, which is what this then reads. That is the point
+/// of building on Defender rather than beside it.
+///
+/// A scan of one path keeps `-DisableRemediation`, where it is valid. That path
+/// comes from a request, and a target reached through a link must not have
+/// Defender act on whatever the link leads to.
+fn arguments(kind: &ScanKind, target: Option<&Path>) -> Vec<String> {
+    let mut arguments = vec!["-Scan".to_owned(), "-ScanType".to_owned()];
+    match (kind, target) {
+        (ScanKind::Quick, _) => arguments.push("1".to_owned()),
+        (ScanKind::Full, _) => arguments.push("2".to_owned()),
+        (ScanKind::Path { .. }, Some(target)) => {
+            arguments.push("3".to_owned());
+            arguments.push("-File".to_owned());
+            arguments.push(target.to_string_lossy().into_owned());
+            arguments.push("-DisableRemediation".to_owned());
+        }
+        // A path scan without its checked target is never built.
+        (ScanKind::Path { .. }, None) => arguments.clear(),
+    }
+    arguments
+}
+
+fn unread_after(error: &Error) -> String {
+    format!(
+        "Defender's detection history could not be read after the scan ({error}), so \
+         this cannot say what it found. Windows Security's Protection history can."
+    )
 }
 
 /// Ask Defender to scan, and report what it found.
@@ -191,42 +241,36 @@ pub fn run(kind: &ScanKind, cancel: &AtomicBool) -> Result<ScanOutcome> {
         )));
     }
 
-    // Built as separate arguments, never a command line. See the module note.
-    let mut arguments: Vec<String> = vec!["-Scan".to_owned(), "-ScanType".to_owned()];
+    // Built as separate arguments, never a command line. See `arguments`.
+    let target = match kind {
+        ScanKind::Path { path } => Some(checked_target(path).map_err(Error::Refused)?),
+        _ => None,
+    };
+    let arguments = arguments(kind, target.as_deref());
     let mut caveat = None;
-    match kind {
-        ScanKind::Quick => arguments.push("1".to_owned()),
-        ScanKind::Full => arguments.push("2".to_owned()),
-        ScanKind::Path { path } => {
-            let target = checked_target(path).map_err(Error::Refused)?;
-            arguments.push("3".to_owned());
-            arguments.push("-File".to_owned());
-            arguments.push(target.to_string_lossy().into_owned());
-        }
-    }
-    // Defender reports; this product decides and acts. See the module note --
-    // without this, a target reached through a junction has Defender removing
-    // the real file somewhere else, outside everything that fences and records
-    // what this software does.
-    arguments.push("-DisableRemediation".to_owned());
 
     // What Defender already knew about, so the new ones can be told apart
-    // without trusting a timestamp format.
-    let before = crate::defender::threats().unwrap_or_default();
-    let known: std::collections::HashSet<(String, Option<String>)> = before
-        .iter()
-        .map(|threat| (threat.name.clone(), threat.detected_at.clone()))
-        .collect();
+    // without trusting a timestamp format. If this cannot be read, nothing
+    // can be called new, and the result says so rather than presenting every
+    // past detection as today's.
+    let known: Option<std::collections::HashSet<(String, Option<String>)>> =
+        crate::defender::threats().ok().map(|before| {
+            before
+                .iter()
+                .map(|threat| (threat.name.clone(), threat.detected_at.clone()))
+                .collect()
+        });
 
     let started = Instant::now();
     let mut child = std::process::Command::new(&executable)
         .args(&arguments)
         .current_dir(safe_working_directory())
         .stdin(std::process::Stdio::null())
-        // Captured so it cannot land in the service's own console, and then
-        // deliberately not read for meaning.
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        // Discarded rather than captured. Nothing reads it for meaning (see
+        // below), and a pipe nobody drains fills up and stalls the scanner
+        // until the timeout, hours later.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|error| {
             Error::Privileged(format!("Defender's scanner could not be started: {error}"))
@@ -283,18 +327,58 @@ pub fn run(kind: &ScanKind, cancel: &AtomicBool) -> Result<ScanOutcome> {
     // was. Raised in review; the lag is plausible rather than demonstrated,
     // which is exactly the sort of thing to spend a second on rather than argue
     // about.
-    let mut found = new_detections(&known);
-    if found.is_empty() {
-        std::thread::sleep(Duration::from_millis(1500));
-        found = new_detections(&known);
+    let mut found = Vec::new();
+    match &known {
+        None => {
+            caveat.get_or_insert_with(|| {
+                "Defender's detection history could not be read before the scan, so \
+                 this cannot say which detections are new. Windows Security's \
+                 Protection history lists everything Defender has found."
+                    .to_owned()
+            });
+        }
+        Some(known) => match new_detections(known) {
+            Ok(first) if !first.is_empty() => found = first,
+            Ok(_) => {
+                std::thread::sleep(Duration::from_millis(1500));
+                match new_detections(known) {
+                    Ok(second) => found = second,
+                    Err(error) => {
+                        caveat.get_or_insert_with(|| unread_after(&error));
+                    }
+                }
+            }
+            Err(error) => {
+                caveat.get_or_insert_with(|| unread_after(&error));
+            }
+        },
+    }
+
+    // A single-path scan keeps remediation off, and with it Defender reports
+    // only in its own console output, which is not read for meaning. Its exit
+    // code is the one signal left, so a non-zero code is said out loud rather
+    // than shown as nothing found.
+    if let (ScanKind::Path { .. }, Some(code)) = (kind, exit_code) {
+        if code != 0 && found.is_empty() && caveat.is_none() {
+            caveat = Some(format!(
+                "Defender finished with code {code}, which it uses when it finds \
+                 something or cannot scan the file. A single-file scan leaves the file \
+                 where it is and does not always record it, so check it with Windows \
+                 Security before trusting it."
+            ));
+        }
     }
 
     if completed && caveat.is_none() && !found.is_empty() {
-        caveat = Some(
-            "Defender was asked to report rather than to act, so anything found \
-             is still where it was. Decide what happens to it here."
+        caveat = Some(match kind {
+            ScanKind::Path { .. } => "Defender was asked to report rather than to act, so \
+                 anything found is still where it was."
                 .to_owned(),
-        );
+            _ => "Defender dealt with these the way Windows Security does, usually by \
+                 quarantining them. Windows Security's Protection history shows what it \
+                 did and can restore anything it got wrong."
+                .to_owned(),
+        });
     }
 
     Ok(ScanOutcome {
@@ -389,22 +473,40 @@ mod tests {
     /// resolved absolute path. This asserts the shape rather than describing it,
     /// because the day somebody adds an option whose value comes from a request
     /// is the day that stops being true.
+    ///
+    /// This used to rebuild the arguments inside the test and then check the
+    /// copy it had just built, so it could never fail. It now calls the
+    /// function the scan uses.
     #[test]
-    fn a_scan_never_asks_defender_to_remediate() {
-        // Reproduces the argument building for each kind, which is the part
-        // worth pinning: remediation off, always.
-        for kind in [ScanKind::Quick, ScanKind::Full] {
-            let mut arguments: Vec<String> = vec!["-Scan".to_owned(), "-ScanType".to_owned()];
-            arguments.push(match kind {
-                ScanKind::Quick => "1".to_owned(),
-                _ => "2".to_owned(),
-            });
-            arguments.push("-DisableRemediation".to_owned());
+    fn scans_are_built_the_way_mpcmdrun_documents_them() {
+        // Quick and full: the same scan as Windows Security's button, with no
+        // switch MpCmdRun documents as valid only for a custom scan.
+        assert_eq!(
+            arguments(&ScanKind::Quick, None),
+            ["-Scan", "-ScanType", "1"]
+        );
+        assert_eq!(
+            arguments(&ScanKind::Full, None),
+            ["-Scan", "-ScanType", "2"]
+        );
 
-            assert!(
-                arguments.iter().any(|part| part == "-DisableRemediation"),
-                "a scan was built that lets Defender act on what it finds"
-            );
+        // One path: custom scan, and remediation off, where it is valid.
+        let target = Path::new(r"C:\Users\someone\thing.exe");
+        let path = ScanKind::Path {
+            path: target.display().to_string(),
+        };
+        let built = arguments(&path, Some(target));
+        assert_eq!(built[..3], ["-Scan", "-ScanType", "3"]);
+        assert!(built.iter().any(|part| part == "-DisableRemediation"));
+
+        // And never a path scan without its checked target.
+        assert!(arguments(&path, None).is_empty());
+
+        for arguments in [
+            arguments(&ScanKind::Quick, None),
+            arguments(&ScanKind::Full, None),
+            built,
+        ] {
             for part in &arguments {
                 assert!(
                     !part.contains('\n') && !part.contains('\r'),

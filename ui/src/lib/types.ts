@@ -438,6 +438,10 @@ export type Threat = {
   status: number | null;
   resources: string[];
   detected_at: string | null;
+  /** What Defender did, in words, from the agent. */
+  status_text: string;
+  /** Defender's action failed or none was taken: it may still be here. */
+  needs_attention: boolean;
 };
 
 /**

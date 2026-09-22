@@ -3177,3 +3177,10 @@ button.ghost {
   padding-top: 10px;
   border-top: 1px solid var(--border);
 }
+
+/* A detection Defender could not deal with: it may still be on the machine,
+   so it is the one row that asks something of the reader. */
+.entry-attention {
+  border-left: 3px solid var(--warn);
+  padding-left: 9px;
+}

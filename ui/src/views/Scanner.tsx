@@ -62,6 +62,7 @@ function age(days: number | null, never: string): string {
 export default function Scanner() {
   const [report, setReport] = useState<DefenderReport | null>(null);
   const [threats, setThreats] = useState<Threat[] | null>(null);
+  const [threatsError, setThreatsError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -72,10 +73,13 @@ export default function Scanner() {
       setError(null);
       try {
         setThreats(await api.defenderThreats());
-      } catch {
-        // A machine that has never detected anything may not publish the
-        // class at all. Not an error worth showing.
-        setThreats([]);
+        setThreatsError(null);
+      } catch (cause) {
+        // Not "no detections". A history that could not be read says nothing
+        // about what is in it, and showing it as empty would be the exact
+        // failure this product is built not to make.
+        setThreats(null);
+        setThreatsError(reason(cause));
       }
     } catch (cause) {
       setError(reason(cause));
@@ -213,7 +217,13 @@ export default function Scanner() {
             <div className="panel-head">
               <h2>What Defender has found</h2>
             </div>
-            {threats === null ? (
+            {threatsError ? (
+              <p className="held-warn">
+                Defender's detection history could not be read, so this cannot say
+                what it has found. Windows Security's Protection history shows the
+                same list. ({threatsError})
+              </p>
+            ) : threats === null ? (
               <p className="empty">Reading…</p>
             ) : threats.length === 0 ? (
               <p className="empty">
@@ -221,39 +231,35 @@ export default function Scanner() {
               </p>
             ) : (
               <ul className="entries">
-                {threats.map((threat, index) => (
-                  <li key={`${threat.name}-${index}`} className="entry">
-                    <span className={`badge severity-${threat.severity ?? 0}`}>
-                      {threat.severity === 5
-                        ? "severe"
-                        : threat.severity === 4
-                          ? "high"
-                          : threat.severity === 2
-                            ? "moderate"
-                            : threat.severity === 1
-                              ? "low"
-                              : "unknown"}
-                    </span>
-                    <div className="entry-body">
-                      <span className="action">{threat.name}</span>
-                      <span className="detail">
-                        {threat.status === 2
-                          ? "cleaned"
-                          : threat.status === 3
-                            ? "quarantined"
-                            : threat.status === 4
-                              ? "removed"
-                              : threat.status === 5
-                                ? "allowed"
-                                : threat.status === 6
-                                  ? "blocked"
-                                  : threat.status === 102
-                                    ? "no longer present"
-                                    : "status unknown"}
+                {/* Anything Defender could not deal with first: those may still
+                    be on this machine, and they are the only rows here that ask
+                    something of the person reading. */}
+                {[...threats]
+                  .sort((a, b) => Number(b.needs_attention) - Number(a.needs_attention))
+                  .map((threat, index) => (
+                    <li
+                      key={`${threat.name}-${threat.detected_at ?? index}`}
+                      className={`entry${threat.needs_attention ? " entry-attention" : ""}`}
+                    >
+                      <span className={`badge severity-${threat.severity ?? 0}`}>
+                        {threat.severity === 5
+                          ? "severe"
+                          : threat.severity === 4
+                            ? "high"
+                            : threat.severity === 2
+                              ? "moderate"
+                              : threat.severity === 1
+                                ? "low"
+                                : "severity not reported"}
                       </span>
-                    </div>
-                  </li>
-                ))}
+                      <div className="entry-body">
+                        <span className="action">{threat.name}</span>
+                        <span className={threat.needs_attention ? "held-warn" : "detail"}>
+                          {threat.status_text}
+                        </span>
+                      </div>
+                    </li>
+                  ))}
               </ul>
             )}
           </section>
@@ -568,9 +574,10 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
         stopped.
       </p>
       <p className="muted">
-        Defender is asked to <strong>report</strong> rather than to remove.
-        Anything it finds stays where it is, and what happens to it is decided
-        here, where it can be undone.
+        This is the same scan as the button in Windows Security. Defender deals
+        with anything it finds the way it is set up to, usually by quarantining
+        it, where Windows Security's Protection history can restore it. When the
+        scan ends, what Defender recorded is listed here.
       </p>
 
       {/* What it is looking with. A scan that finds nothing means one thing
@@ -657,9 +664,10 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
                 {outcome.found.map((threat) => (
                   <li key={`${threat.name}-${threat.detected_at ?? ""}`}>
                     <strong>{threat.name}</strong>
-                    {threat.detected_at && (
-                      <span className="muted"> — {threat.detected_at}</span>
-                    )}
+                    <span className={threat.needs_attention ? "held-warn" : "muted"}>
+                      {" "}
+                      {threat.status_text}
+                    </span>
                   </li>
                 ))}
               </ul>

@@ -115,6 +115,16 @@ pub struct Threat {
     /// Files or registry keys involved, as Defender recorded them.
     pub resources: Vec<String>,
     pub detected_at: Option<String>,
+    /// What Defender did, in words, from `status_label`. Sent with the
+    /// detection so the window never keeps a second, drifting copy of the
+    /// mapping. It did: it read 102, "quarantine failed", as "no longer
+    /// present".
+    #[serde(default)]
+    pub status_text: String,
+    /// True when Defender's action failed or it took none, so the thing may
+    /// still be on this machine and somebody should look.
+    #[serde(default)]
+    pub needs_attention: bool,
 }
 
 impl Threat {
@@ -128,22 +138,35 @@ impl Threat {
         }
     }
 
-    /// Defender's `ThreatStatusID`, translated.
+    /// Defender's `ThreatStatusID`, translated, from Microsoft's documented
+    /// values for `MSFT_MpThreatDetection`.
     ///
     /// The values that matter to a person are whether it is gone and whether
-    /// anything is still required of them.
+    /// anything is still required of them. The 100-range values are Defender's
+    /// own action *failing*, which is the most important thing this can say,
+    /// and 102 in particular was being shown as "no longer present" when it
+    /// means the quarantine did not happen.
     pub fn status_label(&self) -> &'static str {
         match self.status {
-            Some(0) => "unknown",
-            Some(1) => "detected",
+            Some(1) => "found, and no action taken yet",
             Some(2) => "cleaned",
             Some(3) => "quarantined",
             Some(4) => "removed",
             Some(5) => "allowed",
             Some(6) => "blocked",
-            Some(102) => "no longer present",
-            _ => "unknown",
+            Some(101) => "cleaning failed, may still be present",
+            Some(102) => "quarantine failed, may still be present",
+            Some(103) => "removal failed, may still be present",
+            Some(104) => "allowing failed",
+            Some(105) => "abandoned, may still be present",
+            Some(107) => "blocking failed, may still be present",
+            _ => "status not reported",
         }
+    }
+
+    /// Whether Defender left something that may still need a person.
+    pub fn needs_attention(&self) -> bool {
+        matches!(self.status, Some(1 | 101 | 102 | 103 | 105 | 107))
     }
 }
 
@@ -212,32 +235,62 @@ pub fn status() -> kam_core::Result<DefenderStatus> {
 /// of what those events were about. The detection rows carry the timestamp and
 /// the files, so they are what is read here.
 pub fn threats() -> kam_core::Result<Vec<Threat>> {
-    const FIELDS: &[&str] = &[
-        "ThreatName",
-        "SeverityID",
-        "CategoryID",
+    // Two classes, joined on `ThreatID`, because neither has everything.
+    //
+    // `MSFT_MpThreatDetection` is one row per detection: when, and what
+    // Defender did about it. It has no name, severity or category at all;
+    // those live on `MSFT_MpThreat`, the catalogue of what was detected. This
+    // read the name from the detection class, found nothing, and called every
+    // detection "unnamed" with an unknown severity.
+    const DETECTION: &[&str] = &[
+        "ThreatID",
         "ThreatStatusID",
         "CleaningActionID",
-        "Resources",
         "InitialDetectionTime",
     ];
+    const CATALOGUE: &[&str] = &["ThreatID", "ThreatName", "SeverityID", "CategoryID"];
 
-    // Detections carry timestamps; the threat catalogue does not.
-    let rows = wmi::query(NAMESPACE, "SELECT * FROM MSFT_MpThreatDetection", FIELDS)
-        .or_else(|_| wmi::query(NAMESPACE, "SELECT * FROM MSFT_MpThreat", FIELDS))?;
+    let detections = wmi::query(NAMESPACE, "SELECT * FROM MSFT_MpThreatDetection", DETECTION)?;
 
-    let mut threats: Vec<Threat> = rows
+    // The catalogue is for names. If it cannot be read, the detections are
+    // still real and still shown; they are named as unread rather than as
+    // anonymous, because "no name" and "could not read the name" differ.
+    let catalogue_rows = wmi::query(NAMESPACE, "SELECT * FROM MSFT_MpThreat", CATALOGUE).ok();
+    let catalogue: std::collections::HashMap<i64, &wmi::Row> = catalogue_rows
         .iter()
-        .map(|row| Threat {
-            name: text(row, "ThreatName").unwrap_or_else(|| "unnamed detection".to_owned()),
-            severity: number(row, "SeverityID"),
-            category: number(row, "CategoryID"),
-            action: number(row, "CleaningActionID"),
-            status: number(row, "ThreatStatusID"),
-            // Resources arrive as a string array, which the reader does not
-            // decode; the name and status are what a person needs.
-            resources: Vec::new(),
-            detected_at: text(row, "InitialDetectionTime"),
+        .flatten()
+        .filter_map(|row| number(row, "ThreatID").map(|id| (id, row)))
+        .collect();
+    let names_read = catalogue_rows.is_some();
+
+    let mut threats: Vec<Threat> = detections
+        .iter()
+        .map(|row| {
+            let entry = number(row, "ThreatID").and_then(|id| catalogue.get(&id).copied());
+            let mut threat = Threat {
+                name: entry
+                    .and_then(|entry| text(entry, "ThreatName"))
+                    .unwrap_or_else(|| {
+                        if names_read {
+                            "a detection Defender did not name".to_owned()
+                        } else {
+                            "name could not be read".to_owned()
+                        }
+                    }),
+                severity: entry.and_then(|entry| number(entry, "SeverityID")),
+                category: entry.and_then(|entry| number(entry, "CategoryID")),
+                action: number(row, "CleaningActionID"),
+                status: number(row, "ThreatStatusID"),
+                // Resources arrive as a string array, which the reader does not
+                // decode; the name and status are what a person needs.
+                resources: Vec::new(),
+                detected_at: text(row, "InitialDetectionTime"),
+                status_text: String::new(),
+                needs_attention: false,
+            };
+            threat.status_text = threat.status_label().to_owned();
+            threat.needs_attention = threat.needs_attention();
+            threat
         })
         .collect();
 
@@ -338,19 +391,55 @@ mod tests {
             .any(|concern| concern.contains("11 days old")));
     }
 
-    #[test]
-    fn severity_and_status_read_as_words() {
-        let threat = Threat {
+    fn threat(status: i64) -> Threat {
+        Threat {
             name: "Test".to_owned(),
             severity: Some(5),
             category: None,
             action: None,
-            status: Some(3),
+            status: Some(status),
             resources: Vec::new(),
             detected_at: None,
-        };
+            status_text: String::new(),
+            needs_attention: false,
+        }
+    }
+
+    #[test]
+    fn severity_and_status_read_as_words() {
+        let threat = threat(3);
         assert_eq!(threat.severity_label(), "severe");
         assert_eq!(threat.status_label(), "quarantined");
+        assert!(!threat.needs_attention());
+    }
+
+    /// Defender's own action failing is the most important thing a detection
+    /// can say, and it must never read as the threat being gone.
+    ///
+    /// 102 is "quarantine failed". It was shown as "no longer present", which
+    /// tells somebody the thing is dealt with at exactly the moment Defender is
+    /// saying it could not deal with it.
+    #[test]
+    fn a_failed_action_says_it_failed_and_asks_for_attention() {
+        for failed in [101, 102, 103, 105, 107] {
+            let threat = threat(failed);
+            assert!(
+                threat.status_label().contains("failed")
+                    || threat.status_label().contains("abandoned"),
+                "{failed} reads as {:?}",
+                threat.status_label()
+            );
+            assert!(
+                threat.needs_attention(),
+                "{failed} did not ask for attention"
+            );
+            assert!(
+                !threat.status_label().contains("no longer present"),
+                "{failed} claimed the threat was gone"
+            );
+        }
+        // Found and not yet acted on also needs a person.
+        assert!(threat(1).needs_attention());
     }
 
     #[test]
