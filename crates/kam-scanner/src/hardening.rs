@@ -292,6 +292,10 @@ impl FolderAccess {
 pub enum SwitchState {
     On,
     Off,
+    /// Switched on in its recording-only form: Defender notes what it would
+    /// have blocked and lets it through. Neither on nor off, and reported as
+    /// exactly what it is rather than rounded to either.
+    Audit,
     /// Nothing written. For most of these that means the Windows default,
     /// which is why each switch carries what its default actually is.
     NotConfigured,
@@ -304,6 +308,7 @@ impl SwitchState {
         match self {
             Self::On => "on".to_owned(),
             Self::Off => "off".to_owned(),
+            Self::Audit => "auditing only".to_owned(),
             Self::NotConfigured => "not configured".to_owned(),
             Self::Unrecognised(value) => format!("set to an unrecognised value ({value})"),
         }
@@ -341,6 +346,11 @@ pub struct Switch {
     /// these can stop software the owner depends on, and one of them cannot be
     /// set programmatically at all by design.
     pub how: String,
+    /// True when an organisation's policy sets this, so a change made here or
+    /// in Windows Security is overridden. The window says so instead of
+    /// offering a button whose effect would be undone.
+    #[serde(default)]
+    pub managed_by_policy: bool,
 }
 
 impl Switch {
@@ -384,13 +394,31 @@ fn switches() -> Vec<Switch> {
     // exactly the band this product's rule engine already targets: bundleware,
     // "optimisers", browser hijackers. Defender will block them and simply is
     // not asked to.
-    let pua = dword(
-        &[
-            r"SOFTWARE\Policies\Microsoft\Windows Defender\MpEngine",
-            r"SOFTWARE\Microsoft\Windows Defender\MpEngine",
-        ],
-        "MpEnablePus",
-    );
+    //
+    // Read from where Defender keeps it. This read `MpEngine\MpEnablePus`, which
+    // is not where the setting lives on current Windows: `Set-MpPreference`
+    // and Windows Security write `PUAProtection` directly under the Defender
+    // key, and group policy writes the same name under `Policies`. On the
+    // machine this was written on, Defender reported audit mode while this
+    // reported "not configured". The old names are still read, after the
+    // current ones, for machines configured before the change.
+    let policy = dword(
+        &[r"SOFTWARE\Policies\Microsoft\Windows Defender"],
+        "PUAProtection",
+    )
+    .or_else(|| {
+        dword(
+            &[r"SOFTWARE\Policies\Microsoft\Windows Defender\MpEngine"],
+            "MpEnablePus",
+        )
+    });
+    let local = dword(&[r"SOFTWARE\Microsoft\Windows Defender"], "PUAProtection").or_else(|| {
+        dword(
+            &[r"SOFTWARE\Microsoft\Windows Defender\MpEngine"],
+            "MpEnablePus",
+        )
+    });
+    let pua = policy.or(local);
     found.push(Switch {
         id: PUA_SWITCH.to_owned(),
         name: "Blocking unwanted applications".to_owned(),
@@ -401,14 +429,16 @@ fn switches() -> Vec<Switch> {
             .to_owned(),
         state: match pua {
             Some(1) => SwitchState::On,
-            // 2 is audit: it writes an event and allows it, which is not
-            // protection and is not described as such.
-            Some(0) | Some(2) => SwitchState::Off,
+            // 2 is audit: it records and allows. Not protection, and not "off"
+            // either, which is what it used to be rounded to.
+            Some(2) => SwitchState::Audit,
+            Some(0) => SwitchState::Off,
             Some(other) => SwitchState::Unrecognised(other),
             None => SwitchState::NotConfigured,
         },
         default: Default_::Off,
         how: "PowerShell as administrator: Set-MpPreference -PUAProtection Enabled".to_owned(),
+        managed_by_policy: policy.is_some(),
     });
 
     // LSA protection. Stops another process reading the memory of the service
@@ -433,6 +463,7 @@ fn switches() -> Vec<Switch> {
         how: "Windows Security > Device security > Core isolation, where recent versions of \
               Windows 11 offer it as Local Security Authority protection."
             .to_owned(),
+        managed_by_policy: false,
     });
 
     // Memory integrity. Off on plenty of machines because an old driver blocks
@@ -458,6 +489,7 @@ fn switches() -> Vec<Switch> {
         },
         default: Default_::Varies,
         how: "Windows Security > Device security > Core isolation > Memory integrity.".to_owned(),
+        managed_by_policy: false,
     });
 
     // The blocklist of drivers with known holes. Attackers bring a signed,
@@ -487,6 +519,7 @@ fn switches() -> Vec<Switch> {
         how: "It follows memory integrity on most machines. Windows Security > Device security > \
               Core isolation."
             .to_owned(),
+        managed_by_policy: false,
     });
 
     found
@@ -1084,6 +1117,7 @@ mod tests {
             state: SwitchState::Off,
             default: Default_::Off,
             how: "somewhere".to_owned(),
+            managed_by_policy: false,
         };
         assert!(!off_by_design.is_unexpectedly_off());
 
@@ -1115,6 +1149,7 @@ mod tests {
                     state: SwitchState::Off,
                     default: Default_::Off,
                     how: "somewhere".to_owned(),
+                    managed_by_policy: false,
                 },
                 Switch {
                     id: "tampered".to_owned(),
@@ -1123,6 +1158,7 @@ mod tests {
                     state: SwitchState::Off,
                     default: Default_::On,
                     how: "somewhere".to_owned(),
+                    managed_by_policy: false,
                 },
             ],
             unreadable: Vec::new(),

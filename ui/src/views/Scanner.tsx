@@ -173,7 +173,12 @@ export default function Scanner() {
               <Setting
                 label="Cloud-delivered protection"
                 value={status.cloud_protection}
-                explain="Checks suspicious files against Microsoft's live intelligence."
+                explain="Checks files it has not seen before against Microsoft's live intelligence. Several of the protections below need it."
+              />
+              <Setting
+                label="Download and attachment scanning"
+                value={status.download_scanning}
+                explain="Scans files as they arrive from the internet or in email."
               />
               <Setting
                 label="Tamper protection"
@@ -1075,9 +1080,11 @@ function Hardening() {
                     <div className="finding-head">
                       <span className="finding-name">{item.name}</span>
                       <span className={`badge attention-${tone}`}>
-                        {typeof item.state === "string"
-                          ? item.state.replace(/_/g, " ")
-                          : "unrecognised"}
+                        {typeof item.state !== "string"
+                          ? "unrecognised"
+                          : item.state === "audit"
+                            ? "auditing only"
+                            : item.state.replace(/_/g, " ")}
                       </span>
                     </div>
                     <p className="rule-explains">{item.explains}</p>
@@ -1089,7 +1096,19 @@ function Hardening() {
                         </strong>
                       </p>
                     )}
-                    {!on && item.id === "pua-protection" ? (
+                    {item.managed_by_policy && (
+                      <p className="footnote">
+                        Your organisation's policy sets this, so a change made
+                        here or in Windows Security would be undone.
+                      </p>
+                    )}
+                    {item.state === "audit" && (
+                      <p className="footnote">
+                        Defender is recording what it would block and letting it
+                        through. Turning it on makes it block.
+                      </p>
+                    )}
+                    {item.managed_by_policy ? null : !on && item.id === "pua-protection" ? (
                       <div className="rule-actions">
                         <button
                           disabled={changing !== null}
@@ -1101,7 +1120,7 @@ function Hardening() {
                     ) : (
                       !on && <p className="footnote">{item.how}</p>
                     )}
-                    {on && item.id === "pua-protection" && (
+                    {on && item.id === "pua-protection" && !item.managed_by_policy && (
                       <div className="rule-actions">
                         <button
                           className="ghost"

@@ -34,8 +34,17 @@ pub struct DefenderStatus {
     pub realtime_protection: Option<bool>,
     /// Watches memory, registry and behaviour rather than files on disk.
     pub behaviour_monitoring: Option<bool>,
-    /// Sends suspicious samples for cloud analysis.
+    /// Cloud-delivered protection: Defender asks Microsoft's cloud about what
+    /// it has not seen before. Read from `MAPSReporting`, which is the setting.
+    ///
+    /// It was read from `IoavProtectionEnabled`, which is a different switch
+    /// entirely (scanning downloads and attachments), so turning cloud
+    /// protection off left this saying "on", and several of the attack surface
+    /// rules this program offers depend on the cloud to work.
     pub cloud_protection: Option<bool>,
+    /// Scanning of downloaded files and attachments, under its own name.
+    #[serde(default)]
+    pub download_scanning: Option<bool>,
     /// Stops other software — including this one — changing Defender settings.
     pub tamper_protection: Option<bool>,
     pub antivirus_signature_version: Option<String>,
@@ -204,6 +213,18 @@ pub fn status() -> kam_core::Result<DefenderStatus> {
     ];
 
     let rows = wmi::query(NAMESPACE, "SELECT * FROM MSFT_MpComputerStatus", FIELDS)?;
+
+    // Cloud protection is a preference, not a status, so it lives on another
+    // class. 0 is off; 1 and 2 are the basic and advanced levels, both on. An
+    // unreadable preference is unknown, not off.
+    let cloud = wmi::query(
+        NAMESPACE,
+        "SELECT * FROM MSFT_MpPreference",
+        &["MAPSReporting"],
+    )
+    .ok()
+    .and_then(|rows| rows.first().and_then(|row| number(row, "MAPSReporting")))
+    .map(|level| level > 0);
     let Some(row) = rows.first() else {
         return Err(kam_core::Error::Refused(
             "Defender did not report a status; it may be replaced by another product".to_owned(),
@@ -218,7 +239,8 @@ pub fn status() -> kam_core::Result<DefenderStatus> {
         antivirus_enabled: flag(row, "AntivirusEnabled"),
         realtime_protection: flag(row, "RealTimeProtectionEnabled"),
         behaviour_monitoring: flag(row, "BehaviorMonitorEnabled"),
-        cloud_protection: flag(row, "IoavProtectionEnabled"),
+        cloud_protection: cloud,
+        download_scanning: flag(row, "IoavProtectionEnabled"),
         tamper_protection: flag(row, "IsTamperProtected"),
         antivirus_signature_version: text(row, "AntivirusSignatureVersion"),
         engine_version: text(row, "AMEngineVersion"),

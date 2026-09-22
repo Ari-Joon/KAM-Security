@@ -306,6 +306,8 @@ export type DefenderStatus = {
   realtime_protection: boolean | null;
   behaviour_monitoring: boolean | null;
   cloud_protection: boolean | null;
+  /** Scanning of downloads and attachments, a separate switch. */
+  download_scanning: boolean | null;
   tamper_protection: boolean | null;
   antivirus_signature_version: string | null;
   engine_version: string | null;
@@ -794,7 +796,7 @@ export type FolderAccess =
   | "not_configured"
   | "unreadable";
 
-export type SwitchState = "on" | "off" | "not_configured" | "unrecognised";
+export type SwitchState = "on" | "off" | "audit" | "not_configured" | "unrecognised";
 
 /**
  * Whether Windows turns a protection on by itself.
@@ -813,6 +815,8 @@ export type HardeningSwitch = {
   default: SwitchDefault;
   /** How to turn it on. Nothing here changes it. */
   how: string;
+  /** Set by an organisation's policy, so a change made here would not stick. */
+  managed_by_policy: boolean;
 };
 
 export type HardeningReport = {

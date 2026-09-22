@@ -35,7 +35,7 @@ use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
 use windows::Win32::System::Variant::{VariantClear, VARIANT};
 use windows::Win32::System::Wmi::{
     IWbemClassObject, IWbemLocator, IWbemServices, WbemLocator, WBEM_FLAG_FORWARD_ONLY,
-    WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE,
+    WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_S_TIMEDOUT,
 };
 
 /// One property value, reduced to the few shapes Defender actually uses.
@@ -204,13 +204,37 @@ pub fn query(namespace: &str, wql: &str, wanted: &[&str]) -> Result<Vec<Row>> {
     }
     .map_err(|error| com_error(error, &format!("query failed: {wql}")))?;
 
+    /// How long one step of an enumeration may take. Defender's classes
+    /// answer in milliseconds; a provider that has not answered in thirty
+    /// seconds is not going to.
+    const NEXT_TIMEOUT_MS: i32 = 30_000;
+
     let mut rows = Vec::new();
     loop {
         let mut objects: [Option<IWbemClassObject>; 1] = [None];
         let mut returned = 0_u32;
-        // Next reports the end of the enumeration by returning nothing, not by
-        // failing, so the count is what terminates this.
-        let _ = unsafe { enumerator.Next(WBEM_INFINITE, &mut objects, &mut returned) };
+        // With `WBEM_FLAG_RETURN_IMMEDIATELY` a query is accepted before it
+        // is run, so a bad class or a provider failure only surfaces here, at
+        // the first `Next`. Its result used to be discarded, which turned every
+        // such failure into "no rows": Defender's detection history reading as
+        // empty when it could not be read at all. A failure is now an error.
+        //
+        // And bounded: a provider that stops answering held the request, and
+        // the agent thread serving it, forever.
+        let status = unsafe { enumerator.Next(NEXT_TIMEOUT_MS, &mut objects, &mut returned) };
+        if status.is_err() {
+            return Err(Error::Privileged(format!(
+                "WMI could not read {wql}: {}",
+                windows::core::Error::from(status)
+            )));
+        }
+        if status.0 == WBEM_S_TIMEDOUT.0 {
+            return Err(Error::Privileged(format!(
+                "WMI did not answer {wql} within {} seconds",
+                NEXT_TIMEOUT_MS / 1000
+            )));
+        }
+        // The end of the enumeration is a success with nothing returned.
         if returned == 0 {
             break;
         }
