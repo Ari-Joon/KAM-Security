@@ -33,8 +33,8 @@ use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-    TOKEN_USER,
+    GetTokenInformation, TokenElevation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES,
@@ -199,16 +199,7 @@ impl PipeStream {
     /// reading, and `TOKEN_QUERY` is enough to read the user out of it. Neither
     /// permits impersonation, and nothing here acquires the caller's rights.
     pub fn client_sid(&self) -> Result<String> {
-        let process_id = self.client_process_id()?;
-
-        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
-            .map_err(|error| win32(error, "could not open the calling process"))?;
-        let process = OwnedHandle(process);
-
-        let mut token = HANDLE::default();
-        unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) }
-            .map_err(|error| win32(error, "could not open the caller's token"))?;
-        let token = OwnedHandle(token);
+        let token = self.client_token()?;
 
         // Two calls: the first fails with the required length, which is the
         // documented way to size a variable-length token structure.
@@ -243,6 +234,49 @@ impl PipeStream {
             .map_err(|_| Error::Protocol("the caller's SID was not valid text".to_owned()))?;
         unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
         Ok(sid)
+    }
+
+    /// Whether the caller is running with administrator rights. Server side
+    /// only.
+    ///
+    /// Read from the caller's own token, the same one its identity comes from,
+    /// so the answer is what Windows itself would use to decide whether this
+    /// caller may change a machine-wide setting. An administrator whose window
+    /// was opened normally is running with a filtered token and reads as not
+    /// elevated here, exactly as they would to Windows Security.
+    pub fn client_is_elevated(&self) -> Result<bool> {
+        let token = self.client_token()?;
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned = 0_u32;
+        unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenElevation,
+                Some((&raw mut elevation).cast()),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned,
+            )
+        }
+        .map_err(|error| win32(error, "could not read whether the caller is elevated"))?;
+        Ok(elevation.TokenIsElevated != 0)
+    }
+
+    /// The caller's access token, opened for reading and nothing else.
+    ///
+    /// `PROCESS_QUERY_LIMITED_INFORMATION` is enough to open the token and
+    /// `TOKEN_QUERY` enough to read it. Neither permits impersonation, and
+    /// nothing here acquires the caller's rights.
+    fn client_token(&self) -> Result<OwnedHandle> {
+        let process_id = self.client_process_id()?;
+
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
+            .map_err(|error| win32(error, "could not open the calling process"))?;
+        let process = OwnedHandle(process);
+
+        let mut token = HANDLE::default();
+        unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) }
+            .map_err(|error| win32(error, "could not open the caller's token"))?;
+        Ok(OwnedHandle(token))
     }
 }
 

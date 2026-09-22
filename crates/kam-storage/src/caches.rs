@@ -665,6 +665,35 @@ pub fn clear(id: &str, user: &UserContext) -> std::result::Result<Cleared, Strin
 }
 
 /// Every id the catalogue defines, for anything that needs to check one.
+/// Whether clearing this cache reaches beyond the caller's own profile.
+///
+/// That is the line Windows draws itself: Disk Cleanup clears a person's own
+/// temporary files and caches without asking, and asks for administrator
+/// rights before touching the Windows update cache, the machine-wide temporary
+/// folder or a previous installation of Windows. A clear that reaches outside
+/// the caller's profile is a machine-wide change and is only made for a caller
+/// who could make it themselves.
+///
+/// An id this does not know is treated as machine-wide. `clear` refuses it
+/// anyway; answering "needs an administrator" costs nothing, and answering the
+/// other way would be a guess in the permissive direction.
+pub fn is_machine_wide(id: &str, user: &UserContext) -> bool {
+    let Some(entry) = CATALOGUE.iter().find(|entry| entry.id == id) else {
+        return true;
+    };
+    let profile = user.profile().to_lowercase().replace('/', "\\");
+    let profile = profile.trim_end_matches('\\');
+    (entry.locate)(user).iter().any(|location| {
+        let location = location.to_string_lossy().to_lowercase().replace('/', "\\");
+        // Inside means the profile itself or below it on a component boundary,
+        // so `C:\Users\Ari` does not claim `C:\Users\Arianna`.
+        !(location == profile
+            || location
+                .strip_prefix(profile)
+                .is_some_and(|rest| rest.starts_with('\\')))
+    })
+}
+
 pub fn known_ids() -> Vec<&'static str> {
     CATALOGUE.iter().map(|entry| entry.id).collect()
 }

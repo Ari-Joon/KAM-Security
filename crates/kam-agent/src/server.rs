@@ -147,6 +147,34 @@ fn handle_connection(
 
     let request: Request = read_frame(stream)?;
     tracing::debug!(client = %image_path.display(), user = %user.profile(), ?request, "serving");
+
+    // Machine-wide changes only for a caller Windows would let make them. See
+    // `dispatch::needs_administrator` for which, and why.
+    //
+    // Checked here, before the request reaches any handler, so that no single
+    // arm can forget it. A token whose elevation cannot be read is treated as
+    // not elevated: the safe answer to "may this caller change a machine-wide
+    // setting" when the question cannot be asked is no.
+    if dispatch::needs_administrator(&request, &user)
+        && !stream.client_is_elevated().unwrap_or(false)
+    {
+        context.audit(
+            "agent",
+            "refuse_unelevated",
+            Effect::Refused,
+            format!(
+                "{} asked for a machine-wide change without administrator rights",
+                user.profile()
+            ),
+        );
+        write_frame(
+            stream,
+            &Reply::Done(Response::Error {
+                message: dispatch::NEEDS_ADMINISTRATOR.to_owned(),
+            }),
+        )?;
+        return Ok(());
+    }
     let response = run_request(stream, request, context, user);
     write_frame(stream, &Reply::Done(response))
 }

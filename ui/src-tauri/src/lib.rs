@@ -8,6 +8,7 @@
 //! Nothing in this process is privileged. It runs as the desktop user and gets
 //! served only because it is installed alongside the agent.
 
+pub mod consent;
 mod recycle;
 mod uninstall;
 mod update;
@@ -354,9 +355,32 @@ fn survey_caches() -> Result<Vec<kam_storage::Cache>, String> {
 ///
 /// Only the id travels. The agent holds the catalogue and resolves the paths
 /// itself, so nothing this process is told can widen what gets deleted.
+/// Run one machine-wide change off the window's thread, with consent.
+///
+/// The permission prompt can sit on screen for as long as the person takes to
+/// answer it, and a command running on the window's own thread would freeze
+/// the window for all of that time.
+async fn with_consent(request: Request) -> Result<Response, String> {
+    tauri::async_runtime::spawn_blocking(move || consent::call(request))
+        .await
+        .map_err(|error| format!("the change did not finish: {error}"))?
+}
+
 #[tauri::command]
-fn clear_cache(id: String) -> Result<kam_storage::Cleared, String> {
-    match kam_ipc::client::call(&Request::ClearCache { id }).map_err(|error| error.to_string())? {
+async fn clear_cache(id: String) -> Result<kam_storage::Cleared, String> {
+    // A person's own caches are theirs to clear without asking anyone, as in
+    // Disk Cleanup. Only a clear that reaches outside their profile asks.
+    let machine_wide = kam_storage::caches::is_machine_wide(&id, &kam_core::UserContext::current());
+    let response = if machine_wide {
+        with_consent(Request::ClearCache { id }).await?
+    } else {
+        tauri::async_runtime::spawn_blocking(move || {
+            kam_ipc::client::call(&Request::ClearCache { id }).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("the clear did not finish: {error}"))??
+    };
+    match response {
         Response::CacheCleared(cleared) => Ok(cleared),
         Response::Error { message } => Err(message),
         other => Err(unexpected(&other)),
@@ -575,11 +599,11 @@ fn hardening() -> Result<kam_scanner::hardening::Report, String> {
 /// and answers with a fresh survey rather than an acknowledgement, so what the
 /// window draws afterwards is what Defender actually reports.
 #[tauri::command]
-fn set_hardening(
+async fn set_hardening(
     id: String,
     wanted: kam_scanner::hardening::Wanted,
 ) -> Result<kam_scanner::hardening::Report, String> {
-    match kam_ipc::client::call(&Request::SetHardening { id, wanted }).map_err(|e| e.to_string())? {
+    match with_consent(Request::SetHardening { id, wanted }).await? {
         Response::Hardening(report) => Ok(*report),
         Response::Error { message } => Err(message),
         other => Err(unexpected(&other)),
@@ -602,8 +626,8 @@ fn protection() -> Result<bool, String> {
 /// there to be switched back on, and a security tool that could be shut down
 /// over its own interface is one an attacker shuts down.
 #[tauri::command]
-fn set_protection(enabled: bool) -> Result<bool, String> {
-    match kam_ipc::client::call(&Request::SetProtection { enabled }).map_err(|e| e.to_string())? {
+async fn set_protection(enabled: bool) -> Result<bool, String> {
+    match with_consent(Request::SetProtection { enabled }).await? {
         Response::Protection { enabled } => Ok(enabled),
         Response::Error { message } => Err(message),
         other => Err(unexpected(&other)),
@@ -635,10 +659,8 @@ fn set_canaries(planted: bool) -> Result<kam_canary::Report, String> {
 /// The one machine-wide setting this product changes. It is behind its own
 /// deliberate action in the window, and the agent records it both ways.
 #[tauri::command]
-fn set_canary_auditing(enabled: bool) -> Result<kam_canary::Report, String> {
-    match kam_ipc::client::call(&Request::SetCanaryAuditing { enabled })
-        .map_err(|e| e.to_string())?
-    {
+async fn set_canary_auditing(enabled: bool) -> Result<kam_canary::Report, String> {
+    match with_consent(Request::SetCanaryAuditing { enabled }).await? {
         Response::Canaries(report) => Ok(*report),
         Response::Error { message } => Err(message),
         other => Err(unexpected(&other)),
@@ -743,8 +765,8 @@ fn connections() -> Result<kam_firewall::connections::ConnectionReport, String> 
 /// and that the rule it creates is tagged as ours — rather than trusting what
 /// the interface sent. Returns the rule name, which is how it is undone.
 #[tauri::command]
-fn block_program(path: String) -> Result<String, String> {
-    match kam_ipc::client::call(&Request::BlockProgram { path }).map_err(|e| e.to_string())? {
+async fn block_program(path: String) -> Result<String, String> {
+    match with_consent(Request::BlockProgram { path }).await? {
         Response::Blocked { rule } => Ok(rule),
         Response::Error { message } => Err(message),
         other => Err(unexpected(&other)),
@@ -753,8 +775,8 @@ fn block_program(path: String) -> Result<String, String> {
 
 /// Remove a block this product created. The agent refuses anything else.
 #[tauri::command]
-fn unblock_program(rule: String) -> Result<(), String> {
-    match kam_ipc::client::call(&Request::UnblockProgram { rule }).map_err(|e| e.to_string())? {
+async fn unblock_program(rule: String) -> Result<(), String> {
+    match with_consent(Request::UnblockProgram { rule }).await? {
         Response::Acknowledged => Ok(()),
         Response::Error { message } => Err(message),
         other => Err(unexpected(&other)),

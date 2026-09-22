@@ -115,6 +115,99 @@ impl Context {
     }
 }
 
+/// Whether a request changes something machine-wide, and so may be made only
+/// for a caller running with administrator rights.
+///
+/// # The rule
+///
+/// The agent runs as LocalSystem, so it can make any change on this machine. A
+/// request is only a request, though: the question is whether the *person
+/// asking* could make that change themselves. For every request listed here,
+/// Windows' own tools require an administrator — Windows Security prompts for
+/// consent before a Defender protection is changed, and firewall rules and
+/// audit policy are administrator-only everywhere. The agent must not be the
+/// one place those same changes can be made without it.
+///
+/// So these run only when the caller's own token is elevated. A person who is
+/// an administrator but opened the window normally is asked to open it as
+/// administrator, which is the same consent Windows asks for.
+///
+/// # Every request is decided here, by hand
+///
+/// The match below has no catch-all arm on purpose. Adding a request to the
+/// protocol does not compile until somebody has written down which group it
+/// belongs to, so a new machine-wide change cannot arrive quietly in the
+/// "anyone" group by default.
+pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
+    match request {
+        // Machine-wide settings. Windows asks for an administrator before any
+        // of these, so this does too.
+        Request::SetHardening { .. }
+        | Request::SetCanaryAuditing { .. }
+        | Request::BlockProgram { .. }
+        | Request::UnblockProgram { .. }
+        | Request::SetProtection { .. } => true,
+
+        // A cache clear is machine-wide exactly when it reaches outside the
+        // caller's own profile: the Windows update cache, the shared temporary
+        // folder, a previous installation of Windows. A person's own browser
+        // cache and thumbnails are theirs to clear, as in Disk Cleanup.
+        Request::ClearCache { id } => kam_storage::caches::is_machine_wide(id, user),
+
+        // Acting on files and folders. Whether the caller may act on each path
+        // is decided per path, in the handler, against that caller's own rights.
+        Request::QuarantinePath { .. }
+        | Request::QuarantineCopy { .. }
+        | Request::RestoreQuarantined { .. }
+        | Request::DeleteQuarantined { .. }
+        | Request::EmptyQuarantine
+        | Request::ApplyMove { .. }
+        | Request::UndoMove { .. } => false,
+
+        // The caller's own things: a schedule that runs as them, unelevated,
+        // and decoy files in their own profile.
+        Request::SetSchedule { .. } | Request::SetCanaries { .. } => false,
+
+        // Recording what the window did, and stopping a job.
+        Request::RecordLookup { .. }
+        | Request::RecordRecycle { .. }
+        | Request::NoteUninstallLaunched { .. }
+        | Request::CancelJob { .. } => false,
+
+        // Reading, measuring and scanning. A Defender scan is something any
+        // user may start from Windows Security.
+        Request::GetSystemStatus
+        | Request::GetRecentAudit { .. }
+        | Request::ListVolumes
+        | Request::ScanPath { .. }
+        | Request::ListApplications { .. }
+        | Request::ListQuarantine
+        | Request::SweepForChanges
+        | Request::DefenderScan { .. }
+        | Request::GetSchedule
+        | Request::RunCheck
+        | Request::SurveyCaches
+        | Request::FindDuplicates { .. }
+        | Request::FindOrganiseProposals { .. }
+        | Request::ListMoves
+        | Request::FindRemnants { .. }
+        | Request::GetFirewall
+        | Request::GetConnections
+        | Request::GetDefenderStatus
+        | Request::GetDefenderThreats
+        | Request::SurveyProvenance { .. }
+        | Request::GetBehaviourEvents
+        | Request::GetExtensions
+        | Request::GetHardening
+        | Request::GetCanaries
+        | Request::GetProtection => false,
+    }
+}
+
+/// What a caller without administrator rights is told, in their terms.
+pub const NEEDS_ADMINISTRATOR: &str = "Changing this needs administrator rights, the same as \
+    changing it in Windows itself.";
+
 pub fn handle(
     request: Request,
     context: &Context,
@@ -1272,6 +1365,92 @@ fn hostname() -> String {
 #[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn someone() -> UserContext {
+        UserContext::new(None, r"C:\Users\someone")
+    }
+
+    /// Changing a machine-wide setting needs an administrator, whichever way.
+    ///
+    /// Turning a protection on is included, not only turning one off. Windows
+    /// asks for an administrator in both directions, and the rule this follows
+    /// is "never a change the caller could not make themselves", which does not
+    /// depend on whether the change looks like tightening.
+    #[test]
+    fn every_machine_wide_setting_needs_an_administrator() {
+        let user = someone();
+        let changes = [
+            Request::SetHardening {
+                id: "pua-protection".to_owned(),
+                wanted: kam_scanner::hardening::Wanted::Block,
+            },
+            Request::SetHardening {
+                id: "pua-protection".to_owned(),
+                wanted: kam_scanner::hardening::Wanted::Off,
+            },
+            Request::SetCanaryAuditing { enabled: true },
+            Request::SetCanaryAuditing { enabled: false },
+            Request::BlockProgram {
+                path: r"C:\Program Files\thing.exe".to_owned(),
+            },
+            Request::UnblockProgram {
+                rule: "KAM Security: block thing.exe".to_owned(),
+            },
+            Request::SetProtection { enabled: true },
+            Request::SetProtection { enabled: false },
+        ];
+        for request in &changes {
+            assert!(
+                needs_administrator(request, &user),
+                "{request:?} was allowed without an administrator"
+            );
+        }
+    }
+
+    /// Reading and measuring are anyone's to ask for.
+    #[test]
+    fn reading_needs_nobody_special() {
+        let user = someone();
+        for request in [
+            Request::GetSystemStatus,
+            Request::GetRecentAudit { limit: 10 },
+            Request::ListVolumes,
+            Request::GetHardening,
+            Request::GetFirewall,
+            Request::GetProtection,
+            Request::SurveyCaches,
+        ] {
+            assert!(
+                !needs_administrator(&request, &user),
+                "{request:?} demanded an administrator for a read"
+            );
+        }
+    }
+
+    /// A cache is the caller's to clear when it is in their profile, and the
+    /// machine's otherwise, the same line Disk Cleanup draws.
+    #[test]
+    fn a_cache_clear_needs_an_administrator_only_beyond_the_callers_profile() {
+        let user = someone();
+        let clear = |id: &str| Request::ClearCache { id: id.to_owned() };
+
+        for own in ["temp-user", "thumbnails"] {
+            assert!(
+                !needs_administrator(&clear(own), &user),
+                "{own} lives in the caller's profile and still demanded an administrator"
+            );
+        }
+        for machine in ["temp-system", "windows-update", "windows-old"] {
+            assert!(
+                needs_administrator(&clear(machine), &user),
+                "{machine} reaches outside the caller's profile and was allowed without one"
+            );
+        }
+        assert!(
+            needs_administrator(&clear("not-a-real-cache"), &user),
+            "an unknown cache was treated as the caller's own"
+        );
+    }
 
     fn context(mode: Mode) -> Context {
         // A scratch quarantine store per test, so nothing here can reach the
