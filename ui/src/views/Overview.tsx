@@ -9,6 +9,7 @@ import type {
   Volume,
 } from "../lib/types";
 import EffectBadge from "../components/EffectBadge";
+import UpdateCheck from "../components/UpdateCheck";
 
 const DAYS = [
   "Sunday",
@@ -302,6 +303,8 @@ export default function Overview({ status, volumes, entries, onOpenStorage }: Pr
       </div>
 
       <Protection />
+
+      <UpdateCheck />
 
       <div className="stat-row">
         <div className="stat">

@@ -854,3 +854,24 @@ export type CanaryReport = {
   auditing: boolean;
   problems: string[];
 };
+
+/** A published release, as GitHub reports it. See ui/src-tauri/src/update.rs. */
+export type Release = {
+  version: string;
+  name: string;
+  published_at: string;
+  /** Plain text. Never rendered as HTML: it came from the network. */
+  notes: string;
+  /** This repository's release page, already checked by the shell. */
+  url: string;
+};
+
+/** Whether a newer release exists, or why that could not be established. */
+export type UpdateCheck = {
+  current: string;
+  latest: Release | null;
+  /** True only when the check completed and the published version is higher. */
+  newer: boolean;
+  /** Why the answer is incomplete. Null means the answer is the whole answer. */
+  problem: string | null;
+};

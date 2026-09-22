@@ -10,6 +10,7 @@
 
 mod recycle;
 mod uninstall;
+mod update;
 
 use kam_core::audit::Record;
 use kam_ipc::{Request, Response, SystemStatus};
@@ -880,6 +881,34 @@ fn protocol_version() -> u32 {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Whether a newer release has been published. See `update.rs`.
+///
+/// Off the interface thread: it waits on the network for up to twenty seconds,
+/// and every command that does not do this freezes the window for as long as
+/// it runs.
+#[tauri::command]
+async fn check_for_update() -> Result<update::UpdateCheck, String> {
+    tauri::async_runtime::spawn_blocking(|| update::check(env!("CARGO_PKG_VERSION")))
+        .await
+        .map_err(|error| format!("the update check did not finish: {error}"))
+}
+
+/// Open a release page in the person's browser.
+///
+/// Checked here rather than trusted from the window: the address came out of a
+/// network response, and this is the only link the check is allowed to open.
+#[tauri::command]
+fn open_release_page(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+
+    if !update::is_our_release_page(&url) {
+        return Err(format!("{url} is not one of this program's release pages"));
+    }
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|error| error.to_string())
+}
+
 mod tray;
 
 pub fn run() {
@@ -956,7 +985,9 @@ pub fn run() {
             can_recycle,
             reveal_in_explorer,
             run_uninstaller,
-            protocol_version
+            protocol_version,
+            check_for_update,
+            open_release_page
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| {

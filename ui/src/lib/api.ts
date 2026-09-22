@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppFootprint,
+  UpdateCheck,
   ApplicationReport,
   Cache,
   CheckFinding,
@@ -134,6 +135,8 @@ export const api = {
   uninstall: (name: string, command: string) =>
     invoke<void>("run_uninstaller", { name, command }),
   protocolVersion: () => invoke<number>("protocol_version"),
+  checkForUpdate: () => invoke<UpdateCheck>("check_for_update"),
+  openReleasePage: (url: string) => invoke<void>("open_release_page", { url }),
 };
 
 /** Tauri rejects with a plain string; normalise anything else into one. */
