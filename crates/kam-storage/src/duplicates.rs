@@ -993,8 +993,8 @@ mod tests {
         let user = someone();
         for path in [
             r"C:\Windows\System32\kernel32.dll",
-            r"C:\Windows\WinSxSmd64_something\payload.dll",
-            r"C:\Windows\Installera2b3c.msi",
+            r"C:\Windows\WinSxS\amd64_something\payload.dll",
+            r"C:\Windows\Installer\1a2b3c.msi",
             r"C:\ProgramData\Package Cache\{guid}\setup.exe",
         ] {
             for intent in [Intent::Suggested, Intent::Chosen] {
