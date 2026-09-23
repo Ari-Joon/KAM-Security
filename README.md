@@ -427,15 +427,16 @@ does not stop it, and neither does signing out. There is nothing to remember to
 launch.
 
 It can be stopped in exactly two places. **Overview → Protection** has a switch,
-and turning it off stops the watching within a few seconds. Turning it off or on
-raises Windows' own permission prompt, the same consent Windows Security asks
-for, so nothing running on the machine can switch it off without you agreeing.
-That does *not* stop
+and turning it off stops the watching within a few seconds. That does *not* stop
 the service, on purpose twice over: something has to remain running to switch it
 back on, and a security tool that can be silenced through its own interface is
 one an attacker silences. Stopping the service itself takes Task Manager or an
 administrator, which is a deliberate act by somebody already in charge of the
 machine.
+
+Turning the switch off or on raises Windows' own permission prompt, the same
+consent Windows Security asks for, so nothing running on the machine can switch
+it off without you agreeing.
 
 The same switch is available headlessly. Reading it needs nobody special;
 changing it needs an administrator terminal, for the same reason:
