@@ -176,25 +176,41 @@ pub fn to_recycle_bin(path: &Path) -> Result<Recycled, String> {
     })
 }
 
-/// Whether the current account can delete this path without help.
+/// Whether the current account can delete this item without help.
 ///
 /// Used to decide what to offer rather than to enforce anything: if the answer
 /// is no, the window offers quarantine, which goes through the agent and its
 /// fences. Getting it wrong costs a clear error message and nothing else.
+///
+/// It opens the item itself asking for delete access and nothing else, so
+/// nothing is written and nothing is left behind. Windows grants that when the
+/// item allows deleting it or its folder allows deleting what it holds, which
+/// is the same decision it makes when the item is actually sent to the bin.
+///
+/// This replaced a probe that created and deleted a file of its own in the
+/// folder above, and that asked the wrong question twice. The window passed it
+/// the folder, and it then looked at the folder's parent. And adding a file of
+/// your own is not the permission to delete one somebody else put there: most
+/// shared folders, `ProgramData` among them, allow the first and not the
+/// second, so the button was offered for leftovers it could not remove.
 pub fn deletable_by_this_account(path: &Path) -> bool {
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    // Removing an entry needs write access to the directory holding it, so
-    // that is what is tested, by the only reliable means: trying it.
-    let probe = parent.join(format!(".kam-write-probe-{}", std::process::id()));
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    // A folder cannot be opened at all without backup semantics, and a link
+    // is asked about as the link, which is what recycling it would remove.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -243,27 +259,90 @@ mod tests {
     /// genuinely write there. That assertion was about Windows' permissions
     /// rather than about this function, and it broke the build for a day.
     ///
-    /// The negative case is now a path whose parent does not exist, which no
-    /// privilege can make writable — a property of the function rather than of
-    /// whoever is running it.
+    /// The negative case is a path that does not exist, which no privilege can
+    /// delete: a property of the function rather than of whoever runs it.
     #[test]
-    fn a_writable_folder_is_deletable_and_a_missing_one_is_not() {
+    fn an_item_of_ones_own_is_deletable_and_a_missing_one_is_not() {
         let scratch = std::env::temp_dir().join(format!("kam-writable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).unwrap();
         let mine = scratch.join("thing.txt");
         std::fs::write(&mine, b"x").unwrap();
 
-        assert!(deletable_by_this_account(&mine));
-
-        // No account, however privileged, can write into a directory that is
-        // not there.
+        assert!(deletable_by_this_account(&mine), "a file of one's own");
+        assert!(deletable_by_this_account(&scratch), "a folder of one's own");
         assert!(!deletable_by_this_account(
-            &scratch.join("no-such-folder").join("thing.txt")
+            &scratch.join("no-such-thing.txt")
         ));
-        // Nor into one with no parent at all.
         assert!(!deletable_by_this_account(Path::new("")));
 
+        // Asking wrote nothing: the folder holds exactly what the test put
+        // there. The probe this replaced created a file of its own, and left
+        // it behind if it was interrupted.
+        let entries = std::fs::read_dir(&scratch).unwrap().count();
+        assert_eq!(entries, 1, "checking left something behind");
+
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Being allowed to add a file is not being allowed to delete one.
+    ///
+    /// The shape of `ProgramData` and most shared folders, rebuilt in a scratch
+    /// folder with deny entries, which bind an administrator too, so the answer
+    /// is the same on a build agent: this account may create a file there and
+    /// delete that file, but may not delete the one already present. The probe
+    /// this function replaced said yes to it, and the window offered the
+    /// Recycle Bin for a leftover it could not remove.
+    #[test]
+    fn adding_a_file_somewhere_is_not_permission_to_delete_what_is_there() {
+        fn icacls(args: &[&str]) {
+            let output = std::process::Command::new("icacls")
+                .args(args)
+                .output()
+                .expect("icacls runs");
+            assert!(output.status.success(), "icacls {args:?} failed");
+        }
+
+        /// Takes the deny entries off again, however the test ends, so the
+        /// folder can be removed.
+        struct Undeny<'a> {
+            folder: &'a str,
+            item: &'a str,
+        }
+        impl Drop for Undeny<'_> {
+            fn drop(&mut self) {
+                for path in [self.item, self.folder] {
+                    let _ = std::process::Command::new("icacls")
+                        .args([path, "/remove:d", "*S-1-1-0"])
+                        .output();
+                }
+                let _ = std::fs::remove_dir_all(self.folder);
+            }
+        }
+
+        let scratch = std::env::temp_dir().join(format!("kam-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let theirs = scratch.join("put-here-by-someone-else.txt");
+        std::fs::write(&theirs, b"x").unwrap();
+
+        let folder = scratch.to_str().unwrap();
+        let item = theirs.to_str().unwrap();
+        let _undeny = Undeny { folder, item };
+        // Everyone is denied deleting the item (DE, delete and nothing else)
+        // and deleting what the folder holds (DC). Adding to the folder is
+        // untouched.
+        icacls(&[item, "/deny", "*S-1-1-0:(DE)"]);
+        icacls(&[folder, "/deny", "*S-1-1-0:(DC)"]);
+
+        // The case is real: a file of one's own can still be added and deleted.
+        let mine = scratch.join("mine.txt");
+        std::fs::write(&mine, b"x").expect("adding a file is still allowed");
+        std::fs::remove_file(&mine).expect("and deleting one's own file");
+
+        assert!(
+            !deletable_by_this_account(&theirs),
+            "offered to delete a file this account may not delete"
+        );
     }
 }

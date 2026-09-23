@@ -253,13 +253,23 @@ fn recycle_item(path: String) -> Result<RecycleOutcome, String> {
     })
 }
 
-/// Whether this account could remove a path itself.
+/// For each item, whether this account could remove it itself.
 ///
 /// Lets the window offer recycling where it will work and quarantine where it
 /// will not, instead of offering both everywhere and failing half the time.
+/// Asked of each item rather than of its folder (see
+/// `recycle::deletable_by_this_account`), all in one call, and off the
+/// window's thread, so a slow or networked path cannot freeze the window.
 #[tauri::command]
-fn can_recycle(path: String) -> bool {
-    recycle::deletable_by_this_account(std::path::Path::new(&path))
+async fn can_recycle_all(paths: Vec<String>) -> Result<Vec<bool>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .iter()
+            .map(|path| recycle::deletable_by_this_account(std::path::Path::new(path)))
+            .collect()
+    })
+    .await
+    .map_err(|error| format!("the check did not finish: {error}"))
 }
 
 #[derive(serde::Serialize)]
@@ -1035,7 +1045,7 @@ pub fn run() {
             empty_quarantine,
             sweep_for_changes,
             recycle_item,
-            can_recycle,
+            can_recycle_all,
             reveal_in_explorer,
             run_uninstaller,
             protocol_version,

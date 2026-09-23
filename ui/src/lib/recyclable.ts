@@ -19,15 +19,17 @@ import { api } from "./api";
  * does not learn that the path is protected; they learn that the button is
  * unreliable, which is a much more expensive thing to teach them.
  *
- * # Why it probes directories rather than files
+ * # Asked of each item, not of its folder
  *
- * Removing an entry needs write access to the directory holding it, so the
- * directory is what the agent tests — by creating a file and deleting it again,
- * which is the only answer that does not depend on reading an ACL correctly. A
- * hundred leftovers usually sit in three or four directories, so asking per
- * directory turns a hundred probes into four.
+ * The first version asked once per folder, by writing a probe file there, and
+ * that asked the wrong question twice: it passed the folder to a check that
+ * then looked at the folder's parent, and adding a file of your own is not the
+ * permission to delete one somebody else put there. Each item is now asked
+ * about itself, by opening it for delete access, with nothing written. All the
+ * items go in one call, and an answer is remembered, so a list that changes
+ * only asks about what is new.
  *
- * # What an unanswered probe means
+ * # What an unanswered check means
  *
  * Optimistic: until the answer comes back, the action is offered. The cost of
  * being wrong in that direction is one clear error message; the cost of being
@@ -43,39 +45,31 @@ export function useRecyclable(paths: string[]): (path: string) => boolean {
 
   useEffect(() => {
     let live = true;
-    const wanted = [...new Set(paths.map(parentOf))].filter(
-      (parent) => parent !== "",
-    );
+    const unasked = [...new Set(paths)].filter((path) => !(path in known));
+    if (unasked.length === 0) return;
 
-    void (async () => {
-      for (const parent of wanted) {
+    api
+      .canRecycleAll(unasked)
+      .then((answers) => {
         if (!live) return;
-        // One at a time rather than all at once: each probe writes and deletes
-        // a real file, and a burst of them against a slow or networked path is
-        // a worse thing to do than taking a moment.
-        try {
-          const answer = await api.canRecycle(parent);
-          if (!live) return;
-          setKnown((current) =>
-            current[parent] === answer ? current : { ...current, [parent]: answer },
-          );
-        } catch {
-          // Could not ask. Left unknown, which reads as "offer it anyway".
-        }
-      }
-    })();
+        setKnown((current) => {
+          const next = { ...current };
+          unasked.forEach((path, index) => {
+            next[path] = answers[index] ?? true;
+          });
+          return next;
+        });
+      })
+      .catch(() => {
+        // Could not ask. Left unknown, which reads as "offer it anyway".
+      });
 
     return () => {
       live = false;
     };
+    // `known` is read to skip what is already answered, not to re-run on it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key]);
 
-  return (path: string) => known[parentOf(path)] ?? true;
-}
-
-/** The directory holding a path, which is what decides whether it can go. */
-function parentOf(path: string): string {
-  const cut = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
-  return cut > 0 ? path.slice(0, cut) : "";
+  return (path: string) => known[path] ?? true;
 }
