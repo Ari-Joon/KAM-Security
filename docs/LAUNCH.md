@@ -1,5 +1,9 @@
 # Publishing this repository
 
+> Status, 23 Sep 2026: done. The repository is public and releases are
+> published on GitHub; this file is kept as the record of how the launch was
+> prepared.
+
 Everything here is prepared but not yet done, because it needs a GitHub account
 and decisions only you can make.
 
@@ -14,7 +18,7 @@ git grep -l OWNER
 
 ## 2. Create the repository and push
 
-Create it **empty** — no README, licence or `.gitignore`, since this repo has
+Create it **empty**: no README, licence or `.gitignore`, since this repo has
 all three and GitHub's versions would conflict.
 
 ```bash
@@ -36,7 +40,7 @@ vulnerability publicly instead.
 ## 4. Check the first CI run
 
 The workflow builds the frontend before cargo, because the shell embeds it at
-compile time. Watch the first run finish before announcing anything — a red
+compile time. Watch the first run finish before announcing anything. A red
 badge at the top of the README is a bad first impression.
 
 ## 5. Repository settings worth setting
@@ -45,9 +49,9 @@ badge at the top of the README is a bad first impression.
   storage engine that reads the NTFS master file table directly."
 - **Topics**: `rust`, `windows`, `tauri`, `ntfs`, `mft`, `security`,
   `disk-usage`, `treemap`, `win32`
-- **Releases, Packages, Environments**: turn off in the sidebar until there is
+- **Packages, Environments**: turn off in the sidebar until there is
   something in them.
-- **Branch protection** on `main`: require CI to pass. Worth it even solo — it
+- **Branch protection** on `main`: require CI to pass. Worth it even solo. It
   stops a broken push landing on the branch strangers clone.
 
 ## 6. Screenshots ✅ done
@@ -58,7 +62,7 @@ changes visibly. The original brief, for reference:
 
 Capture at 1280×800 with the window maximised:
 
-1. **Overview** with real drives — the first impression.
+1. **Overview** with real drives, the first impression.
 2. **Storage** after a scan of `C:\`, treemap filled. This is the screenshot
    that explains the project faster than any paragraph.
 3. **Activity** showing a refusal entry, which demonstrates the audit log doing

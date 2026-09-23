@@ -12,7 +12,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet -
 ```
 
 If you prefer the installer UI, select the **Desktop development with C++**
-workload. The Windows SDK is included and is required — this project calls Win32
+workload. The Windows SDK is included and is required: this project calls Win32
 APIs directly.
 
 ## 2. Rust
@@ -30,7 +30,7 @@ rustc --version && cargo --version
 
 ## 3. Node
 
-Already present (v26). The Tauri shell is added in Phase 1.
+Already present (v26). The Tauri shell in `ui/` needs it.
 
 ## 4. First build
 
@@ -38,13 +38,7 @@ Already present (v26). The Tauri shell is added in Phase 1.
 cargo build --workspace
 ```
 
-The dependency versions in `Cargo.toml` are starting points written before a
-toolchain existed on this machine. If resolution fails, let cargo pick current
-versions:
-
-```bash
-cargo update
-```
+`Cargo.lock` is committed, so this builds the same dependency versions CI does.
 
 ## 5. Verify the checks CI runs
 
@@ -59,6 +53,12 @@ no copyleft dependency enters the tree:
 cargo install cargo-deny && cargo deny check
 ```
 
+Before pushing, run everything the way CI does, frontend build included:
+
+```bash
+powershell -ExecutionPolicy Bypass -File scripts\check.ps1
+```
+
 ## 6. Run the agent
 
 The agent normally runs as a Windows service under SYSTEM. Developing that way
@@ -70,8 +70,7 @@ same dispatch path:
 cargo run -p kam-agent -- --console
 ```
 
-Service hosting arrives in Phase 1 and is exercised only by integration tests
-and release builds.
+Running it as a real service is covered in section 9.
 
 Log level is controlled by `KAM_LOG`, using `tracing-subscriber` filter syntax:
 
@@ -89,11 +88,11 @@ cargo run -p kam-agent -- --probe
 ```
 
 The probe is the same executable as the agent, so it sits in the agent's own
-directory and passes the caller check that the shell will later have to pass.
+directory and passes the caller check that the shell has to pass.
 Everyday development therefore exercises that check rather than bypassing it.
 
 To see the check reject something, copy the binary elsewhere and run it from
-there — the agent answers with an authorisation error and records the refusal:
+there. The agent answers with an authorisation error and records the refusal:
 
 ```bash
 cp target/debug/kam-agent.exe "$TEMP/kam-agent.exe" && "$TEMP/kam-agent.exe" --probe
@@ -110,15 +109,11 @@ python -c "import sqlite3;print(*sqlite3.connect('target/debug/kam-dev-state/kam
 The desktop app lives in `ui/`. Install its dependencies once:
 
 ```bash
-cd ui && npm install
+cd ui && npm ci --ignore-scripts
 ```
 
-npm blocks package install scripts by default. Vite needs esbuild's, so approve
-that one:
-
-```bash
-cd ui && npm approve-scripts esbuild
-```
+This is what CI runs. Nothing in the tree needs a package install script, so
+none is allowed to run.
 
 Run the agent in one terminal and the shell in another:
 
@@ -144,7 +139,7 @@ side.
 ## 9. Running as a real service
 
 Day-to-day development should use `--console`. Install the service only when
-you need to verify behaviour that depends on actually running as LocalSystem —
+you need to verify behaviour that depends on actually running as LocalSystem:
 file permissions, `%ProgramData%` paths, or the pipe DACL doing real work.
 
 All four commands need an **elevated** terminal.
@@ -157,11 +152,12 @@ cargo build && target\debug\kam-agent.exe --install
 sc start KamSecurityAgent
 ```
 
-The service registers as `KamSecurityAgent`, starts on demand rather than at
-boot, and runs as LocalSystem. Its `ImagePath` carries an explicit `--service`
-so the registry states plainly how the process expects to be running.
+The service registers as `KamSecurityAgent`, starts automatically at boot,
+restarts itself 5, 15 and 60 seconds after a crash, and runs as LocalSystem.
+Its `ImagePath` carries an explicit `--service` so the registry states plainly
+how the process expects to be running.
 
-While it is running, `--probe` from the build directory still works — that is
+While it is running, `--probe` from the build directory still works. That is
 the whole point of the split, an unprivileged client driving a SYSTEM process
 across an access-controlled pipe:
 
@@ -184,12 +180,12 @@ instead of the build directory:
 | Log | stdout | `%ProgramData%\KAM Security\logs\agent.log` |
 
 `--uninstall` removes the service but deliberately leaves `%ProgramData%\KAM
-Security` alone — the audit log outliving the binary is the point of an audit
+Security` alone: the audit log outliving the binary is the point of an audit
 log. Delete that directory by hand if you want a clean slate.
 
 ## Notes
 
-- Some Phase 2 and 3 work needs an elevated shell — reading the MFT requires
+- Some Phase 2 and 3 work needs an elevated shell: reading the MFT requires
   volume-level access. Develop those features in an elevated terminal.
 - Test destructive paths in a VM with a snapshot, never on your own profile.
 - Defender may flag debug builds during storage work. Add the `target`

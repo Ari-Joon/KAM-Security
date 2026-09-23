@@ -181,7 +181,10 @@ Write-Host '  - registered the KamSecurityAgent service, which starts with Windo
 Write-Host '  - put a shortcut on your desktop' -ForegroundColor Gray
 Write-Host ''
 Write-Host 'What it did not change:' -ForegroundColor White
-Write-Host '  - nothing was added to the run keys, and the window does not open at logon' -ForegroundColor Gray
 Write-Host '  - no browser, firewall or Defender setting was touched' -ForegroundColor Gray
+Write-Host ''
+Write-Host 'The first time you open it:' -ForegroundColor White
+Write-Host '  - KAM Security adds itself to your sign-in items, so its icon sits by the clock' -ForegroundColor Gray
+Write-Host '  - untick "Start KAM Security when I sign in" on the Overview to stop that' -ForegroundColor Gray
 Write-Host ''
 Write-Host 'Undo all of it with:  setup.ps1 -Remove' -ForegroundColor Gray

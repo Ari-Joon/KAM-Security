@@ -12,11 +12,18 @@ reasons that were never written down where you could find them.
 ## Setting up
 
 See [docs/SETUP.md](docs/SETUP.md). Short version: Visual Studio Build Tools
-with the C++ workload, `rustup`, then `npm install` in `ui/`.
+with the C++ workload, `rustup`, then `npm ci --ignore-scripts` in `ui/`.
 
 ## What CI checks
 
-Run these before pushing; they are exactly what the workflow runs.
+Run `scripts\check.ps1` before pushing. It runs the CI workflow's steps in
+order, with the same environment (warnings as errors, `npm ci`, `cargo deny`):
+
+```bash
+powershell -ExecutionPolicy Bypass -File scripts\check.ps1
+```
+
+To run one check on its own:
 
 ```bash
 cargo fmt --all -- --check
@@ -43,7 +50,7 @@ panic there is a service that stops answering.
 
 - **Comments explain why, never what.** If a line needs a comment saying what it
   does, rename something instead. The comments worth writing are the ones that
-  record a decision, a constraint, or a trap — `DisconnectNamedPipe` discarding
+  record a decision, a constraint, or a trap: `DisconnectNamedPipe` discarding
   unread data, or only the VCN-0 fragment carrying a file's real size.
 - **Full words in names.** `directory`, not `dir`.
 - Prefer a hard fence over a heuristic wherever data can be destroyed.
@@ -61,16 +68,18 @@ Pull requests for these will be declined regardless of quality:
 - **A registry cleaner.** No measurable benefit and real breakage risk.
 - **GPL dependencies**, including libclamav. `cargo deny` enforces this; the
   project ships under Apache-2.0 and is staying permissive.
-- **Anything that deletes by default.** Everything destructive goes through
-  quarantine with an undo.
-- **Scareware patterns** — inflated issue counts, alarming red states by
+- **Anything that deletes by default.** Everything destructive starts out
+  reversible, in quarantine for thirty days or in the Recycle Bin. Deleting for
+  good is a separate step the person asks for. Clearing a cache is the one
+  exception, and it says what it costs before it runs.
+- **Scareware patterns**: inflated issue counts, alarming red states by
   default, "your PC is at risk" language.
 
 ## Commits
 
 Explain why the change is right, not what the diff shows. If you found something
-surprising — a Win32 call that behaves unexpectedly, a number that did not add
-up — put it in the commit message. That is the part nobody can reconstruct
+surprising (a Win32 call that behaves unexpectedly, a number that did not add
+up), put it in the commit message. That is the part nobody can reconstruct
 later.
 
 ## Licence

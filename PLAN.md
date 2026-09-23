@@ -1,11 +1,14 @@
-# KAM Security — Project Plan
+# KAM Security: Project Plan
+
+> This is the plan the project was built from, kept as the record of its decisions.
+> Where it and the README disagree, the README describes the software as it is.
 
 A control plane for Windows' built-in security primitives, plus a storage intelligence
 engine that answers questions Windows already knows the answers to but never surfaces.
 
 **Stack:** Rust + Tauri v2 (backend), TypeScript + React (frontend), SQLite (state)
 **Target:** Windows 10 1809+ / Windows 11, x64 and arm64
-**License:** MIT or Apache-2.0 (no GPL dependencies — see "Licensing constraints")
+**License:** Apache-2.0 (no GPL dependencies; see "Licensing constraints")
 
 ---
 
@@ -43,13 +46,13 @@ engine that answers questions Windows already knows the answers to but never sur
 
 ```
 ┌──────────────────────────────────────────────────┐
-│  KAM Shell — Tauri window, normal user rights    │
+│  KAM Shell: Tauri window, normal user rights     │
 │  React UI · charts · treemap · no privileges     │
 └───────────────────────┬──────────────────────────┘
                         │  named pipe, authenticated,
                         │  length-prefixed JSON-RPC
 ┌───────────────────────▼──────────────────────────┐
-│  KAM Agent — Windows Service, runs as SYSTEM     │
+│  KAM Agent: Windows Service, runs as SYSTEM      │
 │                                                  │
 │  ┌────────────┬────────────┬──────────────────┐  │
 │  │  scanner   │  firewall  │     storage      │  │
@@ -85,7 +88,7 @@ kam-security/
 
 | Crate | Purpose | Confidence |
 |---|---|---|
-| `windows` (windows-rs) | All Win32 APIs — Microsoft's official binding | Certain |
+| `windows` (windows-rs) | All Win32 APIs (Microsoft's official binding) | Certain |
 | `tauri` v2 | App shell | Certain |
 | `serde` / `serde_json` | RPC + manifests | Certain |
 | `rusqlite` (bundled) | Local state, scan history, undo journal | Certain |
@@ -99,15 +102,15 @@ Anything marked "verify" gets a spike before it's committed to. Each has a docum
 fallback that does not block the phase.
 
 ### Licensing constraints
-- **No libclamav.** GPLv2 — linking it makes the entire project GPL.
-- YARA is BSD-3-Clause — compatible, fine to link.
+- **No libclamav.** GPLv2: linking it makes the entire project GPL.
+- YARA is BSD-3-Clause: compatible, fine to link.
 - Everything else must be MIT/Apache/BSD. `cargo-deny` runs in CI to enforce this.
 
 ---
 
 ## 3. Modules
 
-### 3.1 Storage Intelligence — the flagship
+### 3.1 Storage Intelligence: the flagship
 
 The differentiating module. Four features, in build order:
 
@@ -137,12 +140,12 @@ than eyeballed:
    **virtual cluster 0** carries the real length. The others hold zero.
 
 The walk remains as the fallback for subdirectories, non-NTFS volumes, and an
-agent without administrative rights. It is slower *and* less accurate — it
+agent without administrative rights. It is slower *and* less accurate: it
 cannot open every directory, and it counts a hard-linked file once per link,
 which on a Windows volume means counting much of `WinSxS` repeatedly.
 
 **(b) True application footprint.**
-Control Panel's size column is `EstimatedSize` — a value the installer self-reports.
+Control Panel's size column is `EstimatedSize`, a value the installer self-reports.
 Often missing, often wrong, and never counts anything outside the install directory.
 We compute the real number by attributing every location an app touches:
 
@@ -166,10 +169,10 @@ that the owner is truly gone.
 **(d) Provenance-aware download intelligence.**
 Two Windows features nobody surfaces to users:
 
-- **`Zone.Identifier` alternate data stream** — present on every downloaded file.
+- **`Zone.Identifier` alternate data stream:** present on every downloaded file.
   Contains `ZoneId=3` and usually `ReferrerUrl` / `HostUrl`. This is how we know a file
   was downloaded, when, and from where.
-- **USN change journal** — tells us when a file appeared and which process created it.
+- **USN change journal:** tells us when a file appeared and which process created it.
 
 Together these produce findings like: *"This 4.1 GB ISO in `Documents` was downloaded
 from example.com on 3 March 2025 and has never been opened."*
@@ -177,7 +180,7 @@ from example.com on 3 March 2025 and has never been opened."*
 Built on this: duplicate detection (blake3 content hash, plus fuzzy matching on names
 like `setup(1).exe` / `setup_v2.exe`), and file-organisation proposals.
 
-**File-organisation safety tiers** — this is a hard fence, not a guideline:
+**File-organisation safety tiers.** This is a hard fence, not a guideline:
 
 | Tier | Rule |
 |---|---|
@@ -191,32 +194,32 @@ as a single operation. Moves are proposed in batches and always dry-run first.
 
 Four layers, each earning its place:
 
-1. **Defender orchestration** — `MSFT_MpScan`, `MSFT_MpThreat`, `MSFT_MpPreference` via
+1. **Defender orchestration:** `MSFT_MpScan`, `MSFT_MpThreat`, `MSFT_MpPreference` via
    WMI, plus `MpCmdRun.exe`. Scan control, threat history, real-time-protection status,
    exclusion management. Microsoft's engine and cloud intel, our UI.
-2. **YARA rules** — targeted at what Defender deliberately tolerates to avoid false
+2. **YARA rules:** targeted at what Defender deliberately tolerates to avoid false
    positives on commercial software: bundled adware, scareware "optimizers", browser
    hijackers, stalkerware, aggressive telemetry, unwanted persistence.
-3. **Provenance & reputation engine** — *the original contribution.* For every executable
+3. **Provenance & reputation engine:** *the original contribution.* For every executable
    on disk: Authenticode signer and validity, arrival time and writing process (USN),
    download origin (`Zone.Identifier`), persistence footprint (Run keys, services,
    scheduled tasks, startup folders), and location risk. An unsigned binary that appeared
    in `%APPDATA%` three weeks ago via a browser download and installed a Run key is
    suspicious with no signature match required.
-4. **VirusTotal** — on-demand, single-file, user supplies their own API key. Free tier is
+4. **VirusTotal:** on-demand, single-file, user supplies their own API key. Free tier is
    rate-limited and non-commercial.
 
 ### 3.3 Firewall
 
-- **Rule management** via `INetFwPolicy2` COM — create, edit, group, and explain existing
+- **Rule management** via `INetFwPolicy2` COM: create, edit, group, and explain existing
   Defender Firewall rules. Includes auditing rules other software has silently added.
-- **Live connection view** — `GetExtendedTcpTable` joined to process → signer →
+- **Live connection view:** `GetExtendedTcpTable` joined to process → signer →
   reverse DNS → ASN/geo. Answers "what is this program talking to."
-- **One-click block** — turn any observed connection into a scoped outbound rule.
+- **One-click block:** turn any observed connection into a scoped outbound rule.
 - **ETW watcher** (`Microsoft-Windows-Kernel-Network`) for near-real-time connection
   events. Observe-then-block, milliseconds late.
 
-Explicitly **not** doing outbound connection *prompting* (Little Snitch style) — that
+Explicitly **not** doing outbound connection *prompting* (Little Snitch style). That
 needs a WFP callout driver. Observe-then-block delivers most of the value with no kernel
 code.
 
@@ -233,11 +236,11 @@ any module.
 
 Each phase ends with something demoable and a tagged release.
 
-### Phase 0 — Foundations
+### Phase 0: Foundations
 Install Rust toolchain (`rustup`, MSVC target) and Tauri prerequisites. Cargo workspace,
 CI (fmt, clippy, test, `cargo-deny`), licence, README stating scope honestly.
 
-### Phase 1 — Skeleton *(chosen starting point)*
+### Phase 1: Skeleton *(chosen starting point)*
 The privilege split, end to end, with one trivial feature proving the whole path.
 
 - `kam-agent` installs and runs as a Windows Service
@@ -250,9 +253,9 @@ The privilege split, end to end, with one trivial feature proving the whole path
 **Done when:** UI button → SYSTEM service → real Win32 call → result on screen, with the
 call recorded in the audit log.
 
-### Phase 2 — Storage Intelligence ✅ **Complete**
+### Phase 2: Storage Intelligence ✅ **Complete**
 Master file table reader, treemap, application footprints, orphan detection,
-download provenance, duplicate detection, and organisation proposals — each with
+download provenance, duplicate detection, and organisation proposals, each with
 its reasoning shown and, where it acts, an undo.
 
 One rule in this plan turned out to contradict itself. It listed "installers" as
@@ -262,7 +265,7 @@ proposed for moving, even though downloaded installers are the most common
 clutter there is. Being wrong about a PDF confuses someone; being wrong about an
 executable silently breaks something.
 
-### Phase 3 — Scanner
+### Phase 3: Scanner
 Defender orchestration first (immediate value), then the provenance engine (the
 differentiator), then YARA, then optional VirusTotal.
 
@@ -276,7 +279,7 @@ signal was dropped rather than approximated.
 
 Verifying a signature turned out to be two questions, not one. `WinVerifyTrust`
 on the file alone reports most of Windows as unsigned, because Windows signs
-itself through catalogues — a `.cat` file elsewhere listing the binary's hash.
+itself through catalogues (a `.cat` file elsewhere listing the binary's hash).
 Checking only embedded signatures would have buried the handful of genuinely
 unsigned binaries among several hundred false ones. Both routes are checked, and
 a file whose *embedded* signature is broken is never rescued by a catalogue
@@ -299,16 +302,16 @@ somewhere in a compressed payload, and `git-lfs.exe` contains both
 "Invoke-Expression" and "DownloadFile" for entirely ordinary reasons. Short
 markers now corroborate rather than establish, and fetch-and-run text only
 counts inside a file Windows would actually execute. Identifying a program by
-strings it merely *mentions* was the same mistake in another form — Safe Exam
+strings it merely *mentions* was the same mistake in another form (Safe Exam
 Browser was called remote-access software because it carries a list of
-remote-access tools in order to block them — so that rule reads the PE version
+remote-access tools in order to block them), so that rule reads the PE version
 resource instead, which is where a file states what it is.
 
 VirusTotal lookups follow the same placement as the rules and for a related
 reason: outbound network requests and a stored credential have no business in a
 LocalSystem service either. The agent guard test covers both crates now.
 
-Two decisions there are worth recording. Hash lookups only, never uploads —
+Two decisions there are worth recording. Hash lookups only, never uploads:
 uploading someone's file publishes its contents irrevocably to anyone with a
 VirusTotal account, and there is deliberately no code in the crate that could
 do it. And WinHTTP rather than a bundled HTTP and TLS stack: it is one GET
@@ -318,7 +321,7 @@ would silently override an administrator who had distrusted a certificate
 authority.
 
 The hardest part was not the transport but the wording. "6 of 70 engines
-flagged this" is the number people read as a verdict, and it is not one — low
+flagged this" is the number people read as a verdict, and it is not one: low
 single-digit counts are overwhelmingly false positives. The interpretation
 lives in Rust with tests on the sentences it produces, so the interface cannot
 recompute a scarier reading from the same numbers.
@@ -331,7 +334,7 @@ be mistaken for a result.
 
 Two things there were worth getting right. The wrapper is tagged *adjacently*
 rather than internally, because `Response` already carries a `kind` field and an
-internal tag flattened both into the same object — every reply failed to
+internal tag flattened both into the same object: every reply failed to
 deserialise, and the end-to-end test is what caught it. And the work runs on its
 own thread reporting through a channel that the connection thread drains onto
 the pipe: the reporter is shared with scoped worker threads and so must be
@@ -343,7 +346,7 @@ it, so the agent keeps the job's stop flag in a registry keyed by an id the
 caller chose, and a later `CancelJob` sets it. Stopping returns
 `Response::Stopped` rather than an error, because nothing went wrong.
 
-### Phase 4 — Firewall
+### Phase 4: Firewall
 Rule management → connection table → one-click block → ETW watcher.
 
 The first three are built. The ETW watcher is not, and is the one item here
@@ -355,7 +358,7 @@ than a whole program, which is worth more.
 
 This is the first phase that changes the machine, and the shape of that is
 worth recording. Every rule the product creates carries a group of its own, and
-removal only ever considers rules bearing it — so a rule Windows or an installer
+removal only ever considers rules bearing it, so a rule Windows or an installer
 created cannot be deleted by us even by accident. A test asserts that removing
 Windows' own "Core Networking" rule is refused. Existing rules are read and
 shown but never edited, blocks are outbound only (blocking a program's incoming
@@ -367,7 +370,7 @@ rule against `notepad.exe`, checks its properties, and removes it again. Testing
 only the refusals would have proved nothing about the path that actually
 changes someone's firewall.
 
-### Phase 5 — Product polish
+### Phase 5: Product polish
 Scheduler, notifications, first-run experience, MSI/NSIS installer, auto-update,
 documentation, screenshots. Decide on code signing here, not before.
 
@@ -377,7 +380,7 @@ documentation, screenshots. Decide on code signing here, not before.
 
 | Risk | Mitigation |
 |---|---|
-| **Our own app looks like malware** — mass file enumeration, elevated service, firewall edits | Never pack or obfuscate. Publish source. Submit false-positive reports to Microsoft. Keep the binary simple and the behaviour explainable. |
+| **Our own app looks like malware:** mass file enumeration, elevated service, firewall edits | Never pack or obfuscate. Publish source. Submit false-positive reports to Microsoft. Keep the binary simple and the behaviour explainable. |
 | **SmartScreen blocks the installer** | Accepted for a GitHub release; document the warning in the README. Revisit an EV certificate (~$400/yr, FIPS hardware key required since 2023) only if adoption warrants it. |
 | **We destroy user data** | Quarantine-only, undo journal, dry-run, hard file-class fencing on moves, never delete by default. |
 | **MFT parsing bugs on unusual volumes** | Handle ReFS/FAT32/network/BitLocker-locked volumes by falling back to directory walking. Fuzz the record parser. |
@@ -388,7 +391,7 @@ documentation, screenshots. Decide on code signing here, not before.
 
 ## 6. Decisions taken
 
-- **Code signing — staying unsigned.** Decided 28 August 2026. An EV
+- **Code signing: staying unsigned.** Decided 28 August 2026. An EV
   certificate is around £300 a year and needs a FIPS hardware key, which is not
   a sensible cost for a project whose purpose is to be read. The consequences
   are accepted rather than hidden: SmartScreen warns the first person who runs
@@ -397,19 +400,19 @@ documentation, screenshots. Decide on code signing here, not before.
   worked around. Revisit only if it is ever distributed to people who did not
   come looking for the source.
 
-- **A continuous behaviour watcher — added after a real incident.** Decided 6
+- **A continuous behaviour watcher: added after a real incident.** Decided 6
   September 2026. Until now the agent did nothing until asked, and that was a
   deliberate strength. An infostealer changed the calculus: it ran for three
   minutes, stole browser credentials, and persisted as a hidden scheduled task
   that relaunched through MSBuild, and none of it was caught until a day later
   by hand. Defender never flagged it. The at-rest provenance survey would have
-  found the task — but only when someone next opened the window. The gap was
+  found the task, but only when someone next opened the window. The gap was
   time, so the agent now takes the weekly check's cheap snapshot every two
   minutes and records anything newly appeared that matches a launcher/hidden-
   task/unsigned-script shape (`kam-scanner::behaviour`, `kam-agent::watch`). It
   is a snapshot, not an event stream, for exactly the reason the firewall's ETW
   watcher was deferred: persistence survives to the next snapshot, so a live
-  sink's privileged surface buys little. It never acts — it writes to the audit
+  sink's privileged surface buys little. It never acts: it writes to the audit
   log and the window, consistent with the rule that circumstantial evidence is
   presented, never enforced. The cost (one registry read a couple of times a
   minute) is documented in the README rather than hidden, because the product
@@ -419,14 +422,14 @@ documentation, screenshots. Decide on code signing here, not before.
   theft (the exact store paths and key-unwrapping markers), a YARA rule for a
   build tool used as a loader (an MSBuild project carrying an inline code task
   that reflectively loads a payload), and the provenance engine now resolves and
-  judges what a launcher is *told* to run rather than the launcher — because
+  judges what a launcher is *told* to run rather than the launcher, because
   scoring `cmd.exe` as "signed by Microsoft, in System32" while it runs a
   stealer's script was the exact blindness that let the task look like Windows.
 
 ## 7. Open decisions
 
-- **YARA integration** — Rust bindings vs. bundling `yara.exe`. Spike in Phase 3.
-- **ETW consumer** — crate maturity unverified; polling fallback exists. Spike in Phase 4.
-- **Licence** — MIT vs. Apache-2.0. Apache-2.0 gives an explicit patent grant; MIT is
+- **YARA integration:** Rust bindings vs. bundling `yara.exe`. Spike in Phase 3.
+- **ETW consumer:** crate maturity unverified; polling fallback exists. Spike in Phase 4.
+- **Licence:** MIT vs. Apache-2.0. Apache-2.0 gives an explicit patent grant; MIT is
   shorter and more familiar. Either works.
-- **Rule distribution** — how YARA rules ship and update (bundled vs. fetched). Phase 3.
+- **Rule distribution:** how YARA rules ship and update (bundled vs. fetched). Phase 3.
