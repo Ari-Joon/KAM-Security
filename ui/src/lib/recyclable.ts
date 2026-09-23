@@ -2,69 +2,80 @@ import { useEffect, useState } from "react";
 import { api } from "./api";
 
 /**
- * Which items this account could actually send to the Recycle Bin.
+ * Which paths this account could actually send to the Recycle Bin.
  *
  * # The button that could not work
  *
- * Leftovers live under `ProgramData` and the `AppData` roots, and duplicate
- * copies live wherever they were found, including `Program Files`: places an
- * unprivileged account often cannot delete from. Offering the Recycle Bin
- * there produced a raw error from inside the shell call. An action that cannot
- * work is worse than none: the person does not learn that the item is
- * protected, they learn the button is unreliable.
+ * `can_recycle` was written, registered, given an API wrapper, and never
+ * called. Its own doc says why it exists: to "offer recycling where it will
+ * work and quarantine where it will not, instead of offering both everywhere
+ * and failing half the time". Both were offered everywhere. Leftovers live
+ * under `ProgramData` and the `AppData` roots and duplicate copies live
+ * wherever they were found, including `Program Files` — places an unprivileged
+ * account usually cannot delete from — so pressing Recycle Bin there produced a
+ * raw COM error from deep inside the shell call.
  *
- * # Asked of each item, not of its folder
+ * Offering an action that cannot work is worse than not offering it. The person
+ * does not learn that the path is protected; they learn that the button is
+ * unreliable, which is a much more expensive thing to teach them.
  *
- * The first version of this asked once per folder, by writing a probe file
- * there. That asked the wrong question twice over: it passed the folder to a
- * check that then looked at the folder's *parent*, and creating a file of your
- * own is not the same permission as deleting one somebody else put there. It
- * now asks, for each item, whether Windows would let this account delete that
- * item and whether its drive has a Recycle Bin at all. Nothing is written.
+ * # Why it probes directories rather than files
  *
- * All the items go in one call, and an answer is remembered, so a list that
- * changes only asks about what is new.
+ * Removing an entry needs write access to the directory holding it, so the
+ * directory is what the agent tests — by creating a file and deleting it again,
+ * which is the only answer that does not depend on reading an ACL correctly. A
+ * hundred leftovers usually sit in three or four directories, so asking per
+ * directory turns a hundred probes into four.
  *
- * # Before the answer arrives
+ * # What an unanswered probe means
  *
- * Optimistic: the button is offered until the answer says otherwise. Being
- * wrong that way costs one clear message; being wrong the other way hides a
- * button that would have worked, which nobody can discover or argue with.
+ * Optimistic: until the answer comes back, the action is offered. The cost of
+ * being wrong in that direction is one clear error message; the cost of being
+ * wrong the other way is hiding a button that would have worked, which the
+ * person cannot discover or argue with.
  */
 export function useRecyclable(paths: string[]): (path: string) => boolean {
   const [known, setKnown] = useState<Record<string, boolean>>({});
 
-  // Joined rather than passed as an array, so the effect does not re-run for
-  // an array rebuilt with the same contents on every render.
+  // Joined rather than passed as an array so the effect does not re-run on
+  // every render for an array that is rebuilt each time with the same contents.
   const key = paths.join("\0");
 
   useEffect(() => {
     let live = true;
-    const unasked = [...new Set(paths)].filter((path) => !(path in known));
-    if (unasked.length === 0) return;
+    const wanted = [...new Set(paths.map(parentOf))].filter(
+      (parent) => parent !== "",
+    );
 
-    api
-      .canRecycleAll(unasked)
-      .then((answers) => {
+    void (async () => {
+      for (const parent of wanted) {
         if (!live) return;
-        setKnown((current) => {
-          const next = { ...current };
-          unasked.forEach((path, index) => {
-            next[path] = answers[index] ?? true;
-          });
-          return next;
-        });
-      })
-      .catch(() => {
-        // Could not ask. Left unknown, which reads as "offer it anyway".
-      });
+        // One at a time rather than all at once: each probe writes and deletes
+        // a real file, and a burst of them against a slow or networked path is
+        // a worse thing to do than taking a moment.
+        try {
+          const answer = await api.canRecycle(parent);
+          if (!live) return;
+          setKnown((current) =>
+            current[parent] === answer ? current : { ...current, [parent]: answer },
+          );
+        } catch {
+          // Could not ask. Left unknown, which reads as "offer it anyway".
+        }
+      }
+    })();
 
     return () => {
       live = false;
     };
-    // `known` is read to skip what is already answered, not to re-run on it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key]);
 
-  return (path: string) => known[path] ?? true;
+  return (path: string) => known[parentOf(path)] ?? true;
+}
+
+/** The directory holding a path, which is what decides whether it can go. */
+function parentOf(path: string): string {
+  const cut = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
+  return cut > 0 ? path.slice(0, cut) : "";
 }

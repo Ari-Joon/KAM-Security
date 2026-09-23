@@ -113,7 +113,6 @@ export const api = {
     invoke<{ in_bin: boolean; warning: string | null }>("recycle_item", { path }),
   /** Whether this account could remove a path itself, without the agent. */
   canRecycle: (path: string) => invoke<boolean>("can_recycle", { path }),
-  canRecycleAll: (paths: string[]) => invoke<boolean[]>("can_recycle_all", { paths }),
   /**
    * Compare the machine with what it looked like last time.
    *

@@ -259,23 +259,7 @@ fn recycle_item(path: String) -> Result<RecycleOutcome, String> {
 /// will not, instead of offering both everywhere and failing half the time.
 #[tauri::command]
 fn can_recycle(path: String) -> bool {
-    recycle::can_recycle(std::path::Path::new(&path))
-}
-
-/// The same question for many items at once, off the window's thread.
-///
-/// One call rather than one per row, and asked of each item itself rather
-/// than of its folder. See `recycle::can_recycle`.
-#[tauri::command]
-async fn can_recycle_all(paths: Vec<String>) -> Result<Vec<bool>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        paths
-            .iter()
-            .map(|path| recycle::can_recycle(std::path::Path::new(path)))
-            .collect()
-    })
-    .await
-    .map_err(|error| format!("the check did not finish: {error}"))
+    recycle::deletable_by_this_account(std::path::Path::new(&path))
 }
 
 #[derive(serde::Serialize)]
@@ -1052,7 +1036,6 @@ pub fn run() {
             sweep_for_changes,
             recycle_item,
             can_recycle,
-            can_recycle_all,
             reveal_in_explorer,
             run_uninstaller,
             protocol_version,
