@@ -492,11 +492,16 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     setError(null);
     try {
       const outcome = await api.recycleItem(path);
-      setNote(
-        outcome.in_bin
-          ? `Sent ${fmt.bytes(bytes)} to the Recycle Bin: ${path}`
-          : (outcome.warning ?? `${path} was removed but did not reach the Recycle Bin.`),
-      );
+      // Gone but not in the bin is not a success, and is not shown in the
+      // success colour. It was, which put "this cannot be restored" in green.
+      if (outcome.in_bin) {
+        setNote(
+          `Sent ${fmt.bytes(bytes)} to the Recycle Bin: ${path}` +
+            (outcome.warning ? ` ${outcome.warning}` : ""),
+        );
+      } else {
+        setError(outcome.warning ?? `${path} was removed but did not reach the Recycle Bin.`);
+      }
       setDuplicates((current) =>
         current
           ? current
@@ -619,13 +624,17 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     setError(null);
     try {
       const outcome = await api.recycleItem(orphan.path);
-      setNote(
-        outcome.in_bin
-          ? `Sent ${orphan.name} (${fmt.bytes(orphan.bytes)}) to the Recycle Bin. ` +
-              `It is in there until you empty it.`
-          : (outcome.warning ??
-            `${orphan.name} was removed but did not reach the Recycle Bin.`),
-      );
+      if (outcome.in_bin) {
+        setNote(
+          `Sent ${orphan.name} (${fmt.bytes(orphan.bytes)}) to the Recycle Bin. ` +
+            `It is in there until you empty it.` +
+            (outcome.warning ? ` ${outcome.warning}` : ""),
+        );
+      } else {
+        setError(
+          outcome.warning ?? `${orphan.name} was removed but did not reach the Recycle Bin.`,
+        );
+      }
       setOrphans((current) =>
         current ? current.filter((item) => item.path !== orphan.path) : current,
       );
@@ -726,9 +735,11 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         <div>
           <h1>Cleanup</h1>
           <p className="lede">
-            Directories left behind by software that is no longer installed.
-            Nothing here is destroyed: quarantine holds it where this program
-            can put it back, the Recycle Bin holds it where Windows can.
+            Space you can get back: folders left behind by software that is no
+            longer installed, duplicate copies, caches and old downloads. What
+            comes out of a folder goes to quarantine or the Recycle Bin, where it
+            can be put back. Clearing a cache removes it outright, and says what
+            that costs before it does.
           </p>
         </div>
       </div>
