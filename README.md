@@ -44,32 +44,32 @@ Presenting circumstantial evidence as a verdict is the whole business model of
 the software this replaces.
 
 <p align="center">
-  <img src="docs/images/overview.png" width="900" alt="The Overview: protection on, running as a Windows service, and the drives it can see">
+  <img src="docs/images/overview.png" width="900" alt="The Overview: protection on, starting at sign-in in the notification area, the update check, and the drives it can see">
 </p>
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/images/storage.png" alt="Storage: 818 GB across 1.5 million files measured from the master file table in 1.6 seconds, drawn as a treemap"></td>
-    <td width="50%"><img src="docs/images/applications.png" alt="Applications: 484 GB actually used against the 55.5 GB Control Panel claims, sorted by real size"></td>
+    <td width="50%"><img src="docs/images/storage.png" alt="Storage: 845 GB across 1.67 million files measured from the master file table in 2.9 seconds, drawn as a treemap"></td>
+    <td width="50%"><img src="docs/images/applications.png" alt="Applications: 484 GB actually used against the 55.7 GB Control Panel claims, sorted by real size"></td>
   </tr>
   <tr>
-    <td><b>Storage:</b> a whole drive read from the master file table in under two seconds, drawn to scale.</td>
+    <td><b>Storage:</b> a whole drive read from the master file table in about three seconds, drawn to scale.</td>
     <td><b>Applications:</b> what each program really occupies, against what its installer claimed.</td>
   </tr>
   <tr>
-    <td><img src="docs/images/firewall.png" alt="Firewall: every profile on, 690 rules, and every open connection grouped by the publisher that signed the program"></td>
-    <td><img src="docs/images/scanner.png" alt="Scanner: Defender's own protections read from Defender, with a quick or full scan started from here"></td>
+    <td><img src="docs/images/firewall.png" alt="Firewall: 698 rules, 71 open connections, and every connection grouped by the publisher that signed the program, with a colour legend"></td>
+    <td><img src="docs/images/scanner.png" alt="Scanner: Defender's own protections read from Defender, with the same quick or full scan as Windows Security started from here"></td>
   </tr>
   <tr>
     <td><b>Firewall:</b> every open socket, grouped by who signed the program holding it.</td>
     <td><b>Scanner:</b> Defender's real state, and the same scan as Windows Security, started from here.</td>
   </tr>
   <tr>
-    <td><img src="docs/images/cleanup.png" alt="Cleanup: leftovers, a thirty-day quarantine, byte-for-byte duplicates, caches and loose files"></td>
+    <td><img src="docs/images/cleanup.png" alt="Cleanup: ten caches holding 76.9 GB, each marked with whether clearing it costs anything"></td>
     <td><img src="docs/images/overview-activity.png" alt="The weekly check registered for Monday at 09:00, and the audit log of recent activity"></td>
   </tr>
   <tr>
-    <td><b>Cleanup:</b> quarantine for thirty days, or the Recycle Bin. Deleting for good is a separate step.</td>
+    <td><b>Cleanup:</b> caches that say what clearing them costs; removal goes to quarantine or the Recycle Bin.</td>
     <td><b>Weekly check and audit log:</b> state read in seconds, and every action written down.</td>
   </tr>
 </table>
@@ -339,6 +339,10 @@ different: services, Run keys, Startup items, scheduled tasks and local
 administrators, compared against a baseline and charted over twelve weeks.
 There is no score, because a score needs an idea of what a correct machine
 looks like, and this software does not have one.
+
+<p align="center">
+  <img src="docs/images/changes.png" width="900" alt="Changes: fifteen things different since the last look, with a source that could not be read said out loud rather than reported as gone">
+</p>
 
 Things disappearing count at least as much as things appearing. An antivirus
 service or a backup task quietly removed is reported, and Windows reports that
