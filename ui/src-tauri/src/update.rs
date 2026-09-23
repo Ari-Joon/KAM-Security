@@ -23,6 +23,8 @@
 //! rule that runs through the rest of this product, that a failure is not an
 //! absence, applies to its own updates as much as to anything it reports on.
 
+use std::cmp::Ordering;
+
 use serde::{Deserialize, Serialize};
 
 /// The API host. Fixed: nothing here is ever asked of a host taken from input.
@@ -47,12 +49,30 @@ pub struct UpdateCheck {
     /// The latest published release, when it could be read.
     pub latest: Option<Release>,
     /// True only when `latest` was read, both versions parsed, and the
-    /// published one is higher. Every other outcome is false, and `problem`
-    /// says why when it is not simply "this is the latest".
+    /// published one is higher. Every other outcome is false: `ahead` says when
+    /// the running version is the higher one, and `problem` says why when the
+    /// two could not be compared at all.
     pub newer: bool,
+    /// True only when both versions parsed and the running one is higher than
+    /// the latest published release: a build that has not been released yet.
+    /// Not newer is not the same as level, and only level is "the latest".
+    pub ahead: bool,
     /// Why the answer is incomplete, in plain words. `None` means the check
     /// completed and its answer is the whole answer.
     pub problem: Option<String>,
+}
+
+impl UpdateCheck {
+    /// Nothing known yet beyond the version that is running.
+    fn unanswered(current: &str) -> Self {
+        Self {
+            current: current.to_owned(),
+            latest: None,
+            newer: false,
+            ahead: false,
+            problem: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,12 +110,7 @@ struct Answer {
 
 /// Ask GitHub, and compare with `current`.
 pub fn check(current: &str) -> UpdateCheck {
-    let mut result = UpdateCheck {
-        current: current.to_owned(),
-        latest: None,
-        newer: false,
-        problem: None,
-    };
+    let mut result = UpdateCheck::unanswered(current);
 
     // GitHub refuses API requests without a User-Agent. The version header pins
     // the response shape so a future API change cannot quietly alter it.
@@ -140,6 +155,19 @@ pub fn check(current: &str) -> UpdateCheck {
         }
     };
 
+    judge(current, answer)
+}
+
+/// Compare the running version with the release GitHub returned.
+///
+/// Kept apart from the network so it can be tested, because this is where
+/// three different answers are told apart: a newer release exists, this is
+/// the latest release, and this build is ahead of every release. The last used
+/// to fall into the second, so a build not yet published was called "the
+/// latest release" beside the previous release's date.
+fn judge(current: &str, answer: Answer) -> UpdateCheck {
+    let mut result = UpdateCheck::unanswered(current);
+
     // The address already excludes both; checked anyway, because "latest" must
     // never mean a draft nobody has published or a pre-release nobody asked for.
     if answer.draft || answer.prerelease {
@@ -159,9 +187,12 @@ pub fn check(current: &str) -> UpdateCheck {
             .unwrap_or_else(|| RELEASES.to_owned()),
     };
 
-    match (parse(current), parse(&release.version)) {
-        (Some(running), Some(published)) => result.newer = published > running,
-        _ => {
+    match compare(current, &release.version) {
+        Some(order) => {
+            result.newer = order == Ordering::Less;
+            result.ahead = order == Ordering::Greater;
+        }
+        None => {
             result.problem = Some(format!(
                 "The versions {current} and {} could not be compared, so this does not \
                  say whether one is newer.",
@@ -172,6 +203,12 @@ pub fn check(current: &str) -> UpdateCheck {
 
     result.latest = Some(release);
     result
+}
+
+/// How the running version stands against a published one, compared as
+/// numbers. `None` when either does not parse.
+fn compare(running: &str, published: &str) -> Option<Ordering> {
+    Some(parse(running)?.cmp(&parse(published)?))
 }
 
 /// Whether `url` is a page under this repository's releases.
@@ -266,6 +303,56 @@ mod tests {
         ] {
             assert!(!is_our_release_page(foreign), "{foreign} was trusted");
         }
+    }
+
+    /// A release as GitHub would return it, published on v0.4.0's date.
+    fn published(tag: &str) -> Answer {
+        Answer {
+            tag_name: tag.to_owned(),
+            name: None,
+            published_at: Some("2026-09-14T09:10:08Z".to_owned()),
+            body: None,
+            html_url: None,
+            draft: false,
+            prerelease: false,
+        }
+    }
+
+    /// Behind, level and ahead are three answers, not two.
+    ///
+    /// Between tagging v0.5.0 and publishing it, the window said "0.5.0 is the
+    /// latest release, published 14 September 2026", which was v0.4.0's date.
+    /// The check reported only "not newer", and the window read that as level.
+    #[test]
+    fn behind_level_and_ahead_are_told_apart() {
+        let behind = judge("0.4.0", published("v0.5.0"));
+        assert!(behind.newer && !behind.ahead, "{behind:?}");
+
+        let level = judge("0.5.0", published("v0.5.0"));
+        assert!(!level.newer && !level.ahead, "{level:?}");
+
+        let ahead = judge("0.5.0", published("v0.4.0"));
+        assert!(!ahead.newer && ahead.ahead, "{ahead:?}");
+        assert_eq!(
+            ahead
+                .latest
+                .as_ref()
+                .map(|release| release.version.as_str()),
+            Some("0.4.0"),
+            "the release it is ahead of is still reported"
+        );
+
+        for answer in [&behind, &level, &ahead] {
+            assert!(answer.problem.is_none(), "{answer:?}");
+        }
+    }
+
+    /// Versions that cannot be compared claim neither direction, and say so.
+    #[test]
+    fn an_uncomparable_version_is_neither_newer_nor_ahead() {
+        let odd = judge("0.5.0", published("latest"));
+        assert!(!odd.newer && !odd.ahead, "{odd:?}");
+        assert!(odd.problem.is_some());
     }
 
     #[test]

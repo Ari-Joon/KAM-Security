@@ -880,6 +880,11 @@ export type UpdateCheck = {
   latest: Release | null;
   /** True only when the check completed and the published version is higher. */
   newer: boolean;
+  /**
+   * True only when the check completed and the running version is higher: a
+   * build that has not been released yet. Not newer is not the same as level.
+   */
+  ahead: boolean;
   /** Why the answer is incomplete. Null means the answer is the whole answer. */
   problem: string | null;
 };

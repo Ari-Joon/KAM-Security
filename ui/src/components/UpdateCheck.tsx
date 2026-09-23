@@ -147,7 +147,18 @@ export default function UpdateCheck() {
         </div>
       )}
 
-      {result && !result.newer && !result.problem && (
+      {/* Not newer is not the same as level. A build ahead of every release
+          used to be called "the latest release", beside the date of the
+          release it was ahead of. */}
+      {result && !result.newer && !result.problem && result.ahead && latest && (
+        <p className="muted">
+          You have {result.current}, which is newer than anything published yet.
+          The latest release is {latest.version}, published{" "}
+          {when(latest.published_at)}.
+        </p>
+      )}
+
+      {result && !result.newer && !result.problem && !result.ahead && (
         <p className="muted">
           {result.current} is the latest release
           {latest ? `, published ${when(latest.published_at)}` : ""}.
