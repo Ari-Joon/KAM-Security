@@ -202,7 +202,8 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
               </nav>
             </div>
             <p className="muted">
-              Each rectangle is sized by what it holds. Click one to go deeper.
+              Each rectangle is sized by what it holds. Click one, or Tab to it
+              and press Enter, to go deeper.
             </p>
             <Treemap node={current} onDrill={(child) => setTrail([...trail, child])} />
           </section>

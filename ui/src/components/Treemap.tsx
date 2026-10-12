@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { squarify } from "../lib/treemap";
 import * as fmt from "../lib/format";
+import { GridLegend } from "./StateGrid";
 import type { TreeNode } from "../lib/types";
 
 type Props = {
@@ -12,9 +13,14 @@ type Props = {
 const LABEL_MIN_WIDTH = 56;
 const LABEL_MIN_HEIGHT = 26;
 
+/** The block that stands in for everything too small to draw separately. */
+const AGGREGATE = "var(--surface-3)";
+
 /**
  * Colour is keyed to rank rather than to the value, so the eye can follow a
- * cell as it moves between levels. Sequential blues, largest darkest.
+ * cell as it moves between levels. Sequential blues, largest darkest. The
+ * legend under the map says so, because a colour with no legend is a meaning
+ * the reader has to guess.
  */
 const RAMP = [
   "#2b5bd7",
@@ -64,44 +70,81 @@ export default function Treemap({ node, onDrill }: Props) {
   const children = [...node.children].sort((a, b) => b.bytes - a.bytes);
   const cells = squarify(children, size.width, size.height);
 
+  // The legend names only what is drawn, so it can never describe a colour
+  // that is not on screen.
+  const legend: [string, string][] = [];
+  if (cells.some((cell) => !cell.item.is_aggregate)) {
+    legend.push([
+      `linear-gradient(90deg, ${RAMP[0]}, ${RAMP[RAMP.length - 1]})`,
+      "Blue by rank in this folder: the largest is darkest",
+    ]);
+  }
+  if (cells.some((cell) => cell.item.is_aggregate)) {
+    legend.push([
+      AGGREGATE,
+      "Grey: the smaller items here, gathered into one block that cannot be opened",
+    ]);
+  }
+
   return (
-    <div className="treemap" ref={container}>
-      {cells.map((cell, index) => {
-        const showLabel =
-          cell.width >= LABEL_MIN_WIDTH && cell.height >= LABEL_MIN_HEIGHT;
-        const drillable = !cell.item.is_aggregate && cell.item.children.length > 0;
-        return (
-          <div
-            key={`${cell.item.path}-${index}`}
-            className={
-              "treemap-cell" +
-              (drillable ? " drillable" : "") +
-              (cell.item.is_aggregate ? " aggregate" : "")
-            }
-            style={{
-              left: cell.x,
-              top: cell.y,
-              width: Math.max(0, cell.width - 2),
-              height: Math.max(0, cell.height - 2),
-              background: cell.item.is_aggregate
-                ? "var(--surface-3)"
-                : RAMP[Math.min(index, RAMP.length - 1)],
-            }}
-            onClick={() => drillable && onDrill(cell.item)}
-            title={`${cell.item.path}\n${fmt.bytes(cell.item.bytes)}`}
-          >
-            {showLabel && (
-              <>
-                <span className="treemap-name">{cell.item.name}</span>
-                <span className="treemap-size">{fmt.bytes(cell.item.bytes)}</span>
-              </>
-            )}
-          </div>
-        );
-      })}
-      {cells.length === 0 && (
-        <p className="treemap-empty">Nothing measurable inside this folder.</p>
-      )}
-    </div>
+    <>
+      <div className="treemap" ref={container}>
+        {cells.map((cell, index) => {
+          const showLabel =
+            cell.width >= LABEL_MIN_WIDTH && cell.height >= LABEL_MIN_HEIGHT;
+          const drillable = !cell.item.is_aggregate && cell.item.children.length > 0;
+          return (
+            <div
+              key={`${cell.item.path}-${index}`}
+              className={
+                "treemap-cell" +
+                (drillable ? " drillable" : "") +
+                (cell.item.is_aggregate ? " aggregate" : "")
+              }
+              style={{
+                left: cell.x,
+                top: cell.y,
+                width: Math.max(0, cell.width - 2),
+                height: Math.max(0, cell.height - 2),
+                background: cell.item.is_aggregate
+                  ? AGGREGATE
+                  : RAMP[Math.min(index, RAMP.length - 1)],
+                // Drawn inside the cell, so a neighbour cannot paint over it.
+                outlineOffset: -2,
+              }}
+              // Reachable and openable from the keyboard, where there is
+              // something to open. A cell that only shows a size is not a
+              // control, so it is not made to look like one to a screen reader.
+              {...(drillable
+                ? {
+                    role: "button",
+                    tabIndex: 0,
+                    "aria-label": `${cell.item.name}, ${fmt.bytes(cell.item.bytes)}. Open to see what is inside.`,
+                    onKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        onDrill(cell.item);
+                      }
+                    },
+                  }
+                : {})}
+              onClick={() => drillable && onDrill(cell.item)}
+              title={`${cell.item.path}\n${fmt.bytes(cell.item.bytes)}`}
+            >
+              {showLabel && (
+                <>
+                  <span className="treemap-name">{cell.item.name}</span>
+                  <span className="treemap-size">{fmt.bytes(cell.item.bytes)}</span>
+                </>
+              )}
+            </div>
+          );
+        })}
+        {cells.length === 0 && (
+          <p className="treemap-empty">Nothing measurable inside this folder.</p>
+        )}
+      </div>
+      {legend.length > 0 && <GridLegend entries={legend} />}
+    </>
   );
 }
