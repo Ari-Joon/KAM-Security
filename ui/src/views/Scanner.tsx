@@ -52,6 +52,38 @@ function Setting({ label, value, explain }: { label: string; value: boolean | nu
   );
 }
 
+/**
+ * What a "nothing to flag" sentence rests on that Defender did not report.
+ *
+ * Defender's concerns only speak about a setting that came back off, which is
+ * right: not reported is not off. But it means no concerns is not the same as
+ * every protection on, and the headline said the second whenever it saw the
+ * first. Mirrors `DefenderStatus::unreported` in the scanner.
+ */
+function unreported(status: DefenderStatus): string[] {
+  const settings: [boolean | null | undefined, string][] = [
+    [status.antivirus_enabled, "the antivirus engine"],
+    [status.realtime_protection, "real-time protection"],
+    [status.behaviour_monitoring, "behaviour monitoring"],
+    [status.cloud_protection, "cloud-delivered protection"],
+    [status.download_scanning, "download and attachment scanning"],
+    [status.tamper_protection, "tamper protection"],
+  ];
+  const missing = settings
+    .filter(([value]) => value === null || value === undefined)
+    .map(([, name]) => name);
+  if (status.signature_age_days === null || status.signature_age_days === undefined) {
+    missing.push("how old its definitions are");
+  }
+  return missing;
+}
+
+/** Names joined for a sentence: "a", "a and b", "a, b and c". */
+function listed(names: string[]): string {
+  if (names.length <= 1) return names.join("");
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
 function age(days: number | null, never: string): string {
   if (days === null) return never;
   if (days === 0) return "today";
@@ -94,6 +126,7 @@ export default function Scanner() {
   }, [refresh]);
 
   const status = report?.status;
+  const missing = status ? unreported(status) : [];
 
   return (
     <>
@@ -118,17 +151,33 @@ export default function Scanner() {
         </div>
       )}
 
+      {/* Built from what Defender actually reported. Its concerns only speak
+          about a setting that came back off, so with none of them the
+          sentence still names anything Defender did not report rather than
+          calling it on. */}
       {report && (
         <div
           className={
-            report.concerns.length === 0 ? "notice notice-ok" : "notice notice-warn"
+            report.concerns.length === 0 && missing.length === 0
+              ? "notice notice-ok"
+              : "notice notice-warn"
           }
         >
-          {report.concerns.length === 0 ? (
+          {report.concerns.length === 0 && missing.length === 0 ? (
             <>
-              <strong>Nothing to flag.</strong> Every protection Defender
-              publishes is on, its definitions are current, and it has scanned
-              recently.
+              <strong>Nothing to flag.</strong> The antivirus engine, real-time
+              protection, behaviour monitoring, cloud-delivered protection,
+              download and attachment scanning and tamper protection are all
+              on, its definitions were{" "}
+              {definitionsAge(report.status.signature_age_days)}, and it has
+              scanned in the last month.
+            </>
+          ) : report.concerns.length === 0 ? (
+            <>
+              <strong>Nothing Defender reported needs attention, but it did not
+              report everything.</strong> It did not say anything about{" "}
+              {listed(missing)}, so this cannot say{" "}
+              {missing.length === 1 ? "that is" : "those are"} on.
             </>
           ) : (
             <>
@@ -137,6 +186,9 @@ export default function Scanner() {
                 {report.concerns.map((concern) => (
                   <li key={concern}>{concern}</li>
                 ))}
+                {missing.length > 0 && (
+                  <li>Defender did not report {listed(missing)}.</li>
+                )}
               </ul>
             </>
           )}

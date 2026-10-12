@@ -71,16 +71,20 @@ pub fn show_window(app: &AppHandle) {
 /// Defender and the firewall; if the agent cannot be reached that is itself
 /// the useful thing to say.
 fn protection_summary() -> String {
-    let Ok(status) = kam_ipc::client::call(&kam_ipc::Request::GetDefenderStatus) else {
+    let Ok(reply) = kam_ipc::client::call(&kam_ipc::Request::GetDefenderStatus) else {
         return "The KAM Security service is not answering".to_owned();
     };
 
-    let kam_ipc::Response::Defender { concerns, .. } = status else {
+    let kam_ipc::Response::Defender { status, concerns } = reply else {
         return "Protection state unknown".to_owned();
     };
 
+    // No concerns is not every protection on: a setting Defender did not
+    // report raises no concern. "On and up to date" is said only when every
+    // fact it rests on was actually read.
     match concerns.len() {
-        0 => "Defender is on and up to date".to_owned(),
+        0 if status.unreported().is_empty() => "Defender is on and up to date".to_owned(),
+        0 => "Defender's state was only partly read".to_owned(),
         1 => "1 thing worth checking".to_owned(),
         many => format!("{many} things worth checking"),
     }

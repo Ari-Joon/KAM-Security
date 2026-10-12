@@ -83,6 +83,15 @@ impl DefenderStatus {
                     .to_owned(),
             );
         }
+        // Read and shown for a while, and never checked here, so the panel
+        // and the tray said every protection was on with this one off.
+        if self.download_scanning == Some(false) {
+            concerns.push(
+                "Download and attachment scanning is off, so files arriving from the \
+                 internet or in email are not checked as they arrive."
+                    .to_owned(),
+            );
+        }
         if self.tamper_protection == Some(false) {
             concerns.push(
                 "Tamper protection is off, so other software can change these settings.".to_owned(),
@@ -108,6 +117,37 @@ impl DefenderStatus {
         }
 
         concerns
+    }
+
+    /// What a "nothing to flag" sentence rests on that Defender did not
+    /// report, named for a sentence.
+    ///
+    /// [`concerns`] only speaks about a value that came back as off, which is
+    /// right: an unreported setting is not a disabled one. But it means no
+    /// concerns is not the same as every protection on, and the panel and the
+    /// tray both said the second whenever they saw the first. Whatever is
+    /// listed here was not read, and anything summarising this status has to
+    /// say so rather than describe it as on.
+    ///
+    /// [`concerns`]: DefenderStatus::concerns
+    pub fn unreported(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        for (value, name) in [
+            (self.antivirus_enabled, "the antivirus engine"),
+            (self.realtime_protection, "real-time protection"),
+            (self.behaviour_monitoring, "behaviour monitoring"),
+            (self.cloud_protection, "cloud-delivered protection"),
+            (self.download_scanning, "download and attachment scanning"),
+            (self.tamper_protection, "tamper protection"),
+        ] {
+            if value.is_none() {
+                missing.push(name);
+            }
+        }
+        if self.signature_age_days.is_none() {
+            missing.push("how old its definitions are");
+        }
+        missing
     }
 }
 
@@ -373,6 +413,48 @@ mod tests {
             status.concerns().is_empty(),
             "a protected machine should be told it is fine, not given filler: {:?}",
             status.concerns()
+        );
+    }
+
+    #[test]
+    fn download_scanning_being_off_is_reported() {
+        let status = DefenderStatus {
+            download_scanning: Some(false),
+            last_quick_scan_age_days: Some(1),
+            ..Default::default()
+        };
+        assert!(status
+            .concerns()
+            .iter()
+            .any(|concern| concern.contains("Download and attachment scanning is off")));
+    }
+
+    /// No concerns is not every protection on: a setting Defender did not
+    /// report raises no concern, and must be named rather than assumed.
+    #[test]
+    fn what_defender_did_not_report_is_named() {
+        let everything = DefenderStatus {
+            antivirus_enabled: Some(true),
+            realtime_protection: Some(true),
+            behaviour_monitoring: Some(true),
+            cloud_protection: Some(true),
+            download_scanning: Some(true),
+            tamper_protection: Some(true),
+            signature_age_days: Some(0),
+            last_quick_scan_age_days: Some(1),
+            ..Default::default()
+        };
+        assert!(everything.unreported().is_empty());
+
+        let partial = DefenderStatus {
+            tamper_protection: None,
+            signature_age_days: None,
+            ..everything
+        };
+        assert!(partial.concerns().is_empty(), "{:?}", partial.concerns());
+        assert_eq!(
+            partial.unreported(),
+            vec!["tamper protection", "how old its definitions are"]
         );
     }
 
