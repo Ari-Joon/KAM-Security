@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactElement } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { api, reason } from "./lib/api";
 import type { Sweep as SweepReport } from "./lib/types";
 import type { AuditRecord, SystemStatus, Volume } from "./lib/types";
@@ -11,10 +12,12 @@ import Cleanup from "./views/Cleanup";
 import Firewall from "./views/Firewall";
 import Scanner from "./views/Scanner";
 import Changes from "./views/Changes";
+import Downloads from "./views/Downloads";
 import {
   ActivityIcon,
   ApplicationsIcon,
   CleanupIcon,
+  DownloadsIcon,
   FirewallIcon,
   OverviewIcon,
   ScannerIcon,
@@ -26,6 +29,7 @@ type Section =
   | "overview"
   | "changes"
   | "storage"
+  | "downloads"
   | "applications"
   | "cleanup"
   | "scanner"
@@ -47,6 +51,12 @@ const NAV: {
     Icon: ActivityIcon,
   },
   { key: "storage", label: "Storage", hint: "Where the space went", Icon: StorageIcon },
+  {
+    key: "downloads",
+    label: "Active downloads",
+    hint: "Checked as they arrive",
+    Icon: DownloadsIcon,
+  },
   {
     key: "applications",
     label: "Applications",
@@ -138,6 +148,27 @@ export default function App() {
       setStatus(null);
       setError(reason(cause));
     }
+  }, []);
+
+  // A file somebody asked about from Explorer's right-click menu or from a
+  // notification opens this window on the downloads page. The request waits
+  // in the shell until the page takes it, so one that arrives before the
+  // window has finished loading is not lost.
+  const [launches, setLaunches] = useState(0);
+  useEffect(() => {
+    api
+      .launchWaiting()
+      .then((waiting) => {
+        if (waiting) setSection("downloads");
+      })
+      .catch(() => {});
+    const unlisten = listen("kam://launch", () => {
+      setSection("downloads");
+      setLaunches((count) => count + 1);
+    });
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
   }, []);
 
   useEffect(() => {
@@ -269,6 +300,8 @@ export default function App() {
             onScanned={() => void refresh()}
           />
         )}
+
+        {section === "downloads" && <Downloads launches={launches} />}
 
         {section === "applications" && (
           <Applications volumes={volumes} onMeasured={() => void refresh()} />

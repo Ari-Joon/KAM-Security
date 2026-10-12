@@ -32,6 +32,12 @@ import type {
   Sweep,
   ScanOutcome,
   Schedule,
+  DownloadsPage,
+  DownloadRecord,
+  DissectionView,
+  Extraction,
+  MenuState,
+  Launch,
 } from "./types";
 
 /**
@@ -141,6 +147,28 @@ export const api = {
   setStartAtSignIn: (enabled: boolean) =>
     invoke<StartState>("set_start_at_sign_in", { enabled }),
   openReleasePage: (url: string) => invoke<void>("open_release_page", { url }),
+
+  /** The Downloads page: history, files not checked yet, and the watcher. */
+  downloadsPage: () => invoke<DownloadsPage>("downloads_page"),
+  /**
+   * Check one file as a new download is checked. Streams progress and can be
+   * stopped; resolves to null when stopped. Defender only reports.
+   */
+  checkDownload: (path: string, job: string) =>
+    invoke<DownloadRecord | null>("check_download", { path, job }),
+  /** Quarantine one download. The agent fences it to the Downloads folder. */
+  quarantineDownload: (path: string) => invoke<Manifest>("quarantine_download", { path }),
+  /**
+   * Take a zip apart. Quarantines the original first when Defender flagged it.
+   * Nothing is extracted until extractClean. Null when stopped.
+   */
+  dissectArchive: (path: string, job: string) =>
+    invoke<DissectionView | null>("dissect_archive", { path, job }),
+  extractClean: (token: string) => invoke<Extraction>("extract_clean", { token }),
+  discardDissection: (token: string) => invoke<void>("discard_dissection", { token }),
+  setContextMenu: (enabled: boolean) => invoke<MenuState>("set_context_menu", { enabled }),
+  takeLaunch: () => invoke<Launch | null>("take_launch"),
+  launchWaiting: () => invoke<boolean>("launch_waiting"),
 };
 
 /** Tauri rejects with a plain string; normalise anything else into one. */

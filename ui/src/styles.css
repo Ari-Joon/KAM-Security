@@ -3184,3 +3184,197 @@ button.ghost {
   border-left: 3px solid var(--warn);
   padding-left: 9px;
 }
+
+/* ---------- active downloads ---------- */
+
+/* A warning long enough to need more than one line. `held-warn` keeps to one
+   line on purpose for short labels; a sentence about why something was not
+   checked has to be readable whole. */
+.wrap {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.dl-list,
+.dl-members,
+.dl-done,
+.dl-notes {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.dl-row {
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
+
+.dl-row:first-child {
+  border-top: none;
+}
+
+/* The file somebody asked about from Explorer or a notification. */
+.dl-focused {
+  border-left: 3px solid var(--accent);
+  padding-left: 10px;
+}
+
+.dl-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.dl-name {
+  flex: 1;
+  min-width: 0;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.dl-size {
+  flex: none;
+  font-size: 12px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.dl-facts {
+  margin: 2px 0 6px;
+  overflow-wrap: anywhere;
+}
+
+/* Defender's answer. Colour follows the words, and the words are always
+   there: green only for "Defender found nothing", amber for a flag or for a
+   check that did not finish, neutral for "not checked yet". */
+.dl-answer {
+  font-size: 13px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+.dl-answer.ok {
+  color: var(--ok);
+  border-color: rgba(61, 214, 140, 0.3);
+  background: rgba(61, 214, 140, 0.08);
+}
+
+.dl-answer.warn {
+  color: var(--warn);
+  border-color: rgba(240, 180, 41, 0.3);
+  background: rgba(240, 180, 41, 0.08);
+}
+
+.dl-answer p {
+  margin: 4px 0 0;
+}
+
+.dl-threat {
+  font-weight: 600;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* Defender's category, as Defender gives it, set apart from the rest of the
+   name so HackTool: and Trojan: read at a glance. */
+.dl-threat-cat {
+  color: var(--warn);
+}
+
+.dl-notes {
+  margin-top: 6px;
+  display: grid;
+  gap: 4px;
+}
+
+.dl-notes li {
+  font-size: 12.5px;
+  color: var(--text-2);
+  line-height: 1.5;
+}
+
+.dl-done {
+  margin-top: 6px;
+}
+
+.dl-done li {
+  padding: 1px 0;
+  overflow-wrap: anywhere;
+}
+
+.dl-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.dl-counts {
+  margin: 12px 0 0;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.dl-extracted {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+}
+
+.dl-extracted p {
+  margin: 0 0 6px;
+  overflow-wrap: anywhere;
+}
+
+.dl-members {
+  margin-top: 12px;
+  max-height: 420px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+}
+
+.dl-member {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) auto minmax(0, 3fr);
+  gap: 12px;
+  align-items: baseline;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.dl-member-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dl-member-status {
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+.dl-member.flagged .dl-member-status {
+  color: var(--warn);
+}
+
+.dl-member.nothing_found .dl-member-status {
+  color: var(--ok);
+}
+
+@media (max-width: 760px) {
+  .dl-member {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .dl-member-status {
+    grid-column: 1 / -1;
+  }
+}

@@ -92,6 +92,20 @@ export function CleanupIcon() {
   );
 }
 
+/**
+ * An arrow coming down into a tray: something arriving. Checked on the way
+ * in, which is the whole of what the page is about.
+ */
+export function DownloadsIcon() {
+  return (
+    <Frame>
+      <path d="M12 3.6 V13.4" />
+      <path d="M8.2 9.8 L12 13.6 L15.8 9.8" />
+      <path d="M4.2 14.2 V18.4 a1.6 1.6 0 0 0 1.6 1.6 h12.4 a1.6 1.6 0 0 0 1.6 -1.6 V14.2" />
+    </Frame>
+  );
+}
+
 /** Aegis sweep — a radar arc and its blip, so: scanning. */
 export function ScannerIcon() {
   return (

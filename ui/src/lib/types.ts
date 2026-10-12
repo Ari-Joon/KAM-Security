@@ -944,3 +944,173 @@ export type StartState = {
   /** This launch turned it on by default, so say so once. */
   turned_on_now: boolean;
 };
+
+// ---------- Downloads -------------------------------------------------------
+
+/** Defender's answer to a report-only check of one file. */
+export type Answer = "nothing_found" | "flagged" | "not_finished";
+
+/** One threat Defender flagged, with the resources it named. */
+export type FlaggedThreat = {
+  name: string;
+  resources: string[];
+};
+
+/**
+ * What one of Defender's names means, written by the scanner rather than
+ * here, so the window never invents an explanation.
+ */
+export type ThreatNote = {
+  name: string;
+  /** The part before the colon, as Defender gives it: HackTool, PUA, Trojan. */
+  category: string | null;
+  meaning: string;
+  /** Unwanted or dual-use rather than malware: the person's call, in Windows Security. */
+  your_decision: boolean;
+  /** The name ends in !ml: Defender's machine-learning model flagged it. */
+  machine_learning: boolean;
+};
+
+export type FileScan = {
+  answer: Answer;
+  /** False when Defender did not finish. Never shown as clean. */
+  completed: boolean;
+  exit_code: number | null;
+  seconds: number;
+  threats: FlaggedThreat[];
+  /** False when Defender's list did not add up to its own counts. */
+  listing_consistent: boolean;
+  caveat: string | null;
+  definitions: string | null;
+  notes: ThreatNote[];
+};
+
+/** Something done to a download, in the agent's words. */
+export type DownloadAction = {
+  at: string;
+  what: string;
+  undo: string | null;
+};
+
+export type MemberStatus =
+  | { state: "nothing_found" }
+  | { state: "flagged"; threats: string[] }
+  | { state: "left_out"; reason: string }
+  | { state: "folder" };
+
+export type Member = {
+  name: string;
+  bytes: number;
+  packed: number;
+  status: MemberStatus;
+};
+
+export type DissectionTotals = {
+  files: number;
+  bytes: number;
+  flagged: number;
+  flagged_bytes: number;
+  left_out: number;
+  left_out_bytes: number;
+  clean: number;
+  clean_bytes: number;
+};
+
+/** An archive taken apart: every member with Defender's answer. */
+export type Dissection = {
+  archive: string;
+  sha256: string;
+  scan: FileScan;
+  members: Member[];
+  members_omitted: number;
+  totals: DissectionTotals;
+  whole_archive: string[];
+  unmatched: string[];
+  offered: boolean;
+  not_offered: string | null;
+  original: { quarantined: string | null; refused: string | null };
+};
+
+export type RemovedFile = {
+  name: string;
+  /** The detection that names it, when Defender's history has one. */
+  threat: string | null;
+  /** What that detection's name means, from the scanner. */
+  note: ThreatNote | null;
+};
+
+export type Extraction = {
+  destination: string;
+  files: number;
+  bytes: number;
+  left_out: number;
+  left_out_bytes: number;
+  failed: string[];
+  /** Written, then gone or not whole when looked at again. Never counted. */
+  removed: RemovedFile[];
+};
+
+/** One row of the download history. */
+export type DownloadRecord = {
+  path: string;
+  name: string;
+  bytes: number;
+  sha256: string;
+  arrived_at: string | null;
+  origin: Origin | null;
+  signature: Signature | null;
+  scan: FileScan;
+  checked_at: string;
+  actions: DownloadAction[];
+  dissection: Dissection | null;
+  first_check: boolean;
+};
+
+export type PageRecord = DownloadRecord & {
+  /** Whether the file is still where it was checked. */
+  present: boolean;
+  archive: "zip" | "other" | null;
+};
+
+export type LooseFile = {
+  path: string;
+  name: string;
+  bytes: number;
+  arrived_at: string | null;
+  archive: "zip" | "other" | null;
+  changed_since_checked: boolean;
+};
+
+export type WatchStatus =
+  | { state: "starting" }
+  | { state: "watching"; folder: string }
+  | { state: "not_watching"; reason: string };
+
+export type MenuState = {
+  enabled: boolean;
+  points_elsewhere: boolean;
+};
+
+export type DownloadsPage = {
+  folder: string | null;
+  folder_error: string | null;
+  watch: WatchStatus;
+  records: PageRecord[];
+  history_error: string | null;
+  unchecked: LooseFile[];
+  failures: { path: string; message: string }[];
+  menu: MenuState;
+  protection: boolean | null;
+  notifications: string | null;
+};
+
+export type DissectionView = {
+  token: string;
+  dissection: Dissection;
+};
+
+/** A file somebody asked about from Explorer or a notification. */
+export type Launch = {
+  action: "check" | "extract" | "show";
+  path: string;
+};
