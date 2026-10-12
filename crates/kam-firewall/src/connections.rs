@@ -142,6 +142,13 @@ pub struct ConnectionReport {
     /// Reported as a number and nothing more: they belong to no process, so
     /// there is nothing to say about them beyond how many there are.
     pub closing: usize,
+    /// Tables that could not be read, phrased for a person.
+    ///
+    /// There are four -- TCP and UDP, each over IPv4 and IPv6 -- and one that
+    /// failed used to be left out without a word, so every socket in it was
+    /// missing from a list that still presented itself as everything open.
+    #[serde(default)]
+    pub unread: Vec<String>,
 }
 
 /// Ports arrive with their bytes the other way round.
@@ -219,12 +226,15 @@ fn image_of(pid: u32) -> Option<String> {
 /// Ask for a table twice: once for its size, once for its contents.
 ///
 /// Returns the raw bytes. The shape differs per address family and protocol,
-/// so the caller casts.
-fn table_bytes(fetch: impl Fn(Option<*mut core::ffi::c_void>, *mut u32) -> u32) -> Option<Vec<u8>> {
+/// so the caller casts. A failure comes back as the Windows error code, so the
+/// caller can say which table was not read and why.
+fn table_bytes(
+    fetch: impl Fn(Option<*mut core::ffi::c_void>, *mut u32) -> u32,
+) -> Result<Vec<u8>, u32> {
     let mut size = 0_u32;
     let outcome = fetch(None, &mut size);
     if outcome != ERROR_INSUFFICIENT_BUFFER.0 || size == 0 {
-        return None;
+        return Err(outcome);
     }
 
     // The table can grow between the two calls, so a second insufficient
@@ -233,13 +243,21 @@ fn table_bytes(fetch: impl Fn(Option<*mut core::ffi::c_void>, *mut u32) -> u32) 
         let mut buffer = vec![0_u8; size as usize];
         let outcome = fetch(Some(buffer.as_mut_ptr() as *mut _), &mut size);
         if outcome == NO_ERROR.0 {
-            return Some(buffer);
+            return Ok(buffer);
         }
         if outcome != ERROR_INSUFFICIENT_BUFFER.0 {
-            return None;
+            return Err(outcome);
         }
     }
-    None
+    Err(ERROR_INSUFFICIENT_BUFFER.0)
+}
+
+/// Say which table could not be read, in words.
+fn unread_table(what: &str, code: u32) -> String {
+    format!(
+        "{what} could not be read (Windows error {code}), so any connections in it \
+         are not shown"
+    )
 }
 
 /// Rows follow the count field contiguously; this reads them as a slice.
@@ -272,9 +290,10 @@ unsafe fn rows<Table, Row>(bytes: &[u8]) -> &[Row] {
 /// Read every open TCP and UDP socket, joined to the program that owns it.
 pub fn survey() -> ConnectionReport {
     let mut found: Vec<Connection> = Vec::new();
+    let mut unread: Vec<String> = Vec::new();
 
     // --- TCP over IPv4 ----------------------------------------------------
-    if let Some(bytes) = table_bytes(|buffer, size| unsafe {
+    match table_bytes(|buffer, size| unsafe {
         GetExtendedTcpTable(
             buffer,
             size,
@@ -284,31 +303,34 @@ pub fn survey() -> ConnectionReport {
             0,
         )
     }) {
-        for row in unsafe { rows::<MIB_TCPTABLE_OWNER_PID, MIB_TCPROW_OWNER_PID>(&bytes) } {
-            let state = State::from_tcp(row.dwState);
-            let remote = ipv4(row.dwRemoteAddr).to_string();
-            found.push(Connection {
-                protocol: "TCP".to_owned(),
-                state,
-                local_address: ipv4(row.dwLocalAddr).to_string(),
-                local_port: port(row.dwLocalPort),
-                external: state != State::Listening && is_external(&remote),
-                remote_port: (state != State::Listening).then(|| port(row.dwRemotePort)),
-                remote_address: (state != State::Listening).then_some(remote),
-                process_id: row.dwOwningPid,
-                image_path: None,
-                name: None,
-                description: None,
-                company: None,
-                signer: None,
-                unsigned: None,
-                ours: false,
-            });
+        Err(code) => unread.push(unread_table("The table of TCP connections over IPv4", code)),
+        Ok(bytes) => {
+            for row in unsafe { rows::<MIB_TCPTABLE_OWNER_PID, MIB_TCPROW_OWNER_PID>(&bytes) } {
+                let state = State::from_tcp(row.dwState);
+                let remote = ipv4(row.dwRemoteAddr).to_string();
+                found.push(Connection {
+                    protocol: "TCP".to_owned(),
+                    state,
+                    local_address: ipv4(row.dwLocalAddr).to_string(),
+                    local_port: port(row.dwLocalPort),
+                    external: state != State::Listening && is_external(&remote),
+                    remote_port: (state != State::Listening).then(|| port(row.dwRemotePort)),
+                    remote_address: (state != State::Listening).then_some(remote),
+                    process_id: row.dwOwningPid,
+                    image_path: None,
+                    name: None,
+                    description: None,
+                    company: None,
+                    signer: None,
+                    unsigned: None,
+                    ours: false,
+                });
+            }
         }
     }
 
     // --- TCP over IPv6 ----------------------------------------------------
-    if let Some(bytes) = table_bytes(|buffer, size| unsafe {
+    match table_bytes(|buffer, size| unsafe {
         GetExtendedTcpTable(
             buffer,
             size,
@@ -318,26 +340,29 @@ pub fn survey() -> ConnectionReport {
             0,
         )
     }) {
-        for row in unsafe { rows::<MIB_TCP6TABLE_OWNER_PID, MIB_TCP6ROW_OWNER_PID>(&bytes) } {
-            let state = State::from_tcp(row.dwState);
-            let remote = ipv6(row.ucRemoteAddr).to_string();
-            found.push(Connection {
-                protocol: "TCP".to_owned(),
-                state,
-                local_address: ipv6(row.ucLocalAddr).to_string(),
-                local_port: port(row.dwLocalPort),
-                external: state != State::Listening && is_external(&remote),
-                remote_port: (state != State::Listening).then(|| port(row.dwRemotePort)),
-                remote_address: (state != State::Listening).then_some(remote),
-                process_id: row.dwOwningPid,
-                image_path: None,
-                name: None,
-                description: None,
-                company: None,
-                signer: None,
-                unsigned: None,
-                ours: false,
-            });
+        Err(code) => unread.push(unread_table("The table of TCP connections over IPv6", code)),
+        Ok(bytes) => {
+            for row in unsafe { rows::<MIB_TCP6TABLE_OWNER_PID, MIB_TCP6ROW_OWNER_PID>(&bytes) } {
+                let state = State::from_tcp(row.dwState);
+                let remote = ipv6(row.ucRemoteAddr).to_string();
+                found.push(Connection {
+                    protocol: "TCP".to_owned(),
+                    state,
+                    local_address: ipv6(row.ucLocalAddr).to_string(),
+                    local_port: port(row.dwLocalPort),
+                    external: state != State::Listening && is_external(&remote),
+                    remote_port: (state != State::Listening).then(|| port(row.dwRemotePort)),
+                    remote_address: (state != State::Listening).then_some(remote),
+                    process_id: row.dwOwningPid,
+                    image_path: None,
+                    name: None,
+                    description: None,
+                    company: None,
+                    signer: None,
+                    unsigned: None,
+                    ours: false,
+                });
+            }
         }
     }
 
@@ -345,7 +370,7 @@ pub fn survey() -> ConnectionReport {
     // Connectionless, so there is no peer to report: only who is holding the
     // port open. Still worth showing — an unexpected program bound to a port
     // is exactly the sort of thing this view is for.
-    if let Some(bytes) = table_bytes(|buffer, size| unsafe {
+    match table_bytes(|buffer, size| unsafe {
         GetExtendedUdpTable(
             buffer,
             size,
@@ -355,28 +380,31 @@ pub fn survey() -> ConnectionReport {
             0,
         )
     }) {
-        for row in unsafe { rows::<MIB_UDPTABLE_OWNER_PID, MIB_UDPROW_OWNER_PID>(&bytes) } {
-            found.push(Connection {
-                protocol: "UDP".to_owned(),
-                state: State::Connectionless,
-                local_address: ipv4(row.dwLocalAddr).to_string(),
-                local_port: port(row.dwLocalPort),
-                remote_address: None,
-                remote_port: None,
-                external: false,
-                process_id: row.dwOwningPid,
-                image_path: None,
-                name: None,
-                description: None,
-                company: None,
-                signer: None,
-                unsigned: None,
-                ours: false,
-            });
+        Err(code) => unread.push(unread_table("The table of UDP ports over IPv4", code)),
+        Ok(bytes) => {
+            for row in unsafe { rows::<MIB_UDPTABLE_OWNER_PID, MIB_UDPROW_OWNER_PID>(&bytes) } {
+                found.push(Connection {
+                    protocol: "UDP".to_owned(),
+                    state: State::Connectionless,
+                    local_address: ipv4(row.dwLocalAddr).to_string(),
+                    local_port: port(row.dwLocalPort),
+                    remote_address: None,
+                    remote_port: None,
+                    external: false,
+                    process_id: row.dwOwningPid,
+                    image_path: None,
+                    name: None,
+                    description: None,
+                    company: None,
+                    signer: None,
+                    unsigned: None,
+                    ours: false,
+                });
+            }
         }
     }
 
-    if let Some(bytes) = table_bytes(|buffer, size| unsafe {
+    match table_bytes(|buffer, size| unsafe {
         GetExtendedUdpTable(
             buffer,
             size,
@@ -386,41 +414,57 @@ pub fn survey() -> ConnectionReport {
             0,
         )
     }) {
-        for row in unsafe { rows::<MIB_UDP6TABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID>(&bytes) } {
-            found.push(Connection {
-                protocol: "UDP".to_owned(),
-                state: State::Connectionless,
-                local_address: ipv6(row.ucLocalAddr).to_string(),
-                local_port: port(row.dwLocalPort),
-                remote_address: None,
-                remote_port: None,
-                external: false,
-                process_id: row.dwOwningPid,
-                image_path: None,
-                name: None,
-                description: None,
-                company: None,
-                signer: None,
-                unsigned: None,
-                ours: false,
-            });
+        Err(code) => unread.push(unread_table("The table of UDP ports over IPv6", code)),
+        Ok(bytes) => {
+            for row in unsafe { rows::<MIB_UDP6TABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID>(&bytes) } {
+                found.push(Connection {
+                    protocol: "UDP".to_owned(),
+                    state: State::Connectionless,
+                    local_address: ipv6(row.ucLocalAddr).to_string(),
+                    local_port: port(row.dwLocalPort),
+                    remote_address: None,
+                    remote_port: None,
+                    external: false,
+                    process_id: row.dwOwningPid,
+                    image_path: None,
+                    name: None,
+                    description: None,
+                    company: None,
+                    signer: None,
+                    unsigned: None,
+                    ours: false,
+                });
+            }
         }
     }
 
+    // --- who owns each socket, asked straight away -------------------------
+    //
+    // Every process id is turned into a path now, before anything slow
+    // happens. It used to be done lazily in the loop below, between signature
+    // checks that each walk a certificate chain, so the last sockets were
+    // attributed seconds after the table was read. A process that exited in
+    // that time can have its id reused, and the socket was then joined to
+    // whatever program got the number next: its path, its signer, its name.
+    // Reading them together keeps the window to the time it takes to ask.
+    let images: HashMap<u32, Option<String>> = found
+        .iter()
+        .map(|connection| connection.process_id)
+        .collect::<std::collections::BTreeSet<u32>>()
+        .into_iter()
+        .map(|pid| (pid, image_of(pid)))
+        .collect();
+
     // --- join to the owning program ---------------------------------------
     //
-    // Cached twice over. A browser holds dozens of sockets from one process,
-    // and signature verification walks a certificate chain — doing either per
+    // Cached per path. A browser holds dozens of sockets from one process,
+    // and signature verification walks a certificate chain — doing it per
     // socket would turn a snapshot into a stall.
-    let mut images: HashMap<u32, Option<String>> = HashMap::new();
     let mut signatures: HashMap<String, (Option<String>, Option<bool>)> = HashMap::new();
     let mut descriptions: HashMap<String, Option<kam_core::version::Claims>> = HashMap::new();
 
     for connection in &mut found {
-        let image = images
-            .entry(connection.process_id)
-            .or_insert_with(|| image_of(connection.process_id))
-            .clone();
+        let image = images.get(&connection.process_id).cloned().flatten();
 
         let Some(path) = image else {
             continue;
@@ -511,6 +555,7 @@ pub fn survey() -> ConnectionReport {
         programs,
         closing,
         connections: found,
+        unread,
     }
 }
 
@@ -573,6 +618,35 @@ mod tests {
             better,
             "every description was just the file name again, which adds nothing"
         );
+    }
+
+    /// A table that would not read says why, rather than reading as empty.
+    ///
+    /// `table_bytes` answered `None` for every failure and the caller skipped
+    /// the family, so a refused IPv6 table looked exactly like a machine with
+    /// no IPv6 connections.
+    #[test]
+    fn a_table_that_will_not_read_is_named_rather_than_left_out() {
+        use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+        let refused = table_bytes(|_, _| ERROR_ACCESS_DENIED.0);
+        assert_eq!(refused, Err(ERROR_ACCESS_DENIED.0));
+        assert!(unread_table("The table of TCP connections over IPv6", 5).contains("error 5"));
+
+        // Asked for its size, then filled: an ordinary read still succeeds.
+        let calls = std::cell::Cell::new(0);
+        let read = table_bytes(|buffer, size| {
+            calls.set(calls.get() + 1);
+            match buffer {
+                None => {
+                    unsafe { *size = 8 };
+                    ERROR_INSUFFICIENT_BUFFER.0
+                }
+                Some(_) => NO_ERROR.0,
+            }
+        });
+        assert_eq!(read.map(|bytes| bytes.len()), Ok(8));
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]

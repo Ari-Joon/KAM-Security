@@ -717,6 +717,8 @@ export type ConnectionReport = {
   programs: number;
   /** Sockets left from connections that already finished; no owner. */
   closing: number;
+  /** Connection tables that could not be read, in plain words. */
+  unread: string[];
 };
 
 /** What an uninstaller left behind, and the shortcuts pointing at it. */

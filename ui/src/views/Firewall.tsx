@@ -924,6 +924,20 @@ export default function Firewall() {
           it cannot. Blocking here adds one rule and changes nothing else.
         </p>
 
+        {live !== null && live.unread.length > 0 && (
+          /* A table that would not read used to be left out without a word,
+             so its sockets were missing from a list that still looked whole. */
+          <div className="notice notice-warn">
+            <strong>Not every connection could be read.</strong> What is shown
+            below is what could be, and nothing is claimed about the rest.
+            <ul className="concerns">
+              {live.unread.map((gap) => (
+                <li key={gap}>{gap}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         {live !== null && live.connections.length > 0 && (
           <div className="conn-controls">
             <input
@@ -1010,7 +1024,11 @@ export default function Firewall() {
         {live === null ? (
           <p className="empty">The connection table could not be read.</p>
         ) : live.connections.length === 0 ? (
-          <p className="empty">Nothing has a socket open.</p>
+          <p className="empty">
+            {live.unread.length > 0
+              ? "Nothing has a socket open in the tables that could be read."
+              : "Nothing has a socket open."}
+          </p>
         ) : shown.length === 0 ? (
           <p className="empty">
             Nothing matches. {programs.length}{" "}
