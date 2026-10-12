@@ -734,7 +734,18 @@ export type Shortcut = {
   bytes: number;
 };
 
-export type Remnant = {
+/**
+ * Whether quarantine would take a leftover, from the same fence the agent
+ * applies when it is asked to. Absent means it was never asked, which reads as
+ * "no" rather than "yes".
+ */
+export type QuarantineAnswer = {
+  quarantinable?: boolean;
+  /** The fence's own reason when it would not. */
+  quarantine_refusal?: string | null;
+};
+
+export type Remnant = QuarantineAnswer & {
   path: string;
   bytes: number;
   kind: string;
@@ -746,9 +757,12 @@ export type Remnant = {
 export type Remnants = {
   name: string;
   locations: Remnant[];
-  shortcuts: Shortcut[];
+  shortcuts: (Shortcut & QuarantineAnswer)[];
   total_bytes: number;
-  /** Paths the agent declined to look at, reported rather than dropped. */
+  /**
+   * Paths the agent declined to look at, reported rather than dropped: outside
+   * the folders it will look in, or there but impossible to resolve.
+   */
   refused: string[];
 };
 
