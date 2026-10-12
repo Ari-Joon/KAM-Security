@@ -162,7 +162,8 @@ pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
         | Request::DeleteQuarantined { .. }
         | Request::EmptyQuarantine
         | Request::ApplyMove { .. }
-        | Request::UndoMove { .. } => false,
+        | Request::UndoMove { .. }
+        | Request::QuarantineDownload { .. } => false,
 
         // The caller's own things: a schedule that runs as them, unelevated,
         // and decoy files in their own profile.
@@ -172,6 +173,8 @@ pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
         Request::RecordLookup { .. }
         | Request::RecordRecycle { .. }
         | Request::NoteUninstallLaunched { .. }
+        | Request::RecordDissection { .. }
+        | Request::RecordExtraction { .. }
         | Request::CancelJob { .. } => false,
 
         // Reading, measuring and scanning. A Defender scan is something any
@@ -200,7 +203,9 @@ pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
         | Request::GetExtensions
         | Request::GetHardening
         | Request::GetCanaries
-        | Request::GetProtection => false,
+        | Request::GetProtection
+        | Request::CheckDownload { .. }
+        | Request::ListDownloads => false,
     }
 }
 
@@ -1048,6 +1053,29 @@ pub fn handle(
 
         Request::QuarantinePath { path, reason } => quarantine_path(&path, &reason, context, user),
 
+        // A download is checked when it lands and whenever somebody asks.
+        // Audited either way: it reads a file as LocalSystem and records it.
+        Request::CheckDownload { path, job, copy_of } => {
+            crate::downloads::check(&path, &job, copy_of.as_deref(), context, reporter, user)
+        }
+
+        // Not audited. The page reads it whenever it is opened.
+        Request::ListDownloads => crate::downloads::list(context, user),
+
+        Request::QuarantineDownload { path } => crate::downloads::quarantine(&path, context, user),
+
+        Request::RecordDissection {
+            path,
+            sha256,
+            dissection,
+        } => crate::downloads::record_dissection(&path, &sha256, *dissection, context, user),
+
+        Request::RecordExtraction {
+            path,
+            sha256,
+            extraction,
+        } => crate::downloads::record_extraction(&path, &sha256, &extraction, context, user),
+
         Request::ListQuarantine => match context.quarantine.list() {
             Ok(items) => Response::QuarantineList { items },
             Err(error) => {
@@ -1358,7 +1386,7 @@ fn apply_move(from: &str, to: &str, context: &Context, user: &UserContext) -> Re
 
 /// Sizes appear in audit entries a person reads, so they are written the way a
 /// person would say them rather than as a raw byte count.
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
@@ -2135,5 +2163,275 @@ mod tests {
             &UserContext::current(),
         );
         assert!(matches!(response, Response::RecentAudit { .. }));
+    }
+
+    // --- downloads -------------------------------------------------------
+
+    /// The person running the tests, identified by a made-up SID so their
+    /// rows have a key, with their real profile so their files are theirs.
+    fn identified(sid: &str) -> UserContext {
+        UserContext::new(Some(sid.to_owned()), UserContext::current().profile())
+    }
+
+    fn scratch_file(tag: &str, contents: &[u8]) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "kam-dispatch-download-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("notes.txt");
+        std::fs::write(&file, contents).unwrap();
+        file
+    }
+
+    fn check(path: &str, user: &UserContext, context: &Context) -> Response {
+        handle(
+            Request::CheckDownload {
+                path: path.to_owned(),
+                job: "test-job".to_owned(),
+                copy_of: None,
+            },
+            context,
+            &Reporter::silent(),
+            user,
+        )
+    }
+
+    /// A check is recorded for the caller, audited, and the first one says so.
+    #[test]
+    fn a_checked_download_is_recorded_for_its_caller_alone() {
+        let context = context(Mode::Service);
+        let me = identified("S-1-5-21-0-0-0-4001");
+        let them = identified("S-1-5-21-0-0-0-4002");
+        let file = scratch_file("record", b"hello");
+        let path = file.to_string_lossy().into_owned();
+
+        let Response::DownloadChecked(first) = check(&path, &me, &context) else {
+            panic!("the check did not come back as a record");
+        };
+        assert!(first.first_check);
+        assert_eq!(first.check.bytes, 5);
+        assert_eq!(
+            first.check.scan.answer,
+            kam_scanner::defender_file::Answer::NothingFound,
+            "{:?}",
+            first.check.scan
+        );
+        let Response::DownloadChecked(second) = check(&path, &me, &context) else {
+            panic!("the second check did not come back as a record");
+        };
+        assert!(!second.first_check, "a second look was announced as new");
+
+        let Response::Downloads { records } =
+            handle(Request::ListDownloads, &context, &Reporter::silent(), &me)
+        else {
+            panic!("no history came back");
+        };
+        assert_eq!(records.len(), 1);
+        let Response::Downloads { records } =
+            handle(Request::ListDownloads, &context, &Reporter::silent(), &them)
+        else {
+            panic!("no history came back");
+        };
+        assert!(records.is_empty(), "somebody else's history was shown");
+
+        let audited = context
+            .store
+            .recent_audit(20)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.module == "downloads" && entry.action == "check")
+            .count();
+        assert_eq!(audited, 2, "each check is in the audit log");
+
+        // The reply crosses the pipe intact.
+        let wire = serde_json::to_string(&kam_ipc::Reply::Done(Response::DownloadChecked(second)))
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<kam_ipc::Reply>(&wire).unwrap(),
+            kam_ipc::Reply::Done(Response::DownloadChecked(_))
+        ));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A working copy is only accepted from the caller's own work folder.
+    #[test]
+    fn a_working_copy_from_anywhere_else_is_refused() {
+        let context = context(Mode::Service);
+        let me = identified("S-1-5-21-0-0-0-4003");
+        let file = scratch_file("copy", b"x");
+        let response = handle(
+            Request::CheckDownload {
+                path: file.to_string_lossy().into_owned(),
+                job: "test-job".to_owned(),
+                copy_of: Some(r"C:\Users\someone\Downloads\a.zip".to_owned()),
+            },
+            &context,
+            &Reporter::silent(),
+            &me,
+        );
+        let Response::Error { message } = &response else {
+            panic!("a working copy outside the work folder was accepted: {response:?}");
+        };
+        assert!(message.contains("work folder"), "{message}");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// Only a file inside the caller's own Downloads folder can be quarantined
+    /// as a download, and every refusal is in the audit log.
+    #[test]
+    fn a_download_quarantine_outside_downloads_is_refused_and_recorded() {
+        let context = context(Mode::Service);
+        let me = UserContext::current();
+        let elsewhere = scratch_file("fence", b"keep me");
+        for path in [
+            elsewhere.to_string_lossy().into_owned(),
+            r"C:\Windows\System32\kernel32.dll".to_owned(),
+            format!(
+                r"{}\..\Desktop\x.txt",
+                kam_storage::downloads::folder_for(&me)
+            ),
+        ] {
+            let response = handle(
+                Request::QuarantineDownload { path: path.clone() },
+                &context,
+                &Reporter::silent(),
+                &me,
+            );
+            assert!(
+                matches!(response, Response::Error { .. }),
+                "{path} was quarantined: {response:?}"
+            );
+        }
+        assert!(elsewhere.exists(), "a refused file was touched");
+        let refused = context
+            .store
+            .recent_audit(20)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.action == "quarantine" && entry.effect == Effect::Refused)
+            .count();
+        assert_eq!(refused, 3);
+        let _ = std::fs::remove_dir_all(elsewhere.parent().unwrap());
+    }
+
+    /// A download in Downloads is held, the row says so, and it comes back.
+    #[test]
+    fn a_download_is_quarantined_noted_on_its_row_and_restored() {
+        let context = context(Mode::Service);
+        let me = UserContext::current();
+        let downloads = std::path::PathBuf::from(kam_storage::downloads::folder_for(&me));
+        if !downloads.is_dir() {
+            return;
+        }
+        let file = downloads.join(format!("kam-download-test-{}.bin", std::process::id()));
+        std::fs::write(&file, vec![3_u8; 1024]).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let Response::DownloadChecked(record) = check(&path, &me, &context) else {
+            let _ = std::fs::remove_file(&file);
+            panic!("the download could not be checked");
+        };
+
+        let held = handle(
+            Request::QuarantineDownload { path: path.clone() },
+            &context,
+            &Reporter::silent(),
+            &me,
+        );
+        let Response::Quarantined(manifest) = &held else {
+            let _ = std::fs::remove_file(&file);
+            panic!("the download was not quarantined: {held:?}");
+        };
+        assert!(!file.exists());
+        let row = context.store.downloads_for("", 10).unwrap().remove(0);
+        assert!(row.actions.contains(&manifest.id), "{}", row.actions);
+        assert_eq!(row.sha256, record.check.sha256);
+
+        let back = handle(
+            Request::RestoreQuarantined {
+                id: manifest.id.clone(),
+            },
+            &context,
+            &Reporter::silent(),
+            &me,
+        );
+        assert!(matches!(back, Response::Quarantined(_)), "{back:?}");
+        assert!(file.exists());
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    /// What the window reports about an archive needs a check on record, and
+    /// lands on that row.
+    #[test]
+    fn a_dissection_is_recorded_only_against_a_checked_archive() {
+        let context = context(Mode::Service);
+        let me = identified("S-1-5-21-0-0-0-4004");
+        let file = scratch_file("dissect", b"not really a zip");
+        let path = file.to_string_lossy().into_owned();
+        let Response::DownloadChecked(record) = check(&path, &me, &context) else {
+            panic!("the check failed");
+        };
+        let dissection = kam_scanner::downloads::dissect(
+            &path,
+            &record.check.sha256,
+            record.check.scan.clone(),
+            &[],
+        );
+
+        let unknown = handle(
+            Request::RecordDissection {
+                path: path.clone(),
+                sha256: "0".repeat(64),
+                dissection: Box::new(dissection.clone()),
+            },
+            &context,
+            &Reporter::silent(),
+            &me,
+        );
+        assert!(matches!(unknown, Response::Error { .. }), "{unknown:?}");
+
+        let recorded = handle(
+            Request::RecordDissection {
+                path: record.check.path.clone(),
+                sha256: record.check.sha256.clone(),
+                dissection: Box::new(dissection),
+            },
+            &context,
+            &Reporter::silent(),
+            &me,
+        );
+        assert!(matches!(recorded, Response::Acknowledged), "{recorded:?}");
+        let extracted = handle(
+            Request::RecordExtraction {
+                path: record.check.path.clone(),
+                sha256: record.check.sha256.clone(),
+                extraction: kam_scanner::downloads::Extraction {
+                    destination: r"C:\Users\me\Downloads\a (checked by KAM)".to_owned(),
+                    files: 2,
+                    bytes: 10,
+                    left_out: 1,
+                    left_out_bytes: 68,
+                    failed: Vec::new(),
+                },
+            },
+            &context,
+            &Reporter::silent(),
+            &me,
+        );
+        assert!(matches!(extracted, Response::Acknowledged));
+
+        let Response::Downloads { records } =
+            handle(Request::ListDownloads, &context, &Reporter::silent(), &me)
+        else {
+            panic!("no history");
+        };
+        assert!(records[0].dissection.is_some());
+        assert!(
+            records[0].actions[0].what.starts_with("Extracted 2 files"),
+            "{:?}",
+            records[0].actions
+        );
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 }

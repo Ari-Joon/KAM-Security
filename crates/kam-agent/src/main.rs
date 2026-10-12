@@ -13,6 +13,7 @@
 mod baseline;
 mod check;
 mod dispatch;
+mod downloads;
 mod server;
 mod service;
 mod store_acl;
@@ -453,6 +454,43 @@ mod tests {
                  reasoning in kam-rules and deny.toml no longer holds and both \
                  must be revisited."
             );
+        }
+    }
+
+    /// The agent never takes an archive apart, so it never links an archive
+    /// reader.
+    ///
+    /// Extracting writes files named by whoever made the archive, and doing
+    /// that as LocalSystem is how a zip-slip becomes a write anywhere on the
+    /// machine. The window does it, as the person, and the agent only reads
+    /// and asks Defender. Asserted for the same reason as the rule engine:
+    /// a dependency added for convenience would undo it without a sound.
+    #[test]
+    fn no_archive_reader_reaches_the_privileged_agent() {
+        let Some(crates) = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent() else {
+            panic!("the agent crate should sit inside a crates directory");
+        };
+        for name in [
+            "kam-agent",
+            "kam-core",
+            "kam-ipc",
+            "kam-scanner",
+            "kam-storage",
+            "kam-quarantine",
+            "kam-firewall",
+        ] {
+            let manifest = crates.join(name).join("Cargo.toml");
+            let Ok(text) = std::fs::read_to_string(&manifest) else {
+                continue;
+            };
+            for line in text.lines() {
+                let key = line.split('=').next().unwrap_or_default().trim();
+                assert!(
+                    !matches!(key, "zip" | "sevenz-rust" | "unrar" | "tar" | "flate2"),
+                    "{name} depends on {key}, which would let the LocalSystem service \
+                     unpack archives. Extraction belongs to the window."
+                );
+            }
         }
     }
 

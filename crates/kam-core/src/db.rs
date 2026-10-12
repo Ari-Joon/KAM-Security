@@ -358,10 +358,17 @@ impl Store {
             Some(id) => {
                 transaction
                     .execute(
+                        // A fact this check could not read keeps what an
+                        // earlier one did: a private copy of an archive has
+                        // no arrival time or origin of its own, and the
+                        // original's should not be lost to it.
                         "UPDATE downloads SET
-                             name = ?2, bytes = ?3, arrived_at = ?4,
+                             name = ?2, bytes = ?3,
+                             arrived_at = COALESCE(?4, arrived_at),
                              checked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                             origin = ?5, signature = ?6, outcome = ?7
+                             origin = COALESCE(?5, origin),
+                             signature = COALESCE(?6, signature),
+                             outcome = ?7
                          WHERE id = ?1",
                         params![
                             id,

@@ -646,6 +646,21 @@ impl Limits {
     }
 }
 
+/// Whether a resolved path lies somewhere the agent must not reach on this
+/// caller's behalf: another account's profile or Recycle Bin, or this
+/// product's own store. `None` when it is none of those.
+///
+/// The same limits [`check_removable`] holds a chosen copy to, offered for a
+/// request that only reads. Reading a file as LocalSystem and handing back its
+/// fingerprint, size and the address it was downloaded from is reaching into
+/// it, and for somebody else's profile that is not the caller's to ask.
+///
+/// `resolved` must already be where the path really leads; `asked` is what
+/// the caller sent, for the message.
+pub fn reach_refusal(resolved: &str, asked: &str, user: &UserContext) -> Option<String> {
+    Limits::for_caller(user).refusal(&crate::paths::plain(resolved), asked, resolved)
+}
+
 /// Decide whether one copy may be removed at all.
 ///
 /// The agent's fence, and it re-derives the answer rather than trusting the

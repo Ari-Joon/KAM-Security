@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `Request` or `Response` changes shape. The shell refuses to
 /// talk to an agent reporting a different version rather than guessing.
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Pipe name. The `\\.\pipe\` prefix is added by the transport.
 pub const PIPE_NAME: &str = "kam-security-agent";
@@ -345,6 +345,50 @@ pub enum Request {
     /// request can do — a security tool that can be silenced over its own
     /// interface is one an attacker silences.
     SetProtection { enabled: bool },
+
+    /// Check one file the way a new download is checked: its size, SHA-256,
+    /// where it came from, who signed it when it is a program, and Defender's
+    /// answer to a report-only scan. Recorded in the caller's download history
+    /// and the audit log.
+    ///
+    /// Streams its progress and can be stopped, like [`Request::DefenderScan`].
+    /// Defender only reports: nothing is moved or deleted by a check.
+    ///
+    /// `copy_of` is set when `path` is the window's private working copy of an
+    /// archive, made in the caller's own `KAM Security\work` folder before the
+    /// original was quarantined. The agent then requires `path` to be inside
+    /// that folder and records the answer under the original's path.
+    CheckDownload {
+        path: String,
+        job: String,
+        #[serde(default)]
+        copy_of: Option<String>,
+    },
+    /// The caller's own download history, and nobody else's.
+    ListDownloads,
+    /// Move one download into quarantine.
+    ///
+    /// Fenced to a file that resolves inside the caller's own Downloads
+    /// folder, judged a component at a time after links and short names are
+    /// followed, and to the limits every chosen quarantine has.
+    QuarantineDownload { path: String },
+    /// Record what an archive was found to hold, as the window reported it.
+    ///
+    /// The window takes archives apart, as the person, because the agent never
+    /// extracts anything. So this is a report taken on trust, and the audit
+    /// entry says the window reported it. The sentence is the agent's.
+    RecordDissection {
+        path: String,
+        sha256: String,
+        dissection: Box<kam_scanner::downloads::Dissection>,
+    },
+    /// Record that the window extracted the parts of an archive Defender did
+    /// not flag, where to, and what it left out. A report, like the above.
+    RecordExtraction {
+        path: String,
+        sha256: String,
+        extraction: kam_scanner::downloads::Extraction,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -458,6 +502,12 @@ pub enum Response {
         enabled: bool,
     },
     Hardening(Box<HardeningReport>),
+    /// One download, as just checked and recorded.
+    DownloadChecked(Box<kam_scanner::downloads::DownloadRecord>),
+    /// The caller's download history, newest first.
+    Downloads {
+        records: Vec<kam_scanner::downloads::DownloadRecord>,
+    },
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {
         message: String,
@@ -563,6 +613,9 @@ mod tests {
         round_trip(Response::Canaries(Default::default()));
         round_trip(Response::Protection { enabled: true });
         round_trip(Response::Hardening(Default::default()));
+        round_trip(Response::Downloads {
+            records: Vec::new(),
+        });
         round_trip(Response::BehaviourEvents {
             observations: Vec::new(),
             watching: true,
