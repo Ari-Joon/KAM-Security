@@ -601,66 +601,41 @@ fn read_run_keys(survey: &mut Survey, users: &[UserContext]) {
                         continue;
                     }
                 };
-                let listing = key.values();
-                if !listing.whole {
+                // Each value is read by position, with its data, rather than
+                // listed by name and then looked up by that name. A name that
+                // holds a NUL, or something that is not text, cannot make that
+                // round trip: the lookup reaches nothing, or a different value,
+                // and the most that could be said was that an entry existed and
+                // could not be read. The writer of a `Run` value is whoever this
+                // is looking for, and those are the names they would choose. Read
+                // by position, what such an entry runs is real and is judged like
+                // any other, and the entry is marked as hidden from Registry
+                // Editor. A value that would not read stops the walk, which
+                // `whole` then reports.
+                let read = key.strings();
+                if !read.whole {
                     survey.unreadable.push(Unreadable::within(
                         anchor.kind(),
                         &named,
                         format!(
-                            "{named} could not be listed to the end, so it may hold \
+                            "{named} could not be read to the end, so it may hold \
                              entries that are not shown"
                         ),
                     ));
                 }
-                for name in listing.names {
-                    // The name came out of the enumeration, so the value is
-                    // there. `None` therefore means it is not a string, which
-                    // is a fact about it; an error means it would not read,
-                    // which is a gap. Those were the same answer, and the
-                    // reader dropped the entry either way -- so a value that
-                    // grows between the size call and the data call left the
-                    // survey silently and was reported as removed next sweep.
-                    // The writer of a `Run` value is whoever this is looking
-                    // for, so that is a flap they can drive.
-                    let command = match key.read_string(&name) {
-                        Ok(Some(command)) => command,
-                        // The enumeration produced this name, so a value that
-                        // is not there under it is a contradiction rather than
-                        // an absence -- and the way to arrange that
-                        // contradiction is a NUL in the name, which no
-                        // installer writes and Registry Editor will not show.
-                        // The entry is unreadable through every
-                        // NUL-terminated entry point there is, so the honest
-                        // report is that it exists and could not be read.
-                        Ok(None) if registry::is_hidden_name(&name) => {
-                            survey.unreadable.push(Unreadable::within(
-                                anchor.kind(),
-                                &named,
-                                format!(
-                                    "{named} holds an entry whose name contains a \
-                                     character that hides it from Registry Editor, \
-                                     so what it runs could not be read"
-                                ),
-                            ));
-                            continue;
-                        }
-                        // Not a string, which is a fact about the value.
-                        Ok(None) => continue,
-                        Err(why) => {
-                            survey.unreadable.push(Unreadable::within(
-                                anchor.kind(),
-                                &named,
-                                why.describe(&format!("{named}, value {name}")),
-                            ));
-                            continue;
-                        }
-                    };
-                    if command.trim().is_empty() {
+                for value in read.values {
+                    // Not a string, or empty: a fact about the value.
+                    let Some(command) = value.text else {
                         continue;
-                    }
-                    survey
-                        .entries
-                        .push(entry(name, anchor, named.clone(), command, false, owner));
+                    };
+                    survey.entries.push(entry(
+                        value.name,
+                        anchor,
+                        named.clone(),
+                        command,
+                        !value.exact,
+                        owner,
+                    ));
                 }
             }
         }
