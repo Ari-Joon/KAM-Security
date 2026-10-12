@@ -176,8 +176,19 @@ impl Report {
 
 /// Read one JSON file, tolerating anything that is not what we expect.
 fn json(path: &Path) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    read_json(path).ok()
+}
+
+/// Read one JSON file, saying why when it cannot be.
+///
+/// A leading byte order mark is skipped. Chromium accepts a manifest that
+/// starts with one and serde_json does not, so an extension saved by an
+/// editor that adds one was installed and running and was missing from this
+/// list without a word.
+fn read_json(path: &Path) -> Result<serde_json::Value, String> {
+    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    serde_json::from_str(text).map_err(|error| error.to_string())
 }
 
 /// Resolve a `__MSG_name__` placeholder against the extension's own locale
@@ -256,28 +267,57 @@ fn age_days(path: &Path, now: u64) -> Option<u64> {
     Some(now.saturating_sub(seconds) / 86_400)
 }
 
+/// The site patterns an extension's content scripts are injected into.
+///
+/// A content script runs inside the page and reads what is on it, so one
+/// matching every site reads every page just as a host permission does.
+/// Leaving these out described an extension that injects a script into every
+/// page as one that reads none.
+fn content_script_sites(manifest: &serde_json::Value) -> Vec<String> {
+    manifest
+        .get("content_scripts")
+        .and_then(|scripts| scripts.as_array())
+        .map(|scripts| {
+            scripts
+                .iter()
+                .flat_map(|script| strings(script.get("matches")))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Read one extension's newest installed version.
+///
+/// `Ok(None)` for a folder with no version in it, which is what the browser
+/// leaves while removing one and is not an installed extension. An error says
+/// why an extension that is there could not be read, so it can be named
+/// rather than left out of the list as though it were not installed.
 fn read_extension(
     browser: &str,
     profile: &str,
     id: &str,
     extension_dir: &Path,
     now: u64,
-) -> Option<Extension> {
+) -> Result<Option<Extension>, String> {
     // An extension folder holds one directory per installed version. The newest
     // is the one in use.
-    let version_dir = std::fs::read_dir(extension_dir)
-        .ok()?
+    let listing = std::fs::read_dir(extension_dir)
+        .map_err(|error| format!("its folder could not be listed ({error})"))?;
+    let Some(version_dir) = listing
         .flatten()
         .filter(|item| item.path().is_dir())
         .max_by_key(|item| {
             item.metadata()
                 .and_then(|meta| meta.modified())
                 .unwrap_or(std::time::UNIX_EPOCH)
-        })?
-        .path();
+        })
+        .map(|item| item.path())
+    else {
+        return Ok(None);
+    };
 
-    let manifest = json(&version_dir.join("manifest.json"))?;
+    let manifest = read_json(&version_dir.join("manifest.json"))
+        .map_err(|why| format!("its manifest could not be read ({why})"))?;
 
     let default_locale = manifest.get("default_locale").and_then(|v| v.as_str());
     let raw_name = manifest
@@ -305,6 +345,7 @@ fn read_extension(
         .into_iter()
         .partition(|item| item.contains("://") || item == "<all_urls>");
     hosts.extend(site_like);
+    hosts.extend(content_script_sites(&manifest));
     hosts.sort();
     hosts.dedup();
     let mut permissions = plain;
@@ -341,7 +382,7 @@ fn read_extension(
         );
     }
 
-    Some(Extension {
+    Ok(Some(Extension {
         browser: browser.to_owned(),
         profile: profile.to_owned(),
         id: id.to_owned(),
@@ -359,7 +400,13 @@ fn read_extension(
         notes,
         added_days_ago: age_days(extension_dir, now),
         path: version_dir.display().to_string(),
-    })
+    }))
+}
+
+/// Whether a folder name has the shape of a Chromium extension id: 32 letters
+/// from `a` to `p`.
+fn is_extension_id(name: &str) -> bool {
+    name.len() == 32 && name.bytes().all(|byte| (b'a'..=b'p').contains(&byte))
 }
 
 /// Every extension installed in every Chromium browser this account has.
@@ -416,8 +463,19 @@ pub fn survey(user: &UserContext) -> Report {
                     continue;
                 }
                 let id = id_entry.file_name().to_string_lossy().into_owned();
-                if let Some(extension) = read_extension(browser, &profile, &id, &id_dir, now) {
-                    report.extensions.push(extension);
+                match read_extension(browser, &profile, &id, &id_dir, now) {
+                    Ok(Some(extension)) => report.extensions.push(extension),
+                    Ok(None) => {}
+                    // The browser keeps working folders here too, such as
+                    // `Temp` while one is being unpacked. One of those that
+                    // does not read as an extension is not a missing one.
+                    Err(_) if !is_extension_id(&id) => {}
+                    // Named, not dropped. An extension whose manifest would
+                    // not parse is still installed, and may still be running.
+                    Err(why) => report.unreadable.push(format!(
+                        "In {browser} ({profile}), the extension {id} could not be read: \
+                         {why}. What it is allowed to do is not shown."
+                    )),
                 }
             }
         }
@@ -466,7 +524,9 @@ mod tests {
                 "permissions":["tabs","cookies"],"host_permissions":["<all_urls>"]}"#,
             None,
         );
-        let extension = read_extension("Chrome", "Default", "aaaa", &root, 0).unwrap();
+        let extension = read_extension("Chrome", "Default", "aaaa", &root, 0)
+            .unwrap()
+            .unwrap();
         assert_eq!(extension.name, "Wide Open");
         assert!(extension.reads_every_page);
         assert_eq!(extension.source, Source::Store);
@@ -489,7 +549,9 @@ mod tests {
                 "permissions":["storage"]}"#,
             None,
         );
-        let extension = read_extension("Chrome", "Default", "bbbb", &root, 0).unwrap();
+        let extension = read_extension("Chrome", "Default", "bbbb", &root, 0)
+            .unwrap()
+            .unwrap();
         assert!(!extension.reads_every_page);
         assert!(extension.notes.is_empty(), "{:?}", extension.notes);
         assert!(!extension.worth_reading());
@@ -505,7 +567,9 @@ mod tests {
             r#"{"name":"Loaded By Hand","version":"0.1","permissions":["storage"]}"#,
             None,
         );
-        let extension = read_extension("Chrome", "Default", "cccc", &root, 0).unwrap();
+        let extension = read_extension("Chrome", "Default", "cccc", &root, 0)
+            .unwrap()
+            .unwrap();
         assert_eq!(extension.source, Source::Sideloaded);
         assert!(extension.worth_reading());
         assert!(extension
@@ -525,7 +589,9 @@ mod tests {
                 "update_url":"https://clients2.google.com/service/update2/crx","permissions":[]}"#,
             Some(r#"{"appName":{"message":"Adblock Something"}}"#),
         );
-        let extension = read_extension("Chrome", "Default", "dddd", &root, 0).unwrap();
+        let extension = read_extension("Chrome", "Default", "dddd", &root, 0)
+            .unwrap()
+            .unwrap();
         assert_eq!(extension.name, "Adblock Something");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -541,7 +607,9 @@ mod tests {
                 "permissions":["tabs","https://*/*","http://*/*"]}"#,
             None,
         );
-        let extension = read_extension("Chrome", "Default", "eeee", &root, 0).unwrap();
+        let extension = read_extension("Chrome", "Default", "eeee", &root, 0)
+            .unwrap()
+            .unwrap();
         assert!(
             extension.reads_every_page,
             "v2 host patterns were not recognised: {:?}",
@@ -549,6 +617,59 @@ mod tests {
         );
         assert!(!extension.permissions.iter().any(|p| p.contains("://")));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A content script injected into every site reads every page, whatever
+    /// the host permissions say.
+    #[test]
+    fn a_content_script_on_every_site_reads_every_page() {
+        let (root, _) = plant(
+            "ffff",
+            r#"{"name":"Injector","version":"1.0","manifest_version":3,
+                "update_url":"https://clients2.google.com/service/update2/crx",
+                "permissions":["storage"],
+                "content_scripts":[{"matches":["<all_urls>"],"js":["content.js"]}]}"#,
+            None,
+        );
+        let extension = read_extension("Chrome", "Default", "ffff", &root, 0)
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        assert!(extension.reads_every_page, "{:?}", extension.hosts);
+        assert!(extension.worth_reading());
+    }
+
+    /// A manifest starting with a byte order mark is read, as Chromium reads
+    /// it, rather than dropped.
+    #[test]
+    fn a_manifest_with_a_byte_order_mark_is_read() {
+        let (root, _) = plant(
+            "gggg",
+            "\u{feff}{\"name\":\"Saved With A Mark\",\"version\":\"1.0\",\
+             \"update_url\":\"https://clients2.google.com/service/update2/crx\"}",
+            None,
+        );
+        let read = read_extension("Chrome", "Default", "gggg", &root, 0);
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(read.unwrap().unwrap().name, "Saved With A Mark");
+    }
+
+    /// An extension whose manifest will not parse is still installed, and is
+    /// said to be unreadable rather than left out as though it were not there.
+    #[test]
+    fn an_unparseable_manifest_is_a_gap_not_an_absence() {
+        let (root, _) = plant("hhhh", "{ this is not json", None);
+        let read = read_extension("Chrome", "Default", "hhhh", &root, 0);
+        std::fs::remove_dir_all(&root).ok();
+        let why = read.expect_err("an unreadable manifest must be an error");
+        assert!(why.contains("manifest"), "{why}");
+    }
+
+    #[test]
+    fn only_extension_shaped_folder_names_are_extension_ids() {
+        assert!(is_extension_id("nmmhkkegccagdldgiimedpiccmgmieda"));
+        assert!(!is_extension_id("Temp"));
+        assert!(!is_extension_id("NMMHKKEGCCAGDLDGIIMEDPICCMGMIEDA"));
     }
 
     #[test]
