@@ -16,15 +16,30 @@
 //! extractions from a document Windows generates to a fixed shape — the same
 //! trade already made in the scheduled-task reader, and for the same reason.
 
+use kam_core::UserContext;
 use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_TIMEOUT};
 use windows::Win32::System::EventLog::{
     EvtClose, EvtNext, EvtQuery, EvtQueryReverseDirection, EvtRender, EvtRenderEventXml, EVT_HANDLE,
 };
 
 /// How many events to look back through. The Security log on a busy machine
 /// turns over quickly, and a canary that was read will be near the top.
+///
+/// Counted without this program's own reads. Checking that a decoy is still
+/// ours means reading it, every status call does that for every decoy, and
+/// each read writes several events. Counted, they filled this window within
+/// minutes while the Scanner page was open, and a real read older than that
+/// was pushed out of it and never shown.
 const MAX_EVENTS: usize = 400;
+
+/// A ceiling on every event looked at, this program's own included, so a log
+/// full of nothing but our own reads still ends.
+const MAX_EXAMINED: usize = 20 * MAX_EVENTS;
+
+/// How long to wait for the log to hand over the next batch.
+const BATCH_WAIT_MS: u32 = 1000;
 
 /// How many reads to hand back, after collapsing the duplicates.
 ///
@@ -50,30 +65,92 @@ const MAX_TRIPS: usize = 50;
 /// you and it. The far likelier outcome without this list is that the feature
 /// becomes noise and gets ignored, which costs more.
 ///
+/// Each one is recognised only where it really lives. This matched the end of
+/// the path, so a stealer that named itself `OneDrive.exe` or `svchost.exe`
+/// and ran from Temp, or from `C:\Users\x\Windows\System32`, was filtered out
+/// as routine: the one reader this feature exists to catch could opt out of it
+/// by choosing a name.
+///
 /// Decoys are also marked not-content-indexed when planted, so the indexer
 /// should not read them at all. This is the second line, for the machines where
 /// that attribute does not take.
-const ROUTINE_READERS: &[&str] = &[
-    r"\windows\system32\searchprotocolhost.exe",
-    r"\windows\system32\searchindexer.exe",
-    r"\windows\system32\searchfilterhost.exe",
-    r"\windows\system32\svchost.exe",
-    r"\windows\explorer.exe",
-    r"\msmpeng.exe",
-    r"\mpcmdrun.exe",
-    r"\nissrv.exe",
-    r"\onedrive.exe",
-    r"\filesynchelper.exe",
-    r"\backgroundtaskhost.exe",
-];
-
-/// Whether a read came from something that reads everything anyway.
-fn routine(process: Option<&str>) -> bool {
+fn routine(process: Option<&str>, user: &UserContext) -> bool {
     let Some(process) = process else {
         return false;
     };
-    let lower = process.to_lowercase().replace('/', "\\");
-    ROUTINE_READERS.iter().any(|known| lower.ends_with(known)) || is_ourselves(&lower)
+    let process = normalise(process);
+    if is_ourselves(&process) {
+        return true;
+    }
+    let Some((folder, file)) = process.rsplit_once('\\') else {
+        return false;
+    };
+    let parent = folder.rsplit_once('\\').map(|(parent, _)| parent);
+    let is = |candidate: Option<String>| candidate.is_some_and(|known| known == folder);
+    let parent_is = |candidate: Option<String>| {
+        candidate.is_some_and(|known| parent.is_some_and(|parent| parent == known))
+    };
+
+    let windows = machine_folder("SystemRoot");
+    let system32 = windows.as_ref().map(|root| format!(r"{root}\system32"));
+    let program_files = machine_folder("ProgramFiles");
+    let program_files_x86 = machine_folder("ProgramFiles(x86)");
+    let program_data = machine_folder("ProgramData");
+    // OneDrive installs either for one person, in their own Local AppData,
+    // or for the whole machine under Program Files.
+    let onedrive = [
+        (!user.profile().is_empty())
+            .then(|| normalise(&format!(r"{}\Microsoft\OneDrive", user.local_app_data()))),
+        program_files
+            .as_ref()
+            .map(|root| format!(r"{root}\microsoft onedrive")),
+        program_files_x86
+            .as_ref()
+            .map(|root| format!(r"{root}\microsoft onedrive")),
+    ];
+
+    match file {
+        "searchprotocolhost.exe"
+        | "searchindexer.exe"
+        | "searchfilterhost.exe"
+        | "svchost.exe"
+        | "backgroundtaskhost.exe" => is(system32),
+        "explorer.exe" => is(windows),
+        // Defender runs from its stub folder under Program Files, or from a
+        // versioned folder under its Platform folder.
+        "msmpeng.exe" | "mpcmdrun.exe" | "nissrv.exe" => {
+            is(program_files
+                .as_ref()
+                .map(|root| format!(r"{root}\windows defender")))
+                || parent_is(
+                    program_data
+                        .as_ref()
+                        .map(|root| format!(r"{root}\microsoft\windows defender\platform")),
+                )
+        }
+        "onedrive.exe" => onedrive.into_iter().any(is),
+        // The helper sits in OneDrive's versioned folder.
+        "filesynchelper.exe" => onedrive.into_iter().any(parent_is),
+        _ => false,
+    }
+}
+
+/// A path in the one spelling every comparison here uses: lower case,
+/// backslashes, no extended-length prefix and no trailing separator.
+fn normalise(path: &str) -> String {
+    let lower = path.trim().to_lowercase().replace('/', "\\");
+    let plain = lower.strip_prefix(r"\\?\").unwrap_or(&lower);
+    plain.trim_end_matches('\\').to_owned()
+}
+
+/// A machine-wide folder named by an environment variable, normalised. These
+/// are the same for every account, so this process's own are right even in
+/// the agent.
+fn machine_folder(variable: &str) -> Option<String> {
+    std::env::var(variable)
+        .ok()
+        .map(|value| normalise(&value))
+        .filter(|value| !value.is_empty())
 }
 
 /// Whether the reader was this very program.
@@ -92,7 +169,7 @@ fn is_ourselves(lowered_process: &str) -> bool {
     let Ok(me) = std::env::current_exe() else {
         return false;
     };
-    let me = me.to_string_lossy().to_lowercase().replace('/', "\\");
+    let me = normalise(&me.to_string_lossy());
     !me.is_empty() && lowered_process == me
 }
 
@@ -190,15 +267,24 @@ fn render(event: EVT_HANDLE) -> Option<String> {
     }
 }
 
+/// What reading the Security log came to.
+#[derive(Debug, Default)]
+pub struct Read {
+    /// Reads of a decoy, newest first.
+    pub trips: Vec<Trip>,
+    /// Why the log could not be read, or not to the end. `None` when it was.
+    pub gap: Option<String>,
+}
+
 /// Every recorded read of one of `paths`, newest first.
 ///
-/// Returns nothing rather than failing when the Security log cannot be read:
-/// an unprivileged caller genuinely cannot see it, and the report says
-/// separately whether auditing is on, so an empty list is never mistaken for an
-/// all-clear.
-pub fn trips(paths: &[String]) -> Vec<Trip> {
+/// A log that could not be read, or stopped answering partway, is said in
+/// `gap` rather than returned as an empty list. It was returned as one, and
+/// with auditing on the panel then read "decoys planted and being watched"
+/// over a list that nothing had actually looked at.
+pub fn trips(paths: &[String], user: &UserContext) -> Read {
     if paths.is_empty() {
-        return Vec::new();
+        return Read::default();
     }
     let wanted: Vec<String> = paths.iter().map(|path| path.to_lowercase()).collect();
 
@@ -214,28 +300,63 @@ pub fn trips(paths: &[String]) -> Vec<Trip> {
         .collect();
 
     let mut found = Vec::new();
+    let mut gap = None;
 
     unsafe {
-        let Ok(results) = EvtQuery(
+        let results = match EvtQuery(
             None,
             PCWSTR(channel.as_ptr()),
             PCWSTR(query.as_ptr()),
             EvtQueryReverseDirection.0,
-        ) else {
-            return found;
+        ) {
+            Ok(results) => results,
+            Err(error) => {
+                return Read {
+                    trips: Vec::new(),
+                    gap: Some(format!(
+                        "The Security log could not be read ({}), so whether anything has \
+                         read a decoy cannot be shown.",
+                        error.message()
+                    )),
+                }
+            }
         };
 
         let mut seen = 0_usize;
-        while seen < MAX_EVENTS {
+        let mut examined = 0_usize;
+        while seen < MAX_EVENTS && examined < MAX_EXAMINED {
             let mut batch = [0_isize; 16];
             let mut returned = 0_u32;
-            if EvtNext(results, &mut batch, 200, 0, &mut returned).is_err() || returned == 0 {
+            if let Err(error) = EvtNext(results, &mut batch, BATCH_WAIT_MS, 0, &mut returned) {
+                // The end of the log is the ordinary way to stop. Anything
+                // else stopped the reading early, and reads older than that
+                // point were never looked at.
+                if error.code() != ERROR_NO_MORE_ITEMS.to_hresult() {
+                    gap = Some(if error.code() == ERROR_TIMEOUT.to_hresult() {
+                        "The Security log stopped answering partway through, so older \
+                         reads of a decoy may not be shown."
+                            .to_owned()
+                    } else {
+                        format!(
+                            "The Security log could not be read to the end ({}), so older \
+                             reads of a decoy may not be shown.",
+                            error.message()
+                        )
+                    });
+                }
+                break;
+            }
+            if returned == 0 {
                 break;
             }
             for handle in batch.iter().take(returned as usize) {
                 let event = EVT_HANDLE(*handle);
-                seen += 1;
-                if let Some(xml) = render(event) {
+                examined += 1;
+                let xml = render(event);
+                if counts_toward_window(xml.as_deref()) {
+                    seen += 1;
+                }
+                if let Some(xml) = xml {
                     if let Some(object) = data(&xml, "ObjectName") {
                         let lower = object.to_lowercase();
                         // Files match exactly. A registry key is named by
@@ -252,7 +373,7 @@ pub fn trips(paths: &[String]) -> Vec<Trip> {
                             // The indexer and the antimalware engine read
                             // everything; reporting them would make the canary
                             // noise on the day it was planted.
-                            if !routine(process.as_deref()) {
+                            if !routine(process.as_deref(), user) {
                                 found.push(Trip {
                                     at: timestamp(&xml).unwrap_or_default(),
                                     path: object,
@@ -270,7 +391,20 @@ pub fn trips(paths: &[String]) -> Vec<Trip> {
         let _ = EvtClose(results);
     }
 
-    collapse(found)
+    Read {
+        trips: collapse(found),
+        gap,
+    }
+}
+
+/// Whether an event counts toward the [`MAX_EVENTS`] window.
+///
+/// Our own reads are looked at but not counted, so they cannot push a real
+/// read out of the window. An event that would not render counts, since
+/// nothing can be said about who wrote it.
+fn counts_toward_window(xml: Option<&str>) -> bool {
+    !xml.and_then(|xml| data(xml, "ProcessName"))
+        .is_some_and(|process| is_ourselves(&normalise(&process)))
 }
 
 /// Collapse the several events one read produces into one row.
@@ -366,12 +500,22 @@ mod tests {
         );
     }
 
+    fn me() -> UserContext {
+        UserContext::new(Some("S-1-5-21-1-2-3-1001".to_owned()), r"C:\Users\me")
+    }
+
     #[test]
     fn reading_the_security_log_never_panics() {
-        // Unprivileged this returns nothing, which is the honest answer and the
-        // one the report distinguishes from "auditing is on and saw nothing".
-        let trips = trips(&[r"C:\Users\nobody\Documents\nothing".to_owned()]);
-        println!("{} trips", trips.len());
+        // Unprivileged the log cannot be read, and that is said rather than
+        // returned as an empty list.
+        let read = trips(
+            &[r"C:\Users\nobody\Documents\nothing".to_owned()],
+            &UserContext::current(),
+        );
+        println!("{} trips, gap: {:?}", read.trips.len(), read.gap);
+        if read.trips.is_empty() && read.gap.is_none() {
+            println!("the log was read and nothing touched the path");
+        }
     }
 
     #[test]
@@ -379,14 +523,47 @@ mod tests {
         // The exact false positive the first end-to-end run produced: the
         // indexer read a decoy seconds after it was planted, because that is
         // its job.
-        assert!(routine(Some(r"C:\Windows\System32\SearchProtocolHost.exe")));
-        assert!(routine(Some(r"C:\Windows\System32\searchindexer.exe")));
-        assert!(routine(Some(
-            r"C:\ProgramData\Microsoft\Windows Defender\Platform\4.18\MsMpEng.exe"
-        )));
-        assert!(routine(Some(
-            r"C:\Program Files\Microsoft OneDrive\OneDrive.exe"
-        )));
+        let windows = std::env::var("SystemRoot").unwrap();
+        let data = std::env::var("ProgramData").unwrap();
+        let program_files = std::env::var("ProgramFiles").unwrap();
+        for reader in [
+            format!(r"{windows}\System32\SearchProtocolHost.exe"),
+            format!(r"{windows}\System32\searchindexer.exe"),
+            format!(r"{windows}\System32\svchost.exe"),
+            format!(r"{windows}\explorer.exe"),
+            format!(r"{data}\Microsoft\Windows Defender\Platform\4.18.1-0\MsMpEng.exe"),
+            format!(r"{program_files}\Windows Defender\MpCmdRun.exe"),
+            format!(r"{program_files}\Microsoft OneDrive\OneDrive.exe"),
+            format!(r"{program_files}\Microsoft OneDrive\26.1.0\FileSyncHelper.exe"),
+            r"C:\Users\me\AppData\Local\Microsoft\OneDrive\OneDrive.exe".to_owned(),
+        ] {
+            assert!(routine(Some(&reader), &me()), "{reader}");
+        }
+    }
+
+    /// A routine reader is routine only where it really lives.
+    ///
+    /// The exemption matched the end of the path, so a stealer that named
+    /// itself after one of these and ran from anywhere else was filtered out
+    /// as routine, which is the one reader this feature exists to catch.
+    #[test]
+    fn a_thief_named_like_a_routine_reader_is_still_reported() {
+        for impostor in [
+            r"C:\Users\me\AppData\Local\Temp\OneDrive.exe",
+            r"C:\Users\me\AppData\Local\Temp\MsMpEng.exe",
+            r"C:\Users\me\AppData\Local\Temp\svchost.exe",
+            r"C:\Users\me\Windows\System32\svchost.exe",
+            r"C:\Users\me\Windows\explorer.exe",
+            r"C:\Users\me\AppData\Local\Microsoft\OneDriveX\OneDrive.exe",
+            r"C:\ProgramData\Microsoft\Windows Defender\MsMpEng.exe",
+            r"C:\ProgramData\Microsoft\Windows Defender\Platform\a\b\MsMpEng.exe",
+            r"C:\Users\other\AppData\Local\Microsoft\OneDrive\OneDrive.exe",
+        ] {
+            assert!(
+                !routine(Some(impostor), &me()),
+                "{impostor} was waved through as routine"
+            );
+        }
     }
 
     #[test]
@@ -394,33 +571,41 @@ mod tests {
         // Checking a decoy means reading it, and that read is audited like any
         // other. Without this the product reported itself as a thief every two
         // minutes.
-        let me = std::env::current_exe().unwrap();
-        assert!(routine(Some(&me.to_string_lossy())));
+        let me_exe = std::env::current_exe().unwrap();
+        assert!(routine(Some(&me_exe.to_string_lossy()), &me()));
         // Upper case, and forward slashes, must not defeat it.
-        assert!(routine(Some(&me.to_string_lossy().to_uppercase())));
+        assert!(routine(
+            Some(&me_exe.to_string_lossy().to_uppercase()),
+            &me()
+        ));
     }
 
     #[test]
     fn something_merely_named_like_us_elsewhere_is_still_reported() {
         // The match is on the whole installed path, not the file name, so a
         // copy planted somewhere else does not inherit the exemption.
-        assert!(!routine(Some(
-            r"C:\Users\me\AppData\Local\Temp\kam-agent.exe"
-        )));
-        assert!(!routine(Some(r"D:\elsewhere\kam-shell.exe")));
+        assert!(!routine(
+            Some(r"C:\Users\me\AppData\Local\Temp\kam-agent.exe"),
+            &me()
+        ));
+        assert!(!routine(Some(r"D:\elsewhere\kam-shell.exe"), &me()));
     }
 
     #[test]
     fn anything_else_reading_a_decoy_is_still_reported() {
         // The signal this whole feature exists for must survive the filter.
-        assert!(!routine(Some(r"C:\Users\me\AppData\Local\Temp\thing.exe")));
-        assert!(!routine(Some(r"C:\Windows\System32\cmd.exe")));
-        assert!(!routine(Some(
-            r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe"
-        )));
-        assert!(!routine(None));
+        assert!(!routine(
+            Some(r"C:\Users\me\AppData\Local\Temp\thing.exe"),
+            &me()
+        ));
+        assert!(!routine(Some(r"C:\Windows\System32\cmd.exe"), &me()));
+        assert!(!routine(
+            Some(r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe"),
+            &me()
+        ));
+        assert!(!routine(None, &me()));
         // A name that merely ends in something similar must not slip through.
-        assert!(!routine(Some(r"C:\Users\me\notsearchindexer.exe")));
+        assert!(!routine(Some(r"C:\Users\me\notsearchindexer.exe"), &me()));
     }
 
     #[test]
@@ -475,8 +660,24 @@ mod tests {
         assert_eq!(collapse(many).len(), MAX_TRIPS);
     }
 
+    /// Our own status checks read every decoy and write several events each,
+    /// and counting them filled the look-back window within minutes.
+    #[test]
+    fn our_own_reads_do_not_use_up_the_window() {
+        let me_exe = std::env::current_exe().unwrap();
+        let ours = format!(
+            "<Data Name='ProcessName'>{}</Data>",
+            me_exe.to_string_lossy().to_uppercase()
+        );
+        assert!(!counts_toward_window(Some(&ours)));
+        assert!(counts_toward_window(Some(SAMPLE)));
+        assert!(counts_toward_window(None));
+    }
+
     #[test]
     fn asking_about_no_paths_does_no_work() {
-        assert!(trips(&[]).is_empty());
+        let read = trips(&[], &me());
+        assert!(read.trips.is_empty());
+        assert!(read.gap.is_none());
     }
 }

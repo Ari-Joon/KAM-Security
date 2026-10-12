@@ -899,6 +899,12 @@ export type CanaryTrip = {
 export type CanaryReport = {
   canaries: Canary[];
   trips: CanaryTrip[];
+  /**
+   * Why the Security log, where reads are recorded, could not be read or not
+   * to the end. When set, an empty `trips` says nothing about whether a decoy
+   * was read. Absent from agents older than this field.
+   */
+  trips_unread?: string | null;
   /** Whether Windows is recording file access at all. Without it, inert. */
   auditing: boolean;
   problems: string[];

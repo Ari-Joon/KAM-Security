@@ -193,6 +193,11 @@ pub struct Report {
     pub canaries: Vec<Canary>,
     /// Reads recorded against a canary, newest first.
     pub trips: Vec<Trip>,
+    /// Why the Security log, where reads are recorded, could not be read or
+    /// not to the end. `None` when it was. When this is set, an empty `trips`
+    /// says nothing about whether a decoy was read.
+    #[serde(default)]
+    pub trips_unread: Option<String>,
     /// Whether Windows is recording file access at all. Without this the
     /// canaries are inert, and the interface must say so rather than implying
     /// they are watching.
@@ -330,8 +335,15 @@ pub fn plant(user: &UserContext) -> Report {
     }
 
     plant_registry(user, &mut report);
-    report.trips = events::trips(&watched_names(user));
+    read_trips(user, &mut report);
     report
+}
+
+/// Fill in what has read a decoy, and whether that could be found out.
+fn read_trips(user: &UserContext, report: &mut Report) {
+    let read = events::trips(&watched_names(user), user);
+    report.trips = read.trips;
+    report.trips_unread = read.gap;
 }
 
 /// Create the registry decoys, with the same rules the files follow.
@@ -529,7 +541,7 @@ pub fn status(user: &UserContext) -> Report {
         });
     }
 
-    report.trips = events::trips(&watched_names(user));
+    read_trips(user, &mut report);
     report
 }
 

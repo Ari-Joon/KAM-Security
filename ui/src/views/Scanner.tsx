@@ -768,6 +768,9 @@ function Canaries() {
   const planted = report?.canaries.length ?? 0;
   const trips = report?.trips ?? [];
   const watching = report?.auditing === true && (report?.canaries.some((c) => c.armed) ?? false);
+  // The record of reads could not be checked, so no reads is not the same as
+  // nothing having read a decoy.
+  const tripsUnread = report?.trips_unread ?? null;
 
   return (
     <section className="panel">
@@ -814,7 +817,7 @@ function Canaries() {
             className={
               planted === 0
                 ? "notice"
-                : watching
+                : watching && !tripsUnread
                   ? "notice notice-ok"
                   : "notice notice-warn"
             }
@@ -824,6 +827,8 @@ function Canaries() {
             ) : watching ? (
               <>
                 <strong>{planted}</strong> decoys planted and being watched.
+                {tripsUnread &&
+                  " Whether anything has read one could not be checked, as the next note says."}
               </>
             ) : (
               <>
@@ -833,6 +838,10 @@ function Canaries() {
               </>
             )}
           </div>
+
+          {tripsUnread && planted > 0 && (
+            <div className="notice notice-warn">{tripsUnread}</div>
+          )}
 
           {planted > 0 && (
             <div className="schedule-row">
