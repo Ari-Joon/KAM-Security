@@ -93,7 +93,12 @@ impl Location {
     /// `C:\WindowsUpdate\x.exe` as the protected Windows folder and
     /// `C:\Program FilesX\x.exe` as an installed program, and described
     /// `C:\Windows\Temp`, which anyone can write to, as protected.
-    fn of(path: &Path) -> Self {
+    ///
+    /// The person's own folders come from `user`, the account the survey is
+    /// for. They came from this process's environment, which inside the agent
+    /// is LocalSystem's: a program in the person's AppData was described as
+    /// being outside the usual program folders.
+    fn of(path: &Path, user: &UserContext) -> Self {
         let text = path.to_string_lossy();
         let under = |variable: &str| {
             places::machine_folder(variable).is_some_and(|root| places::within(&text, &root))
@@ -112,10 +117,11 @@ impl Location {
         if under("ProgramData") {
             return Self::Shared;
         }
-        for variable in ["LOCALAPPDATA", "APPDATA", "TEMP", "USERPROFILE"] {
-            if folder(variable).is_some_and(|root| places::within(&text, &root)) {
-                return Self::UserWritable;
-            }
+        if personal_folders(user)
+            .iter()
+            .any(|root| places::within(&text, root))
+        {
+            return Self::UserWritable;
         }
         Self::Elsewhere
     }
@@ -131,11 +137,28 @@ impl Location {
     }
 }
 
-fn folder(variable: &str) -> Option<String> {
-    std::env::var(variable)
-        .ok()
-        .map(|value| value.to_lowercase().replace('/', "\\"))
-        .filter(|value| !value.is_empty())
+/// The folders that belong to the person a survey is for.
+///
+/// For the running account (no SID) the environment is that person's own, and
+/// its `%TEMP%` is added, because it can be spelled differently from the one
+/// derived from the profile. For anybody else everything comes from their
+/// profile, never from this process.
+fn personal_folders(user: &UserContext) -> Vec<String> {
+    if user.profile().is_empty() {
+        return Vec::new();
+    }
+    let mut folders = vec![
+        user.local_app_data(),
+        user.roaming_app_data(),
+        user.temp(),
+        user.profile().to_owned(),
+    ];
+    if user.sid().is_none() {
+        if let Ok(temp) = std::env::var("TEMP") {
+            folders.push(temp);
+        }
+    }
+    folders
 }
 
 /// How much attention something warrants. Three levels, because a scale with
@@ -228,7 +251,10 @@ pub struct Report {
     /// so "examined" stays an honest count of real work rather than a number
     /// inflated by files that were looked at and immediately dismissed.
     pub swept_files: usize,
-    /// Sources that could not be read, carried up from the persistence survey.
+    /// Everything that could not be looked at, in plain sentences: sources the
+    /// persistence survey could not read, download folders that would not
+    /// open, and files that could not be examined. Empty only when the whole
+    /// picture was read.
     pub unreadable: Vec<String>,
     /// Folders swept for downloaded executables, so the reader knows what was
     /// and was not covered.
@@ -482,8 +508,17 @@ fn weigh(finding: &mut Finding) {
 }
 
 /// Examine one file.
-fn examine(path: &Path, anchored: &[Entry], now: u64) -> Option<Finding> {
-    let metadata = std::fs::metadata(path).ok()?;
+///
+/// An error says why it could not be, so a file that could not be read is
+/// named rather than dropped from the list as though it had never been found.
+fn examine(
+    path: &Path,
+    anchored: &[Entry],
+    now: u64,
+    user: &UserContext,
+) -> Result<Finding, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("{} could not be read ({error})", path.display()))?;
     let text = path.to_string_lossy().into_owned();
     let origin = origin_of(&text);
 
@@ -499,7 +534,7 @@ fn examine(path: &Path, anchored: &[Entry], now: u64) -> Option<Finding> {
         bytes: metadata.len(),
         arrived_days_ago: arrival(&metadata, now),
         signature: signature::of(path),
-        location: Location::of(path),
+        location: Location::of(path, user),
         persistence: anchored.to_vec(),
         ours: kam_core::ourselves::is_ours(path),
         path: text,
@@ -508,7 +543,7 @@ fn examine(path: &Path, anchored: &[Entry], now: u64) -> Option<Finding> {
     };
 
     weigh(&mut finding);
-    Some(finding)
+    Ok(finding)
 }
 
 /// Whether everything in a folder is worth judging, or only what can be shown
@@ -527,44 +562,140 @@ enum Sweep {
     OnlyIfItCameFromOutside,
 }
 
-/// The folders where downloaded executables land.
-fn sweep_folders() -> Vec<(PathBuf, Sweep)> {
-    let mut folders = Vec::new();
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        let profile = PathBuf::from(profile);
-        folders.push((profile.join("Downloads"), Sweep::Everything));
-        folders.push((profile.join("Desktop"), Sweep::Everything));
-    }
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let local = PathBuf::from(local);
-        folders.push((local.join("Temp"), Sweep::OnlyIfItCameFromOutside));
-        folders.push((local.join("Programs"), Sweep::OnlyIfItCameFromOutside));
-    }
-    folders.retain(|(folder, _)| folder.is_dir());
-    folders
+/// Where Explorer records a person's Desktop and Downloads, which can be moved
+/// away from the profile (OneDrive moves the Desktop, for one).
+const SHELL_FOLDERS: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders";
+
+/// The value naming the Downloads folder. It has no friendly name.
+const DOWNLOADS_VALUE: &str = "{374DE290-123F-4565-9164-39C4925E467B}";
+
+/// One of the person's own shell folders, wherever they have put it.
+fn shell_folder(user: &UserContext, value: &str, default: &str) -> PathBuf {
+    user.open_key(SHELL_FOLDERS, kam_core::registry::View::Native)
+        .and_then(|key| key.string(value))
+        .map(|stored| kam_core::env::expand_for(&stored, user))
+        .filter(|path| !path.trim().is_empty() && !path.contains('%'))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(user.folder(default)))
 }
 
-fn walk(folder: &Path, depth: usize, found: &mut Vec<PathBuf>) {
-    if depth > MAX_DEPTH || found.len() >= MAX_LOOSE_CANDIDATES {
+/// The folders where downloaded executables land, for the person the survey
+/// is for.
+///
+/// These came from this process's own `USERPROFILE` and `LOCALAPPDATA`, which
+/// inside the agent are LocalSystem's. So the agent swept SYSTEM's empty
+/// profile, and the person's real Downloads and Desktop were never looked at.
+fn sweep_folders(user: &UserContext) -> Vec<(PathBuf, Sweep)> {
+    if user.profile().is_empty() {
+        return Vec::new();
+    }
+    let local = PathBuf::from(user.local_app_data());
+    vec![
+        (
+            shell_folder(user, DOWNLOADS_VALUE, "Downloads"),
+            Sweep::Everything,
+        ),
+        (shell_folder(user, "Desktop", "Desktop"), Sweep::Everything),
+        (PathBuf::from(user.temp()), Sweep::OnlyIfItCameFromOutside),
+        (local.join("Programs"), Sweep::OnlyIfItCameFromOutside),
+    ]
+}
+
+/// What one folder's walk found, and what it could not look at.
+#[derive(Debug, Default)]
+struct Walked {
+    found: Vec<PathBuf>,
+    /// Folders below the top that would not open.
+    unread: usize,
+    /// The first of those, with its error, to name in the sentence.
+    first_unread: Option<String>,
+    /// Whether the walk stopped at its cap with more left to look at.
+    capped: bool,
+}
+
+fn walk(folder: &Path, depth: usize, walked: &mut Walked) {
+    if depth > MAX_DEPTH {
         return;
     }
-    let Ok(listing) = std::fs::read_dir(folder) else {
+    if walked.found.len() >= MAX_LOOSE_CANDIDATES {
+        walked.capped = true;
         return;
-    };
-    for item in listing.flatten() {
-        if found.len() >= MAX_LOOSE_CANDIDATES {
+    }
+    let listing = match std::fs::read_dir(folder) {
+        Ok(listing) => listing,
+        // Gone between being listed and being opened, which is a fact about
+        // a Temp folder rather than a gap in what was read.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            walked.unread += 1;
+            walked
+                .first_unread
+                .get_or_insert_with(|| format!("{} ({error})", folder.display()));
             return;
         }
+    };
+    for item in listing {
+        if walked.found.len() >= MAX_LOOSE_CANDIDATES {
+            walked.capped = true;
+            return;
+        }
+        let item = match item {
+            Ok(item) => item,
+            Err(error) => {
+                walked.unread += 1;
+                walked
+                    .first_unread
+                    .get_or_insert_with(|| format!("{} ({error})", folder.display()));
+                break;
+            }
+        };
         let path = item.path();
         match item.file_type() {
             // Not following links: a junction pointing upwards would make this
             // walk forever, and nothing here needs to cross one.
             Ok(kind) if kind.is_symlink() => continue,
-            Ok(kind) if kind.is_dir() => walk(&path, depth + 1, found),
-            Ok(_) if is_executable(&path) => found.push(path),
+            Ok(kind) if kind.is_dir() => walk(&path, depth + 1, walked),
+            Ok(_) if is_executable(&path) => walked.found.push(path),
             _ => {}
         }
     }
+}
+
+/// Sweep one of the download folders, saying what could not be read.
+///
+/// A folder that is simply not there has nothing in it to miss. A folder that
+/// is there and would not open is a different answer, and returning nothing
+/// for it made "nothing downloaded" and "could not look" the same sentence.
+fn sweep(folder: &Path, gaps: &mut Vec<String>) -> Option<Vec<PathBuf>> {
+    if let Err(error) = std::fs::read_dir(folder) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            gaps.push(format!(
+                "{} could not be read ({error}), so programs in it were not examined.",
+                folder.display()
+            ));
+        }
+        return None;
+    }
+    let mut walked = Walked::default();
+    walk(folder, 0, &mut walked);
+    if walked.unread > 0 {
+        gaps.push(format!(
+            "{} folder(s) inside {} could not be read, so programs in them were not \
+             examined. The first was {}.",
+            walked.unread,
+            folder.display(),
+            walked.first_unread.unwrap_or_default()
+        ));
+    }
+    if walked.capped {
+        gaps.push(format!(
+            "The sweep of {} stopped after {MAX_LOOSE_CANDIDATES} programs, so any \
+             beyond those were not examined.",
+            folder.display()
+        ));
+    }
+    Some(walked.found)
 }
 
 /// Examine everything on this machine that starts itself, plus executables
@@ -605,13 +736,15 @@ pub fn survey(reporter: &Reporter, user: &UserContext) -> Result<Report, Cancell
     // Loose executables in the download folders, minus anything already
     // accounted for above.
     reporter.stage("Sweeping the download folders", None);
-    let folders = sweep_folders();
+    let mut unreadable = persistence.reasons();
+    let mut swept = Vec::new();
     let mut loose: Vec<(PathBuf, Sweep)> = Vec::new();
-    for (folder, policy) in &folders {
-        let mut found = Vec::new();
-        walk(folder, 0, &mut found);
-        reporter.advance(found.len() as u64);
-        loose.extend(found.into_iter().map(|path| (path, *policy)));
+    for (folder, policy) in sweep_folders(user) {
+        if let Some(found) = sweep(&folder, &mut unreadable) {
+            swept.push(folder.display().to_string());
+            reporter.advance(found.len() as u64);
+            loose.extend(found.into_iter().map(|path| (path, policy)));
+        }
         reporter.check()?;
     }
 
@@ -643,13 +776,14 @@ pub fn survey(reporter: &Reporter, user: &UserContext) -> Result<Report, Cancell
         .unwrap_or(4);
     let chunk = candidates.len().div_ceil(threads.max(1)).max(1);
 
-    let mut findings: Vec<Finding> = std::thread::scope(|scope| {
+    let (mut findings, failed): (Vec<Finding>, Vec<String>) = std::thread::scope(|scope| {
         let handles: Vec<_> = candidates
             .chunks(chunk)
             .map(|batch| {
                 let reporter = reporter.clone();
                 scope.spawn(move || {
                     let mut found = Vec::new();
+                    let mut failed = Vec::new();
                     for (path, anchors) in batch {
                         // Checked per file rather than per batch: with the work
                         // split across cores a batch is a quarter of the job,
@@ -661,22 +795,28 @@ pub fn survey(reporter: &Reporter, user: &UserContext) -> Result<Report, Cancell
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        if let Some(finding) = examine(path, anchors, now) {
-                            found.push(finding);
+                        match examine(path, anchors, now, user) {
+                            Ok(finding) => found.push(finding),
+                            Err(why) => failed.push(why),
                         }
                         reporter.advance_with(&name);
                     }
-                    found
+                    (found, failed)
                 })
             })
             .collect();
 
-        handles
-            .into_iter()
-            .filter_map(|handle| handle.join().ok())
-            .flatten()
-            .collect()
+        let mut findings = Vec::new();
+        let mut failed = Vec::new();
+        for (found, missed) in handles.into_iter().filter_map(|handle| handle.join().ok()) {
+            findings.extend(found);
+            failed.extend(missed);
+        }
+        (findings, failed)
     });
+    for why in failed {
+        unreadable.push(format!("{why}, so it was not examined."));
+    }
 
     // Most interesting first, then largest, then by name so the order does not
     // shuffle between runs.
@@ -693,11 +833,8 @@ pub fn survey(reporter: &Reporter, user: &UserContext) -> Result<Report, Cancell
         examined: findings.len(),
         swept_files,
         findings,
-        unreadable: persistence.reasons(),
-        swept: folders
-            .iter()
-            .map(|(folder, _)| folder.display().to_string())
-            .collect(),
+        unreadable,
+        swept,
     })
 }
 
@@ -846,21 +983,20 @@ mod tests {
     fn a_location_is_decided_by_whole_folder_names() {
         let windows = std::env::var("SystemRoot").unwrap();
         let program_files = std::env::var("ProgramFiles").unwrap();
+        let user = UserContext::current();
+        let of = |path: String| Location::of(Path::new(&path), &user);
 
         assert_eq!(
-            Location::of(Path::new(&format!(r"{windows}\System32\notepad.exe"))),
+            of(format!(r"{windows}\System32\notepad.exe")),
             Location::System
         );
-        assert_ne!(
-            Location::of(Path::new(&format!(r"{windows}Update\x.exe"))),
-            Location::System
-        );
+        assert_ne!(of(format!(r"{windows}Update\x.exe")), Location::System);
         assert_eq!(
-            Location::of(Path::new(&format!(r"{program_files}\App\app.exe"))),
+            of(format!(r"{program_files}\App\app.exe")),
             Location::Installed
         );
         assert_ne!(
-            Location::of(Path::new(&format!(r"{program_files}X\app.exe"))),
+            of(format!(r"{program_files}X\app.exe")),
             Location::Installed
         );
         for writable in [
@@ -871,11 +1007,74 @@ mod tests {
             r"System32\spool\drivers\color\x.exe",
         ] {
             assert_eq!(
-                Location::of(Path::new(&format!(r"{windows}\{writable}"))),
+                of(format!(r"{windows}\{writable}")),
                 Location::UserWritable,
                 "{writable} is open to everyone and must not read as protected"
             );
         }
+    }
+
+    /// The person's own folders are theirs, not the agent's.
+    ///
+    /// Inside the LocalSystem agent `%LOCALAPPDATA%` is SYSTEM's, so a program
+    /// in the person's AppData read as outside the usual program folders and
+    /// their Downloads and Desktop were never swept.
+    #[test]
+    fn a_named_persons_folders_come_from_their_profile() {
+        let them = UserContext::new(
+            Some("S-1-5-21-1-2-3-1001".to_owned()),
+            r"C:\Users\kam-test-them",
+        );
+        assert_eq!(
+            Location::of(
+                Path::new(r"C:\Users\kam-test-them\AppData\Local\Updater\u.exe"),
+                &them
+            ),
+            Location::UserWritable
+        );
+        assert_eq!(
+            Location::of(Path::new(r"C:\Users\kam-test-themx\u.exe"), &them),
+            Location::Elsewhere
+        );
+
+        let folders: Vec<PathBuf> = sweep_folders(&them)
+            .into_iter()
+            .map(|(folder, _)| folder)
+            .collect();
+        // Nobody of that SID is signed in, so there is no hive to say where
+        // the folders were moved to, and the profile's own are used.
+        for expected in [
+            r"C:\Users\kam-test-them\Downloads",
+            r"C:\Users\kam-test-them\Desktop",
+            r"C:\Users\kam-test-them\AppData\Local\Temp",
+            r"C:\Users\kam-test-them\AppData\Local\Programs",
+        ] {
+            assert!(
+                folders.contains(&PathBuf::from(expected)),
+                "{expected} not swept: {folders:?}"
+            );
+        }
+    }
+
+    /// A download folder that is there and would not open is said out loud.
+    #[test]
+    fn a_folder_that_will_not_open_is_named_rather_than_skipped() {
+        // A file where a folder should be will not list, and is certain to
+        // exist; an access-denied folder would need an ACL changed.
+        let not_a_folder =
+            std::env::temp_dir().join(format!("kam-sweep-file-{}", std::process::id()));
+        std::fs::write(&not_a_folder, b"x").unwrap();
+        let mut gaps = Vec::new();
+        let found = sweep(&not_a_folder, &mut gaps);
+        std::fs::remove_file(&not_a_folder).unwrap();
+        assert!(found.is_none());
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].contains("could not be read"), "{gaps:?}");
+
+        // Simply absent is not a gap: there is nothing in it to miss.
+        let mut gaps = Vec::new();
+        assert!(sweep(Path::new(r"C:\kam-definitely-absent-folder"), &mut gaps).is_none());
+        assert!(gaps.is_empty(), "{gaps:?}");
     }
 
     #[test]
