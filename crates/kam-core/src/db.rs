@@ -635,8 +635,11 @@ impl Store {
         });
 
         // Kept so the machine can be charted against itself later. A sweep that
-        // found nothing still counts as a week with nothing in it, which is the
-        // comparison that makes a busy week legible.
+        // found nothing writes nothing here; it still counts as a week with
+        // nothing in it, because the sweep itself is recorded above and its
+        // date comes back in `swept`. That is the comparison that makes a busy
+        // week legible, and it is what tells a quiet week from one nobody
+        // looked at.
         for difference in &differences {
             connection
                 .execute(
@@ -683,6 +686,29 @@ impl Store {
             .collect();
         drop(recent);
 
+        // When the machine was compared with itself, over the same window as
+        // the history. Without these a week in which nothing was swept and a
+        // week in which a sweep found nothing were the same empty bar, and the
+        // chart called a week nobody looked at "nothing changed".
+        //
+        // The first sweep is left out. It took the baseline and compared
+        // nothing, so a week holding only that sweep is not a week in which
+        // nothing changed either.
+        let mut dates = connection
+            .prepare(
+                "SELECT at FROM sweeps
+                  WHERE id > (SELECT MIN(id) FROM sweeps)
+                    AND at >= datetime('now', '-84 days')
+                  ORDER BY id DESC",
+            )
+            .map_err(to_db_error)?;
+        let swept: Vec<String> = dates
+            .query_map([], |row| row.get(0))
+            .map_err(to_db_error)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(to_db_error)?;
+        drop(dates);
+
         connection.commit().map_err(to_db_error)?;
 
         Ok(crate::changes::Sweep {
@@ -695,6 +721,7 @@ impl Store {
             previous_at,
             at: now,
             history,
+            swept,
             unvouched,
         })
     }
@@ -1493,6 +1520,32 @@ mod tests {
             "the failed sweep swallowed a disappearance: {:?}",
             sweep.differences
         );
+    }
+
+    /// The history says when the machine was looked at, so a week nobody
+    /// looked at is not drawn as a week in which nothing changed.
+    #[test]
+    fn the_dates_of_sweeps_come_back_with_the_history() {
+        let store = Store::open_in_memory().unwrap();
+        let things = [seen("service", "One", "a")];
+
+        let first = store.sweep(&things, &[]).unwrap();
+        assert!(
+            first.swept.is_empty(),
+            "the baseline compared nothing, so it is not a sweep that looked"
+        );
+
+        store.sweep(&things, &[]).unwrap();
+        let third = store.sweep(&things, &[]).unwrap();
+        assert!(third.differences.is_empty());
+        assert!(third.history.is_empty(), "nothing changed");
+        assert_eq!(
+            third.swept.len(),
+            2,
+            "two sweeps compared the machine and found nothing: {:?}",
+            third.swept
+        );
+        assert_eq!(third.swept[0], third.at, "newest first");
     }
 
     #[test]

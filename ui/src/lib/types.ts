@@ -420,6 +420,14 @@ export type Sweep = {
   /** Every difference from the last twelve weeks, newest first. */
   history: Difference[];
   /**
+   * When a sweep compared the machine with an earlier one, over the same
+   * twelve weeks, newest first. The baseline sweep is not among them.
+   *
+   * What tells a week in which nothing changed from a week nobody looked at.
+   * Without it both are the same empty bar.
+   */
+  swept: string[];
+  /**
    * Things already present when the baseline was first taken that nothing
    * vouches for. Only ever populated on the first sweep.
    *

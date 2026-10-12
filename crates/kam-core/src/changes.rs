@@ -271,6 +271,16 @@ pub struct Sweep {
     /// weeks". That question needs history, and a table that only remembers
     /// the present cannot answer it.
     pub history: Vec<Difference>,
+    /// When the machine was compared with itself, over the same twelve weeks
+    /// as `history`, newest first. The baseline sweep is not among them,
+    /// because it compared nothing.
+    ///
+    /// A week with no difference in `history` is two very different weeks:
+    /// one in which a sweep looked and found nothing, and one in which nothing
+    /// was looked at. Only these dates tell them apart, and drawing the second
+    /// as the first would be a failure to look presented as a quiet week.
+    #[serde(default)]
+    pub swept: Vec<String>,
     /// Things that were already here when the baseline was first taken, and
     /// that nothing vouches for.
     ///

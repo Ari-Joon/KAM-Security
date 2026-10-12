@@ -333,7 +333,7 @@ export default function Changes({ sweep }: { sweep: Sweep | null }) {
               and no target — only whether this week looks like the others.
               Colour shows what kind of thing changed, not how serious it was.
             </p>
-            <ChangeBars history={sweep.history} />
+            <ChangeBars history={sweep.history} swept={sweep.swept ?? []} />
           </section>
         </>
       )}
