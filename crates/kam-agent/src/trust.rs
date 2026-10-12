@@ -23,6 +23,18 @@
 //! inherits exactly the same thing. It is the default outcome of the obvious
 //! action, which is the worst kind of trap for a security tool to leave.
 //!
+//! # The list is not the whole answer: the owner
+//!
+//! Windows lets an object's owner read and rewrite its access control list
+//! whatever the list says, unless the list carries an `OWNER RIGHTS` entry
+//! that replaces those implicit rights. So a folder locked to administrators
+//! and the system, but still *owned* by the ordinary account that unzipped it,
+//! is a folder that account can give itself write access to at any moment.
+//! That was `dist\` here after the list was fixed: adversarial review opened it
+//! and the agent's binary for `WRITE_DAC` as the unelevated owner, and both
+//! were granted. The owner is therefore counted as a writer unless it is one of
+//! the accounts that are supposed to be able to write anyway.
+//!
 //! # What is done about it
 //!
 //! Installation refuses. Not a warning printed above a success message that
@@ -39,7 +51,8 @@ use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID,
 };
 
 /// Rights that would let somebody replace what lives in a directory.
@@ -60,6 +73,10 @@ const DANGEROUS: u32 = 0x0000_0002 // FILE_ADD_FILE / FILE_WRITE_DATA
     | 0x1000_0000 // GENERIC_ALL
     | 0x4000_0000; // GENERIC_WRITE
 
+/// The `OWNER RIGHTS` principal. An entry for it, allow or deny, replaces the
+/// rights an owner otherwise holds implicitly.
+const OWNER_RIGHTS: &str = "S-1-3-4";
+
 /// Accounts that are *supposed* to be able to write here.
 ///
 /// Anything running as one of these can already replace the agent by other
@@ -74,10 +91,31 @@ fn is_expected(sid: &str) -> bool {
     )
 }
 
+/// The text form of a SID, or `None` if Windows will not render it.
+///
+/// # Safety
+///
+/// `sid` must be null or point at a valid SID that outlives the call.
+unsafe fn sid_string(sid: PSID) -> Option<String> {
+    if sid.0.is_null() {
+        return None;
+    }
+    let mut text = windows::core::PWSTR::null();
+    // SAFETY: `sid` is valid per this function's contract.
+    unsafe { ConvertSidToStringSidW(sid, &mut text) }.ok()?;
+    // SAFETY: on success Windows hands back a NUL-terminated string that this
+    // function owns and frees immediately after copying.
+    let rendered = unsafe { text.to_string() }.ok();
+    unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
+    rendered
+}
+
 /// Principals that can replace files in `path`, by SID.
 ///
 /// Empty means the directory is safe to trust. Any entry means it is not, and
-/// the caller should say so rather than continue.
+/// the caller should say so rather than continue. The owner is included when
+/// it is an account that could not write here otherwise, because an owner can
+/// always grant itself the rest.
 pub fn writers_of(path: &Path) -> Result<Vec<String>> {
     let wide: Vec<u16> = path
         .as_os_str()
@@ -86,17 +124,18 @@ pub fn writers_of(path: &Path) -> Result<Vec<String>> {
         .chain(std::iter::once(0))
         .collect();
 
+    let mut owner = PSID::default();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
 
-    // The descriptor owns the ACL, so it is freed once and the ACL pointer is
-    // only valid until then.
+    // The descriptor owns the owner SID and the ACL, so it is freed once and
+    // both pointers are only valid until then.
     let status = unsafe {
         GetNamedSecurityInfoW(
             PCWSTR(wide.as_ptr()),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
             None,
             Some(&mut dacl),
             None,
@@ -119,6 +158,7 @@ pub fn writers_of(path: &Path) -> Result<Vec<String>> {
         return Ok(found);
     }
 
+    let mut owner_rights_listed = false;
     let count = unsafe { (*dacl).AceCount } as u32;
     for index in 0..count {
         let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
@@ -127,29 +167,43 @@ pub fn writers_of(path: &Path) -> Result<Vec<String>> {
         }
 
         let header = unsafe { *(ace as *const ACE_HEADER) };
-        // Only allow entries grant anything; deny entries are handled by
-        // Windows before any of this matters.
-        if header.AceType != 0 {
+        // Allow (0) and deny (1) entries share one layout: header, mask, SID.
+        // Anything else is an object or callback entry this check does not
+        // interpret.
+        if header.AceType > 1 {
             continue;
         }
 
-        let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
-        if allowed.Mask & DANGEROUS == 0 {
-            continue;
-        }
-
+        let entry = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
         // The SID follows the fixed part of the structure, in the same
         // allocation, which is why the pointer is taken from its address.
-        let sid = PSID(std::ptr::addr_of!(allowed.SidStart) as *mut core::ffi::c_void);
-        let mut text = windows::core::PWSTR::null();
-        if unsafe { ConvertSidToStringSidW(sid, &mut text) }.is_err() {
+        let sid = PSID(std::ptr::addr_of!(entry.SidStart) as *mut core::ffi::c_void);
+        let Some(sid_text) = (unsafe { sid_string(sid) }) else {
+            continue;
+        };
+
+        if sid_text == OWNER_RIGHTS {
+            owner_rights_listed = true;
+        }
+
+        // Only allow entries grant anything; deny entries are handled by
+        // Windows before any of this matters.
+        if header.AceType != 0 || entry.Mask & DANGEROUS == 0 {
             continue;
         }
-        let sid_text = unsafe { text.to_string() }.unwrap_or_default();
-        unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
 
         if !is_expected(&sid_text) && !found.contains(&sid_text) {
             found.push(sid_text);
+        }
+    }
+
+    // The owner's implicit rights, unless an OWNER RIGHTS entry has replaced
+    // them (in which case that entry was judged on its own mask above).
+    if !owner_rights_listed {
+        if let Some(owner_sid) = unsafe { sid_string(owner) } {
+            if !is_expected(&owner_sid) && !found.contains(&owner_sid) {
+                found.push(owner_sid);
+            }
         }
     }
 
@@ -184,8 +238,11 @@ pub fn check_install_directory(path: &Path) -> Result<()> {
         "{} can be written to by: {}.\n\n\
          The agent serves any program that sits in its own directory, so a folder \
          other people can write to is a folder where anyone can drop a program that \
-         drives this service as LocalSystem — or replace the agent itself.\n\n\
-         Move the whole folder somewhere only administrators can write, such as \
+         drives this service as LocalSystem — or replace the agent itself. That \
+         includes the account that owns the folder: Windows lets an owner change who \
+         may write whenever it likes.\n\n\
+         Run setup.ps1, which secures the folder and hands it to Administrators, or \
+         move the whole folder somewhere only administrators can write, such as \
          C:\\Program Files\\KAM Security, and install from there.",
         path.display(),
         named.join(", ")
@@ -264,6 +321,70 @@ mod tests {
     }
 
     #[test]
+    fn an_ordinary_owner_is_a_writer_whatever_the_list_says() {
+        // Adversarial review: `dist\` was locked to administrators and the
+        // system, and still owned by the account that unzipped it. An owner
+        // can rewrite the list without any entry granting it, so the list
+        // alone called a folder safe that its owner could take back at will.
+        let scratch = std::env::temp_dir().join(format!("kam-trust-owner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let icacls = Path::new(&std::env::var("SystemRoot").unwrap())
+            .join("System32")
+            .join("icacls.exe");
+        let me = format!(
+            "{}\\{}",
+            std::env::var("USERDOMAIN").unwrap(),
+            std::env::var("USERNAME").unwrap()
+        );
+        // Owned by this account explicitly: an elevated CI runner would
+        // otherwise make Administrators the owner and prove nothing.
+        let owned = std::process::Command::new(&icacls)
+            .arg(&scratch)
+            .args(["/setowner", &me])
+            .output()
+            .unwrap();
+        // Then a list granting write to nobody but administrators and the
+        // system: exactly what setup.ps1 leaves behind.
+        let locked = std::process::Command::new(&icacls)
+            .arg(&scratch)
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-11:(OI)(CI)RX",
+            ])
+            .output()
+            .unwrap();
+
+        let writers = writers_of(&scratch);
+        // Removed before asserting, so a failure does not leave a locked
+        // folder behind. Deleting it needs only the temp folder's own rights.
+        let _ = std::fs::remove_dir(&scratch);
+
+        assert!(
+            owned.status.success(),
+            "could not take ownership: {owned:?}"
+        );
+        assert!(
+            locked.status.success(),
+            "could not lock the list: {locked:?}"
+        );
+        let writers = writers.unwrap();
+        assert_eq!(
+            writers.len(),
+            1,
+            "only the owner should be reported, got {writers:?}"
+        );
+        assert!(
+            !is_expected(&writers[0]),
+            "the reported writer should be the ordinary owner, got {writers:?}"
+        );
+    }
+
+    #[test]
     fn the_refusal_says_what_to_do_about_it() {
         let scratch = std::env::temp_dir().join(format!("kam-trust-msg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
@@ -296,5 +417,6 @@ mod tests {
         assert!(is_expected("S-1-5-32-544"));
         assert!(!is_expected("S-1-5-11"));
         assert!(!is_expected("S-1-1-0"));
+        assert!(!is_expected(OWNER_RIGHTS));
     }
 }

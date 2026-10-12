@@ -196,7 +196,19 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "could not secure $dist (icacls exit $LASTEXITCODE); the agent will refuse to run from it"
     }
-    Say '  install directory is administrator-writable only.' 'Green'
+
+    # The list is only half of it. Windows lets an owner rewrite a folder's list
+    # whatever the list says, and `dist` and every binary copied into it were
+    # owned by the account that created them -- an ordinary one, which could
+    # therefore grant itself write access again and replace the agent without
+    # elevating. Adversarial review opened both for WRITE_DAC unelevated.
+    # Copying over an existing file keeps its owner, so this runs on every
+    # deploy rather than once. /T for everything inside.
+    & icacls $dist /setowner '*S-1-5-32-544' /T /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "could not hand $dist to Administrators (icacls exit $LASTEXITCODE); its owner could make it writable again"
+    }
+    Say '  install directory is administrator-writable only, and administrator-owned.' 'Green'
 
     # --- lock the store, for the same reason and a sharper one ---------------
     #

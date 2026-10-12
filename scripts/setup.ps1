@@ -127,7 +127,18 @@ Write-Host 'Setting KAM Security up...' -ForegroundColor Cyan
 if ($LASTEXITCODE -ne 0) {
     throw "the install folder could not be secured (icacls exit $LASTEXITCODE); the agent will not run from a folder anybody can write to"
 }
-Write-Host '  install folder secured (administrators only can write)' -ForegroundColor Gray
+
+# The list alone is not enough: Windows lets a folder's owner rewrite its list
+# whatever the list says, and the owner of an unzipped folder is the ordinary
+# account that unzipped it. That account could grant itself write access again
+# at any moment and replace the agent, so the folder and everything in it are
+# handed to Administrators. The agent refuses to register from a folder an
+# ordinary account owns.
+& icacls $here /setowner '*S-1-5-32-544' /T /Q | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "the install folder could not be handed to Administrators (icacls exit $LASTEXITCODE); its owner could make it writable again"
+}
+Write-Host '  install folder secured (administrators only can write, and own it)' -ForegroundColor Gray
 
 # The store, for the same reason and a sharper one.
 #
