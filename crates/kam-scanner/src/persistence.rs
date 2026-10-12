@@ -150,6 +150,61 @@ impl Entry {
     pub fn target(&self) -> Option<&Path> {
         self.payload.as_deref().or(self.executable.as_deref())
     }
+
+    /// A sentence saying that what this runs could not be told, when it could
+    /// not. `None` when there is a file to judge.
+    ///
+    /// Everything that judges an entry judges its target, so an entry with
+    /// none dropped out of all of them without a word: a sign-in entry whose
+    /// program is gone, a shortcut to something that is not a file, a service
+    /// whose image path names a file that is not there. Each of those is
+    /// something that starts itself and was not looked at, which is a gap and
+    /// is said as one.
+    pub fn unresolved(&self) -> Option<String> {
+        if self.target().is_some() {
+            return None;
+        }
+        let mut sentence = format!(
+            "Could not tell what {} \"{}\" runs: {} names nothing that could be found.",
+            self.anchor.label(),
+            self.name,
+            self.command
+        );
+        if let Some(twin) = wow64_twin(&self.command) {
+            sentence.push_str(&format!(
+                " A file of that name is in {}, which is where a 32-bit installer's \
+                 System32 lands, but that is not the path the entry names.",
+                twin.display()
+            ));
+        }
+        Some(sentence)
+    }
+}
+
+/// The `SysWOW64` file a command naming a missing `System32` file probably
+/// meant.
+///
+/// A 32-bit installer that writes to `System32` is redirected to `SysWOW64`,
+/// and writes the path it asked for, so its service names a file in the real
+/// `System32` that is not there. Pointed out, not assumed: the entry names the
+/// path it names, and the twin is not what it says it runs.
+fn wow64_twin(command: &str) -> Option<PathBuf> {
+    let expanded = kam_core::env::expand(command.trim());
+    let start = expanded.len() - expanded.trim_start_matches('"').len();
+    let end = expanded.to_ascii_lowercase().find(".exe")? + 4;
+    let raw = expanded.get(start..end)?;
+    let named = crate::places::normalise(raw);
+    let system32 = format!(r"{}\system32", crate::places::machine_folder("SystemRoot")?);
+    let inside = named.strip_prefix(&system32)?.strip_prefix('\\')?;
+    // Shown as the entry spells it where that can be done exactly.
+    let inside = match raw.get(raw.len().checked_sub(inside.len())?..) {
+        Some(spelled) if spelled.eq_ignore_ascii_case(inside) => spelled,
+        _ => inside,
+    };
+    let twin = PathBuf::from(std::env::var("SystemRoot").ok()?)
+        .join("SysWOW64")
+        .join(inside);
+    twin.is_file().then_some(twin)
 }
 
 /// Programs whose purpose is to run something named on their command line.
@@ -659,20 +714,20 @@ fn entry(
 
 /// Files sitting in a Startup folder.
 fn read_startup_folders(survey: &mut Survey, users: &[UserContext]) {
-    let mut folders: Vec<(PathBuf, bool)> = Vec::new();
+    let mut folders: Vec<(PathBuf, Option<&UserContext>)> = Vec::new();
 
     // Per-user, so it comes from the caller rather than from `%APPDATA%`.
     for user in users {
         folders.push((
             PathBuf::from(user.roaming_app_data())
                 .join(r"Microsoft\Windows\Start Menu\Programs\Startup"),
-            false,
+            Some(user),
         ));
     }
     match std::env::var("ProgramData") {
         Ok(program_data) => folders.push((
             PathBuf::from(program_data).join(r"Microsoft\Windows\Start Menu\Programs\StartUp"),
-            true,
+            None,
         )),
         // Reported rather than skipped. Without the variable the machine-wide
         // Startup folder is not read, and every item in it would then be
@@ -686,7 +741,9 @@ fn read_startup_folders(survey: &mut Survey, users: &[UserContext]) {
         )),
     }
 
-    for (folder, machine_wide) in folders {
+    for (folder, owner) in folders {
+        let machine_wide = owner.is_none();
+        let expand = owner.map_or(Expand::Machine, Expand::For);
         let listing = match std::fs::read_dir(&folder) {
             Ok(listing) => listing,
             // No Startup folder is the normal state of a fresh account, and an
@@ -734,10 +791,8 @@ fn read_startup_folders(survey: &mut Survey, users: &[UserContext]) {
                 .extension()
                 .map(|extension| extension.to_string_lossy().to_lowercase())
                 .unwrap_or_default();
-            // A shortcut points elsewhere, and resolving it needs the shell
-            // link interface. The file itself is still the honest answer to
-            // "what is in this folder". A script or program placed here
-            // directly is what runs, and is judged as such.
+            // A script or program placed here directly is what runs, and is
+            // judged as such.
             let runs_directly = matches!(
                 extension.as_str(),
                 "exe"
@@ -752,19 +807,127 @@ fn read_startup_folders(survey: &mut Survey, users: &[UserContext]) {
                     | "jse"
                     | "wsf"
             );
+            // A shortcut points elsewhere, and what it points at is what runs.
+            // It was never read, so every shortcut here had nothing to judge
+            // and was left out of everything that judges what starts itself,
+            // which is the usual way a Startup item is made. The target is
+            // read as stored, without asking Windows to go looking for it.
+            // The entry is still the shortcut, which is what is in the folder
+            // and what a person would remove.
+            let resolved = if runs_directly {
+                Resolved {
+                    executable: Some(path.clone()),
+                    ..Default::default()
+                }
+            } else if extension == "lnk" {
+                shortcut_command(&path)
+                    .map(|command| resolve_with(&command, expand))
+                    .unwrap_or_default()
+            } else {
+                Resolved::default()
+            };
             survey.entries.push(Entry {
                 name,
                 anchor: Anchor::StartupFolder,
                 location: folder.display().to_string(),
                 command: path.display().to_string(),
-                executable: runs_directly.then(|| path.clone()),
-                payload: None,
-                host: None,
+                executable: resolved.executable,
+                payload: resolved.payload,
+                host: resolved.host,
                 hidden: false,
                 machine_wide,
             });
         }
     }
+}
+
+/// COM, entered for the life of one shortcut read and left only if this
+/// entered it. A thread already in another apartment keeps it; the shell link
+/// object works in either.
+struct ComScope(bool);
+
+impl ComScope {
+    fn enter() -> Self {
+        // S_OK and S_FALSE both need a matching CoUninitialize; a thread
+        // already in the other apartment model returns an error and must not
+        // be uninitialised by us.
+        let outcome = unsafe {
+            windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_MULTITHREADED,
+            )
+        };
+        Self(outcome.is_ok())
+    }
+}
+
+impl Drop for ComScope {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
+    }
+}
+
+/// What a shortcut runs, as a command line: its target as stored, quoted,
+/// then its arguments.
+///
+/// Read with `SLGP_RAWPATH`, which returns what the shortcut holds and asks
+/// Windows to search for nothing: resolving a shortcut whose target has moved
+/// can wake an installer. The variables are left in for the caller to expand
+/// as the right person. `None` for a shortcut that could not be read or names
+/// no file, such as one pointing at a Store app.
+fn shortcut_command(lnk: &Path) -> Option<String> {
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+
+    /// Return the path as stored, without resolving or searching for it.
+    const SLGP_RAWPATH: u32 = 0x4;
+
+    fn text(buffer: &[u16]) -> String {
+        let end = buffer
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(buffer.len());
+        String::from_utf16_lossy(&buffer[..end]).trim().to_owned()
+    }
+
+    // Declared first so it is dropped last, after the interfaces below.
+    let _com = ComScope::enter();
+    let link: IShellLinkW =
+        unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.ok()?;
+    let file: IPersistFile = link.cast().ok()?;
+    let wide: Vec<u16> = lnk
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe { file.Load(PCWSTR(wide.as_ptr()), STGM_READ) }.ok()?;
+
+    let mut target = vec![0_u16; 1024];
+    let mut found = WIN32_FIND_DATAW::default();
+    unsafe { link.GetPath(&mut target, &mut found, SLGP_RAWPATH) }.ok()?;
+    let target = text(&target);
+    if target.is_empty() {
+        return None;
+    }
+
+    let mut arguments = vec![0_u16; 4096];
+    let arguments = match unsafe { link.GetArguments(&mut arguments) } {
+        Ok(()) => text(&arguments),
+        Err(_) => String::new(),
+    };
+
+    Some(if arguments.is_empty() {
+        format!("\"{target}\"")
+    } else {
+        format!("\"{target}\" {arguments}")
+    })
 }
 
 /// Services that start without being asked.
@@ -1621,6 +1784,75 @@ mod tests {
         let hosted = resolve_for(r#"cmd.exe /c "%APPDATA%\run.cmd""#, &user);
         assert_eq!(hosted.payload.as_deref(), Some(script.as_path()));
         assert_eq!(hosted.host.as_deref(), Some("cmd.exe"));
+    }
+
+    /// Write a real shortcut, the way Explorer does.
+    fn make_shortcut(lnk: &Path, target: &Path, arguments: &str) {
+        use windows::core::{Interface, HSTRING};
+        use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER};
+        use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+
+        let _com = ComScope::enter();
+        let link: IShellLinkW =
+            unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.unwrap();
+        unsafe {
+            link.SetPath(&HSTRING::from(target.as_os_str())).unwrap();
+            link.SetArguments(&HSTRING::from(arguments)).unwrap();
+        }
+        let file: IPersistFile = link.cast().unwrap();
+        unsafe { file.Save(&HSTRING::from(lnk.as_os_str()), true) }.unwrap();
+    }
+
+    /// A shortcut in a Startup folder is judged on what it points at.
+    ///
+    /// Shortcuts were never read, so the usual way a Startup item is made had
+    /// nothing to judge and was left out of everything that judges.
+    #[test]
+    fn a_startup_shortcut_is_judged_on_what_it_points_at() {
+        let (profile, user) = scratch_profile("startup");
+        let startup = profile
+            .0
+            .join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup");
+        std::fs::create_dir_all(&startup).unwrap();
+        let script = profile.0.join(r"AppData\Local\Temp\launch.cmd");
+        std::fs::write(&script, "@echo off\r\n").unwrap();
+        let cmd = PathBuf::from(std::env::var("SystemRoot").unwrap()).join(r"System32\cmd.exe");
+        make_shortcut(
+            &startup.join("Helper.lnk"),
+            &cmd,
+            &format!("/c \"{}\"", script.display()),
+        );
+
+        let mut survey = Survey::default();
+        read_startup_folders(&mut survey, std::slice::from_ref(&user));
+        let entry = survey
+            .entries
+            .iter()
+            .find(|entry| entry.name == "Helper")
+            .expect("the shortcut is listed");
+        assert_eq!(entry.host.as_deref(), Some("cmd.exe"));
+        assert_eq!(entry.payload.as_deref(), Some(script.as_path()));
+        assert_eq!(entry.target(), Some(script.as_path()));
+        assert!(entry.unresolved().is_none());
+        // Still the shortcut, which is what is in the folder.
+        assert!(entry.command.to_lowercase().ends_with("helper.lnk"));
+    }
+
+    /// An entry that names nothing to be found says so in a sentence.
+    #[test]
+    fn an_entry_naming_nothing_is_a_gap_with_a_sentence() {
+        let gone = entry(
+            "Gone".to_owned(),
+            Anchor::Service,
+            r"HKLM\SYSTEM\CurrentControlSet\Services\Gone".to_owned(),
+            r"C:\Windows\system32\kam-not-a-real-service.exe".to_owned(),
+            false,
+            None,
+        );
+        assert!(gone.target().is_none());
+        let note = gone.unresolved().expect("a gap");
+        assert!(note.starts_with("Could not tell what a Windows service \"Gone\" runs"));
+        assert!(note.contains("kam-not-a-real-service.exe"));
     }
 
     #[test]

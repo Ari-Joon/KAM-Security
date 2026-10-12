@@ -737,6 +737,13 @@ pub fn survey(reporter: &Reporter, user: &UserContext) -> Result<Report, Cancell
     // accounted for above.
     reporter.stage("Sweeping the download folders", None);
     let mut unreadable = persistence.reasons();
+    // Something that starts itself and names nothing that could be found
+    // left the grouping above without a word, so it was in no list at all.
+    for entry in &persistence.entries {
+        if let Some(note) = entry.unresolved() {
+            unreadable.push(format!("{note} It was not examined."));
+        }
+    }
     let mut swept = Vec::new();
     let mut loose: Vec<(PathBuf, Sweep)> = Vec::new();
     for (folder, policy) in sweep_folders(user) {

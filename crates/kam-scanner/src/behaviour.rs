@@ -287,6 +287,15 @@ fn headless_console(command: &str) -> bool {
     lower.contains("--headless") && !lower.contains("--server") && !lower.contains("--signal")
 }
 
+/// The first letter in upper case, for a label used to open a sentence.
+fn capitalised(text: &str) -> String {
+    let mut characters = text.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -504,7 +513,32 @@ fn msi_argument(start: &ProcessStart) -> Option<PathBuf> {
 /// after, and reads the same whether the process has run yet or not.
 pub fn judge_entry(entry: &Entry) -> Option<Observation> {
     let kind = Kind::of_anchor(entry.anchor);
-    let target = entry.target()?;
+    let Some(target) = entry.target() else {
+        // Nothing to judge is not nothing to say. This returned quietly, so a
+        // new entry naming a program that is not there, or a shortcut to
+        // something that is not a file, could appear without a line: the
+        // shapes below could not be checked against it, and that was never
+        // written down. Said as what it is, not as a finding.
+        return Some(observation(
+            kind,
+            Concern::Notable,
+            format!(
+                "{}, and what it runs could not be told",
+                capitalised(kind.label())
+            ),
+            vec![
+                entry.unresolved().unwrap_or_else(|| {
+                    format!("{} names nothing that could be found.", entry.command)
+                }),
+                "So whether it runs from a folder any program can write to, and who signed \
+                 it, could not be checked."
+                    .to_owned(),
+            ],
+            entry.location.clone(),
+            entry.command.clone(),
+            None,
+        ));
+    };
     let target_text = target.to_string_lossy().into_owned();
     let place = dropper_place(&target_text);
     let script = is_script(target) || is_project(target);
@@ -786,12 +820,38 @@ mod tests {
         assert!(observation.summary.to_lowercase().contains("hidden"));
     }
 
+    /// A new entry whose program cannot be found is written down as that,
+    /// not passed over as though there were nothing to say.
     #[test]
-    fn a_run_key_pointing_at_a_signed_program_in_program_files_is_quiet() {
+    fn a_new_entry_naming_nothing_that_exists_is_said_out_loud() {
+        let missing = entry(
+            Anchor::RunKey,
+            r"C:\Users\me\AppData\Local\Temp\kam-gone-for-good\upd.exe /silent",
+            false,
+        );
+        assert!(missing.target().is_none());
+        let observation = judge_entry(&missing).expect("an unreadable entry is not silence");
+        assert_eq!(observation.concern, Concern::Notable);
+        assert_eq!(observation.kind, Kind::SignInEntry);
+        assert!(
+            observation.summary.contains("could not be told"),
+            "{}",
+            observation.summary
+        );
+        assert!(observation
+            .evidence
+            .iter()
+            .any(|line| line.contains("kam-gone-for-good")));
+    }
+
+    #[test]
+    fn a_run_key_pointing_at_a_signed_program_in_a_protected_folder_is_quiet() {
         // The ordinary case: Steam, Discord, an updater. Signed or not, it is
-        // not in a place this fires on.
-        let command = r#""C:\Program Files\Thing\thing.exe" --background"#;
-        assert!(judge_entry(&entry(Anchor::RunKey, command, false)).is_none());
+        // not in a place this fires on. The program has to be there: one that
+        // is not cannot be judged, and that is said rather than kept quiet.
+        let root = std::env::var("SystemRoot").unwrap();
+        let command = format!(r#""{root}\System32\notepad.exe" --background"#);
+        assert!(judge_entry(&entry(Anchor::RunKey, &command, false)).is_none());
     }
 
     #[test]
