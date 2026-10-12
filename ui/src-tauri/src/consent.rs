@@ -125,6 +125,16 @@ fn ask_windows(request: &Request) -> Result<Response, String> {
     match serde_json::from_slice::<Outcome>(&written) {
         Ok(Outcome::Answered(response)) => Ok(response),
         Ok(Outcome::Failed(message)) => Err(message),
+        // 2 is the approved copy refusing its own arguments, which it decides
+        // before it ever contacts the agent, so nothing can have changed. The
+        // usual cause is an administrator other than the signed-in person
+        // approving the prompt: the approved copy then runs as them, with their
+        // temporary folder, and will not write its answer into somebody else's.
+        Err(_) if code == 2 => Err(
+            "Permission was given, but the change was never attempted, so nothing was changed. \
+             This happens when the account that approved the prompt is not the one signed in."
+                .to_owned(),
+        ),
         // Nothing usable came back. Not "it worked": the window re-reads the
         // real state afterwards, and this says plainly that the answer is
         // missing rather than inventing one.
