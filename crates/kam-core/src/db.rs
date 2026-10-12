@@ -485,20 +485,33 @@ impl Store {
                     // column existed, which is a gap being filled rather than
                     // anything moving.
                     let trust_moved = !was_trust.is_empty() && was_trust != sighting.trust;
+                    // Either it points somewhere else now, or the file it
+                    // points at is not the file it was. The second is the case
+                    // a path comparison cannot see: same entry, same path,
+                    // different binary. Nothing keeps its standing just
+                    // because it had it yesterday.
+                    let altered = detail != sighting.detail || trust_moved;
 
-                    let change = if flaps >= FLAPS_BEFORE_RECURRING {
-                        Some(Change::Recurring)
-                    } else if returned {
-                        Some(Change::Appeared)
-                    } else if detail != sighting.detail || trust_moved {
-                        // Either it points somewhere else now, or the file it
-                        // points at is not the file it was. The second is the
-                        // case a path comparison cannot see: same entry, same
-                        // path, different binary. Nothing keeps its standing
-                        // just because it had it yesterday.
-                        Some(Change::Altered)
-                    } else {
-                        None
+                    // `Recurring` is said only on a sweep where the thing
+                    // actually came back. It used to be said on every sweep
+                    // once the flap count reached the threshold, whether or not
+                    // anything had happened -- so a flapping service wrote a
+                    // `changes` row each time the view was opened, and the
+                    // weekly bars measured how often somebody looked. And it
+                    // was checked before anything else, so an ImagePath
+                    // hijack of a service that flaps read as "comes and goes".
+                    // Coming and going is noted; it is not a licence.
+                    let recurring = flaps >= FLAPS_BEFORE_RECURRING;
+                    let change = match (returned, recurring, altered) {
+                        // Back again, and nothing else about it is different.
+                        (true, true, false) => Some(Change::Recurring),
+                        // Back again before it has made a habit of it.
+                        (true, false, _) => Some(Change::Appeared),
+                        // Pointing somewhere else, whether or not it flaps.
+                        (_, _, true) => Some(Change::Altered),
+                        // Here last time and here now, unchanged: nothing to
+                        // say, and nothing is written.
+                        (false, _, false) => None,
                     };
                     if let Some(change) = change {
                         differences.push(Difference {
@@ -1335,6 +1348,98 @@ mod tests {
                 "a flapping service was announced as though it were new"
             );
         }
+    }
+
+    /// Something that comes and goes is noted when it comes or goes, and not
+    /// on every sweep in between.
+    ///
+    /// Once the flap count reached the threshold, every later sweep reported
+    /// it as `Recurring` whether or not anything had happened, and wrote a
+    /// `changes` row each time -- so the weekly bars grew with how often the
+    /// view was opened. And `Recurring` was decided before anything else, so
+    /// pointing a flapping service at a different program read as "comes and
+    /// goes" rather than as a change.
+    #[test]
+    fn a_thing_that_comes_and_goes_is_noted_only_when_it_comes_or_goes() {
+        use crate::changes::Change;
+
+        let store = Store::open_in_memory().unwrap();
+        let present = [seen("service", "AntiCheat", "C:\\ac.exe")];
+
+        store.sweep(&present, &[]).unwrap();
+        for _ in 0..3 {
+            store.sweep(&[], &[]).unwrap();
+            store.sweep(&present, &[]).unwrap();
+        }
+
+        // Present last time and present now, unchanged: nothing to say, and
+        // nothing written to the history.
+        let before = store.sweep(&present, &[]).unwrap().history.len();
+        let quiet = store.sweep(&present, &[]).unwrap();
+        assert!(
+            quiet.differences.is_empty(),
+            "a sweep in which nothing happened reported {:?}",
+            quiet.differences
+        );
+        assert_eq!(
+            quiet.history.len(),
+            before,
+            "a sweep in which nothing happened wrote to the history"
+        );
+
+        // It goes, and that is noted as coming and going.
+        let gone = store.sweep(&[], &[]).unwrap();
+        assert_eq!(
+            gone.differences
+                .iter()
+                .find(|d| d.name == "AntiCheat")
+                .map(|d| d.change),
+            Some(Change::Recurring)
+        );
+
+        // It comes back, and that is noted too.
+        let back = store.sweep(&present, &[]).unwrap();
+        assert_eq!(
+            back.differences
+                .iter()
+                .find(|d| d.name == "AntiCheat")
+                .map(|d| d.change),
+            Some(Change::Recurring)
+        );
+
+        // And while it is here, it is hijacked: same service, another program.
+        let hijacked = store
+            .sweep(
+                &[seen("service", "AntiCheat", "C:\\Users\\me\\evil.exe")],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            hijacked
+                .differences
+                .iter()
+                .find(|d| d.name == "AntiCheat")
+                .map(|d| d.change),
+            Some(Change::Altered),
+            "a flapping service pointed elsewhere read as coming and going"
+        );
+
+        // A hijack that arrives with a return is a change too, not a flap.
+        store.sweep(&[], &[]).unwrap();
+        let returned_elsewhere = store
+            .sweep(
+                &[seen("service", "AntiCheat", "C:\\Users\\me\\worse.exe")],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            returned_elsewhere
+                .differences
+                .iter()
+                .find(|d| d.name == "AntiCheat")
+                .map(|d| d.change),
+            Some(Change::Altered)
+        );
     }
 
     /// A sweep that fails partway leaves the baseline as it was.

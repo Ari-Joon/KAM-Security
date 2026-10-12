@@ -36,7 +36,9 @@
 //! **Things that come and go.** Something that has appeared and vanished
 //! repeatedly is marked as doing that, once, rather than reported every cycle —
 //! but it is never silently dropped, because a rule that hides flapping is a
-//! rule an attacker can use by flapping.
+//! rule an attacker can use by flapping. "Once" means once per coming or
+//! going: a sweep in which it neither came nor went says nothing about it, and
+//! a flapping thing that now runs something else is reported as altered.
 
 use serde::{Deserialize, Serialize};
 
