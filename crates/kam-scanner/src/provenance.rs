@@ -372,8 +372,17 @@ fn weigh(finding: &mut Finding) {
             }
         }
         Signature::Valid { signer, catalogue } => {
-            if catalogue.is_some() {
+            // A catalogue is how Windows signs Windows, and also how a vendor
+            // driver is signed once Microsoft's hardware programme has passed
+            // it ("Microsoft Windows Hardware Compatibility Publisher"). Only
+            // the first is part of Windows; the second was described as if it
+            // were. What was established is said, and no more.
+            if catalogue.is_some() && signature::is_windows_signer(signer) {
                 reasons.push(format!("Part of Windows, signed by {signer}."));
+            } else if catalogue.is_some() {
+                reasons.push(format!(
+                    "Signed through a Windows catalogue by {signer}, and Windows accepts it."
+                ));
             } else {
                 reasons.push(format!("Signed by {signer}, and Windows accepts it."));
             }
@@ -1108,6 +1117,48 @@ mod tests {
             "signed Windows services must not fill the list: {:?}",
             finding.reasons
         );
+    }
+
+    /// A vendor's driver signed through Microsoft's hardware programme is
+    /// signed through a catalogue, and is not part of Windows.
+    #[test]
+    fn only_windows_own_catalogue_signature_reads_as_part_of_windows() {
+        let catalogue = Some(r"C:\Windows\System32\CatRoot\x\oem12.cat".to_owned());
+        let driver = finding(
+            Signature::Valid {
+                signer: "Microsoft Windows Hardware Compatibility Publisher".to_owned(),
+                catalogue: catalogue.clone(),
+            },
+            Location::System,
+            vec![anchor(Anchor::Service)],
+        );
+        assert!(
+            driver
+                .reasons
+                .iter()
+                .all(|r| !r.contains("Part of Windows")),
+            "{:?}",
+            driver.reasons
+        );
+        assert!(driver
+            .reasons
+            .iter()
+            .any(|r| r.contains("through a Windows catalogue by Microsoft Windows Hardware")));
+
+        let windows = finding(
+            Signature::Valid {
+                signer: "Microsoft Windows".to_owned(),
+                catalogue,
+            },
+            Location::System,
+            vec![anchor(Anchor::Service)],
+        );
+        assert!(windows
+            .reasons
+            .iter()
+            .any(|r| r.contains("Part of Windows")));
+        // Wording only: the weighing is the same either way.
+        assert_eq!(driver.attention, windows.attention);
     }
 
     #[test]

@@ -460,10 +460,22 @@ const LOCATION_LABELS: Record<Location, string> = {
   elsewhere: "outside the usual program folders",
 };
 
+/**
+ * The name Windows signs its own components with. A catalogue signature by
+ * anyone else, such as the hardware programme's signature on a vendor's
+ * driver, is signed through a Windows catalogue and is not part of Windows.
+ */
+function isWindowsSigner(signer: string): boolean {
+  return signer.trim().toLowerCase() === "microsoft windows";
+}
+
 function signatureLabel(signature: Signature): string {
   switch (signature.state) {
     case "valid":
-      return signature.catalogue ? `${signature.signer} (part of Windows)` : signature.signer;
+      if (!signature.catalogue) return signature.signer;
+      return isWindowsSigner(signature.signer)
+        ? `${signature.signer} (part of Windows)`
+        : `${signature.signer} (through a Windows catalogue)`;
     case "invalid":
       return signature.signer ? `${signature.signer} — not accepted` : "signature not accepted";
     case "unsigned":

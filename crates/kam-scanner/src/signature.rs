@@ -89,6 +89,15 @@ impl Signature {
     }
 }
 
+/// Whether a signer's name is the one Windows signs its own components with.
+///
+/// Exactly that name. "Microsoft Windows Hardware Compatibility Publisher"
+/// begins the same way and is the signature Microsoft's hardware programme
+/// puts on other companies' drivers, which are not part of Windows.
+pub fn is_windows_signer(signer: &str) -> bool {
+    signer.trim().eq_ignore_ascii_case("Microsoft Windows")
+}
+
 fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str()
         .to_string_lossy()
