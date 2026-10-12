@@ -109,6 +109,33 @@ impl UserContext {
         format!(r"{}\AppData\Roaming", self.profile)
     }
 
+    /// `C:\Users\someone\AppData\Local\Temp`, which is where Windows points a
+    /// person's `%TEMP%` and `%TMP%` unless they have changed it.
+    pub fn temp(&self) -> String {
+        format!(r"{}\Temp", self.local_app_data())
+    }
+
+    /// `C:` for a profile at `C:\Users\someone`, as `%HOMEDRIVE%` would read.
+    /// `None` for a profile that is not on a lettered drive.
+    pub fn home_drive(&self) -> Option<String> {
+        self.drive_split().map(|(drive, _)| drive.to_owned())
+    }
+
+    /// `\Users\someone` for a profile at `C:\Users\someone`, as `%HOMEPATH%`
+    /// would read.
+    pub fn home_path(&self) -> Option<String> {
+        self.drive_split().map(|(_, rest)| rest.to_owned())
+    }
+
+    fn drive_split(&self) -> Option<(&str, &str)> {
+        let bytes = self.profile.as_bytes();
+        let lettered = bytes.len() > 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\';
+        lettered.then(|| self.profile.split_at(2))
+    }
+
     /// A folder directly inside the profile, such as `Downloads`.
     pub fn folder(&self, name: &str) -> String {
         format!(r"{}\{name}", self.profile)
@@ -168,6 +195,16 @@ mod tests {
         assert_eq!(user.profile(), r"C:\Users\someone");
         assert_eq!(user.local_app_data(), r"C:\Users\someone\AppData\Local");
         assert_eq!(user.folder("Downloads"), r"C:\Users\someone\Downloads");
+        assert_eq!(user.temp(), r"C:\Users\someone\AppData\Local\Temp");
+        assert_eq!(user.home_drive().as_deref(), Some("C:"));
+        assert_eq!(user.home_path().as_deref(), Some(r"\Users\someone"));
+    }
+
+    #[test]
+    fn a_profile_off_a_lettered_drive_has_no_home_drive() {
+        let user = UserContext::new(None, r"\\server\profiles\someone");
+        assert_eq!(user.home_drive(), None);
+        assert_eq!(user.home_path(), None);
     }
 
     #[test]

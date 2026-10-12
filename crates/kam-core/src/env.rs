@@ -12,12 +12,51 @@
 //! and that reader exists to offer removing shortcuts whose target is gone, so
 //! the bug would have proposed deleting working Start Menu entries.
 
+use crate::UserContext;
+
 /// Expand `%NAME%` references against the current environment.
 ///
 /// An unset variable is left exactly as written. Substituting an empty string
 /// would turn `%NOPE%\thing.exe` into `\thing.exe`, which looks like a real
 /// path and is not one; leaving it alone keeps the failure visible.
 pub fn expand(text: &str) -> String {
+    expand_with(text, lookup)
+}
+
+/// Expand `%NAME%` references as they would expand for one particular person.
+///
+/// A command stored in somebody's own hive or Startup folder runs in their
+/// session, so `%TEMP%` there means *their* Temp. Expanded inside the agent,
+/// which runs as LocalSystem, it meant `C:\Windows\TEMP` instead, and
+/// `%LOCALAPPDATA%` meant SYSTEM's empty profile: a sign-in entry running
+/// `%TEMP%\upd.exe` was judged as a file in a folder where it does not exist,
+/// so what it actually runs was never looked at.
+///
+/// The per-user variables come from the person's [`UserContext`]; everything
+/// else, such as `%SystemRoot%` and `%ProgramFiles%`, is the same for everyone
+/// and comes from this process. For a context with no SID the process *is*
+/// that person, so its own environment is already the right one and is used
+/// unchanged.
+pub fn expand_for(text: &str, user: &UserContext) -> String {
+    expand_with(text, |name| per_user(name, user).or_else(|| lookup(name)))
+}
+
+/// The value of one per-user variable for this person, when it is one.
+fn per_user(name: &str, user: &UserContext) -> Option<String> {
+    user.sid()?;
+    let value = match name.to_ascii_uppercase().as_str() {
+        "USERPROFILE" => user.profile().to_owned(),
+        "LOCALAPPDATA" => user.local_app_data(),
+        "APPDATA" => user.roaming_app_data(),
+        "TEMP" | "TMP" => user.temp(),
+        "HOMEDRIVE" => user.home_drive()?,
+        "HOMEPATH" => user.home_path()?,
+        _ => return None,
+    };
+    (!value.is_empty()).then_some(value)
+}
+
+fn expand_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
 
@@ -120,5 +159,58 @@ mod tests {
         let expanded = expand("%SystemRoot%;%SystemRoot%");
         assert!(!expanded.contains('%'), "{expanded}");
         assert!(expanded.contains(';'));
+    }
+
+    /// A named person's own folders come from their profile, not this process.
+    ///
+    /// The bug: inside the LocalSystem agent a sign-in entry reading
+    /// `%TEMP%\upd.exe` expanded to `C:\Windows\TEMP\upd.exe`, and
+    /// `%LOCALAPPDATA%` to SYSTEM's profile, so what the entry runs was looked
+    /// for where it is not.
+    #[test]
+    fn a_named_persons_variables_expand_to_their_own_folders() {
+        let them = UserContext::new(Some("S-1-5-21-1-2-3-1001".to_owned()), r"C:\Users\them");
+        for (stored, expected) in [
+            (
+                r"%TEMP%\upd.exe",
+                r"C:\Users\them\AppData\Local\Temp\upd.exe",
+            ),
+            (
+                r"%tmp%\upd.exe",
+                r"C:\Users\them\AppData\Local\Temp\upd.exe",
+            ),
+            (
+                r"%LOCALAPPDATA%\x\y.exe",
+                r"C:\Users\them\AppData\Local\x\y.exe",
+            ),
+            (
+                r"%AppData%\x\y.exe",
+                r"C:\Users\them\AppData\Roaming\x\y.exe",
+            ),
+            (r"%USERPROFILE%\x.exe", r"C:\Users\them\x.exe"),
+            (r"%HOMEDRIVE%%HOMEPATH%\x.exe", r"C:\Users\them\x.exe"),
+        ] {
+            assert_eq!(expand_for(stored, &them), expected, "{stored}");
+        }
+    }
+
+    #[test]
+    fn machine_wide_variables_still_expand_for_a_named_person() {
+        let them = UserContext::new(Some("S-1-5-21-1-2-3-1001".to_owned()), r"C:\Users\them");
+        assert_eq!(
+            expand_for(r"%SystemRoot%\System32\notepad.exe", &them),
+            expand(r"%SystemRoot%\System32\notepad.exe")
+        );
+        assert_eq!(
+            expand_for(r"%KAM_DEFINITELY_NOT_SET%\x.exe", &them),
+            r"%KAM_DEFINITELY_NOT_SET%\x.exe"
+        );
+    }
+
+    #[test]
+    fn the_running_account_keeps_its_own_environment() {
+        // No SID means this process is that person, so nothing is derived.
+        let me = UserContext::current();
+        assert_eq!(expand_for(r"%TEMP%\x", &me), expand(r"%TEMP%\x"));
     }
 }

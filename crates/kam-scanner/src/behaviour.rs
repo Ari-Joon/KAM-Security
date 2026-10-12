@@ -44,6 +44,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kam_core::UserContext;
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::{self, Anchor, Entry};
@@ -153,6 +154,26 @@ pub struct ProcessStart {
     pub name: String,
     pub path: Option<String>,
     pub command: String,
+    /// The person the process ran as, when the feed knows. Their `%TEMP%`
+    /// and `%LOCALAPPDATA%` are what a variable left in the command means;
+    /// without it the agent's own environment, LocalSystem's, is used.
+    pub user: Option<UserContext>,
+}
+
+impl ProcessStart {
+    fn expand(&self, text: &str) -> String {
+        match &self.user {
+            Some(user) => kam_core::env::expand_for(text, user),
+            None => kam_core::env::expand(text),
+        }
+    }
+
+    fn resolved(&self) -> persistence::Resolved {
+        match &self.user {
+            Some(user) => persistence::resolve_for(&self.command, user),
+            None => persistence::resolve(&self.command),
+        }
+    }
 }
 
 /// Extensions that run as scripts. A file with one of these cannot carry a
@@ -289,7 +310,7 @@ fn observation(
 /// launcher-based infection uses.
 pub fn judge_process(start: &ProcessStart) -> Option<Observation> {
     let name = start.name.to_lowercase();
-    let resolved = persistence::resolve(&start.command);
+    let resolved = start.resolved();
     let observe = |concern, summary, evidence, subject: String| {
         Some(observation(
             Kind::ProcessStart,
@@ -401,7 +422,7 @@ pub fn judge_process(start: &ProcessStart) -> Option<Observation> {
 
     // --- an unsigned installer from Temp claiming a hardware vendor --------
     if name == "msiexec.exe" {
-        if let Some(msi) = msi_argument(&start.command) {
+        if let Some(msi) = msi_argument(start) {
             if let Some(place) = dropper_place(&msi.to_string_lossy()) {
                 let signature = signature::of(&msi);
                 let unsigned = matches!(signature, Signature::Unsigned | Signature::Invalid { .. });
@@ -442,8 +463,8 @@ fn vendor_claim(path: &Path) -> Option<&'static str> {
 /// exists. Installers that clean up after themselves remove the package within
 /// seconds, and "an installer ran from Temp and is already gone" is still worth
 /// a line.
-fn msi_argument(command: &str) -> Option<PathBuf> {
-    let tokens = persistence::tokenise(command);
+fn msi_argument(start: &ProcessStart) -> Option<PathBuf> {
+    let tokens = persistence::tokenise(&start.command);
     let lower: Vec<String> = tokens.iter().map(|token| token.to_lowercase()).collect();
     let after = lower
         .iter()
@@ -460,7 +481,7 @@ fn msi_argument(command: &str) -> Option<PathBuf> {
         .find(|token| token.to_lowercase().ends_with(".msi"));
     after
         .or(bare)
-        .map(|token| PathBuf::from(kam_core::env::expand(token.trim())))
+        .map(|token| PathBuf::from(start.expand(token.trim())))
 }
 
 /// Judge one newly appeared startup entry.
@@ -579,7 +600,25 @@ mod tests {
             name: name.to_owned(),
             path: Some(format!(r"C:\Windows\System32\{name}")),
             command: command.to_owned(),
+            user: None,
         }
+    }
+
+    /// An installer named with a variable is looked for in the person's own
+    /// Temp, not the agent's.
+    #[test]
+    fn an_installer_named_with_a_variable_is_read_as_the_persons_own() {
+        let root = std::env::temp_dir().join(format!("kam-msi-profile-{}", std::process::id()));
+        let user = UserContext::new(
+            Some("S-1-5-21-1-2-3-1001".to_owned()),
+            &root.display().to_string(),
+        );
+        let mut started = start("msiexec.exe", r#"msiexec.exe /i "%TEMP%\Setup.msi" /qn"#);
+        started.user = Some(user);
+        assert_eq!(
+            msi_argument(&started),
+            Some(root.join(r"AppData\Local\Temp\Setup.msi"))
+        );
     }
 
     /// A real file on disk that removes itself when the test ends.

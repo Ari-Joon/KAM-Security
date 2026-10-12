@@ -191,6 +191,30 @@ pub struct Resolved {
     pub payload: Option<PathBuf>,
 }
 
+/// Whose `%NAME%` values a command is expanded with.
+///
+/// A command in somebody's own hive or Startup folder runs in their session,
+/// so `%TEMP%` in it means their Temp. Inside the agent the process's own
+/// environment is LocalSystem's, and expanding a per-user command against it
+/// sent `%TEMP%\upd.exe` to `C:\Windows\TEMP` and `%LOCALAPPDATA%` to SYSTEM's
+/// empty profile, so what the entry runs was looked for where it is not.
+#[derive(Debug, Clone, Copy)]
+enum Expand<'a> {
+    /// Machine-wide entries: services, tasks, `HKLM`.
+    Machine,
+    /// An entry that belongs to one person.
+    For(&'a UserContext),
+}
+
+impl Expand<'_> {
+    fn apply(self, text: &str) -> String {
+        match self {
+            Self::Machine => kam_core::env::expand(text),
+            Self::For(user) => kam_core::env::expand_for(text, user),
+        }
+    }
+}
+
 /// Pull the executable out of a command line.
 ///
 /// Registry commands are written by whoever installed them and follow no rule:
@@ -313,7 +337,7 @@ fn is_switch(token: &str) -> bool {
 }
 
 /// The argument a host program is told to run, if it names a file that exists.
-fn payload_of(host: &str, arguments: &str) -> Option<PathBuf> {
+fn payload_of(host: &str, arguments: &str, expand: Expand<'_>) -> Option<PathBuf> {
     let tokens = tokenise(arguments);
     let lower: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
     let after = |flags: &[&str]| -> Option<&String> {
@@ -352,7 +376,7 @@ fn payload_of(host: &str, arguments: &str) -> Option<PathBuf> {
     } else {
         candidate.as_str()
     };
-    let path = PathBuf::from(kam_core::env::expand(candidate.trim()));
+    let path = PathBuf::from(expand.apply(candidate.trim()));
     path.is_file().then_some(path)
 }
 
@@ -361,11 +385,25 @@ fn payload_of(host: &str, arguments: &str) -> Option<PathBuf> {
 /// `conhost.exe --headless <command>` is unwrapped, because it is not the
 /// program but a way of running the program with no window, and the interesting
 /// part is what follows.
+///
+/// Variables are expanded against this process's environment, which is right
+/// for anything machine-wide. A command that belongs to one person goes
+/// through [`resolve_for`] instead.
 pub fn resolve(command: &str) -> Resolved {
-    resolve_expanded(&kam_core::env::expand(command.trim()), 0)
+    resolve_with(command, Expand::Machine)
 }
 
-fn resolve_expanded(expanded: &str, depth: u8) -> Resolved {
+/// The same, for a command from one person's own hive or Startup folder, with
+/// `%TEMP%`, `%LOCALAPPDATA%` and the rest read as that person's.
+pub fn resolve_for(command: &str, user: &UserContext) -> Resolved {
+    resolve_with(command, Expand::For(user))
+}
+
+fn resolve_with(command: &str, expand: Expand<'_>) -> Resolved {
+    resolve_expanded(&expand.apply(command.trim()), 0, expand)
+}
+
+fn resolve_expanded(expanded: &str, depth: u8, expand: Expand<'_>) -> Resolved {
     let Some((executable, rest)) = split_executable(expanded) else {
         return Resolved::default();
     };
@@ -402,7 +440,7 @@ fn resolve_expanded(expanded: &str, depth: u8) -> Resolved {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            let inner = resolve_expanded(&inner, depth + 1);
+            let inner = resolve_expanded(&inner, depth + 1, expand);
             if inner.executable.is_some() {
                 return Resolved {
                     host: inner.host.or(Some("conhost.exe".to_owned())),
@@ -417,7 +455,7 @@ fn resolve_expanded(expanded: &str, depth: u8) -> Resolved {
     }
 
     if HOSTS.contains(&name.as_str()) {
-        if let Some(payload) = payload_of(&name, &rest) {
+        if let Some(payload) = payload_of(&name, &rest, expand) {
             return Resolved {
                 executable: Some(executable),
                 host: Some(name),
@@ -454,7 +492,8 @@ fn read_run_keys(survey: &mut Survey, users: &[UserContext]) {
     // LocalSystem service `HKEY_CURRENT_USER` is SYSTEM's own hive, where
     // nobody has ever put a startup entry, so a survey of what starts itself
     // silently omitted half of what does.
-    let mut hives = vec![(HKEY_LOCAL_MACHINE, String::new(), "HKLM".to_owned(), true)];
+    let mut hives: Vec<(_, String, String, Option<&UserContext>)> =
+        vec![(HKEY_LOCAL_MACHINE, String::new(), "HKLM".to_owned(), None)];
     for user in users {
         let (hive, prefix) = user.hive();
         // Named for the key that was actually opened, and for nothing else.
@@ -472,10 +511,11 @@ fn read_run_keys(survey: &mut Survey, users: &[UserContext]) {
             Some(sid) => format!("HKEY_USERS\\{sid}"),
             None => "HKCU".to_owned(),
         };
-        hives.push((hive, prefix, label, false));
+        hives.push((hive, prefix, label, Some(user)));
     }
 
-    for (hive, prefix, hive_label, machine_wide) in hives {
+    for (hive, prefix, hive_label, owner) in hives {
+        let machine_wide = owner.is_none();
         // WOW64 redirection applies to `HKLM\Software`. It does not apply to a
         // user hive, where both views open the same key -- so reading both
         // there recorded every per-user entry twice, under two locations, one
@@ -563,14 +603,9 @@ fn read_run_keys(survey: &mut Survey, users: &[UserContext]) {
                     if command.trim().is_empty() {
                         continue;
                     }
-                    survey.entries.push(entry(
-                        name,
-                        anchor,
-                        named.clone(),
-                        command,
-                        false,
-                        machine_wide,
-                    ));
+                    survey
+                        .entries
+                        .push(entry(name, anchor, named.clone(), command, false, owner));
                 }
             }
         }
@@ -592,15 +627,23 @@ fn shown(path: &str, view: View) -> String {
 }
 
 /// Build an entry from a command, resolving what it runs.
+///
+/// `owner` is the person whose hive the command came from, so that their own
+/// `%TEMP%` and `%LOCALAPPDATA%` are what it is read with. `None` for
+/// machine-wide sources.
 fn entry(
     name: String,
     anchor: Anchor,
     location: String,
     command: String,
     hidden: bool,
-    machine_wide: bool,
+    owner: Option<&UserContext>,
 ) -> Entry {
-    let resolved = resolve(&command);
+    let machine_wide = owner.is_none();
+    let resolved = match owner {
+        Some(user) => resolve_for(&command, user),
+        None => resolve(&command),
+    };
     Entry {
         name,
         anchor,
@@ -856,7 +899,7 @@ fn read_services(survey: &mut Survey) {
             format!(r"HKLM\SYSTEM\CurrentControlSet\Services\{name}"),
             image,
             false,
-            true,
+            None,
         ));
     }
 
@@ -1097,7 +1140,7 @@ fn task_entry_or(root: &Path, path: &Path) -> Result<Option<Entry>, std::io::Err
         path.display().to_string(),
         full,
         hidden,
-        true,
+        None,
     )))
 }
 
@@ -1388,6 +1431,64 @@ mod tests {
         }
         std::fs::remove_file(&script).unwrap();
         std::fs::remove_file(&project).unwrap();
+    }
+
+    /// A profile in the temp folder, with a named SID, standing in for a
+    /// person the agent is reading on behalf of. Removed when dropped.
+    struct ScratchProfile(PathBuf);
+
+    impl Drop for ScratchProfile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch_profile(tag: &str) -> (ScratchProfile, UserContext) {
+        let root = std::env::temp_dir().join(format!(
+            "kam-profile-{}-{tag}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(root.join(r"AppData\Local\Temp")).unwrap();
+        std::fs::create_dir_all(root.join(r"AppData\Roaming")).unwrap();
+        let user = UserContext::new(
+            Some("S-1-5-21-1-2-3-1001".to_owned()),
+            &root.display().to_string(),
+        );
+        (ScratchProfile(root), user)
+    }
+
+    /// A sign-in entry in somebody's own hive is read with their folders.
+    ///
+    /// The bug: inside the LocalSystem agent `%TEMP%\upd.exe` resolved to
+    /// `C:\Windows\TEMP\upd.exe`, where it is not, so the entry was judged on
+    /// nothing at all.
+    #[test]
+    fn a_per_user_command_is_read_with_that_persons_folders() {
+        let (profile, user) = scratch_profile("expand");
+        let program = profile.0.join(r"AppData\Local\Temp\upd.exe");
+        std::fs::write(&program, "MZ").unwrap();
+        let script = profile.0.join(r"AppData\Roaming\run.cmd");
+        std::fs::write(&script, "@echo off\r\n").unwrap();
+
+        let direct = entry(
+            "Updater".to_owned(),
+            Anchor::RunKey,
+            r"HKEY_USERS\S-1-5-21-1-2-3-1001\Software\Microsoft\Windows\CurrentVersion\Run"
+                .to_owned(),
+            r"%TEMP%\upd.exe /silent".to_owned(),
+            false,
+            Some(&user),
+        );
+        assert_eq!(direct.executable.as_deref(), Some(program.as_path()));
+        assert!(!direct.machine_wide);
+
+        let hosted = resolve_for(r#"cmd.exe /c "%APPDATA%\run.cmd""#, &user);
+        assert_eq!(hosted.payload.as_deref(), Some(script.as_path()));
+        assert_eq!(hosted.host.as_deref(), Some("cmd.exe"));
     }
 
     #[test]
