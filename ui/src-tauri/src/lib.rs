@@ -33,46 +33,78 @@ fn unexpected(response: &Response) -> String {
     format!("the agent replied with something unexpected: {response:?}")
 }
 
-#[tauri::command]
-fn agent_status() -> Result<SystemStatus, String> {
-    match kam_ipc::client::call(&Request::GetSystemStatus).map_err(|error| error.to_string())? {
-        Response::SystemStatus(status) => Ok(status),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+/// Run a command's work off the window's thread.
+///
+/// A plain `fn` command runs inside the handler WebView2 calls on the window's
+/// own thread, so for as long as it runs nothing on screen can move: not the
+/// window, not other commands' replies, not progress events, not the tray menu.
+/// A full-drive scan held it for a minute, and on 23 Sep 2026 Windows closed
+/// the window as not responding. So every command that waits on the agent, the
+/// disk or another program is `async` and does its work here, on Tauri's pool
+/// for blocking work. The few left as plain `fn` answer from memory.
+async fn off_the_window<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| format!("the work stopped before it finished: {error}"))?
 }
 
 #[tauri::command]
-fn recent_audit(limit: u32) -> Result<Vec<Record>, String> {
-    match kam_ipc::client::call(&Request::GetRecentAudit { limit })
-        .map_err(|error| error.to_string())?
-    {
-        Response::RecentAudit { entries } => Ok(entries),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn agent_status() -> Result<SystemStatus, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetSystemStatus).map_err(|error| error.to_string())? {
+            Response::SystemStatus(status) => Ok(status),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
-fn list_volumes() -> Result<Vec<Volume>, String> {
-    match kam_ipc::client::call(&Request::ListVolumes).map_err(|error| error.to_string())? {
-        Response::Volumes { volumes } => Ok(volumes),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn recent_audit(limit: u32) -> Result<Vec<Record>, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetRecentAudit { limit })
+            .map_err(|error| error.to_string())?
+        {
+            Response::RecentAudit { entries } => Ok(entries),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn list_volumes() -> Result<Vec<Volume>, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::ListVolumes).map_err(|error| error.to_string())? {
+            Response::Volumes { volumes } => Ok(volumes),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Measure a directory tree.
 ///
-/// Takes about a minute on a full system drive, and the agent serves each
-/// connection on its own thread, so the shell stays responsive while this runs.
+/// Takes about a minute on a full system drive. The agent serves each
+/// connection on its own thread and this waits off the window's thread, so
+/// the window stays responsive while it runs.
 #[tauri::command]
-fn scan_path(path: String) -> Result<Scan, String> {
-    match kam_ipc::client::call(&Request::ScanPath { path }).map_err(|error| error.to_string())? {
-        Response::Scan(scan) => Ok(*scan),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn scan_path(path: String) -> Result<Scan, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::ScanPath { path })
+            .map_err(|error| error.to_string())?
+        {
+            Response::Scan(scan) => Ok(*scan),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// What every installed application really occupies.
@@ -80,30 +112,33 @@ fn scan_path(path: String) -> Result<Scan, String> {
 /// Needs a privileged agent, and takes a couple of seconds — it reads the whole
 /// master file table to answer.
 #[tauri::command]
-fn list_applications(drive: String) -> Result<ApplicationReport, String> {
-    match kam_ipc::client::call(&Request::ListApplications { drive })
-        .map_err(|error| error.to_string())?
-    {
-        Response::Applications {
-            apps,
-            summary,
-            orphans,
-            orphan_summary,
-            downloads,
-            download_summary,
-            timings,
-        } => Ok(ApplicationReport {
-            apps,
-            summary,
-            orphans,
-            orphan_summary,
-            downloads,
-            download_summary,
-            timings,
-        }),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn list_applications(drive: String) -> Result<ApplicationReport, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::ListApplications { drive })
+            .map_err(|error| error.to_string())?
+        {
+            Response::Applications {
+                apps,
+                summary,
+                orphans,
+                orphan_summary,
+                downloads,
+                download_summary,
+                timings,
+            } => Ok(ApplicationReport {
+                apps,
+                summary,
+                orphans,
+                orphan_summary,
+                downloads,
+                download_summary,
+                timings,
+            }),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Everything one read of the master file table produced, in one reply.
@@ -129,10 +164,13 @@ struct ApplicationReport {
 /// Every size in the result is the installer's own claim. Nothing has been
 /// measured, and the interface says so rather than showing a zero.
 #[tauri::command]
-fn list_applications_preview() -> Result<Vec<AppFootprint>, String> {
-    Ok(kam_storage::apps::registry_listing(
-        &kam_core::UserContext::current(),
-    ))
+async fn list_applications_preview() -> Result<Vec<AppFootprint>, String> {
+    off_the_window(move || {
+        Ok(kam_storage::apps::registry_listing(
+            &kam_core::UserContext::current(),
+        ))
+    })
+    .await
 }
 
 /// Byte-for-byte duplicate files.
@@ -203,12 +241,15 @@ async fn defender_scan(
 /// true. Runs in the agent because the baseline has to live where a non-admin
 /// cannot edit it.
 #[tauri::command]
-fn sweep_for_changes() -> Result<kam_core::changes::Sweep, String> {
-    match kam_ipc::client::call(&Request::SweepForChanges).map_err(|error| error.to_string())? {
-        Response::Changes(sweep) => Ok(sweep),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn sweep_for_changes() -> Result<kam_core::changes::Sweep, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::SweepForChanges).map_err(|error| error.to_string())? {
+            Response::Changes(sweep) => Ok(sweep),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Send one thing to the Recycle Bin.
@@ -222,35 +263,38 @@ fn sweep_for_changes() -> Result<kam_core::changes::Sweep, String> {
 /// Windows does silently for items too large for it. The window must say so
 /// rather than repeating the reassurance.
 #[tauri::command]
-fn recycle_item(path: String) -> Result<RecycleOutcome, String> {
-    let outcome = recycle::to_recycle_bin(std::path::Path::new(&path))?;
+async fn recycle_item(path: String) -> Result<RecycleOutcome, String> {
+    off_the_window(move || {
+        let outcome = recycle::to_recycle_bin(std::path::Path::new(&path))?;
 
-    // Recorded after the fact, and only after it worked.
-    //
-    // The agent no longer witnesses this act, so the log would otherwise hold
-    // some removals and not others with nothing marking which. Asking it to
-    // record the report closes that, and the entry it writes says the window
-    // reported it rather than that the agent did it.
-    //
-    // The order matters: a record written first would claim something that had
-    // not happened yet, and a failure between the two would leave a log saying
-    // a file went to the bin when it is still on disk. This way the log can
-    // only ever lag reality, never lead it.
-    //
-    // A failure to record is not a failure to recycle, and reporting it as one
-    // would be a lie in the other direction. It is logged where the developer
-    // can see it and the person is told what actually happened to their file.
-    if let Err(error) = kam_ipc::client::call(&Request::RecordRecycle {
-        path,
-        in_bin: outcome.in_bin,
-    }) {
-        eprintln!("the recycle could not be recorded in the audit log: {error}");
-    }
+        // Recorded after the fact, and only after it worked.
+        //
+        // The agent no longer witnesses this act, so the log would otherwise hold
+        // some removals and not others with nothing marking which. Asking it to
+        // record the report closes that, and the entry it writes says the window
+        // reported it rather than that the agent did it.
+        //
+        // The order matters: a record written first would claim something that had
+        // not happened yet, and a failure between the two would leave a log saying
+        // a file went to the bin when it is still on disk. This way the log can
+        // only ever lag reality, never lead it.
+        //
+        // A failure to record is not a failure to recycle, and reporting it as one
+        // would be a lie in the other direction. It is logged where the developer
+        // can see it and the person is told what actually happened to their file.
+        if let Err(error) = kam_ipc::client::call(&Request::RecordRecycle {
+            path,
+            in_bin: outcome.in_bin,
+        }) {
+            eprintln!("the recycle could not be recorded in the audit log: {error}");
+        }
 
-    Ok(RecycleOutcome {
-        in_bin: outcome.in_bin,
-        warning: outcome.warning,
+        Ok(RecycleOutcome {
+            in_bin: outcome.in_bin,
+            warning: outcome.warning,
+        })
     })
+    .await
 }
 
 /// For each item, whether this account could remove it itself.
@@ -283,14 +327,17 @@ struct RecycleOutcome {
 /// There is no undo, which is why the interface asks first and why this is a
 /// separate command rather than a flag on restore.
 #[tauri::command]
-fn delete_quarantined(id: String) -> Result<Removal, String> {
-    finish_removal(kam_ipc::client::call(&Request::DeleteQuarantined { id }))
+async fn delete_quarantined(id: String) -> Result<Removal, String> {
+    off_the_window(move || {
+        finish_removal(kam_ipc::client::call(&Request::DeleteQuarantined { id }))
+    })
+    .await
 }
 
 /// Delete everything currently held.
 #[tauri::command]
-fn empty_quarantine() -> Result<Removal, String> {
-    finish_removal(kam_ipc::client::call(&Request::EmptyQuarantine))
+async fn empty_quarantine() -> Result<Removal, String> {
+    off_the_window(move || finish_removal(kam_ipc::client::call(&Request::EmptyQuarantine))).await
 }
 
 #[derive(serde::Serialize)]
@@ -318,12 +365,15 @@ fn finish_removal(reply: kam_core::Result<Response>) -> Result<Removal, String> 
 
 /// Whether a weekly check is registered, and when it runs.
 #[tauri::command]
-fn schedule() -> Result<kam_schedule::Schedule, String> {
-    match kam_ipc::client::call(&Request::GetSchedule).map_err(|error| error.to_string())? {
-        Response::Schedule(schedule) => Ok(schedule),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn schedule() -> Result<kam_schedule::Schedule, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetSchedule).map_err(|error| error.to_string())? {
+            Response::Schedule(schedule) => Ok(schedule),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Turn the weekly check on or off.
@@ -332,34 +382,47 @@ fn schedule() -> Result<kam_schedule::Schedule, String> {
 /// agent's decision, because this registers something that runs elevated on a
 /// timer.
 #[tauri::command]
-fn set_schedule(enabled: bool, day: String, hour: u8) -> Result<kam_schedule::Schedule, String> {
-    match kam_ipc::client::call(&Request::SetSchedule { enabled, day, hour })
-        .map_err(|error| error.to_string())?
-    {
-        Response::Schedule(schedule) => Ok(schedule),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn set_schedule(
+    enabled: bool,
+    day: String,
+    hour: u8,
+) -> Result<kam_schedule::Schedule, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::SetSchedule { enabled, day, hour })
+            .map_err(|error| error.to_string())?
+        {
+            Response::Schedule(schedule) => Ok(schedule),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Run the check now rather than waiting for the schedule.
 #[tauri::command]
-fn run_check() -> Result<Vec<kam_ipc::CheckFinding>, String> {
-    match kam_ipc::client::call(&Request::RunCheck).map_err(|error| error.to_string())? {
-        Response::Checked { findings } => Ok(findings),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn run_check() -> Result<Vec<kam_ipc::CheckFinding>, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::RunCheck).map_err(|error| error.to_string())? {
+            Response::Checked { findings } => Ok(findings),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Every cache and scratch directory holding anything, largest first.
 #[tauri::command]
-fn survey_caches() -> Result<Vec<kam_storage::Cache>, String> {
-    match kam_ipc::client::call(&Request::SurveyCaches).map_err(|error| error.to_string())? {
-        Response::Caches { caches } => Ok(caches),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn survey_caches() -> Result<Vec<kam_storage::Cache>, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::SurveyCaches).map_err(|error| error.to_string())? {
+            Response::Caches { caches } => Ok(caches),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Empty one of them.
@@ -404,18 +467,21 @@ async fn clear_cache(id: String) -> Result<kam_storage::Cleared, String> {
 /// being wrong about a duplicate costs data, so being wrong here costs a press
 /// of "put back" instead.
 #[tauri::command]
-fn quarantine_copy(path: String, reason: String, chosen: bool) -> Result<Manifest, String> {
-    match kam_ipc::client::call(&Request::QuarantineCopy {
-        path,
-        reason,
-        chosen,
+async fn quarantine_copy(path: String, reason: String, chosen: bool) -> Result<Manifest, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::QuarantineCopy {
+            path,
+            reason,
+            chosen,
+        })
+        .map_err(|error| error.to_string())?
+        {
+            Response::Quarantined(manifest) => Ok(manifest),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
     })
-    .map_err(|error| error.to_string())?
-    {
-        Response::Quarantined(manifest) => Ok(manifest),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+    .await
 }
 
 /// Move a leftover directory into quarantine.
@@ -423,34 +489,43 @@ fn quarantine_copy(path: String, reason: String, chosen: bool) -> Result<Manifes
 /// The agent re-checks the path against its own fence, so this is a request
 /// rather than an instruction.
 #[tauri::command]
-fn quarantine_path(path: String, reason: String) -> Result<Manifest, String> {
-    match kam_ipc::client::call(&Request::QuarantinePath { path, reason })
-        .map_err(|error| error.to_string())?
-    {
-        Response::Quarantined(manifest) => Ok(manifest),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn quarantine_path(path: String, reason: String) -> Result<Manifest, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::QuarantinePath { path, reason })
+            .map_err(|error| error.to_string())?
+        {
+            Response::Quarantined(manifest) => Ok(manifest),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
-fn list_quarantine() -> Result<Vec<Manifest>, String> {
-    match kam_ipc::client::call(&Request::ListQuarantine).map_err(|error| error.to_string())? {
-        Response::QuarantineList { items } => Ok(items),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn list_quarantine() -> Result<Vec<Manifest>, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::ListQuarantine).map_err(|error| error.to_string())? {
+            Response::QuarantineList { items } => Ok(items),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
-fn restore_quarantined(id: String) -> Result<Manifest, String> {
-    match kam_ipc::client::call(&Request::RestoreQuarantined { id })
-        .map_err(|error| error.to_string())?
-    {
-        Response::Quarantined(manifest) => Ok(manifest),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn restore_quarantined(id: String) -> Result<Manifest, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::RestoreQuarantined { id })
+            .map_err(|error| error.to_string())?
+        {
+            Response::Quarantined(manifest) => Ok(manifest),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Open Explorer with a file or folder selected.
@@ -461,40 +536,46 @@ fn restore_quarantined(id: String) -> Result<Manifest, String> {
 /// The shell already runs as the user, which is who should be looking at their
 /// own files.
 #[tauri::command]
-fn reveal_in_explorer(path: String) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
+async fn reveal_in_explorer(path: String) -> Result<(), String> {
+    off_the_window(move || {
+        use std::os::windows::process::CommandExt;
 
-    let target = std::path::Path::new(&path);
-    if !target.is_absolute() {
-        return Err("only an absolute path can be revealed".to_owned());
-    }
-    // A quote in the path would end the argument early and let the rest be read
-    // as further switches to explorer.
-    if path.contains('"') {
-        return Err("that path cannot be opened safely".to_owned());
-    }
-    if !target.exists() {
-        return Err(format!("{path} is no longer there"));
-    }
+        let target = std::path::Path::new(&path);
+        if !target.is_absolute() {
+            return Err("only an absolute path can be revealed".to_owned());
+        }
+        // A quote in the path would end the argument early and let the rest be read
+        // as further switches to explorer.
+        if path.contains('"') {
+            return Err("that path cannot be opened safely".to_owned());
+        }
+        if !target.exists() {
+            return Err(format!("{path} is no longer there"));
+        }
 
-    // explorer.exe parses its own command line rather than using argv, so the
-    // argument is passed raw with the quoting it expects.
-    std::process::Command::new("explorer.exe")
-        .raw_arg(format!("/select,\"{path}\""))
-        .spawn()
-        .map_err(|error| format!("could not open Explorer: {error}"))?;
-    Ok(())
+        // explorer.exe parses its own command line rather than using argv, so the
+        // argument is passed raw with the quoting it expects.
+        std::process::Command::new("explorer.exe")
+            .raw_arg(format!("/select,\"{path}\""))
+            .spawn()
+            .map_err(|error| format!("could not open Explorer: {error}"))?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-fn find_organise_proposals(drive: String) -> Result<OrganiseReport, String> {
-    match kam_ipc::client::call(&Request::FindOrganiseProposals { drive })
-        .map_err(|error| error.to_string())?
-    {
-        Response::Organise { proposals, summary } => Ok(OrganiseReport { proposals, summary }),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn find_organise_proposals(drive: String) -> Result<OrganiseReport, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::FindOrganiseProposals { drive })
+            .map_err(|error| error.to_string())?
+        {
+            Response::Organise { proposals, summary } => Ok(OrganiseReport { proposals, summary }),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 #[derive(serde::Serialize)]
@@ -504,41 +585,53 @@ struct OrganiseReport {
 }
 
 #[tauri::command]
-fn apply_move(from: String, to: String) -> Result<MoveRecord, String> {
-    match kam_ipc::client::call(&Request::ApplyMove { from, to })
-        .map_err(|error| error.to_string())?
-    {
-        Response::Moved(record) => Ok(record),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn apply_move(from: String, to: String) -> Result<MoveRecord, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::ApplyMove { from, to })
+            .map_err(|error| error.to_string())?
+        {
+            Response::Moved(record) => Ok(record),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
-fn undo_move(id: String) -> Result<MoveRecord, String> {
-    match kam_ipc::client::call(&Request::UndoMove { id }).map_err(|error| error.to_string())? {
-        Response::Moved(record) => Ok(record),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn undo_move(id: String) -> Result<MoveRecord, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::UndoMove { id }).map_err(|error| error.to_string())? {
+            Response::Moved(record) => Ok(record),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
-fn list_moves() -> Result<Vec<MoveRecord>, String> {
-    match kam_ipc::client::call(&Request::ListMoves).map_err(|error| error.to_string())? {
-        Response::Moves { records } => Ok(records),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn list_moves() -> Result<Vec<MoveRecord>, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::ListMoves).map_err(|error| error.to_string())? {
+            Response::Moves { records } => Ok(records),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
-fn defender_status() -> Result<DefenderReport, String> {
-    match kam_ipc::client::call(&Request::GetDefenderStatus).map_err(|e| e.to_string())? {
-        Response::Defender { status, concerns } => Ok(DefenderReport { status, concerns }),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn defender_status() -> Result<DefenderReport, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetDefenderStatus).map_err(|e| e.to_string())? {
+            Response::Defender { status, concerns } => Ok(DefenderReport { status, concerns }),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 #[derive(serde::Serialize)]
@@ -548,12 +641,15 @@ struct DefenderReport {
 }
 
 #[tauri::command]
-fn defender_threats() -> Result<Vec<Threat>, String> {
-    match kam_ipc::client::call(&Request::GetDefenderThreats).map_err(|e| e.to_string())? {
-        Response::DefenderThreats { threats } => Ok(threats),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn defender_threats() -> Result<Vec<Threat>, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetDefenderThreats).map_err(|e| e.to_string())? {
+            Response::DefenderThreats { threats } => Ok(threats),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 #[derive(serde::Serialize)]
@@ -568,40 +664,49 @@ struct BehaviourReport {
 /// Read-only, like everything the watcher exposes: it reports what appeared and
 /// why, and there is deliberately no command that acts on the result.
 #[tauri::command]
-fn behaviour_events() -> Result<BehaviourReport, String> {
-    match kam_ipc::client::call(&Request::GetBehaviourEvents).map_err(|e| e.to_string())? {
-        Response::BehaviourEvents {
-            observations,
-            watching,
-            since,
-        } => Ok(BehaviourReport {
-            observations,
-            watching,
-            since,
-        }),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn behaviour_events() -> Result<BehaviourReport, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetBehaviourEvents).map_err(|e| e.to_string())? {
+            Response::BehaviourEvents {
+                observations,
+                watching,
+                since,
+            } => Ok(BehaviourReport {
+                observations,
+                watching,
+                since,
+            }),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Every browser extension installed, and what each one may read.
 #[tauri::command]
-fn browser_extensions() -> Result<kam_scanner::extensions::Report, String> {
-    match kam_ipc::client::call(&Request::GetExtensions).map_err(|e| e.to_string())? {
-        Response::Extensions(report) => Ok(report),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn browser_extensions() -> Result<kam_scanner::extensions::Report, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetExtensions).map_err(|e| e.to_string())? {
+            Response::Extensions(report) => Ok(report),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Which of Defender's free hardening rules are actually switched on.
 #[tauri::command]
-fn hardening() -> Result<kam_scanner::hardening::Report, String> {
-    match kam_ipc::client::call(&Request::GetHardening).map_err(|e| e.to_string())? {
-        Response::Hardening(report) => Ok(*report),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn hardening() -> Result<kam_scanner::hardening::Report, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetHardening).map_err(|e| e.to_string())? {
+            Response::Hardening(report) => Ok(*report),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Turn one hardening protection on, or off.
@@ -623,12 +728,15 @@ async fn set_hardening(
 
 /// Whether the protective work is running.
 #[tauri::command]
-fn protection() -> Result<bool, String> {
-    match kam_ipc::client::call(&Request::GetProtection).map_err(|e| e.to_string())? {
-        Response::Protection { enabled } => Ok(enabled),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn protection() -> Result<bool, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetProtection).map_err(|e| e.to_string())? {
+            Response::Protection { enabled } => Ok(enabled),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Turn the protective work on or off.
@@ -647,22 +755,28 @@ async fn set_protection(enabled: bool) -> Result<bool, String> {
 
 /// What decoys are planted, and anything that has read one.
 #[tauri::command]
-fn canaries() -> Result<kam_canary::Report, String> {
-    match kam_ipc::client::call(&Request::GetCanaries).map_err(|e| e.to_string())? {
-        Response::Canaries(report) => Ok(*report),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn canaries() -> Result<kam_canary::Report, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetCanaries).map_err(|e| e.to_string())? {
+            Response::Canaries(report) => Ok(*report),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Plant the decoys, or take them away.
 #[tauri::command]
-fn set_canaries(planted: bool) -> Result<kam_canary::Report, String> {
-    match kam_ipc::client::call(&Request::SetCanaries { planted }).map_err(|e| e.to_string())? {
-        Response::Canaries(report) => Ok(*report),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn set_canaries(planted: bool) -> Result<kam_canary::Report, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::SetCanaries { planted }).map_err(|e| e.to_string())? {
+            Response::Canaries(report) => Ok(*report),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Turn Windows' file-access auditing on or off.
@@ -737,36 +851,45 @@ async fn stream_job<T: Send + 'static>(
 /// afterwards the registry entry is gone and there is nothing left to measure
 /// from. The agent fences them regardless of what is sent.
 #[tauri::command]
-fn find_remnants(
+async fn find_remnants(
     name: String,
     paths: Vec<String>,
     kinds: Vec<kam_storage::apps::LocationKind>,
 ) -> Result<kam_storage::remnants::Remnants, String> {
-    match kam_ipc::client::call(&Request::FindRemnants { name, paths, kinds })
-        .map_err(|error| error.to_string())?
-    {
-        Response::Remnants(report) => Ok(*report),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::FindRemnants { name, paths, kinds })
+            .map_err(|error| error.to_string())?
+        {
+            Response::Remnants(report) => Ok(*report),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
-fn firewall() -> Result<kam_firewall::policy::FirewallReport, String> {
-    match kam_ipc::client::call(&Request::GetFirewall).map_err(|e| e.to_string())? {
-        Response::Firewall(report) => Ok(*report),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn firewall() -> Result<kam_firewall::policy::FirewallReport, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetFirewall).map_err(|e| e.to_string())? {
+            Response::Firewall(report) => Ok(*report),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
-fn connections() -> Result<kam_firewall::connections::ConnectionReport, String> {
-    match kam_ipc::client::call(&Request::GetConnections).map_err(|e| e.to_string())? {
-        Response::Connections(report) => Ok(report),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn connections() -> Result<kam_firewall::connections::ConnectionReport, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetConnections).map_err(|e| e.to_string())? {
+            Response::Connections(report) => Ok(report),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Stop a program reaching the network.
@@ -796,12 +919,15 @@ async fn unblock_program(rule: String) -> Result<(), String> {
 
 /// Ask a running job to stop.
 #[tauri::command]
-fn cancel_job(job: String) -> Result<(), String> {
-    match kam_ipc::client::call(&Request::CancelJob { job }).map_err(|e| e.to_string())? {
-        Response::Acknowledged => Ok(()),
-        Response::Error { message } => Err(message),
-        other => Err(unexpected(&other)),
-    }
+async fn cancel_job(job: String) -> Result<(), String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::CancelJob { job }).map_err(|e| e.to_string())? {
+            Response::Acknowledged => Ok(()),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
 }
 
 /// Match the bundled YARA rules against files the agent identified.
@@ -893,17 +1019,20 @@ async fn virustotal_lookup(path: String) -> Result<kam_virustotal::Verdict, Stri
 /// uninstaller was started when it was not, which is a smaller lie than the
 /// reverse -- an application removed with no record of who removed it.
 #[tauri::command]
-fn run_uninstaller(name: String, command: String) -> Result<(), String> {
-    let noted = kam_ipc::client::call(&Request::NoteUninstallLaunched {
-        name,
-        command: command.clone(),
-    });
-    if let Err(error) = noted {
-        // Not fatal. Refusing to uninstall because the log is unreachable
-        // would be the audit trail holding the machine hostage.
-        eprintln!("could not record the uninstall in the audit log: {error}");
-    }
-    uninstall::run(&command)
+async fn run_uninstaller(name: String, command: String) -> Result<(), String> {
+    off_the_window(move || {
+        let noted = kam_ipc::client::call(&Request::NoteUninstallLaunched {
+            name,
+            command: command.clone(),
+        });
+        if let Err(error) = noted {
+            // Not fatal. Refusing to uninstall because the log is unreachable
+            // would be the audit trail holding the machine hostage.
+            eprintln!("could not record the uninstall in the audit log: {error}");
+        }
+        uninstall::run(&command)
+    })
+    .await
 }
 
 /// Version of the protocol this build speaks, so the UI can say plainly when it

@@ -42,7 +42,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
@@ -462,26 +462,61 @@ impl Default for PipeListener {
     }
 }
 
+/// How long a client waits for a free instance before giving up.
+///
+/// Every instance can be taken for a moment: the listener makes its next one
+/// only after handing the last to a worker, so when several requests start
+/// together all but the first find the name busy. Waiting for an instance is
+/// the documented way to handle that, and failing at once would turn an
+/// ordinary burst of requests into errors on screen. Five seconds is long
+/// enough for an instance to come free and short enough that a wedged agent is
+/// still reported as one.
+const CONNECT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Client end. Used by the shell, and by the integration tests.
 pub fn connect(name: &str) -> Result<PipeStream> {
     let path = full_pipe_path(name);
-    let handle = unsafe {
-        CreateFileW(
-            PCWSTR(path.as_ptr()),
-            CLIENT_ACCESS,
-            FILE_SHARE_MODE(0),
-            None,
-            OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(0),
-            None,
-        )
+    let deadline = std::time::Instant::now() + CONNECT_PATIENCE;
+    loop {
+        let opened = unsafe {
+            CreateFileW(
+                PCWSTR(path.as_ptr()),
+                CLIENT_ACCESS,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                None,
+            )
+        };
+        match opened {
+            Ok(handle) => {
+                return Ok(PipeStream {
+                    handle,
+                    is_server: false,
+                })
+            }
+            Err(error)
+                if error.code() == windows::Win32::Foundation::ERROR_PIPE_BUSY.to_hresult() =>
+            {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err(win32(error, "could not connect to the agent"));
+                }
+                let wait_ms = u32::try_from(left.as_millis()).unwrap_or(u32::MAX).max(1);
+                // Returns once an instance is listening, or when the wait runs
+                // out; either way the open is simply tried again. It fails at
+                // once if no instance exists at this instant, which is the
+                // listener between instances, so pause briefly instead.
+                if !unsafe { WaitNamedPipeW(PCWSTR(path.as_ptr()), wait_ms) }.as_bool() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            // Anything else, including the agent not running at all, is
+            // reported straight away as it always was.
+            Err(error) => return Err(win32(error, "could not connect to the agent")),
+        }
     }
-    .map_err(|error| win32(error, "could not connect to the agent"))?;
-
-    Ok(PipeStream {
-        handle,
-        is_server: false,
-    })
 }
 
 #[cfg(test)]
@@ -601,6 +636,75 @@ mod tests {
         }
 
         server.join().unwrap();
+    }
+
+    /// A busy pipe is waited for, not reported as a failure.
+    ///
+    /// The listener makes its next instance only after handing the last to a
+    /// worker, so requests started together find every instance taken for a
+    /// moment. Once the window's commands stopped queueing on its own thread
+    /// that became the ordinary case, and every request but the first would
+    /// have come back as "all pipe instances are busy".
+    #[test]
+    fn a_busy_pipe_is_waited_for_rather_than_reported_as_a_failure() {
+        let name = unique_name("busy");
+        let path = full_pipe_path(&name);
+
+        // Exactly one instance, so a second client finds it taken.
+        let only = unsafe {
+            CreateNamedPipeW(
+                PCWSTR(path.as_ptr()),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                PIPE_BUFFER_BYTES,
+                PIPE_BUFFER_BYTES,
+                PIPE_DEFAULT_TIMEOUT_MS,
+                None,
+            )
+        };
+        assert!(!only.is_invalid(), "the test could not create its pipe");
+
+        let first = connect(&name).expect("the first client should get the only instance");
+
+        // Free the instance a moment later, the way a finished request does.
+        // The handle crosses threads as a number because HANDLE is not Send.
+        let raw = only.0 as isize;
+        let freer = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(300));
+            let handle = HANDLE(raw as *mut core::ffi::c_void);
+            unsafe {
+                let _ = DisconnectNamedPipe(handle);
+                let _ = ConnectNamedPipe(handle, None);
+            }
+        });
+
+        let second = connect(&name);
+
+        // Without the fix `second` failed at once and the freer would wait for
+        // a client for ever. Give it one, so the test fails rather than hangs.
+        let mut rescue = None;
+        if second.is_err() {
+            for _ in 0..100 {
+                if let Ok(stream) = connect(&name) {
+                    rescue = Some(stream);
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        freer.join().unwrap();
+        drop(rescue);
+        drop(first);
+        unsafe {
+            let _ = CloseHandle(only);
+        }
+
+        assert!(
+            second.is_ok(),
+            "a client that found the pipe busy failed instead of waiting: {:?}",
+            second.err()
+        );
     }
 
     #[test]
