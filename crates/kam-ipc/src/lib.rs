@@ -599,4 +599,60 @@ mod tests {
                 .unwrap_or_else(|error| panic!("could not read {json}: {error}"));
         }
     }
+
+    /// What an uninstaller left, with the quarantine fence's answer per item.
+    ///
+    /// The shortcut is flattened into its entry beside the two new fields, so
+    /// this goes through serde and back for the same reason the manifest test
+    /// above does. And a remnant from an agent that never asked the fence
+    /// reads as "quarantine would not take it", never as "it would".
+    #[test]
+    fn a_leftover_report_survives_the_wire_and_an_unasked_item_reads_as_no() {
+        use kam_storage::remnants::{LeftoverShortcut, Remnant};
+        use kam_storage::shortcuts::{Place, Shortcut};
+
+        let report = RemnantReport {
+            name: "thing".to_owned(),
+            locations: vec![Remnant {
+                path: r"C:\Users\someone\AppData\Local\Thing".to_owned(),
+                bytes: 4096,
+                kind: LocationKind::LocalData,
+                partial: false,
+                files: 2,
+                quarantinable: true,
+                quarantine_refusal: None,
+            }],
+            shortcuts: vec![LeftoverShortcut {
+                shortcut: Shortcut {
+                    path: r"C:\Users\someone\Desktop\Thing.lnk".to_owned(),
+                    name: "Thing".to_owned(),
+                    place: Place::Desktop,
+                    target: None,
+                    app_id: None,
+                    broken: true,
+                    machine_wide: false,
+                    bytes: 1200,
+                },
+                quarantinable: false,
+                quarantine_refusal: Some("not inside a data root".to_owned()),
+            }],
+            total_bytes: 4096,
+            refused: Vec::new(),
+        };
+        round_trip(Response::Remnants(Box::new(report.clone())));
+
+        let wire = serde_json::to_value(&report).unwrap();
+        let shortcut = &wire["shortcuts"][0];
+        assert_eq!(shortcut["path"], r"C:\Users\someone\Desktop\Thing.lnk");
+        assert_eq!(shortcut["quarantinable"], false);
+        assert_eq!(shortcut["quarantine_refusal"], "not inside a data root");
+        assert_eq!(wire["locations"][0]["quarantinable"], true);
+
+        let unasked: Remnant = serde_json::from_value(serde_json::json!({
+            "path": "x", "bytes": 1, "kind": "local_data", "partial": false, "files": 1
+        }))
+        .unwrap();
+        assert!(!unasked.quarantinable);
+        assert!(unasked.quarantine_refusal.is_none());
+    }
 }
