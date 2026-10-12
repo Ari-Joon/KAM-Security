@@ -1,29 +1,113 @@
-//! The icon the taskbar draws for the open window.
+//! The icon the taskbar draws for the open window, and who the window says it is.
 //!
 //! Tauri hands a window only its *small* icon: `WM_SETICON` with `ICON_SMALL`,
 //! through tao's `set_window_icon`. It never sets the large one, which tao
-//! keeps behind a separate `set_taskbar_icon` that Tauri does not call. With
-//! no large icon on the window and none on its class, the taskbar falls back
-//! to whatever Explorer has cached for the executable or its pinned shortcut,
-//! which is one more thing that can go stale. The owner saw a blank page there
-//! after a deploy replaced the executable in place.
+//! keeps behind a separate `set_taskbar_icon` that Tauri does not call. So the
+//! window is given both icons directly, loaded at the sizes Windows asks for
+//! from the icon tauri-build embeds in this executable.
 //!
-//! So the window is given both icons directly, loaded at the sizes Windows
-//! asks for from the icon tauri-build embeds in this executable. Nothing
-//! outside the process is consulted.
+//! That was not enough on its own. The taskbar draws an application, not a
+//! window, and a window that does not say which application it belongs to is
+//! left for the taskbar to work out from the process. On the owner's machine
+//! that came out as a blank page every time, while the same executable drew
+//! correctly on the desktop and in every query made of the shell. Giving the
+//! window an explicit AppUserModel identity, with the icon and relaunch command
+//! that go with it, made the taskbar draw the logo at once; that was tried on
+//! the running window before it was written here. The identity is Tauri's own
+//! identifier, so notifications, a Start menu entry and a pinned shortcut can
+//! all name the same application.
 //!
 //! Failing here costs only the icon, so it is reported on stderr and otherwise
 //! ignored: the window still opens.
 
 use std::sync::OnceLock;
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use std::mem::ManuallyDrop;
+
+use windows::core::{GUID, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{E_OUTOFMEMORY, HWND, LPARAM, PROPERTYKEY, WPARAM};
+use windows::Win32::System::Com::CoTaskMemAlloc;
+use windows::Win32::System::Com::StructuredStorage::{
+    PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Variant::VT_LPWSTR;
+use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR,
     SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SYSTEM_METRICS_INDEX, WM_SETICON,
 };
+
+/// Who the window says it is, to the taskbar and to notifications.
+///
+/// Tauri's own identifier, so anything else that has to name this
+/// application (a notification, a Start menu shortcut) can use the same one.
+pub const APP_ID: &str = "com.kamsecurity.shell";
+
+/// The property set `PKEY_AppUserModel_*` belongs to.
+const APP_USER_MODEL: GUID = GUID::from_u128(0x9F4C2855_9F79_4B39_A8D0_E1D42DE1D5F3);
+
+/// Give the window an AppUserModel identity, with the icon and relaunch
+/// command that go with it, so the taskbar draws this application rather than
+/// guessing from the process.
+fn identify(hwnd: HWND) -> windows::core::Result<()> {
+    let exe = std::env::current_exe()
+        .map_err(|error| windows::core::Error::new(E_OUTOFMEMORY, error.to_string()))?;
+    let exe = exe.to_string_lossy();
+
+    // SAFETY: `hwnd` is a window this process created and still owns.
+    let store: IPropertyStore = unsafe { SHGetPropertyStoreForWindow(hwnd) }?;
+    // The identity goes last, so the taskbar regroups the window with the
+    // relaunch details already in place.
+    let properties = [
+        (2, format!("\"{exe}\"")),      // RelaunchCommand
+        (3, format!("{exe},0")),        // RelaunchIconResource
+        (4, "KAM Security".to_owned()), // RelaunchDisplayNameResource
+        (5, APP_ID.to_owned()),         // ID
+    ];
+    for (pid, value) in properties {
+        let key = PROPERTYKEY {
+            fmtid: APP_USER_MODEL,
+            pid,
+        };
+        let value = text(&value)?;
+        // SAFETY: both live across the call, and the store copies the value.
+        unsafe { store.SetValue(&key, &value) }?;
+    }
+    // SAFETY: as above.
+    unsafe { store.Commit() }
+}
+
+/// A `VT_LPWSTR` property value.
+///
+/// Not `PROPVARIANT::from(&str)`, which makes a `VT_BSTR`: the AppUserModel
+/// properties are documented as `VT_LPWSTR`, and that is the form shown to
+/// work here. The text is allocated from the COM allocator because
+/// `PROPVARIANT`'s `Drop` releases it with `PropVariantClear`, which frees it
+/// there.
+fn text(value: &str) -> windows::core::Result<PROPVARIANT> {
+    let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: a plain allocation, checked below.
+    let raw = unsafe { CoTaskMemAlloc(wide.len() * 2) }.cast::<u16>();
+    if raw.is_null() {
+        return Err(E_OUTOFMEMORY.into());
+    }
+    // SAFETY: `raw` has room for exactly `wide.len()` units.
+    unsafe { std::ptr::copy_nonoverlapping(wide.as_ptr(), raw, wide.len()) };
+    Ok(PROPVARIANT {
+        Anonymous: PROPVARIANT_0 {
+            Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
+                vt: VT_LPWSTR,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: PROPVARIANT_0_0_0 {
+                    pwszVal: PWSTR(raw),
+                },
+            }),
+        },
+    })
+}
 
 /// The resource id tauri-build gives the application icon.
 ///
@@ -51,6 +135,12 @@ pub fn apply(window: &tauri::WebviewWindow) {
             return;
         }
     };
+
+    // First, and whatever happens to the icons: this is what the taskbar
+    // actually needed.
+    if let Err(error) = identify(hwnd) {
+        eprintln!("could not tell the taskbar which application this window is: {error}");
+    }
 
     let Some((large, small)) = *ICONS.get_or_init(load) else {
         return;
