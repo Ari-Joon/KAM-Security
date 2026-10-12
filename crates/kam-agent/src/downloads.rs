@@ -45,6 +45,63 @@ fn work_folder(user: &UserContext) -> String {
     format!(r"{}\{}\work", user.local_app_data(), kam_core::PRODUCT_NAME)
 }
 
+/// Whether a path is a plain path on a lettered drive: `C:\...`, or the same
+/// with the `\\?\` prefix.
+///
+/// Checked before anything is resolved. Resolving `\\server\share\x` is a
+/// network connection made as LocalSystem: it can hold the agent for as long
+/// as Windows waits on a host that never answers, and to one that does it
+/// signs in as this machine's own account. Device paths (`\\.\`) and
+/// `\\?\UNC\` are not files a person downloaded either.
+fn on_a_drive(path: &str) -> bool {
+    let text = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let bytes = text.as_bytes();
+    bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+}
+
+/// Refuse anything but a plain drive path, for the file and for the original
+/// it is a copy of. See [`on_a_drive`].
+pub fn plain_paths(path: &str, copy_of: Option<&str>) -> Result<(), String> {
+    for candidate in std::iter::once(path).chain(copy_of) {
+        if !on_a_drive(candidate.trim()) {
+            return Err(format!(
+                "{candidate} is not a file on one of this PC's drives, so it was not checked"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether the caller could open these files themselves.
+///
+/// Run as the caller (`PipeStream::as_client`), before the handler reads
+/// anything as LocalSystem. The handler hands back a file's fingerprint, size,
+/// signer and download address, and for a file the person could not open each
+/// of those is something this service would be telling them that Windows
+/// would not. A list of forbidden folders always misses one; asking Windows on
+/// the person's behalf cannot.
+///
+/// The original of a working copy may already be in quarantine, where it is
+/// simply not found, and then nothing of it is read. Found and refused is a
+/// refusal.
+pub fn caller_can_read(path: &str, copy_of: Option<&str>) -> Result<(), String> {
+    std::fs::File::open(path).map_err(|error| {
+        format!("{path} was not checked, because your account cannot open it ({error})")
+    })?;
+    if let Some(original) = copy_of {
+        match std::fs::File::open(original.trim()) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "{original} was not read, because your account cannot open it ({error})"
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Decide whether a path may be checked for this caller, and where it leads.
 ///
 /// Any file the person chose, on any lettered drive, except inside another
@@ -53,10 +110,37 @@ fn work_folder(user: &UserContext) -> String {
 /// download address, which for somebody else's file is not the caller's to
 /// ask. A private working copy must be inside the caller's own work folder.
 fn checkable(path: &str, copy_of: Option<&str>, user: &UserContext) -> Result<String, String> {
+    // Before anything is resolved: see `on_a_drive`.
+    plain_paths(path, copy_of)?;
     let target = Path::new(path);
     if !target.is_absolute() {
         return Err(format!("{path} is not a full path, so it was not checked"));
     }
+
+    // The original of a working copy is read as well (its creation time and
+    // its download address), so it is held to the same rule as the file. It
+    // was the one thing nothing fenced: a copy in the caller's own work folder
+    // could name another account's download as its original.
+    if let Some(original) = copy_of.map(str::trim) {
+        let judged = std::fs::canonicalize(original)
+            .map(|real| {
+                let text = real.to_string_lossy().into_owned();
+                text.strip_prefix(r"\\?\")
+                    .map(str::to_owned)
+                    .unwrap_or(text)
+            })
+            .unwrap_or_else(|_| original.to_owned());
+        if let Some(refusal) = kam_storage::duplicates::reach_refusal(&judged, original, user) {
+            return Err(format!(
+                "{original} was not read. {}",
+                refusal.replace(
+                    "move another account's files",
+                    "read another account's files"
+                )
+            ));
+        }
+    }
+
     let real = std::fs::canonicalize(target)
         .map_err(|error| format!("{path} could not be found ({error}), so it was not checked"))?;
     let text = real.to_string_lossy().into_owned();
@@ -629,6 +713,113 @@ mod tests {
     fn text_from_the_window_is_flattened_and_cut() {
         assert_eq!(clipped("a\nb", 10), "a b");
         assert_eq!(clipped(&"x".repeat(20), 5), "xxxxx…");
+    }
+
+    #[test]
+    fn only_plain_drive_paths_are_checked() {
+        // Network shares, device paths and relative names are refused before
+        // anything is resolved, for the file and for its original alike.
+        for refused in [
+            r"\\server\share\x.zip",
+            r"\\?\UNC\server\share\x.zip",
+            r"\\.\pipe\kam",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\x.zip",
+            "x.zip",
+            "",
+        ] {
+            assert!(
+                plain_paths(refused, None).is_err(),
+                "{refused:?} was accepted"
+            );
+            assert!(
+                plain_paths(r"C:\Users\x\Downloads\a.zip", Some(refused)).is_err(),
+                "{refused:?} was accepted as the original"
+            );
+        }
+        assert!(plain_paths(r"C:\Users\x\Downloads\a.zip", None).is_ok());
+        assert!(plain_paths(r"\\?\D:\a.zip", Some(r"C:\a.zip")).is_ok());
+    }
+
+    #[test]
+    fn a_network_path_is_refused_without_being_resolved() {
+        // Red review: resolving this would make LocalSystem wait on the
+        // network, or sign in as the machine to whatever answered. The address
+        // is reserved for documentation and never routes.
+        let started = std::time::Instant::now();
+        let refusal =
+            checkable(r"\\192.0.2.1\share\x.zip", None, &UserContext::current()).unwrap_err();
+        assert!(
+            refusal.contains("not a file on one of this PC's drives"),
+            "{refusal}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the network path was resolved before it was refused"
+        );
+    }
+
+    #[test]
+    fn the_original_of_a_copy_cannot_be_another_accounts_file() {
+        // Red review: a copy in the caller's own work folder could name
+        // another account's download as its original, and the agent read that
+        // file's download address and creation time as LocalSystem.
+        let refusal = checkable(
+            r"C:\nowhere\copy.zip",
+            Some(r"C:\Users\Default\Downloads\secret.zip"),
+            &UserContext::current(),
+        )
+        .unwrap_err();
+        assert!(refusal.contains("was not read"), "{refusal}");
+    }
+
+    #[test]
+    fn a_file_the_caller_cannot_open_is_refused_and_one_they_can_is_not() {
+        let scratch =
+            std::env::temp_dir().join(format!("kam-unreadable-{}.bin", std::process::id()));
+        std::fs::write(&scratch, b"private").unwrap();
+        let path = scratch.to_string_lossy().into_owned();
+        assert!(
+            caller_can_read(&path, None).is_ok(),
+            "a readable file was refused"
+        );
+        // An original already moved into quarantine is simply not found.
+        assert!(caller_can_read(&path, Some(r"C:\nowhere\gone.zip")).is_ok());
+
+        let me = format!(
+            "{}\\{}",
+            std::env::var("USERDOMAIN").unwrap(),
+            std::env::var("USERNAME").unwrap()
+        );
+        let icacls = Path::new(&std::env::var("SystemRoot").unwrap())
+            .join("System32")
+            .join("icacls.exe");
+        let denied = std::process::Command::new(&icacls)
+            .arg(&scratch)
+            .args(["/deny", &format!("{me}:(R)")])
+            .output()
+            .unwrap();
+        let refused = caller_can_read(&path, None);
+        let refused_as_original = caller_can_read(r"C:\Windows\win.ini", Some(&path));
+
+        // Undo before asserting, so a failure leaves nothing locked behind.
+        let _ = std::process::Command::new(&icacls)
+            .arg(&scratch)
+            .args(["/remove:d", &me])
+            .output();
+        let _ = std::fs::remove_file(&scratch);
+
+        assert!(
+            denied.status.success(),
+            "could not deny the read: {denied:?}"
+        );
+        assert!(
+            refused.is_err(),
+            "a file the caller cannot open was accepted"
+        );
+        assert!(
+            refused_as_original.is_err(),
+            "an original the caller cannot open was accepted"
+        );
     }
 
     #[test]

@@ -149,6 +149,39 @@ pub struct PipeStream {
 unsafe impl Send for PipeStream {}
 
 impl PipeStream {
+    /// Run `work` with this thread acting as the process at the other end,
+    /// then return to the agent's own identity.
+    ///
+    /// For questions that have to be asked with the caller's rights rather than
+    /// LocalSystem's, such as whether the caller could open a file at all.
+    /// Windows allows it only on the server end, and only once something has
+    /// been read from the pipe, which every request has by the time it is
+    /// served. If Windows will not give the agent its own identity back the
+    /// process stops: carrying on as somebody else is the one outcome worse
+    /// than stopping, and the service restarts itself.
+    pub fn as_client<T>(&self, work: impl FnOnce() -> T) -> Result<T> {
+        if !self.is_server {
+            return Err(Error::Privileged(
+                "only the agent's end of a pipe can act as the other end".to_owned(),
+            ));
+        }
+        // SAFETY: the handle is this stream's own, connected server end.
+        unsafe { windows::Win32::System::Pipes::ImpersonateNamedPipeClient(self.handle) }
+            .map_err(|error| win32(error, "could not act as the caller"))?;
+
+        struct BackToSelf;
+        impl Drop for BackToSelf {
+            fn drop(&mut self) {
+                // SAFETY: no preconditions; reverts this thread's impersonation.
+                if unsafe { windows::Win32::Security::RevertToSelf() }.is_err() {
+                    std::process::abort();
+                }
+            }
+        }
+        let _back = BackToSelf;
+        Ok(work())
+    }
+
     /// Process id at the far end. Server side only.
     pub fn client_process_id(&self) -> Result<u32> {
         let mut process_id = 0_u32;
@@ -704,6 +737,65 @@ mod tests {
             second.is_ok(),
             "a client that found the pipe busy failed instead of waiting: {:?}",
             second.err()
+        );
+    }
+
+    /// The agent can ask a question as the caller and is itself again after.
+    ///
+    /// Used to check that a caller could open a file before the agent reads it
+    /// as LocalSystem. Windows allows it only once something has been read from
+    /// the pipe, so the client sends a request first, as every real one does.
+    #[test]
+    fn the_server_can_act_as_its_client_and_come_back() {
+        let name = unique_name("asclient");
+        let listener = PipeListener::with_name(name.clone());
+
+        let server = thread::spawn(move || {
+            let mut stream = listener.accept().unwrap();
+            let _: Request = read_frame(&mut stream).unwrap();
+            let acting_as_someone = || {
+                let mut token = HANDLE::default();
+                // SAFETY: the current thread's pseudo-handle; a token opened
+                // here is closed straight away.
+                let held = unsafe {
+                    windows::Win32::System::Threading::OpenThreadToken(
+                        windows::Win32::System::Threading::GetCurrentThread(),
+                        TOKEN_QUERY,
+                        true,
+                        &mut token,
+                    )
+                }
+                .is_ok();
+                if held {
+                    unsafe {
+                        let _ = CloseHandle(token);
+                    }
+                }
+                held
+            };
+            let during = stream.as_client(acting_as_someone).unwrap();
+            let after = acting_as_someone();
+            (during, after)
+        });
+
+        let mut client = None;
+        for _ in 0..50 {
+            match connect(&name) {
+                Ok(stream) => {
+                    client = Some(stream);
+                    break;
+                }
+                Err(_) => thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut client = client.expect("the listener never came up");
+        write_frame(&mut client, &Request::GetSystemStatus).unwrap();
+
+        let (during, after) = server.join().unwrap();
+        assert!(during, "the work did not run as the client");
+        assert!(
+            !after,
+            "the thread was still acting as the client afterwards"
         );
     }
 

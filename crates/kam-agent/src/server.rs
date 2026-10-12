@@ -175,6 +175,26 @@ fn handle_connection(
         )?;
         return Ok(());
     }
+    // A file is checked only if the caller could open it themselves. The
+    // handler reads it as LocalSystem and hands back its fingerprint, signer
+    // and download address, so without this the service would answer about
+    // files Windows would not let the caller see. Asked as the caller, on this
+    // thread, before any handler runs. Network and device paths are refused
+    // first, because even opening one reaches out over the network.
+    if let Request::CheckDownload { path, copy_of, .. } = &request {
+        let copy_of = copy_of.as_deref();
+        let verdict = crate::downloads::plain_paths(path, copy_of).and_then(|()| {
+            stream
+                .as_client(|| crate::downloads::caller_can_read(path, copy_of))
+                .unwrap_or_else(|error| Err(format!("{path} was not checked: {error}")))
+        });
+        if let Err(message) = verdict {
+            context.audit("downloads", "check", Effect::Refused, message.clone());
+            write_frame(stream, &Reply::Done(Response::Error { message }))?;
+            return Ok(());
+        }
+    }
+
     let response = run_request(stream, request, context, user);
     write_frame(stream, &Reply::Done(response))
 }

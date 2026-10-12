@@ -2263,11 +2263,14 @@ mod tests {
         let context = context(Mode::Service);
         let me = identified("S-1-5-21-0-0-0-4003");
         let file = scratch_file("copy", b"x");
+        // The original is under the caller's own profile, so it is the
+        // work-folder rule that refuses this. An original in somebody else's
+        // profile is refused earlier, by its own test in `downloads`.
         let response = handle(
             Request::CheckDownload {
                 path: file.to_string_lossy().into_owned(),
                 job: "test-job".to_owned(),
-                copy_of: Some(r"C:\Users\someone\Downloads\a.zip".to_owned()),
+                copy_of: Some(format!(r"{}\Downloads\a.zip", me.profile())),
             },
             &context,
             &Reporter::silent(),
