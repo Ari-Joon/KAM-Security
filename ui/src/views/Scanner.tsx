@@ -664,12 +664,19 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
               reached.
             </p>
           )}
+          {/* A finished scan that left a caveat, such as Defender ending
+              with a failure code, has not come back clean, so the clean
+              sentence gives way to the caveat. */}
           {outcome.found.length === 0 ? (
-            <p className="muted">
-              {outcome.completed
-                ? "Defender recorded nothing new."
-                : "Nothing was recorded in the part that ran."}
-            </p>
+            outcome.completed && outcome.caveat ? (
+              <p className="held-warn">{outcome.caveat}</p>
+            ) : (
+              <p className="muted">
+                {outcome.completed
+                  ? "Defender recorded nothing new."
+                  : "Nothing was recorded in the part that ran."}
+              </p>
+            )
           ) : (
             <>
               <p>
@@ -698,7 +705,10 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
               {definitionsAge(status.signature_age_days)}.
             </p>
           )}
-          {outcome.caveat && <p className="muted">{outcome.caveat}</p>}
+          {outcome.caveat &&
+            !(outcome.completed && outcome.found.length === 0) && (
+              <p className="muted">{outcome.caveat}</p>
+            )}
         </div>
       )}
     </section>

@@ -220,6 +220,31 @@ fn arguments(kind: &ScanKind, target: Option<&Path>) -> Vec<String> {
     arguments
 }
 
+/// What a non-zero exit means when the history shows nothing new.
+///
+/// This was said only for a scan of one path, so a quick or full scan that
+/// Defender could not finish, and said so in its exit code, read as
+/// "Defender recorded nothing new" exactly as a clean one does.
+fn exit_caveat(kind: &ScanKind, exit_code: Option<i32>) -> Option<String> {
+    let code = exit_code.filter(|code| *code != 0)?;
+    Some(match kind {
+        // Remediation is off for a single path, and with it Defender reports
+        // only in its own console output.
+        ScanKind::Path { .. } => format!(
+            "Defender finished with code {code}, which it uses when it finds \
+             something or cannot scan the file. A single-file scan leaves the file \
+             where it is and does not always record it, so check it with Windows \
+             Security before trusting it."
+        ),
+        ScanKind::Quick | ScanKind::Full => format!(
+            "Defender finished with code {code}, which it uses when it finds \
+             something or cannot finish the scan, but nothing new appeared in its \
+             detection history. This is not a clean result. Windows Security's \
+             Protection history and its own scan results say what happened."
+        ),
+    })
+}
+
 fn unread_after(error: &Error) -> String {
     format!(
         "Defender's detection history could not be read after the scan ({error}), so \
@@ -354,19 +379,12 @@ pub fn run(kind: &ScanKind, cancel: &AtomicBool) -> Result<ScanOutcome> {
         },
     }
 
-    // A single-path scan keeps remediation off, and with it Defender reports
-    // only in its own console output, which is not read for meaning. Its exit
-    // code is the one signal left, so a non-zero code is said out loud rather
-    // than shown as nothing found.
-    if let (ScanKind::Path { .. }, Some(code)) = (kind, exit_code) {
-        if code != 0 && found.is_empty() && caveat.is_none() {
-            caveat = Some(format!(
-                "Defender finished with code {code}, which it uses when it finds \
-                 something or cannot scan the file. A single-file scan leaves the file \
-                 where it is and does not always record it, so check it with Windows \
-                 Security before trusting it."
-            ));
-        }
+    // Defender's console output is not read for meaning, so its exit code is
+    // the one signal left about how the scan went. A non-zero code with
+    // nothing new in the history is said out loud rather than shown as
+    // nothing found.
+    if found.is_empty() && caveat.is_none() {
+        caveat = exit_caveat(kind, exit_code);
     }
 
     if completed && caveat.is_none() && !found.is_empty() {
@@ -465,6 +483,24 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A scan Defender ended with a failure code is never a clean result,
+    /// whichever kind of scan it was.
+    #[test]
+    fn a_non_zero_exit_is_said_for_every_kind_of_scan() {
+        for kind in [
+            ScanKind::Quick,
+            ScanKind::Full,
+            ScanKind::Path {
+                path: r"C:\x".to_owned(),
+            },
+        ] {
+            let caveat = exit_caveat(&kind, Some(2)).unwrap_or_default();
+            assert!(caveat.contains("code 2"), "{kind:?}: {caveat:?}");
+            assert_eq!(exit_caveat(&kind, Some(0)), None, "{kind:?}");
+            assert_eq!(exit_caveat(&kind, None), None, "{kind:?}");
+        }
     }
 
     /// Nothing a caller supplies can become a flag.
