@@ -2653,7 +2653,7 @@ dependencies = [
 
 [[package]]
 name = "kam-agent"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "kam-canary",
  "kam-core",
@@ -2673,7 +2673,7 @@ dependencies = [
 
 [[package]]
 name = "kam-canary"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "kam-core",
  "serde",
@@ -2683,7 +2683,7 @@ dependencies = [
 
 [[package]]
 name = "kam-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -2694,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "kam-firewall"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "kam-core",
  "kam-scanner",
@@ -2705,7 +2705,7 @@ dependencies = [
 
 [[package]]
 name = "kam-ipc"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "kam-canary",
  "kam-core",
@@ -2721,7 +2721,7 @@ dependencies = [
 
 [[package]]
 name = "kam-quarantine"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "kam-core",
  "serde",
@@ -2731,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "kam-rules"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "kam-core",
  "serde",
@@ -2741,7 +2741,7 @@ dependencies = [
 
 [[package]]
 name = "kam-scanner"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "kam-core",
  "kam-storage",
@@ -2753,7 +2753,7 @@ dependencies = [
 
 [[package]]
 name = "kam-schedule"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "kam-core",
  "serde",
@@ -2763,7 +2763,7 @@ dependencies = [
 
 [[package]]
 name = "kam-shell"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "kam-canary",
  "kam-core",
@@ -2786,7 +2786,7 @@ dependencies = [
 
 [[package]]
 name = "kam-storage"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "kam-core",
@@ -2797,7 +2797,7 @@ dependencies = [
 
 [[package]]
 name = "kam-virustotal"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "kam-core",
  "serde",
