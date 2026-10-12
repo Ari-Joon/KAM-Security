@@ -46,8 +46,10 @@ use std::io::Read;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
+use kam_core::registry::{Key, View};
 use kam_core::{Cancelled, Reporter, UserContext};
 use serde::{Deserialize, Serialize};
+use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 
 use crate::index::VolumeIndex;
 
@@ -470,6 +472,144 @@ pub enum Intent {
     Chosen,
 }
 
+/// Where Windows records every account's profile, and where profiles go.
+const PROFILE_LIST: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList";
+
+/// The folder under the profiles directory that every account shares.
+const SHARED_PROFILE: &str = "public";
+
+/// The places no removal reaches, whoever asks and however, for one caller.
+///
+/// Every entry is in [`crate::paths::plain`] form with no trailing separator,
+/// and every directory is held twice where it can be: as Windows names it and
+/// as it resolves. The path judged against them is always a resolved one, and
+/// a resolved path must meet resolved limits; see `paths::resolved_root` for
+/// why both sides matter.
+struct Limits {
+    /// The caller's own profile.
+    own: Vec<String>,
+    /// Directories that hold profiles: `C:\Users`, as the registry records it
+    /// and as the caller's own profile implies it.
+    containers: Vec<String>,
+    /// Every other profile Windows lists, wherever it lives. Catches one kept
+    /// outside the profiles directory, which the container rule cannot see.
+    others: Vec<String>,
+    /// This product's own store: quarantine, the audit record and the rest.
+    store: Vec<String>,
+}
+
+/// Both spellings of a directory, skipping one that is empty.
+fn both_spellings(path: &str, into: &mut Vec<String>) {
+    let text = crate::paths::plain(path).trim_end_matches('\\').to_owned();
+    if text.is_empty() {
+        return;
+    }
+    into.push(text);
+    if let Some(real) = crate::paths::existing_plain(path) {
+        into.push(real.trim_end_matches('\\').to_owned());
+    }
+}
+
+/// The components of `path` below `directory`, or `None` when it is not at or
+/// below it. Compared a component at a time, so `C:\Users2` is not below
+/// `C:\Users`.
+fn below<'a>(path: &'a str, directory: &str) -> Option<Vec<&'a str>> {
+    let mut parts = path.split('\\');
+    for expected in directory.split('\\') {
+        if parts.next()? != expected {
+            return None;
+        }
+    }
+    Some(parts.collect())
+}
+
+impl Limits {
+    fn for_caller(user: &UserContext) -> Self {
+        let mut own = Vec::new();
+        both_spellings(user.profile(), &mut own);
+
+        let mut containers = Vec::new();
+        let mut others = Vec::new();
+        if let Some(list) = Key::open(HKEY_LOCAL_MACHINE, PROFILE_LIST, View::Native) {
+            if let Some(directory) = list.string("ProfilesDirectory") {
+                both_spellings(&kam_core::env::expand(&directory), &mut containers);
+            }
+            for sid in list.subkey_names() {
+                let Some(image) = list
+                    .child(&sid)
+                    .and_then(|key| key.string("ProfileImagePath"))
+                else {
+                    continue;
+                };
+                both_spellings(&kam_core::env::expand(&image), &mut others);
+            }
+        }
+        // The caller's profile sits in the profiles directory too, which
+        // covers a machine whose registry could not be read.
+        if let Some(parent) = std::path::Path::new(user.profile()).parent() {
+            both_spellings(&parent.to_string_lossy(), &mut containers);
+        }
+        others.retain(|other| !own.contains(other));
+
+        let program_data =
+            std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_owned());
+        let mut store = Vec::new();
+        both_spellings(
+            &format!("{program_data}\\{}", kam_core::PRODUCT_NAME),
+            &mut store,
+        );
+
+        Self {
+            own,
+            containers,
+            others,
+            store,
+        }
+    }
+
+    /// Why a path may not be removed, if it may not.
+    ///
+    /// `plain` is where the path really leads, in plain form. `asked` is what
+    /// the caller sent and `resolved` the same place as Windows spelled it,
+    /// both only for the message.
+    fn refusal(&self, plain: &str, asked: &str, resolved: &str) -> Option<String> {
+        let path = plain.trim_end_matches('\\');
+        let what = format!("{asked} resolves to {resolved}, which");
+
+        if self.store.iter().any(|store| below(path, store).is_some()) {
+            return Some(format!(
+                "{what} is inside KAM Security's own store, which holds what is in \
+                 quarantine and the record of what was done. This is refused however \
+                 it is asked for."
+            ));
+        }
+
+        let foreign = format!(
+            "{what} is inside a profile folder that is not yours. The agent acts with \
+             the system's rights on your behalf, so it does not move another \
+             account's files, however it is asked."
+        );
+        // The caller's own profile first: it is inside the profiles directory
+        // too, and would otherwise look like anybody else's.
+        if self.own.iter().any(|own| below(path, own).is_some()) {
+            return None;
+        }
+        if self.others.iter().any(|other| below(path, other).is_some()) {
+            return Some(foreign);
+        }
+        for container in &self.containers {
+            // Something inside a folder of the profiles directory. A file
+            // sitting loose in `C:\Users` is in nobody's profile.
+            if let Some(rest) = below(path, container) {
+                if rest.len() >= 2 && rest[0] != SHARED_PROFILE {
+                    return Some(foreign);
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Decide whether one copy may be removed at all.
 ///
 /// The agent's fence, and it re-derives the answer rather than trusting the
@@ -486,19 +626,45 @@ pub enum Intent {
 /// those, correctly. Declining to guess is not the same as forbidding somebody
 /// who knows.
 ///
-/// So a chosen copy may be taken where a suggested one may not, with two
-/// limits that hold whatever anybody asks for:
+/// So a chosen copy may be taken where a suggested one may not, with limits
+/// that hold whatever anybody asks for:
 ///
 /// - **Windows' own files and the servicing store are never removed.** Taking
 ///   one breaks an update and Windows puts it back, so there is no upside to
 ///   weigh against the risk.
+/// - **Nothing inside another account's profile.** The agent does this as
+///   LocalSystem on behalf of whoever is on the other end of the pipe, and
+///   LocalSystem can reach every profile on the machine. A person choosing
+///   which copy to keep is deciding about their own files; it is not a way to
+///   move somebody else's. The shared `Public` folder is nobody's profile and
+///   stays reachable, as do Program Files, game libraries, ProgramData and
+///   other drives, which is the widening this was built for.
+/// - **Nothing inside this product's own store.** That is where quarantined
+///   items and the audit record live, and holding one of those in quarantine
+///   would be holding the evidence in the thing it is evidence about.
 /// - **It is still quarantine, not deletion.** The copy is moved, recorded,
 ///   and comes back with one press for thirty days. That is what makes it
 ///   reasonable to honour a choice this product would not have made itself.
+///
+/// The profile and store limits are judged on where the path really leads, so
+/// a junction in a folder of yours that points into somebody else's profile is
+/// refused like the profile itself, and a path that cannot be resolved at all
+/// is refused before any of it.
 pub fn check_removable(
     path: &str,
     user: &UserContext,
     intent: Intent,
+) -> std::result::Result<(), String> {
+    check_within(path, user, intent, &Limits::for_caller(user))
+}
+
+/// [`check_removable`] against limits given rather than read from the machine,
+/// so the store limit can be tested on a store that is not the real one.
+fn check_within(
+    path: &str,
+    user: &UserContext,
+    intent: Intent,
+    limits: &Limits,
 ) -> std::result::Result<(), String> {
     let owner = owner_of(path, user);
     match intent {
@@ -528,24 +694,42 @@ pub fn check_removable(
     //
     // The owner is then re-derived from the resolved path, so a name that
     // classified as harmless cannot be the one that gets acted on.
+    //
+    // A path that cannot be resolved is refused rather than judged by its
+    // text, as `paths::resolved` asks of every caller: something that cannot
+    // be located is not something to move as LocalSystem.
     let target = std::path::Path::new(path);
-    if let Ok(resolved) = std::fs::canonicalize(target) {
-        let resolved = resolved.to_string_lossy().into_owned();
-        let real = owner_of(&resolved, user);
-        if matches!(real, Owner::Windows | Owner::Servicing) {
+    let resolved = match std::fs::canonicalize(target) {
+        Ok(resolved) => resolved.to_string_lossy().into_owned(),
+        Err(error) => {
             return Err(format!(
-                "{path} resolves to {resolved}, which is {}. Windows puts these back \
-                 and removing one breaks an update, so this is refused.",
-                real.describes()
+                "{path} could not be located on disk ({error}), so it will not be touched"
             ));
         }
-        if intent == Intent::Suggested && !real.removable() {
-            return Err(format!(
-                "{path} resolves to {resolved}, which is {} -- only a copy in a folder \
-                 of yours may be removed this way",
-                real.describes()
-            ));
-        }
+    };
+    let real = owner_of(&resolved, user);
+    if matches!(real, Owner::Windows | Owner::Servicing) {
+        return Err(format!(
+            "{path} resolves to {resolved}, which is {}. Windows puts these back \
+             and removing one breaks an update, so this is refused.",
+            real.describes()
+        ));
+    }
+    if intent == Intent::Suggested && !real.removable() {
+        return Err(format!(
+            "{path} resolves to {resolved}, which is {} -- only a copy in a folder \
+             of yours may be removed this way",
+            real.describes()
+        ));
+    }
+    // The profile and store limits are judged here only, on where the path
+    // really leads. Judging the text as well would refuse a request that
+    // reaches the caller's own profile by a short name such as `RUNNER~1`,
+    // because that reads as some other folder of the profiles directory; and
+    // the text can add nothing, since a path that does not resolve has
+    // already been refused above.
+    if let Some(refusal) = limits.refusal(&crate::paths::plain(&resolved), path, &resolved) {
+        return Err(refusal);
     }
 
     let metadata = std::fs::symlink_metadata(target)
@@ -1079,6 +1263,255 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         // And once it is gone there is nothing to remove.
         assert!(check_removable(&path, &user, Intent::Suggested).is_err());
+    }
+
+    /// Limits written out by hand, so the rule itself can be read in one place.
+    fn limits(store: &str) -> Limits {
+        Limits {
+            own: vec![r"c:\users\someone".to_owned()],
+            containers: vec![r"c:\users".to_owned()],
+            others: vec![r"d:\profiles\elsewhere".to_owned()],
+            store: vec![store.to_owned()],
+        }
+    }
+
+    /// What the limits refuse, and the widening they leave exactly as it was.
+    #[test]
+    fn the_limits_refuse_other_profiles_and_the_store_and_nothing_else() {
+        let limits = limits(r"c:\programdata\kam security");
+        let refused = |path: &str| limits.refusal(path, path, path);
+
+        for path in [
+            r"c:\users\otherperson\downloads\holiday.mp4",
+            r"c:\users\otherperson\appdata\local\thing\blob.bin",
+            r"c:\users\default\ntuser.dat",
+            r"d:\profiles\elsewhere\documents\report.pdf",
+        ] {
+            let why = refused(path).unwrap_or_else(|| panic!("{path} was allowed"));
+            assert!(why.contains("not yours"), "unhelpful refusal: {why}");
+        }
+        for path in [
+            r"c:\programdata\kam security\quarantine\1700000000-0001\payload",
+            r"c:\programdata\kam security\kam.db",
+        ] {
+            let why = refused(path).unwrap_or_else(|| panic!("{path} was allowed"));
+            assert!(why.contains("own store"), "unhelpful refusal: {why}");
+        }
+
+        // The widening the owner chose, untouched, and the caller's own files.
+        for path in [
+            r"c:\users\someone\downloads\holiday.mp4",
+            r"c:\users\someone\appdata\local\thing\blob.bin",
+            r"c:\users\public\videos\holiday.mp4",
+            r"c:\program files\thing\shared.dll",
+            r"c:\program files (x86)\steam\steamapps\common\game\data.pak",
+            r"c:\programdata\vendor\cache.bin",
+            r"d:\games\something\data.bin",
+            // In nobody's profile, and not a profile's name.
+            r"c:\users\loose.bin",
+            r"c:\users2\otherperson\x.bin",
+            r"c:\programdata\kam security2\x.bin",
+        ] {
+            assert_eq!(refused(path), None, "{path} was refused");
+        }
+    }
+
+    /// The limits read from this machine name the real store.
+    #[test]
+    fn the_limits_on_this_machine_include_the_real_store() {
+        let program_data = std::env::var("ProgramData").unwrap();
+        let expected = crate::paths::plain(&format!("{program_data}\\KAM Security"));
+        let limits = Limits::for_caller(&someone());
+        assert!(
+            limits.store.contains(&expected),
+            "{expected} missing from {:?}",
+            limits.store
+        );
+        assert!(
+            limits.containers.iter().any(|dir| dir == r"c:\users"),
+            "the caller's profiles directory is missing: {:?}",
+            limits.containers
+        );
+    }
+
+    /// A folder of somebody else's profile, really on disk.
+    ///
+    /// `Default` is the template every new profile is copied from. It is
+    /// present on every Windows installation and readable by everyone, and it
+    /// is not the caller's, so it stands in for another account's profile
+    /// without needing a second account on the test machine.
+    fn a_profile_folder_that_is_not_ours() -> Option<std::path::PathBuf> {
+        let user = UserContext::current();
+        let profiles = std::path::Path::new(user.profile()).parent()?;
+        let default = profiles.join("Default");
+        if !default.is_dir() || default == std::path::Path::new(user.profile()) {
+            return None;
+        }
+        std::fs::read_dir(&default)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| std::fs::canonicalize(path).is_ok())
+    }
+
+    /// An explicit choice does not reach into another profile.
+    ///
+    /// The agent runs as LocalSystem and can open every profile on the
+    /// machine, so this is the fence standing between a person's choice about
+    /// their own copies and somebody else's files.
+    #[test]
+    fn a_chosen_copy_in_another_profile_is_refused() {
+        let Some(theirs) = a_profile_folder_that_is_not_ours() else {
+            return;
+        };
+        let path = theirs.to_string_lossy().into_owned();
+        let user = UserContext::current();
+
+        for intent in [Intent::Suggested, Intent::Chosen] {
+            assert!(
+                check_removable(&path, &user, intent).is_err(),
+                "{path} was allowed with {intent:?}"
+            );
+        }
+        let why = check_removable(&path, &user, Intent::Chosen).unwrap_err();
+        assert!(
+            why.contains("not yours"),
+            "refused for the wrong reason: {why}"
+        );
+    }
+
+    /// A junction in a folder of yours does not carry a choice into theirs.
+    #[test]
+    fn a_junction_into_another_profile_is_refused_when_chosen() {
+        let Some(theirs) = a_profile_folder_that_is_not_ours() else {
+            return;
+        };
+        let Some(their_profile) = theirs.parent() else {
+            return;
+        };
+        let scratch = std::env::temp_dir().join(format!("kam-dup-junction-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let link = scratch.join("Holiday");
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(their_profile)
+            .output();
+        if !made.map(|out| out.status.success()).unwrap_or(false) {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return;
+        }
+
+        let name = theirs.file_name().unwrap();
+        let through = link.join(name).to_string_lossy().into_owned();
+        let outcome = check_removable(&through, &UserContext::current(), Intent::Chosen);
+
+        // The link only, never what it points at.
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        let why = outcome.expect_err("a junction into another profile was allowed");
+        assert!(
+            why.contains("not yours"),
+            "refused for the wrong reason: {why}"
+        );
+    }
+
+    /// This product's own store is refused, chosen or not.
+    ///
+    /// Run against a scratch store rather than the real one, which a test has
+    /// no business writing into.
+    #[test]
+    fn a_chosen_copy_inside_the_store_is_refused() {
+        let scratch = std::env::temp_dir().join(format!("kam-dup-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let held = scratch
+            .join("store")
+            .join("quarantine")
+            .join("1700000000-0001");
+        std::fs::create_dir_all(&held).unwrap();
+        let payload = held.join("payload");
+        std::fs::write(&payload, b"held").unwrap();
+
+        let user = UserContext::current();
+        let mut limits = Limits::for_caller(&user);
+        limits.store.clear();
+        both_spellings(&scratch.join("store").to_string_lossy(), &mut limits.store);
+
+        let path = payload.to_string_lossy().into_owned();
+        let outcome = check_within(&path, &user, Intent::Chosen, &limits);
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        let why = outcome.expect_err("a file inside the store was allowed");
+        assert!(
+            why.contains("own store"),
+            "refused for the wrong reason: {why}"
+        );
+    }
+
+    /// The owner's widening still holds: a chosen copy in a program's folder
+    /// may go, where a suggested one may not.
+    ///
+    /// Built in a scratch folder named like Program Files, which is what the
+    /// ownership rule reads, so it runs the same with or without the rights to
+    /// write the real one.
+    #[test]
+    fn a_chosen_copy_in_program_files_is_still_allowed() {
+        let scratch = std::env::temp_dir().join(format!("kam-dup-programs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let folder = scratch.join("Program Files").join("Thing");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("shared.dll");
+        std::fs::write(&file, b"a runtime").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let user = UserContext::current();
+
+        assert_eq!(owner_of(&path, &user), Owner::Program, "the premise");
+        let chosen = check_removable(&path, &user, Intent::Chosen);
+        let suggested = check_removable(&path, &user, Intent::Suggested);
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        assert_eq!(
+            chosen,
+            Ok(()),
+            "a chosen copy in a program's folder was refused"
+        );
+        assert!(
+            suggested.is_err(),
+            "a suggestion reached a program's folder"
+        );
+    }
+
+    /// And the real Program Files, where this machine has a file to ask about.
+    /// Asking moves nothing.
+    #[test]
+    fn a_chosen_copy_in_the_real_program_files_is_not_caught_by_the_limits() {
+        let Ok(root) = std::env::var("ProgramFiles") else {
+            return;
+        };
+        let file = std::fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| std::fs::read_dir(entry.path()).ok())
+            .flatten()
+            .flatten()
+            .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .map(|entry| entry.path());
+        let Some(file) = file else {
+            return;
+        };
+        let path = file.to_string_lossy().into_owned();
+        let user = UserContext::current();
+        // Whatever else this machine's copy of the file may be, it is in no
+        // profile and not in the store.
+        if let Err(why) = check_removable(&path, &user, Intent::Chosen) {
+            assert!(
+                !why.contains("not yours") && !why.contains("own store"),
+                "{path} was caught by the profile or store limit: {why}"
+            );
+        }
     }
 
     #[test]

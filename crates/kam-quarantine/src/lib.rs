@@ -93,6 +93,22 @@ fn now_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+/// A path in the form two can be compared in: lower case, one kind of
+/// separator, and no extended-length prefix, which `canonicalize` adds and a
+/// path as written usually lacks. Compared as a `Path`, so a match is a whole
+/// component and `store2` is not inside `store`.
+fn comparable(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    let text = if let Some(rest) = text.strip_prefix(r"\\?\unc\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        text
+    };
+    PathBuf::from(text)
+}
+
 /// Windows path comparison is case-insensitive, and a volume is identified by
 /// its first character.
 fn volume_of(path: &Path) -> Option<char> {
@@ -113,6 +129,17 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Whether `path` is the store, inside it, or a folder that holds it.
+    ///
+    /// Judged on where both really lead, so a junction or a short name cannot
+    /// make the store look like somewhere else. A path that cannot be resolved
+    /// is compared as written, which still catches it spelled plainly.
+    fn overlaps(&self, path: &Path) -> bool {
+        let root = comparable(&fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone()));
+        let target = comparable(&fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+        target.starts_with(&root) || root.starts_with(&target)
     }
 
     /// Whether an id is one this store issued.
@@ -214,6 +241,22 @@ impl Store {
                 "{} is on a different volume from the quarantine store; a \
                  cross-volume move would have to copy and re-apply permissions, \
                  which this deliberately does not do",
+                path.display()
+            )));
+        }
+
+        // The store itself, anything in it, and any folder holding it. The
+        // fences in front of this decide by where a path sits, and the store
+        // sits in a folder they allow -- its own parent is directly inside
+        // ProgramData, which is exactly the shape of a leftover. Taking it
+        // would move every held item, and the record of each, into an item of
+        // its own; taking something inside it would hold a held item twice.
+        // Neither is ever what was meant, so neither happens, whichever fence
+        // a caller came through.
+        if self.overlaps(path) {
+            return Err(Error::Refused(format!(
+                "{} is part of the quarantine store or holds it, so it cannot be \
+                 quarantined",
                 path.display()
             )));
         }
@@ -946,6 +989,47 @@ mod tests {
         let outcome = store.take(&link, 0, "test");
         assert!(matches!(outcome, Err(Error::Refused(_))));
         assert!(link.exists(), "the link should be untouched");
+    }
+
+    /// The store never takes itself, anything in it, or a folder holding it.
+    ///
+    /// Its parent is directly inside ProgramData, which is the shape the
+    /// leftover fence allows, and the duplicate fence allows ProgramData for an
+    /// explicit choice. This is the guard that holds whichever fence a request
+    /// came through.
+    #[test]
+    fn the_store_will_not_take_itself_or_what_holds_it() {
+        let scratch = Scratch::new("itself");
+        let store = scratch.store();
+        let victim = scratch.join("victim.bin");
+        fs::write(&victim, b"held").unwrap();
+        let held = store.take(&victim, 4, "test").unwrap();
+        let inside = store.root().join(&held.id).join(PAYLOAD);
+        assert!(inside.exists(), "the premise: something is held");
+
+        let upper = scratch.join("STORE");
+        for path in [
+            store.root().to_path_buf(),
+            inside.clone(),
+            store.root().join(&held.id),
+            scratch.0.clone(),
+            // The same places spelled differently.
+            upper,
+            PathBuf::from(format!("\\\\?\\{}", store.root().display())),
+        ] {
+            let outcome = store.take(&path, 0, "test");
+            assert!(
+                matches!(outcome, Err(Error::Refused(ref why)) if why.contains("quarantine store")),
+                "{} was not refused: {outcome:?}",
+                path.display()
+            );
+        }
+        assert!(inside.exists(), "the held item was disturbed");
+
+        // A sibling whose name merely starts the same way is not the store.
+        let sibling = scratch.join("store2");
+        fs::create_dir_all(&sibling).unwrap();
+        assert!(store.take(&sibling, 0, "test").is_ok());
     }
 
     #[test]
