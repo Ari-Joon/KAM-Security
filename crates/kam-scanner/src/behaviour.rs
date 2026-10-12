@@ -48,6 +48,7 @@ use kam_core::UserContext;
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::{self, Anchor, Entry};
+use crate::places;
 use crate::signature::{self, Signature};
 
 /// How much attention an observation warrants. Two levels, deliberately: this
@@ -236,16 +237,26 @@ pub fn is_project(path: &Path) -> bool {
 /// Matched by shape rather than against the environment, because the watcher
 /// runs as LocalSystem and `%LOCALAPPDATA%` there is SYSTEM's own, empty,
 /// AppData. A path under any account's profile is what matters, whoever is
-/// asking.
+/// asking. Each shape is a whole folder name with a separator either side, so
+/// `\desktop\` never matches inside `\desktopthing\`.
 pub fn dropper_place(path: &str) -> Option<&'static str> {
     let text = path.to_lowercase().replace('/', "\\");
     // Defender's own engine lives under ProgramData and runs constantly; it is
     // not a dropper location and must never be treated as one.
-    if text.contains(r"\programdata\microsoft\windows defender\") {
+    //
+    // Anchored to where that folder really is. This was a `contains`, so a
+    // script at `...\AppData\Local\Temp\ProgramData\Microsoft\Windows
+    // Defender\x.cmd`, a path anything can create, was waved through as
+    // Defender's own.
+    if places::in_defenders_own_folder(path) {
         return None;
     }
     if text.contains(r"\appdata\local\temp\") || text.contains(r"\windows\temp\") {
         return Some("Temp");
+    }
+    // Inside Windows, and open to everyone all the same. See `places`.
+    if places::writable_inside_windows(path) {
+        return Some("a writable folder inside Windows");
     }
     if text.contains(r"\appdata\local\") || text.contains(r"\appdata\roaming\") {
         return Some("AppData");
@@ -808,5 +819,40 @@ mod tests {
             Some("Temp")
         );
         assert_eq!(dropper_place(r"C:\Program Files\App\app.exe"), None);
+    }
+
+    /// Defender's exemption belongs to Defender's folder, not to its name.
+    ///
+    /// It was a `contains`, so any writable folder could be given a path with
+    /// Defender's folder names in it and a script there was never a dropper
+    /// place at all.
+    #[test]
+    fn a_writable_folder_dressed_as_defenders_is_still_a_dropper_place() {
+        assert_eq!(
+            dropper_place(
+                r"C:\Users\me\AppData\Local\Temp\ProgramData\Microsoft\Windows Defender\x.cmd"
+            ),
+            Some("Temp")
+        );
+        let data = std::env::var("ProgramData").unwrap();
+        assert_eq!(
+            dropper_place(&format!(
+                r"{data}\Microsoft\Windows Defender\Platform\4.18\MpCmdRun.exe"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn the_folders_inside_windows_open_to_everyone_are_dropper_places() {
+        let windows = std::env::var("SystemRoot").unwrap();
+        for tail in [r"Tasks\x.cmd", r"tracing\x.exe", r"System32\Tasks\x.exe"] {
+            assert_eq!(
+                dropper_place(&format!(r"{windows}\{tail}")),
+                Some("a writable folder inside Windows"),
+                "{tail}"
+            );
+        }
+        assert_eq!(dropper_place(&format!(r"{windows}\System32\cmd.exe")), None);
     }
 }

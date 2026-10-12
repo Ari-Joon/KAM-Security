@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use kam_core::UserContext;
 
 use crate::persistence::{self, Anchor, Entry};
+use crate::places;
 use crate::signature::{self, Signature};
 
 /// How much of the disk to sweep for downloaded executables that are not
@@ -62,7 +63,10 @@ const EXECUTABLE: &[&str] = &["exe", "com", "scr", "bat", "cmd", "ps1", "vbs", "
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Location {
-    /// Under `Windows`. Writing here needs administrator rights.
+    /// Under `Windows`. Writing here needs administrator rights, apart from
+    /// the few folders inside it that do not, which are [`UserWritable`].
+    ///
+    /// [`UserWritable`]: Location::UserWritable
     System,
     /// Under `Program Files`. Also protected, and where installers belong.
     Installed,
@@ -75,7 +79,9 @@ pub enum Location {
     /// `AppData`, `Temp`, `Downloads`, `Desktop` — anywhere a program can
     /// write without asking anyone. Perfectly normal for lots of legitimate
     /// software, and also the only place software that was never granted
-    /// administrator rights can put itself.
+    /// administrator rights can put itself. Includes `C:\Windows\Temp` and the
+    /// other folders inside Windows that are open to everyone; see
+    /// [`crate::places::WRITABLE_INSIDE_WINDOWS`].
     UserWritable,
     /// Somewhere else entirely: another drive, a game library, a projects
     /// folder.
@@ -83,25 +89,31 @@ pub enum Location {
 }
 
 impl Location {
+    /// Decided by whole folder names. A plain text prefix described
+    /// `C:\WindowsUpdate\x.exe` as the protected Windows folder and
+    /// `C:\Program FilesX\x.exe` as an installed program, and described
+    /// `C:\Windows\Temp`, which anyone can write to, as protected.
     fn of(path: &Path) -> Self {
-        let text = path.to_string_lossy().to_lowercase().replace('/', "\\");
-        let windows = folder("SystemRoot");
-        let program_files = folder("ProgramFiles");
-        let program_files_x86 = folder("ProgramFiles(x86)");
+        let text = path.to_string_lossy();
+        let under = |variable: &str| {
+            places::machine_folder(variable).is_some_and(|root| places::within(&text, &root))
+        };
 
-        if windows.is_some_and(|root| text.starts_with(&root)) {
+        // Before the Windows folder, which these are inside of.
+        if places::writable_inside_windows(&text) {
+            return Self::UserWritable;
+        }
+        if under("SystemRoot") {
             return Self::System;
         }
-        if program_files.is_some_and(|root| text.starts_with(&root))
-            || program_files_x86.is_some_and(|root| text.starts_with(&root))
-        {
+        if under("ProgramFiles") || under("ProgramFiles(x86)") || under("ProgramW6432") {
             return Self::Installed;
         }
-        if folder("ProgramData").is_some_and(|root| text.starts_with(&root)) {
+        if under("ProgramData") {
             return Self::Shared;
         }
         for variable in ["LOCALAPPDATA", "APPDATA", "TEMP", "USERPROFILE"] {
-            if folder(variable).is_some_and(|root| text.starts_with(&root)) {
+            if folder(variable).is_some_and(|root| places::within(&text, &root)) {
                 return Self::UserWritable;
             }
         }
@@ -822,6 +834,48 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("cmd.exe")));
+    }
+
+    /// Locations are folders, not text.
+    ///
+    /// `C:\WindowsUpdate` starts with the same letters as `C:\Windows` and is
+    /// a folder anyone can create at the root of the drive; `C:\Windows\Temp`
+    /// is inside Windows and anyone can write to it. The prefix check called
+    /// the first protected and the second protected too.
+    #[test]
+    fn a_location_is_decided_by_whole_folder_names() {
+        let windows = std::env::var("SystemRoot").unwrap();
+        let program_files = std::env::var("ProgramFiles").unwrap();
+
+        assert_eq!(
+            Location::of(Path::new(&format!(r"{windows}\System32\notepad.exe"))),
+            Location::System
+        );
+        assert_ne!(
+            Location::of(Path::new(&format!(r"{windows}Update\x.exe"))),
+            Location::System
+        );
+        assert_eq!(
+            Location::of(Path::new(&format!(r"{program_files}\App\app.exe"))),
+            Location::Installed
+        );
+        assert_ne!(
+            Location::of(Path::new(&format!(r"{program_files}X\app.exe"))),
+            Location::Installed
+        );
+        for writable in [
+            r"Temp\x.exe",
+            r"Tasks\x.exe",
+            r"tracing\x.exe",
+            r"System32\Tasks\x.exe",
+            r"System32\spool\drivers\color\x.exe",
+        ] {
+            assert_eq!(
+                Location::of(Path::new(&format!(r"{windows}\{writable}"))),
+                Location::UserWritable,
+                "{writable} is open to everyone and must not read as protected"
+            );
+        }
     }
 
     #[test]

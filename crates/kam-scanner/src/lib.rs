@@ -17,6 +17,7 @@ pub mod defender_scan;
 pub mod extensions;
 pub mod hardening;
 pub mod persistence;
+pub mod places;
 pub mod provenance;
 pub mod signature;
 pub mod wmi;
