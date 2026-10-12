@@ -204,11 +204,17 @@ impl Store {
     }
 
     fn from_connection(connection: Connection) -> Result<Self> {
+        // `recursive_triggers` is what makes the audit log's delete trigger
+        // hold against `INSERT OR REPLACE`. A REPLACE removes the conflicting
+        // row before inserting its own, and SQLite only fires delete triggers
+        // for that removal when this is on. With it off, a REPLACE naming an
+        // existing id rewrote that audit row in place, past both triggers.
         connection
             .execute_batch(
                 "PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = NORMAL;
-                 PRAGMA foreign_keys = ON;",
+                 PRAGMA foreign_keys = ON;
+                 PRAGMA recursive_triggers = ON;",
             )
             .map_err(to_db_error)?;
 
@@ -1294,6 +1300,39 @@ mod tests {
             .execute("UPDATE audit SET detail = 'tampered'", [])
             .is_err());
         assert!(connection.execute("DELETE FROM audit", []).is_err());
+    }
+
+    /// `INSERT OR REPLACE` cannot rewrite an audit row.
+    ///
+    /// A REPLACE deletes the conflicting row and inserts its own, and SQLite
+    /// fires delete triggers for that deletion only with `recursive_triggers`
+    /// on. Without it, naming an existing id replaced that entry in place and
+    /// both append-only triggers were walked straight past.
+    #[test]
+    fn replacing_an_audit_row_is_refused() {
+        let store = Store::open_in_memory().unwrap();
+        store.record(entry("first")).unwrap();
+        let original = store.recent_audit(1).unwrap().remove(0);
+
+        let connection = store.lock().unwrap();
+        for statement in [
+            "INSERT OR REPLACE INTO audit (id, at, module, action, effect, detail)
+             VALUES (?1, '2000-01-01T00:00:00.000Z', 'storage', 'nothing', 'observed', 'tampered')",
+            "REPLACE INTO audit (id, at, module, action, effect, detail)
+             VALUES (?1, '2000-01-01T00:00:00.000Z', 'storage', 'nothing', 'observed', 'tampered')",
+        ] {
+            assert!(
+                connection.execute(statement, params![original.id]).is_err(),
+                "an audit row was replaced by: {statement}"
+            );
+        }
+        drop(connection);
+
+        let after = store.recent_audit(10).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].action, original.action);
+        assert_eq!(after[0].detail, original.detail);
+        assert_eq!(after[0].at, original.at);
     }
 
     #[test]
