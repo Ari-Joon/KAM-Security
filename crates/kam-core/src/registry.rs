@@ -12,8 +12,8 @@ use std::os::windows::ffi::OsStringExt;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND,
-    ERROR_SUCCESS, WIN32_ERROR,
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME, ERROR_MORE_DATA,
+    ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, FILETIME, WIN32_ERROR,
 };
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegQueryValueExW,
@@ -81,6 +81,11 @@ fn from_wide(buffer: &[u16]) -> String {
 /// them apart, after which the name simply cannot be looked up through the
 /// NUL-terminated Win32 entry points, and the caller has to say so rather than
 /// treat it as a value that is not there.
+///
+/// A name that is not valid UTF-16 -- a lone surrogate, which `HKCU` also
+/// accepts from anybody -- cannot be held in a `String` at all, and comes back
+/// with U+FFFD in place of the unit that would not decode. See
+/// [`is_hidden_name`] for what that means for looking it up again.
 fn exactly(buffer: &[u16], length: u32) -> String {
     let end = (length as usize).min(buffer.len());
     OsString::from_wide(&buffer[..end])
@@ -88,12 +93,28 @@ fn exactly(buffer: &[u16], length: u32) -> String {
         .into_owned()
 }
 
-/// Whether a name holds a character that hides it from Registry Editor.
+/// Whether a name cannot be handed back to Windows and still mean the entry it
+/// came from.
 ///
-/// Worth telling a person in as many words: no installer produces one, and
-/// nothing in Windows' own interface will show it to them.
+/// Two ways, and both need no privilege on `HKCU`:
+///
+/// - A NUL, which hides the rest of the name from Registry Editor and from
+///   every NUL-terminated entry point. Looked up again, `Updater` followed by
+///   NUL and `evil` is just `Updater`.
+/// - A UTF-16 unit that is not text, such as a lone surrogate. It decodes to
+///   U+FFFD, and U+FFFD looked up again is a different name: the read says
+///   "not found", the entry used to be skipped as "not a string", the count
+///   still agreed, and the walk called itself whole with the entry invisible.
+///
+/// A genuine U+FFFD in a name is treated the same way. No installer writes
+/// one, and the decoded string cannot say which of the two it was, so the
+/// careful reading is the only safe one: the entry is reported as unreadable
+/// rather than looked up and possibly confused with another.
+///
+/// Worth telling a person in as many words: nothing in Windows' own interface
+/// will show them what these names really are.
 pub fn is_hidden_name(name: &str) -> bool {
-    name.contains('\0')
+    name.contains('\0') || name.contains(char::REPLACEMENT_CHARACTER)
 }
 
 /// Why a key could not be opened.
@@ -148,12 +169,42 @@ impl Unopened {
 #[derive(Debug, Clone, Default)]
 pub struct Listing {
     pub names: Vec<String>,
-    /// True only when as many entries came back as Windows said there were.
+    /// True only when as many entries came back as Windows said there were,
+    /// and the key was not written to while it was walked.
     ///
     /// Not "the loop ended tidily". A key can be written to while it is being
     /// walked, and index-based enumeration is not a snapshot — deleting an
     /// entry mid-walk makes the following one skip, and the walk still ends
-    /// normally. Counting is what tells those apart.
+    /// normally. Counting tells most of those apart. It cannot tell one that
+    /// deletes an entry and adds another: the count comes out the same and
+    /// the walk has missed one. The key's last-write time can, so it is asked
+    /// before and after and must not have moved.
+    pub whole: bool,
+}
+
+/// One value, with what it holds, read in the same call that named it.
+#[derive(Debug, Clone)]
+pub struct Value {
+    /// The name as it can be shown. Not always the name Windows holds: see
+    /// `exact`.
+    pub name: String,
+    /// False when the name holds something that hides it, or something that
+    /// is not text (see [`is_hidden_name`]). The value was still read, by
+    /// position rather than by name, so what it holds is real; it is the name
+    /// that a person cannot take at face value or find in Registry Editor.
+    pub exact: bool,
+    /// The text it holds. `None` when it is not a string, or is empty, which
+    /// are facts about the value rather than failures to read it.
+    pub text: Option<String>,
+}
+
+/// Every value in a key, with what each holds, and whether that is all of them.
+///
+/// The same promise as [`Listing`]: `whole` is false unless the count agreed and
+/// nothing was written to the key while it was read.
+#[derive(Debug, Clone, Default)]
+pub struct Values {
+    pub values: Vec<Value>,
     pub whole: bool,
 }
 
@@ -164,6 +215,11 @@ struct Shape {
     longest_subkey: u32,
     values: u32,
     longest_value: u32,
+    /// The largest value's data, in bytes.
+    longest_data: u32,
+    /// When the key or one of its values was last written, as the raw
+    /// `FILETIME`. Compared, never shown.
+    written: u64,
 }
 
 /// How many times a walk is repeated while the count disagrees.
@@ -174,9 +230,27 @@ struct Shape {
 const RETRIES: usize = 3;
 
 impl Shape {
-    /// Finish a walk, claiming completeness only if the count agrees.
-    fn finish(self, names: Vec<String>, expected: u32) -> Listing {
-        let whole = names.len() == expected as usize;
+    /// Whether a walk that found `got` entries has read the key to the end.
+    ///
+    /// `count` picks which of the two counts the walk was over. The count has
+    /// to agree, and the key must look the same afterwards as it did before:
+    /// the same number of entries and the same last-write time. A delete and
+    /// an add during the walk leave the count alone and move the time.
+    ///
+    /// The time is only as fine as the clock that stamps it, so a write landing
+    /// in the same tick as the write before it could still slip past. That is
+    /// a window of milliseconds, straight after a write, that has to be hit on
+    /// every one of the retries in [`Key::values`]; the count alone left the
+    /// whole walk open.
+    fn settled(self, after: Option<Self>, got: usize, count: fn(&Self) -> u32) -> bool {
+        got == count(&self) as usize
+            && after
+                .is_some_and(|after| after.written == self.written && count(&after) == count(&self))
+    }
+
+    /// Finish a walk, claiming completeness only if nothing moved under it.
+    fn finish(self, names: Vec<String>, after: Option<Self>, count: fn(&Self) -> u32) -> Listing {
+        let whole = self.settled(after, names.len(), count);
         Listing { names, whole }
     }
 }
@@ -214,7 +288,16 @@ impl Key {
     }
 
     /// Open a subkey of this one, saying why if it could not be opened.
+    ///
+    /// A name that cannot be handed back to Windows intact (see
+    /// [`is_hidden_name`]) is answered as not there, without asking: asking
+    /// would open whatever the truncated or substituted name reaches, which is
+    /// a different key. A caller that took the name from an enumeration checks
+    /// `is_hidden_name` to tell that apart from an ordinary absence.
     pub fn look_child(&self, name: &str) -> std::result::Result<Self, Unopened> {
+        if is_hidden_name(name) {
+            return Err(Unopened::Absent);
+        }
         let mut handle = HKEY::default();
         let name = wide(name);
         let status =
@@ -257,6 +340,7 @@ impl Key {
             // be claimed about having got them all.
             return Listing::default();
         };
+        let count: fn(&Shape) -> u32 = |shape| shape.subkeys;
 
         let mut names = Vec::new();
         let mut index = 0_u32;
@@ -283,7 +367,7 @@ impl Key {
                     names.push(exactly(&buffer, length));
                     index += 1;
                 }
-                _ => return shape.finish(names, shape.subkeys),
+                _ => return shape.finish(names, self.shape(), count),
             }
         }
     }
@@ -336,6 +420,7 @@ impl Key {
         let Some(shape) = self.shape() else {
             return Listing::default();
         };
+        let count: fn(&Shape) -> u32 = |shape| shape.values;
 
         let mut names = Vec::new();
         let mut index = 0_u32;
@@ -359,9 +444,106 @@ impl Key {
                     names.push(exactly(&buffer, length));
                     index += 1;
                 }
-                _ => return shape.finish(names, shape.values),
+                _ => return shape.finish(names, self.shape(), count),
             }
         }
+    }
+
+    /// Every value that holds text, read where it stands in the enumeration.
+    ///
+    /// # Why not [`Key::values`] and then [`Key::read_string`]
+    ///
+    /// That reads each value twice: once to learn its name, and again by that
+    /// name. The second read only finds the same value if the name survives
+    /// the round trip, and the names worth finding are exactly the ones that
+    /// do not. A NUL truncates the name to a different one. A lone surrogate
+    /// cannot be held in a `String` at all and comes back as U+FFFD, which is a
+    /// different name too. Either way the lookup reaches nothing, or reaches
+    /// some other value, and the entry it was meant to read is not read.
+    ///
+    /// Here the data comes back with the name, from the same index, in the
+    /// same call, so the name is never looked up again and what it decodes to
+    /// does not matter. [`Value::exact`] still says whether the name shown is
+    /// the real one, because a person reading it needs to know that too.
+    ///
+    /// Retried and judged whole exactly as [`Key::values`] is.
+    pub fn strings(&self) -> Values {
+        for _ in 0..RETRIES {
+            let read = self.walk_strings();
+            if read.whole {
+                return read;
+            }
+        }
+        self.walk_strings()
+    }
+
+    fn walk_strings(&self) -> Values {
+        let Some(shape) = self.shape() else {
+            return Values::default();
+        };
+        let count: fn(&Shape) -> u32 = |shape| shape.values;
+
+        let mut values = Vec::new();
+        let mut index = 0_u32;
+        // Sized from what Windows said, and grown if a value grows between
+        // that answer and the read.
+        let mut name_room = shape.longest_value as usize + 1;
+        let mut data_room = shape.longest_data as usize;
+        'walk: loop {
+            for _ in 0..4 {
+                let mut name = vec![0_u16; name_room];
+                let mut name_length = name.len() as u32;
+                // A `u16` buffer so the text is aligned for decoding; Windows
+                // is told its size in bytes.
+                let mut data = vec![0_u16; data_room.div_ceil(2).max(1)];
+                let mut data_length = (data.len() * 2) as u32;
+                let mut kind = 0_u32;
+                let status: WIN32_ERROR = unsafe {
+                    RegEnumValueW(
+                        self.0,
+                        index,
+                        Some(windows::core::PWSTR(name.as_mut_ptr())),
+                        &mut name_length,
+                        None,
+                        Some(&mut kind),
+                        Some(data.as_mut_ptr().cast::<u8>()),
+                        Some(&mut data_length),
+                    )
+                };
+                match status {
+                    ERROR_SUCCESS => {
+                        let shown = exactly(&name, name_length);
+                        let units = (data_length as usize / 2).min(data.len());
+                        let kind = REG_VALUE_TYPE(kind);
+                        let text = if kind == REG_SZ || kind == REG_EXPAND_SZ {
+                            let text = from_wide(&data[..units]).trim().to_owned();
+                            (!text.is_empty()).then_some(text)
+                        } else {
+                            None
+                        };
+                        values.push(Value {
+                            exact: !is_hidden_name(&shown),
+                            name: shown,
+                            text,
+                        });
+                        index += 1;
+                        continue 'walk;
+                    }
+                    ERROR_MORE_DATA => {
+                        // Something under this index grew. The data length is
+                        // reported back; the name's is not, so it doubles.
+                        data_room = data_room.max(data_length as usize);
+                        name_room = (name_room * 2).min(32_768);
+                    }
+                    _ => break 'walk,
+                }
+            }
+            // Four tries and it still would not fit: stop here, and let the
+            // count say this was not the whole key.
+            break;
+        }
+        let whole = shape.settled(self.shape(), values.len(), count);
+        Values { values, whole }
     }
 
     /// What Windows says this key holds, asked before walking it.
@@ -373,6 +555,8 @@ impl Key {
         let mut longest_subkey = 0_u32;
         let mut values = 0_u32;
         let mut longest_value = 0_u32;
+        let mut longest_data = 0_u32;
+        let mut written = FILETIME::default();
         let status = unsafe {
             RegQueryInfoKeyW(
                 self.0,
@@ -384,19 +568,22 @@ impl Key {
                 None,
                 Some(&mut values),
                 Some(&mut longest_value),
+                Some(&mut longest_data),
                 None,
-                None,
-                None,
+                Some(&mut written),
             )
         };
         (status == ERROR_SUCCESS).then_some(Shape {
             subkeys,
-            // Both maxima are in characters and exclude the terminator, which
-            // the buffers above add back. The `cb` in the parameter names is
-            // misleading; for the wide entry points these are character counts.
+            // Both name maxima are in characters and exclude the terminator,
+            // which the buffers above add back. The `cb` in the parameter
+            // names is misleading; for the wide entry points these are
+            // character counts. The data maximum really is in bytes.
             longest_subkey,
             values,
             longest_value,
+            longest_data,
+            written: (u64::from(written.dwHighDateTime) << 32) | u64::from(written.dwLowDateTime),
         })
     }
 
@@ -418,7 +605,17 @@ impl Key {
     /// reader is looking at the `Run` keys, where the writer of the value is
     /// whoever is being looked for: alternating one between a short and a long
     /// string makes a legitimate startup entry come and go on demand.
+    ///
+    /// A name that cannot be handed back to Windows intact (see
+    /// [`is_hidden_name`]) is answered `None` without asking, because asking
+    /// would read whatever value the truncated or substituted name reaches. A
+    /// caller holding a name from an enumeration checks `is_hidden_name` to
+    /// tell that from a value that is not a string, as the startup reader
+    /// does; [`Key::strings`] avoids the question by never looking a name up.
     pub fn read_string(&self, value: &str) -> std::result::Result<Option<String>, Unopened> {
+        if is_hidden_name(value) {
+            return Ok(None);
+        }
         // Two calls, one for the size and one for the data, so a value that
         // grows in between returns ERROR_MORE_DATA. Retried rather than
         // treated as absent, and a retry that keeps losing is a failure that
@@ -493,6 +690,10 @@ impl Key {
     /// the code that understands the layout, rather than teaching this module
     /// about every structure Windows invents.
     pub fn binary(&self, value: &str) -> Option<Vec<u8>> {
+        // Never another value's bytes under this one's name.
+        if is_hidden_name(value) {
+            return None;
+        }
         let name = wide(value);
         let mut kind = REG_VALUE_TYPE::default();
         let mut size = 0_u32;
@@ -542,6 +743,11 @@ impl Key {
     /// and suppressed vanish reporting across all of them. Absence here is the
     /// common case and says nothing; only a refusal is worth reporting.
     pub fn read_dword(&self, value: &str) -> std::result::Result<Option<u32>, Unopened> {
+        // Refused rather than answered `None`: here `None` means "nothing to
+        // report", and a value that cannot be named is not that.
+        if is_hidden_name(value) {
+            return Err(Unopened::Failed(ERROR_INVALID_NAME.0));
+        }
         let name = wide(value);
         let mut kind = REG_VALUE_TYPE::default();
         let mut data = 0_u32;
@@ -575,8 +781,8 @@ mod tests {
     // Write entry points, used only to plant what these tests then read. The
     // module itself stays read-only on purpose.
     use windows::Win32::System::Registry::{
-        RegCreateKeyExW, RegDeleteKeyW, RegSetValueExW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
-        KEY_WRITE, REG_OPTION_NON_VOLATILE,
+        RegCreateKeyExW, RegDeleteKeyW, RegDeleteValueW, RegSetValueExW, HKEY_CURRENT_USER,
+        HKEY_LOCAL_MACHINE, KEY_WRITE, REG_OPTION_NON_VOLATILE,
     };
 
     #[test]
@@ -695,7 +901,14 @@ mod tests {
         }
 
         fn put(&self, name: &str, data: &str) {
-            let wide_name = wide(name);
+            let units: Vec<u16> = name.encode_utf16().collect();
+            self.put_units(&units, data);
+        }
+
+        /// Write a value whose name is given as raw UTF-16, so it can hold
+        /// what a `&str` cannot.
+        fn put_units(&self, name: &[u16], data: &str) {
+            let wide_name: Vec<u16> = name.iter().copied().chain(std::iter::once(0)).collect();
             let bytes: Vec<u8> = wide(data)
                 .iter()
                 .flat_map(|unit| unit.to_le_bytes())
@@ -715,6 +928,12 @@ mod tests {
                 "could not write a value of {} chars",
                 name.len()
             );
+        }
+
+        fn delete(&self, name: &str) {
+            let wide_name = wide(name);
+            let status = unsafe { RegDeleteValueW(self.handle, PCWSTR(wide_name.as_ptr())) };
+            assert_eq!(status, ERROR_SUCCESS, "could not delete {name}");
         }
 
         fn read(&self) -> Listing {
@@ -811,17 +1030,148 @@ mod tests {
         assert_eq!(listing.names.len(), 4);
 
         // What a skipped entry looks like to the code that decides.
-        let short = Shape {
+        let shape = Shape {
             subkeys: 0,
             longest_subkey: 0,
             values: 4,
             longest_value: 16,
-        }
-        .finish(vec!["value0".to_owned(), "value2".to_owned()], 4);
+            longest_data: 4,
+            written: 1,
+        };
+        let short = shape.finish(
+            vec!["value0".to_owned(), "value2".to_owned()],
+            Some(shape),
+            |shape| shape.values,
+        );
         assert!(
             !short.whole,
             "a list two short of the reported count called itself complete"
         );
+    }
+
+    /// A delete and an add during a walk do not leave it calling itself whole.
+    ///
+    /// Counting caught a walk that lost an entry. It could not catch one that
+    /// lost an entry while another was added: the count comes out the same,
+    /// the walk has missed one, and it said `whole`. The key's last-write
+    /// time moves on every such write, so it is compared before and after.
+    ///
+    /// Shown on the real registry, because the property relied on is a
+    /// property of Windows: that deleting one value and adding another moves
+    /// the key's time and leaves its count where it was.
+    #[test]
+    fn a_delete_and_an_add_during_a_walk_is_not_whole() {
+        let scratch = Scratch::new("swapped");
+        for index in 0..3 {
+            scratch.put(&format!("value{index}"), "x");
+        }
+        // Past the clock's tick, so the writes below cannot share a timestamp
+        // with the ones above.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+
+        let key = Key::look(HKEY_CURRENT_USER, &scratch.path, View::Native)
+            .expect("the scratch key should open");
+        let before = key.shape().expect("the scratch key should describe itself");
+
+        // What the walk would not see happen between two of its reads.
+        scratch.delete("value1");
+        scratch.put("planted", "x");
+
+        let after = key.shape().expect("the scratch key should describe itself");
+        assert_eq!(after.values, before.values, "the count did not stay equal");
+        assert!(
+            !before.settled(Some(after), 3, |shape| shape.values),
+            "a key written to during the walk was called whole"
+        );
+
+        // And left alone, the same key does read whole.
+        assert!(key.values().whole);
+    }
+
+    /// A value whose name is not text is not skipped as though it were not
+    /// there.
+    ///
+    /// A lone surrogate is a legal value name, and `HKCU` takes one from any
+    /// process. It decodes to U+FFFD, so the name the enumeration produced
+    /// was not the name Windows holds: looked up again it was "not found",
+    /// the startup reader took that as "not a string" and moved on, the count
+    /// still agreed, and the walk said `whole` with the entry invisible.
+    ///
+    /// Planted with a genuine U+FFFD value beside it, which is the worse case:
+    /// looked up by the decoded name, the hidden entry's read lands on its
+    /// neighbour and reports the neighbour's command under the hidden name.
+    #[test]
+    fn a_value_whose_name_is_not_text_is_not_skipped() {
+        let scratch = Scratch::new("surrogate");
+        let mut hidden: Vec<u16> = "Updater".encode_utf16().collect();
+        hidden.push(0xD800);
+        scratch.put_units(&hidden, "C:\\hidden.exe");
+        scratch.put("Updater\u{FFFD}", "C:\\decoy.exe");
+        scratch.put("after", "C:\\after.exe");
+
+        let listing = scratch.read();
+        assert!(listing.whole);
+        assert_eq!(listing.names.len(), 3);
+
+        let key = Key::look(HKEY_CURRENT_USER, &scratch.path, View::Native)
+            .expect("the scratch key should open");
+        for name in listing
+            .names
+            .iter()
+            .filter(|name| name.starts_with("Updater"))
+        {
+            // The caller has to be able to tell this from "not a string".
+            assert!(
+                is_hidden_name(name),
+                "a name that does not survive the round trip was not flagged: {name:?}"
+            );
+            // And the lookup must not answer with some other value's data.
+            assert_eq!(
+                key.read_string(name).unwrap(),
+                None,
+                "a name that does not survive the round trip was read as {name:?}"
+            );
+        }
+        assert_eq!(
+            key.read_string("after").unwrap().as_deref(),
+            Some("C:\\after.exe")
+        );
+
+        // Read by position, every value comes back with its own data.
+        let strings = key.strings();
+        assert!(strings.whole);
+        let texts: Vec<(&str, bool)> = strings
+            .values
+            .iter()
+            .map(|value| (value.text.as_deref().unwrap_or(""), value.exact))
+            .collect();
+        assert!(
+            texts.contains(&("C:\\hidden.exe", false)),
+            "the hidden entry's own command was not read: {texts:?}"
+        );
+        assert!(texts.contains(&("C:\\decoy.exe", false)), "{texts:?}");
+        assert!(texts.contains(&("C:\\after.exe", true)), "{texts:?}");
+    }
+
+    /// The by-position reader reads what a long value holds.
+    #[test]
+    fn strings_are_read_whole_and_by_position() {
+        let scratch = Scratch::new("strings");
+        let long = "x".repeat(5000);
+        scratch.put("long", &long);
+        scratch.put("short", "y");
+
+        let strings = Key::look(HKEY_CURRENT_USER, &scratch.path, View::Native)
+            .expect("the scratch key should open")
+            .strings();
+        assert!(strings.whole);
+        let long_value = strings
+            .values
+            .iter()
+            .find(|value| value.name == "long")
+            .expect("the long value");
+        assert_eq!(long_value.text.as_deref(), Some(long.as_str()));
+        assert!(long_value.exact);
     }
 
     #[test]
