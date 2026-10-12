@@ -125,11 +125,14 @@ jobs:
             untick **Start KAM Security when I sign in** on the Overview to stop
             that.
 
-            To remove all of it:
+            To remove the service and the shortcut:
 
             ```
             powershell -ExecutionPolicy Bypass -File setup.ps1 -Remove
             ```
+
+            The sign-in entry belongs to the app rather than the script, so
+            untick the box above first if you are removing it for good.
 
             You can skip the script entirely and just run `kam-shell.exe`; the
             disk scan then falls back to walking directories, which works and is

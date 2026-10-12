@@ -14,7 +14,9 @@
     itself to that list while doing so would be indefensible.
 
     Everything it does is undone by `-Remove`, which is the same argument in
-    reverse rather than a separate script that can drift out of step.
+    reverse rather than a separate script that can drift out of step. The
+    sign-in entry is not among them: the app adds that itself the first time
+    it runs, so it is switched off from the app's Overview, not from here.
 
 .PARAMETER Remove
     Stop and unregister the service and delete the shortcut.
@@ -198,4 +200,4 @@ Write-Host 'The first time you open it:' -ForegroundColor White
 Write-Host '  - KAM Security adds itself to your sign-in items, so its icon sits by the clock' -ForegroundColor Gray
 Write-Host '  - untick "Start KAM Security when I sign in" on the Overview to stop that' -ForegroundColor Gray
 Write-Host ''
-Write-Host 'Undo all of it with:  setup.ps1 -Remove' -ForegroundColor Gray
+Write-Host 'Undo what this script did with:  setup.ps1 -Remove  (the sign-in entry is the app''s: untick it first)' -ForegroundColor Gray
