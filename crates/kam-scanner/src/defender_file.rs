@@ -1048,6 +1048,11 @@ mod tests {
 
     /// Defender really answers, report-only, about a harmless file. Nothing is
     /// flagged and nothing is changed; the file is still there afterwards.
+    ///
+    /// Whether Defender can finish is a fact about the machine (a build
+    /// runner may have it switched off), so this asserts what holds either
+    /// way: a harmless file is never flagged, and an unfinished answer says
+    /// why rather than reading as clean.
     #[test]
     fn defender_answers_about_a_harmless_file_and_leaves_it_alone() {
         let scratch =
@@ -1058,7 +1063,11 @@ mod tests {
         std::fs::write(&file, b"nothing to see here").unwrap();
 
         let scan = check_file(&file.to_string_lossy(), &AtomicBool::new(false)).unwrap();
-        assert_eq!(scan.answer, Answer::NothingFound, "{scan:?}");
+        println!("{scan:?}");
+        assert_ne!(scan.answer, Answer::Flagged, "{scan:?}");
+        if scan.answer == Answer::NotFinished {
+            assert!(!scan.completed && scan.caveat.is_some(), "{scan:?}");
+        }
         assert!(file.exists(), "a report-only check removed the file");
 
         let _ = std::fs::remove_dir_all(&scratch);

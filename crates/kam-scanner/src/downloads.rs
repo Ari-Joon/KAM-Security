@@ -736,12 +736,9 @@ mod tests {
             checked.signature.is_none(),
             "a text file has no signature to read"
         );
-        assert_eq!(
-            checked.scan.answer,
-            Answer::NothingFound,
-            "{:?}",
-            checked.scan
-        );
+        // Whether Defender can finish depends on the machine; a harmless file
+        // is never flagged either way.
+        assert_ne!(checked.scan.answer, Answer::Flagged, "{:?}", checked.scan);
         assert!(!checked.path.starts_with(r"\\?\"));
 
         let _ = std::fs::remove_dir_all(&scratch);
