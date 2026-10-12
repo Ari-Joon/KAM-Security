@@ -78,6 +78,45 @@ function unreported(status: DefenderStatus): string[] {
   return missing;
 }
 
+/**
+ * A path that opens its folder in Explorer, and says so when it cannot.
+ *
+ * These were `void api.reveal(...)`, which dropped a failure without a word:
+ * pressing the path did nothing and gave no reason. A path that has since
+ * moved, or a place that is not a folder on disk, is worth a sentence next to
+ * the control that was pressed.
+ */
+function Reveal({
+  path,
+  className,
+  children,
+}: {
+  path: string;
+  className: string;
+  children: React.ReactNode;
+}) {
+  const [failed, setFailed] = useState<string | null>(null);
+  return (
+    <>
+      <button
+        className={className}
+        title="Open the containing folder"
+        onClick={() => {
+          setFailed(null);
+          api.reveal(path).catch((cause) => setFailed(reason(cause)));
+        }}
+      >
+        {children}
+      </button>
+      {failed && (
+        <span className="vt-error" style={{ display: "block" }}>
+          It could not be shown in Explorer: {failed}
+        </span>
+      )}
+    </>
+  );
+}
+
 /** Names joined for a sentence: "a", "a and b", "a, b and c". */
 function listed(names: string[]): string {
   if (names.length <= 1) return names.join("");
@@ -684,7 +723,15 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
         <div className="scan-running">
           <p>
             {running === "quick" ? "Quick scan" : "Full scan"} running —{" "}
-            {fmt.duration(elapsed * 1000)} so far. You can leave this page.
+            {fmt.duration(elapsed * 1000)} so far.
+          </p>
+          {/* It said "You can leave this page", which was not true: leaving
+              unmounts this panel, and with it the result and the Stop
+              button. */}
+          <p className="small muted">
+            If you leave this page the scan carries on in Defender, but this
+            page will not show its result or be able to stop it. Windows
+            Security's Protection history lists anything Defender records.
           </p>
           <p className="small muted">Covering {COVERS[running]}</p>
           {/* No bar, and no percentage. Defender publishes neither, so any
@@ -787,15 +834,20 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
  */
 function Canaries() {
   const [report, setReport] = useState<CanaryReport | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // Kept apart, because they are cleared at different times. A failed read
+  // is replaced by the next read; a failed action stays until the next
+  // action. One shared slot let the 20-second poll wipe "that did not work"
+  // before anybody had read it.
+  const [readError, setReadError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
       setReport(await api.canaries());
-      setError(null);
+      setReadError(null);
     } catch (cause) {
-      setError(reason(cause));
+      setReadError(reason(cause));
     }
   }, []);
 
@@ -807,16 +859,22 @@ function Canaries() {
 
   async function act(work: () => Promise<CanaryReport>) {
     setBusy(true);
-    setError(null);
+    setActionError(null);
     try {
       setReport(await work());
+      setReadError(null);
     } catch (cause) {
-      setError(reason(cause));
+      setActionError(reason(cause));
     } finally {
       setBusy(false);
     }
   }
 
+  // Whether what is planted is actually known. Until a read has worked, and
+  // while the latest one has not, the count below is not a count: it was
+  // read as zero, and the button offered to plant decoys that may already be
+  // there.
+  const known = report !== null && readError === null;
   const planted = report?.canaries.length ?? 0;
   const trips = report?.trips ?? [];
   const watching = report?.auditing === true && (report?.canaries.some((c) => c.armed) ?? false);
@@ -828,12 +886,16 @@ function Canaries() {
     <section className="panel">
       <div className="panel-head">
         <h2>Decoy files</h2>
-        <button
-          onClick={() => void act(() => api.setCanaries(planted === 0))}
-          disabled={busy}
-        >
-          {busy ? "Working…" : planted === 0 ? "Plant decoys" : "Remove decoys"}
-        </button>
+        {known ? (
+          <button
+            onClick={() => void act(() => api.setCanaries(planted === 0))}
+            disabled={busy}
+          >
+            {busy ? "Working…" : planted === 0 ? "Plant decoys" : "Remove decoys"}
+          </button>
+        ) : (
+          !readError && <button disabled>Reading…</button>
+        )}
       </div>
 
       <p className="lede panel-lede">
@@ -847,10 +909,22 @@ function Canaries() {
         program did it.
       </p>
 
-      {error && (
+      {actionError && (
         <div className="notice notice-down">
           <strong>That did not work.</strong>
-          <pre className="error">{error}</pre>
+          <pre className="error">{actionError}</pre>
+        </div>
+      )}
+
+      {readError && (
+        <div className="notice notice-down">
+          <strong>
+            The decoys could not be read
+            {report ? ", so what follows is the last read that worked" : ""}.
+          </strong>{" "}
+          Whether any are planted is not known, so planting or removing them
+          is not offered until they can be read.
+          <pre className="error">{readError}</pre>
         </div>
       )}
 
@@ -925,13 +999,9 @@ function Canaries() {
                     </span>
                     <span className="badge attention-unusual">worth a look</span>
                   </div>
-                  <button
-                    className="finding-path"
-                    title="Open the containing folder"
-                    onClick={() => void api.reveal(trip.path)}
-                  >
+                  <Reveal className="finding-path" path={trip.path}>
                     {trip.path}
-                  </button>
+                  </Reveal>
                   <dl className="finding-facts">
                     <div>
                       <dt>Read by</dt>
@@ -1007,36 +1077,47 @@ function isProtecting(mode: HardeningMode): boolean {
 }
 
 /**
- * The four states a protection can be in, and what each colour means.
+ * The states a rule can be drawn in, and what each colour means.
  *
  * Green is not "good" and grey is not "bad". Most of these are off because
- * Microsoft ships them off, which is ordinary and not a finding — so off is the
- * dullest colour there is rather than a warning one. The only state that earns
- * attention is a protection Windows switches on by itself that is now off,
- * because something on this machine turned it off.
+ * Microsoft ships them off, which is ordinary and not a finding, so off is the
+ * dullest colour there is rather than a warning one.
+ *
+ * The legend is exactly what the grid draws. It carried a red "off, though
+ * Windows switches it on by itself" that no tile was ever drawn in, and a mode
+ * Defender reported as a number this does not recognise was drawn grey and
+ * described as "off, which is how Windows ships it", a claim about a setting
+ * nothing had read. That state now has its own colour and its own words.
  */
 const RULE_COLOUR = {
   on: "#2f7d5b",
   audit: "#3465de",
   off: "#6b7280",
-  unexpected: "#a33b45",
+  unrecognised: "#a8742a",
 } as const;
 
 const RULE_LEGEND: [string, string][] = [
-  [RULE_COLOUR.on, "On, and blocking"],
+  [RULE_COLOUR.on, "On, blocking or warning"],
   [RULE_COLOUR.audit, "Auditing only, which records and blocks nothing"],
   [RULE_COLOUR.off, "Off, which is how Windows ships it"],
-  [RULE_COLOUR.unexpected, "Off, though Windows switches it on by itself"],
+  [RULE_COLOUR.unrecognised, "Set to a value this does not recognise, so not known"],
 ];
+
+/** The colour a rule's tile is drawn in. One of the four in the legend. */
+function ruleColour(mode: HardeningMode): string {
+  if (typeof mode === "object") return RULE_COLOUR.unrecognised;
+  if (isProtecting(mode)) return RULE_COLOUR.on;
+  if (mode === "audit") return RULE_COLOUR.audit;
+  return RULE_COLOUR.off;
+}
 
 /**
  * Protections Windows already has and leaves switched off.
  *
- * Nothing here can be turned on from this window, deliberately. A rule in
- * blocking mode changes what every program on the machine may do and can stop
- * software somebody depends on, which is why Microsoft ships them off and
- * offers an audit mode first. This says what each one would prevent and leaves
- * the decision where it belongs.
+ * A rule in blocking mode changes what every program on the machine may do
+ * and can stop software somebody depends on, which is why Microsoft ships them
+ * off and offers an audit mode first. This says what each one would prevent,
+ * and changes one only when the button beside that rule is pressed.
  */
 function Hardening() {
   const [report, setReport] = useState<HardeningReport | null>(null);
@@ -1097,11 +1178,7 @@ function Hardening() {
     key: rule.id,
     label: rule.name,
     state: modeLabel(rule.mode),
-    colour: isProtecting(rule.mode)
-      ? RULE_COLOUR.on
-      : rule.mode === "audit"
-        ? RULE_COLOUR.audit
-        : RULE_COLOUR.off,
+    colour: ruleColour(rule.mode),
   }));
   const selection = useGridSelection(tiles);
   const open = shown.find((rule) => rule.id === selection.selected) ?? null;
@@ -1117,9 +1194,11 @@ function Hardening() {
         Defender ships a set of Attack Surface Reduction rules — narrow blocks on
         things malware does and ordinary software almost never does. They are
         free, already installed, and off by default. This reports which are on
-        and what each one would prevent. It cannot switch them on: a rule in
-        blocking mode changes what every program may do, and that is your
-        decision rather than this window's.
+        and what each one would prevent. Choose a rule to read what it does;
+        from there you can try it in audit mode, which only records, or turn
+        it on. Nothing changes unless you press one of those buttons, because
+        a rule in blocking mode changes what every program may do, and that
+        is your decision rather than this window's.
       </p>
 
       {error && (
@@ -1370,7 +1449,9 @@ function Extensions() {
 
       {report && (
         <>
-          <div className="notice notice-ok">
+          <div
+            className={report.unreadable.length === 0 ? "notice notice-ok" : "notice"}
+          >
             Found <strong>{all.length}</strong>{" "}
             {all.length === 1 ? "extension" : "extensions"} across{" "}
             {report.examined.length}{" "}
@@ -1384,11 +1465,21 @@ function Extensions() {
             .
           </div>
 
+          {/* The clean sentence only for a complete read. Beside a notice
+              that some of it could not be read, it claimed more than was
+              looked at. */}
           {shown.length === 0 ? (
-            <p className="empty">
-              Nothing installed asks for more than it needs. That is the ordinary
-              result.
-            </p>
+            report.unreadable.length === 0 ? (
+              <p className="empty">
+                Nothing installed asks for more than it needs. That is the
+                ordinary result.
+              </p>
+            ) : (
+              <p className="empty">
+                Nothing that could be read asks for more than it needs, but not
+                everything could be read, as the note below says.
+              </p>
+            )
           ) : (
             <ul className="findings">
               {shown.map((extension) => (
@@ -1411,13 +1502,9 @@ function Extensions() {
                     </span>
                   </div>
 
-                  <button
-                    className="finding-path"
-                    title="Open the containing folder"
-                    onClick={() => void api.reveal(extension.path)}
-                  >
+                  <Reveal className="finding-path" path={extension.path}>
                     {extension.browser} · {extension.profile} · {extension.id}
-                  </button>
+                  </Reveal>
 
                   {extension.notes.length > 0 && (
                     <ul className="finding-reasons">
@@ -1558,11 +1645,19 @@ function BehaviourWatch() {
         </p>
       )}
 
+      {/* The clean sentence is a claim about what the watcher saw, so it is
+          made only when the watcher was read just now and is running. It was
+          shown before the first answer, when the read failed, and when the
+          watcher was not running at all. */}
       {observations.length === 0 ? (
-        <p className="empty">
-          Nothing has started itself in an unusual way since watching began. That
-          is the ordinary result.
-        </p>
+        report && !error && report.watching ? (
+          <p className="empty">
+            Nothing has started itself in an unusual way since watching began.
+            That is the ordinary result.
+          </p>
+        ) : !report && !error ? (
+          <p className="empty">Reading…</p>
+        ) : null
       ) : (
         <ul className="findings">
           {observations.map((observation, index) => (
@@ -1583,13 +1678,9 @@ function BehaviourWatch() {
                 </span>
               </div>
 
-              <button
-                className="finding-path"
-                title="Open the containing folder"
-                onClick={() => void api.reveal(observation.subject)}
-              >
+              <Reveal className="finding-path" path={observation.subject}>
                 {observation.subject}
-              </button>
+              </Reveal>
 
               <ul className="finding-reasons">
                 {observation.evidence.map((why) => (
@@ -1765,12 +1856,18 @@ function Provenance() {
 
       {report && (
         <>
-          <div className="notice notice-ok">
+          <div
+            className={report.unreadable.length === 0 ? "notice notice-ok" : "notice"}
+          >
             Judged <strong>{report.examined}</strong>{" "}
             {report.examined === 1 ? "program" : "programs"}
             {report.swept_files > 0 && <> after passing over {report.swept_files} files</>}.{" "}
             {flagged.length === 0 ? (
-              <>Nothing stood out.</>
+              report.unreadable.length === 0 ? (
+                <>Nothing stood out.</>
+              ) : (
+                <>Nothing that could be read stood out.</>
+              )
             ) : (
               <>
                 <strong>{flagged.length}</strong>{" "}
@@ -1824,11 +1921,20 @@ function Provenance() {
             </div>
           )}
 
+          {/* The clean sentence only for a complete read: "nothing on this
+              machine" is a claim about all of it. */}
           {shown.length === 0 ? (
-            <p className="empty">
-              Nothing on this machine looks out of place. That is the ordinary
-              result.
-            </p>
+            report.unreadable.length === 0 ? (
+              <p className="empty">
+                Nothing on this machine looks out of place. That is the ordinary
+                result.
+              </p>
+            ) : (
+              <p className="empty">
+                Nothing that could be read looks out of place, but not everything
+                could be read, as the note above says.
+              </p>
+            )
           ) : (
             <ul className="findings">
               {shown.map((finding) => (
@@ -1844,13 +1950,9 @@ function Provenance() {
                     </span>
                   </div>
 
-                  <button
-                    className="finding-path"
-                    title="Open the containing folder"
-                    onClick={() => void api.reveal(finding.path)}
-                  >
+                  <Reveal className="finding-path" path={finding.path}>
                     {finding.path}
-                  </button>
+                  </Reveal>
 
                   {matchesFor(finding.path).map((hit) => (
                     <div key={hit.rule} className={`rule-hit rule-${hit.confidence}`}>
@@ -1937,12 +2039,9 @@ function Provenance() {
                 <>
                   {" "}
                   Drop your own <code>.yar</code> files in{" "}
-                  <button
-                    className="inline-path"
-                    onClick={() => void api.reveal(rules.user_rules_directory)}
-                  >
+                  <Reveal className="inline-path" path={rules.user_rules_directory}>
                     {rules.user_rules_directory}
-                  </button>{" "}
+                  </Reveal>{" "}
                   to have them matched too.
                 </>
               )}
