@@ -34,28 +34,13 @@ yanked = "deny"
 # Every entry here is justified. An unexplained ignore is how a real advisory
 # gets waved through six months later.
 ignore = [
-    # GTK3 and its ecosystem are unmaintained. They reach the lockfile through
-    # Tauri's Linux backend and are never compiled: this project targets
-    # Windows only, where Tauri uses WebView2. They disappear when Tauri
-    # completes its GTK4 migration; there is nothing to upgrade to meanwhile.
-    { id = "RUSTSEC-2024-0411", reason = "gtk — Linux-only Tauri dependency, not built on Windows" },
-    { id = "RUSTSEC-2024-0412", reason = "gtk-sys — Linux-only Tauri dependency, not built on Windows" },
-    { id = "RUSTSEC-2024-0413", reason = "gtk3-macros — Linux-only Tauri dependency, not built on Windows" },
-    { id = "RUSTSEC-2024-0414", reason = "glib — Linux-only Tauri dependency, not built on Windows" },
-    { id = "RUSTSEC-2024-0415", reason = "gdk — Linux-only Tauri dependency, not built on Windows" },
-    { id = "RUSTSEC-2024-0416", reason = "gdk-sys — Linux-only Tauri dependency, not built on Windows" },
-    { id = "RUSTSEC-2024-0417", reason = "atk — Linux-only Tauri dependency, not built on Windows" },
-    { id = "RUSTSEC-2024-0418", reason = "atk-sys — Linux-only Tauri dependency, not built on Windows" },
-    { id = "RUSTSEC-2024-0419", reason = "gdkwayland-sys — Linux-only Tauri dependency, not built on Windows" },
-    { id = "RUSTSEC-2024-0420", reason = "gdkx11-sys — Linux-only Tauri dependency, not built on Windows" },
-
     # A real vulnerability, in code this project does not compile.
     #
     # RUSTSEC-2026-0269 is a sandbox escape in Wasmtime's WASI *filesystem*
     # implementation, reached when a guest resolves a path with a trailing
     # slash. Wasmtime is here because yara-x compiles YARA rules to WebAssembly
     # and executes them, and the fix is in wasmtime 46, which no published
-    # yara-x depends on yet -- 1.20, the newest, still pins 45.
+    # yara-x depends on yet -- 1.21, the newest, still requires 45.
     #
     # It is ignored because the vulnerable code is not linked, not because it is
     # inconvenient. `wasmtime-wasi` does not appear anywhere in the dependency
@@ -69,6 +54,26 @@ ignore = [
     #
     # Revisit when yara-x moves to wasmtime 46 or later, and delete this.
     { id = "RUSTSEC-2026-0269", reason = "wasmtime WASI filesystem escape; wasmtime-wasi is not in the tree and the wasi feature is off, so the code is never compiled" },
+
+    # Two more in the same position, published after v0.5.0, and both in
+    # Wasmtime's *component model*. yara-x compiles each rule set to a core
+    # WebAssembly module and never instantiates a component, and wasmtime's
+    # `component-model` feature is not enabled anywhere in this tree, so the
+    # code these describe is not compiled into anything shipped.
+    #
+    #   RUSTSEC-2026-0316: host allocations made while lifting component
+    #     records were not charged against fuel. Its fix (wasmtime PR 14415)
+    #     touches only crates/wasmtime/src/runtime/component/values.rs.
+    #   RUSTSEC-2026-0327: the result count of an async-lifted component
+    #     callback was not validated. Component-model async only.
+    #
+    # Fixed in wasmtime 48.0.4 and 49.0.2; yara-x 1.21, the newest, still
+    # requires ^45.0.3, so there is no version to move to yet. Checkable:
+    #     cargo tree -e features -i wasmtime   -> no "component-model" feature
+    #
+    # Revisit when yara-x moves to a fixed wasmtime, and delete both.
+    { id = "RUSTSEC-2026-0316", reason = "wasmtime component-model record lifting; the component-model feature is off, so the code is never compiled" },
+    { id = "RUSTSEC-2026-0327", reason = "wasmtime component-model async callbacks; the component-model feature is off, so the code is never compiled" },
 
     # Unmaintained transitive crates with no published successor. None is a
     # vulnerability; all arrive through Tauri and none is reachable from code
@@ -85,10 +90,10 @@ ignore = [
     # reason it is linked only by the unprivileged shell.
     #
     # yara-x compiles rules to WebAssembly and runs them through wasmtime. That
-    # brings a JIT compiler, and wasmtime 43.x has a published advisory with no
+    # brings a JIT compiler, and wasmtime 45.x has a published advisory with no
     # fixed release in its line -- the fixes landed in 24.0.12, 36.0.13, 46.0.2
-    # and 47.0.3, and yara-x 1.19 (the latest) pins 43.x. There is no version
-    # pairing and no feature flag that avoids it.
+    # and 47.0.3, and yara-x 1.21 (the latest) still requires 45.x. There is no
+    # version pairing and no feature flag that avoids it.
     #
     # This is accepted rather than ignored, on three grounds, and it should be
     # revisited the moment yara-x moves to a fixed wasmtime:
@@ -108,7 +113,7 @@ ignore = [
     #
     # If any of those three stops being true, this entry must go and the
     # feature must go with it.
-    { id = "RUSTSEC-2026-0222", reason = "wasmtime, via yara-x — no fixed release in the 43.x line; confined to the unprivileged shell, runs only rules we or the user supply" },
+    { id = "RUSTSEC-2026-0222", reason = "wasmtime, via yara-x — no fixed release in the 45.x line; confined to the unprivileged shell, runs only rules we or the user supply" },
 
     # `rsa` reaches the tree through yara-x's PE module, which uses it to parse
     # Authenticode signatures. The Marvin attack recovers a *private* key from
