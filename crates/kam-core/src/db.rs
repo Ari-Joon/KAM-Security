@@ -15,7 +15,7 @@ use crate::audit::{AuditLog, Effect, Entry, Record};
 use crate::{Error, Result};
 
 /// Bumped whenever the schema below changes. Stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE audit (
@@ -152,6 +152,71 @@ const SCHEMA_V5: &str = "
 ALTER TABLE sightings ADD COLUMN trust TEXT NOT NULL DEFAULT '';
 ";
 
+/// Every download that has been checked, for whom, and what came of it.
+///
+/// # One row per person, path and content
+///
+/// The key is the caller's SID, the file's path and its SHA-256 together. The
+/// same file checked twice is one row brought up to date; a different file
+/// saved under the same name is a new row, because it is a different download
+/// and its history is its own. Rows outlive the file: a download quarantined or
+/// deleted last week is still something that happened.
+///
+/// # Not the audit log
+///
+/// Rows are rewritten as a file is checked again and as things are done to it,
+/// so unlike the audit table this one carries no append-only triggers. The
+/// audit log is still the record of each check and each action; this is the
+/// page's memory of where each download stands.
+///
+/// The richer parts (where it came from, who signed it, Defender's answer, what
+/// was done, what an archive held) are JSON written by the agent, because their
+/// shapes belong to the crates that produce them and this one cannot depend on
+/// those. `path` compares without regard to case, as Windows does.
+const SCHEMA_V6: &str = "
+CREATE TABLE downloads (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    sid         TEXT    NOT NULL,
+    path        TEXT    NOT NULL COLLATE NOCASE,
+    sha256      TEXT    NOT NULL,
+    name        TEXT    NOT NULL,
+    bytes       INTEGER NOT NULL,
+    arrived_at  TEXT,
+    checked_at  TEXT    NOT NULL,
+    origin      TEXT,
+    signature   TEXT,
+    outcome     TEXT    NOT NULL,
+    actions     TEXT    NOT NULL DEFAULT '[]',
+    dissection  TEXT,
+    UNIQUE (sid, path, sha256)
+);
+
+CREATE INDEX downloads_caller_idx ON downloads (sid, checked_at DESC);
+";
+
+/// One checked download as the store keeps it. See [`SCHEMA_V6`].
+///
+/// The JSON columns are carried as text: this crate stores them and the agent
+/// gives them their shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadRow {
+    pub sid: String,
+    pub path: String,
+    pub sha256: String,
+    pub name: String,
+    pub bytes: u64,
+    /// When the file was created where it is, in the store's ISO form.
+    pub arrived_at: Option<String>,
+    /// Written by the store's own clock when the row is recorded.
+    pub checked_at: String,
+    pub origin: Option<String>,
+    pub signature: Option<String>,
+    pub outcome: String,
+    /// A JSON array, oldest first.
+    pub actions: String,
+    pub dissection: Option<String>,
+}
+
 /// Whether the protective work is running, as stored in `settings`.
 ///
 /// Absent means on. A machine that has never been told otherwise is protected,
@@ -263,6 +328,169 @@ impl Store {
 
     pub fn set_protection_enabled(&self, enabled: bool) -> Result<()> {
         self.set_setting(PROTECTION_SETTING, if enabled { "on" } else { "off" })
+    }
+
+    /// Record that a download was checked, and say whether it is new.
+    ///
+    /// The row for this person, path and content is written if there is none,
+    /// and brought up to date if there is: what was found, where it came from
+    /// and when it was checked are replaced, while what was done to it and any
+    /// record of taking it apart are kept, because those happened and a second
+    /// look does not undo them. `checked_at` is the store's own clock, like the
+    /// audit log's, whatever the row passed in says.
+    ///
+    /// Returns true the first time this person's file with this content is
+    /// recorded, which is what decides whether a notice is worth sending.
+    pub fn record_download_check(&self, row: &DownloadRow) -> Result<bool> {
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(to_db_error)?;
+        let existing: Option<i64> = transaction
+            .query_row(
+                "SELECT id FROM downloads WHERE sid = ?1 AND path = ?2 AND sha256 = ?3",
+                params![row.sid, row.path, row.sha256],
+                |found| found.get(0),
+            )
+            .optional()
+            .map_err(to_db_error)?;
+        match existing {
+            Some(id) => {
+                transaction
+                    .execute(
+                        "UPDATE downloads SET
+                             name = ?2, bytes = ?3, arrived_at = ?4,
+                             checked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                             origin = ?5, signature = ?6, outcome = ?7
+                         WHERE id = ?1",
+                        params![
+                            id,
+                            row.name,
+                            row.bytes as i64,
+                            row.arrived_at,
+                            row.origin,
+                            row.signature,
+                            row.outcome
+                        ],
+                    )
+                    .map_err(to_db_error)?;
+            }
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO downloads
+                             (sid, path, sha256, name, bytes, arrived_at, checked_at,
+                              origin, signature, outcome, actions, dissection)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                                 ?7, ?8, ?9, '[]', NULL)",
+                        params![
+                            row.sid,
+                            row.path,
+                            row.sha256,
+                            row.name,
+                            row.bytes as i64,
+                            row.arrived_at,
+                            row.origin,
+                            row.signature,
+                            row.outcome
+                        ],
+                    )
+                    .map_err(to_db_error)?;
+            }
+        }
+        transaction.commit().map_err(to_db_error)?;
+        Ok(existing.is_none())
+    }
+
+    /// One person's checked downloads, most recently checked first.
+    ///
+    /// Only theirs. The agent serves everybody signed in to the machine, and a
+    /// list of what somebody downloaded is theirs to read and nobody else's.
+    pub fn downloads_for(&self, sid: &str, limit: usize) -> Result<Vec<DownloadRow>> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT sid, path, sha256, name, bytes, arrived_at, checked_at,
+                        origin, signature, outcome, actions, dissection
+                 FROM downloads WHERE sid = ?1
+                 ORDER BY checked_at DESC, id DESC LIMIT ?2",
+            )
+            .map_err(to_db_error)?;
+        let rows = statement
+            .query_map(params![sid, limit as i64], |row| {
+                Ok(DownloadRow {
+                    sid: row.get(0)?,
+                    path: row.get(1)?,
+                    sha256: row.get(2)?,
+                    name: row.get(3)?,
+                    bytes: row.get::<_, i64>(4)?.max(0) as u64,
+                    arrived_at: row.get(5)?,
+                    checked_at: row.get(6)?,
+                    origin: row.get(7)?,
+                    signature: row.get(8)?,
+                    outcome: row.get(9)?,
+                    actions: row.get(10)?,
+                    dissection: row.get(11)?,
+                })
+            })
+            .map_err(to_db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(to_db_error)
+    }
+
+    /// Note something done to a download, on its most recent row.
+    ///
+    /// `sha256` narrows it to one content when the caller knows it; without it
+    /// the newest row for the path is the one meant, which is the file that was
+    /// there when the action was taken. `action` is one JSON value and is
+    /// appended, so earlier actions are never rewritten.
+    ///
+    /// Returns false when there is no row to note it on, which is not an error:
+    /// the audit log has the action either way.
+    pub fn add_download_action(
+        &self,
+        sid: &str,
+        path: &str,
+        sha256: Option<&str>,
+        action: &str,
+    ) -> Result<bool> {
+        let connection = self.lock()?;
+        let changed = connection
+            .execute(
+                "UPDATE downloads SET actions = json_insert(actions, '$[#]', json(?4))
+                 WHERE id = (
+                     SELECT id FROM downloads
+                     WHERE sid = ?1 AND path = ?2 AND (?3 IS NULL OR sha256 = ?3)
+                     ORDER BY checked_at DESC, id DESC LIMIT 1
+                 )",
+                params![sid, path, sha256, action],
+            )
+            .map_err(to_db_error)?;
+        Ok(changed > 0)
+    }
+
+    /// Keep what an archive was found to hold, on that archive's row.
+    ///
+    /// Replaces any earlier dissection of the same content: taking the same
+    /// archive apart again produces the current answer, which is the one worth
+    /// showing. Returns false when there is no such row.
+    pub fn set_download_dissection(
+        &self,
+        sid: &str,
+        path: &str,
+        sha256: &str,
+        dissection: &str,
+    ) -> Result<bool> {
+        let connection = self.lock()?;
+        let changed = connection
+            .execute(
+                "UPDATE downloads SET dissection = ?4
+                 WHERE sid = ?1 AND path = ?2 AND sha256 = ?3",
+                params![sid, path, sha256, dissection],
+            )
+            .map_err(to_db_error)?;
+        Ok(changed > 0)
     }
 
     /// Most recent entries first. This is what the UI's activity view reads.
@@ -814,12 +1042,13 @@ fn one_line(detail: &str) -> String {
 }
 
 /// Every schema step, with the version it brings the store to.
-const MIGRATIONS: [(i64, &str); 5] = [
+const MIGRATIONS: [(i64, &str); 6] = [
     (1, SCHEMA_V1),
     (2, SCHEMA_V2),
     (3, SCHEMA_V3),
     (4, SCHEMA_V4),
     (5, SCHEMA_V5),
+    (6, SCHEMA_V6),
 ];
 
 fn migrate(connection: &Connection) -> Result<()> {
@@ -1677,5 +1906,168 @@ mod tests {
         connection
             .execute_batch("SELECT trust FROM sightings")
             .expect("the column the upgrade adds is there");
+    }
+
+    fn download(sid: &str, path: &str, sha256: &str, outcome: &str) -> DownloadRow {
+        DownloadRow {
+            sid: sid.to_owned(),
+            path: path.to_owned(),
+            sha256: sha256.to_owned(),
+            name: "setup.exe".to_owned(),
+            bytes: 4096,
+            arrived_at: Some("2026-10-12T09:00:00.000Z".to_owned()),
+            checked_at: String::new(),
+            origin: Some(r#"{"zone":"internet"}"#.to_owned()),
+            signature: None,
+            outcome: outcome.to_owned(),
+            actions: String::new(),
+            dissection: None,
+        }
+    }
+
+    /// A store from before downloads were recorded gains the table, keeps what
+    /// it already held, and can then record a download.
+    #[test]
+    fn a_version_five_store_is_brought_up_to_six_and_keeps_its_history() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_through(&connection, &MIGRATIONS[..5]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO audit (at, module, action, effect, detail)
+                 VALUES ('2026-10-01T00:00:00.000Z', 'storage', 'scan', 'observed', 'before')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute_batch("SELECT id FROM downloads")
+                .is_err(),
+            "the premise: a version five store has no downloads table"
+        );
+
+        migrate(&connection).expect("the upgrade to six should apply");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+        let kept: String = connection
+            .query_row("SELECT detail FROM audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, "before", "the audit log did not survive the upgrade");
+
+        // And the upgraded store is a working one.
+        let store = Store {
+            connection: Mutex::new(connection),
+        };
+        assert!(store
+            .record_download_check(&download("S-1-5-21-1", r"C:\D\a.exe", "aa", "{}"))
+            .unwrap());
+    }
+
+    /// The v6 step, stopped partway, leaves the store at v5 and the next start
+    /// finishes it rather than failing on a table that half exists.
+    #[test]
+    fn an_interrupted_upgrade_to_six_is_finished_by_the_next_start() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_through(&connection, &MIGRATIONS[..5]).unwrap();
+        let interrupted = [(
+            6,
+            "CREATE TABLE downloads (id INTEGER PRIMARY KEY);
+             this is where the process was stopped;",
+        )];
+        assert!(migrate_through(&connection, &interrupted).is_err());
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
+
+        migrate(&connection).expect("the next start should finish the upgrade");
+        connection
+            .execute_batch("SELECT sid, path, sha256, actions, dissection FROM downloads")
+            .expect("the table the upgrade adds is there, whole");
+    }
+
+    /// One row per person, path and content. A second check of the same file
+    /// updates it and keeps what was done; new content is a new row.
+    #[test]
+    fn a_download_is_one_row_per_person_path_and_content() {
+        let store = Store::open_in_memory().unwrap();
+        let me = "S-1-5-21-1-1001";
+        let path = r"C:\Users\me\Downloads\setup.exe";
+
+        assert!(store
+            .record_download_check(&download(me, path, "aa", r#"{"answer":"nothing_found"}"#))
+            .unwrap());
+        assert!(store
+            .add_download_action(me, path, None, r#"{"what":"quarantined"}"#)
+            .unwrap());
+        // The same content again, spelled with other capitals: the same row,
+        // brought up to date, with its action kept.
+        let again = download(me, &path.to_uppercase(), "aa", r#"{"answer":"flagged"}"#);
+        assert!(
+            !store.record_download_check(&again).unwrap(),
+            "a second check was taken for a first"
+        );
+        let rows = store.downloads_for(me, 50).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].outcome, r#"{"answer":"flagged"}"#);
+        assert_eq!(rows[0].actions, r#"[{"what":"quarantined"}]"#);
+        assert!(
+            rows[0].checked_at.ends_with('Z'),
+            "the store's clock writes checked_at"
+        );
+
+        // Different content under the same name is a different download.
+        assert!(store
+            .record_download_check(&download(me, path, "bb", "{}"))
+            .unwrap());
+        assert_eq!(store.downloads_for(me, 50).unwrap().len(), 2);
+
+        // A dissection lands on the row it describes and nowhere else.
+        assert!(store
+            .set_download_dissection(me, path, "bb", r#"{"members":[]}"#)
+            .unwrap());
+        assert!(!store.set_download_dissection(me, path, "cc", "{}").unwrap());
+        let rows = store.downloads_for(me, 50).unwrap();
+        let described: Vec<_> = rows.iter().filter(|row| row.dissection.is_some()).collect();
+        assert_eq!(described.len(), 1);
+        assert_eq!(described[0].sha256, "bb");
+    }
+
+    /// Somebody else's downloads are not in anybody's list but theirs.
+    #[test]
+    fn a_caller_sees_only_their_own_downloads() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_download_check(&download(
+                "S-1-5-21-1-1001",
+                r"C:\Users\me\Downloads\a.exe",
+                "aa",
+                "{}",
+            ))
+            .unwrap();
+        store
+            .record_download_check(&download(
+                "S-1-5-21-1-1002",
+                r"C:\Users\them\Downloads\b.exe",
+                "bb",
+                "{}",
+            ))
+            .unwrap();
+
+        let mine = store.downloads_for("S-1-5-21-1-1001", 50).unwrap();
+        assert_eq!(mine.len(), 1);
+        assert!(mine[0].path.contains(r"\me\"));
+        assert!(
+            !store
+                .add_download_action(
+                    "S-1-5-21-1-1001",
+                    r"C:\Users\them\Downloads\b.exe",
+                    None,
+                    "{}"
+                )
+                .unwrap(),
+            "an action landed on somebody else's row"
+        );
     }
 }
