@@ -1629,6 +1629,7 @@ function Provenance() {
           matches: [],
           files_scanned: 0,
           skipped: [],
+          failed: [],
           rules_loaded: 0,
           user_rules_directory: "",
           user_rules_loaded: 0,
@@ -1724,20 +1725,32 @@ function Provenance() {
                   <>, including {rules.user_rules_loaded} of your own</>
                 )}
                 .
+                {(rules.failed ?? []).length + rules.skipped.length > 0 && (
+                  <>
+                    {" "}
+                    <strong>{(rules.failed ?? []).length + rules.skipped.length}</strong>{" "}
+                    could not be matched, so the rules say nothing about them.
+                  </>
+                )}
               </>
             )}
           </div>
 
-          {rules && rules.problems.length > 0 && (
-            <div className="notice notice-warn">
-              <strong>Rules:</strong>
-              <ul className="concerns">
-                {rules.problems.map((problem) => (
-                  <li key={problem}>{problem}</li>
-                ))}
-              </ul>
-            </div>
-          )}
+          {/* Everything the rules did not finish reading, said out loud: a
+              file the rules never saw is not a file they found nothing in. */}
+          {rules &&
+            rules.problems.length + (rules.failed ?? []).length + rules.skipped.length > 0 && (
+              <div className="notice notice-warn">
+                <strong>Rules:</strong>
+                <ul className="concerns">
+                  {[...rules.problems, ...(rules.failed ?? []), ...rules.skipped].map(
+                    (problem) => (
+                      <li key={problem}>{problem}</li>
+                    ),
+                  )}
+                </ul>
+              </div>
+            )}
 
           {report.unreadable.length > 0 && (
             <div className="notice notice-warn">

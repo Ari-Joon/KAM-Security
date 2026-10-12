@@ -115,9 +115,18 @@ pub struct RuleMatch {
 pub struct RuleReport {
     /// Matches by file path. Files with nothing to say do not appear.
     pub matches: Vec<FileMatches>,
+    /// Files the rules were actually run over, to the end.
     pub files_scanned: usize,
     /// Files passed over because they were too large, with the reason.
     pub skipped: Vec<String>,
+    /// Files that could not be read, or whose matching did not finish, each
+    /// with the reason.
+    ///
+    /// Counted apart from `files_scanned`. They were counted in it, so a file
+    /// that could not be opened, or that hit the time limit, was reported as
+    /// matched against and found to have nothing to say.
+    #[serde(default)]
+    pub failed: Vec<String>,
     pub rules_loaded: usize,
     /// Where user rules were looked for, so an empty result is explicable.
     pub user_rules_directory: String,
@@ -153,13 +162,92 @@ pub fn user_rules_directory() -> PathBuf {
     PathBuf::from(base).join("KAM Security").join("rules")
 }
 
+/// The namespace the bundled rules are compiled into, which is how a match is
+/// told to be this product's rather than the user's.
+const BUNDLED_NAMESPACE: &str = "default";
+
+/// Compile every rule file in the user's own folder, each in a namespace of
+/// its own, and return how many compiled.
+///
+/// # Why a namespace each
+///
+/// A YARA `global` rule gates every rule in its namespace. User files were
+/// compiled into the same namespace as the bundled rules, so one user file
+/// holding `global rule x { condition: false }` silently switched off every
+/// rule this product ships. In its own namespace a global rule only governs
+/// the file it came from.
+///
+/// # Why a folder that would not open is a problem
+///
+/// It was ignored, so the rules in it never loaded and nobody was told. The
+/// rules run in the shell, as the person, and the folder sits under a
+/// `ProgramData` folder that ordinary accounts cannot list, which is exactly
+/// when that happens.
+fn load_user_rules(
+    compiler: &mut yara_x::Compiler<'_>,
+    directory: &Path,
+    problems: &mut Vec<String>,
+) -> usize {
+    let listing = match std::fs::read_dir(directory) {
+        Ok(listing) => listing,
+        // No folder is no rules, which is the ordinary state.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => {
+            problems.push(format!(
+                "The folder for your own rules, {}, could not be read ({error}), so no \
+                 rules in it were loaded.",
+                directory.display()
+            ));
+            return 0;
+        }
+    };
+
+    let mut paths = Vec::new();
+    for item in listing {
+        match item {
+            Ok(item) => paths.push(item.path()),
+            Err(error) => {
+                problems.push(format!(
+                    "The folder for your own rules, {}, could not be listed to the end \
+                     ({error}), so some rules in it may not have been loaded.",
+                    directory.display()
+                ));
+                break;
+            }
+        }
+    }
+    paths.retain(|path| {
+        path.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("yar") || extension.eq_ignore_ascii_case("yara")
+        })
+    });
+    paths.sort();
+
+    let mut loaded = 0;
+    for (index, path) in paths.iter().enumerate() {
+        match std::fs::read_to_string(path) {
+            Ok(source) => {
+                compiler.new_namespace(&format!("user_{index}"));
+                match compiler.add_source(source.as_str()) {
+                    Ok(_) => loaded += 1,
+                    Err(error) => problems.push(format!(
+                        "{} did not compile and was skipped: {error}",
+                        path.display()
+                    )),
+                }
+            }
+            Err(error) => problems.push(format!("{} could not be read: {error}", path.display())),
+        }
+    }
+    loaded
+}
+
 /// Compiled rules, ready to match against files.
 ///
 /// `yara_x::Rules` is not `Debug`, so this is written out by hand rather than
 /// derived; the compiled rule set is not something worth printing anyway.
 pub struct Engine {
     rules: yara_x::Rules,
-    bundled_rules: Vec<String>,
     loaded: usize,
     user_loaded: usize,
     problems: Vec<String>,
@@ -183,6 +271,10 @@ impl Engine {
     /// allowed to take the bundled rules down with it: someone experimenting
     /// with their own rule should not lose the working ones.
     pub fn load() -> kam_core::Result<Self> {
+        Self::load_from(&user_rules_directory())
+    }
+
+    fn load_from(user_directory: &Path) -> kam_core::Result<Self> {
         let mut compiler = yara_x::Compiler::new();
         let mut problems = Vec::new();
 
@@ -194,47 +286,19 @@ impl Engine {
                 kam_core::Error::Refused(format!("rule globals could not be declared: {error}"))
             })?;
 
+        // The bundled rules live in the default namespace, which is how a match
+        // is told to be ours rather than the user's.
         compiler.add_source(BUNDLED).map_err(|error| {
             kam_core::Error::Refused(format!("bundled rules did not compile: {error}"))
         })?;
 
-        // Remember which identifiers are ours, so the interface can tell the
-        // reader whether a match came from this product or from a rule they
-        // added themselves.
-        let bundled_rules: Vec<String> = rule_names(BUNDLED);
-
-        let directory = user_rules_directory();
-        let mut user_loaded = 0;
-        if let Ok(listing) = std::fs::read_dir(&directory) {
-            for item in listing.flatten() {
-                let path = item.path();
-                let is_rule = path.extension().is_some_and(|extension| {
-                    extension.eq_ignore_ascii_case("yar") || extension.eq_ignore_ascii_case("yara")
-                });
-                if !is_rule {
-                    continue;
-                }
-                match std::fs::read_to_string(&path) {
-                    Ok(source) => match compiler.add_source(source.as_str()) {
-                        Ok(_) => user_loaded += 1,
-                        Err(error) => problems.push(format!(
-                            "{} did not compile and was skipped: {error}",
-                            path.display()
-                        )),
-                    },
-                    Err(error) => {
-                        problems.push(format!("{} could not be read: {error}", path.display()))
-                    }
-                }
-            }
-        }
+        let user_loaded = load_user_rules(&mut compiler, user_directory, &mut problems);
 
         let rules = compiler.build();
         let loaded = rules.iter().count();
 
         Ok(Self {
             rules,
-            bundled_rules,
             loaded,
             user_loaded,
             problems,
@@ -253,7 +317,15 @@ impl Engine {
         path: &Path,
         report: &mut RuleReport,
     ) -> Option<FileMatches> {
-        let metadata = std::fs::metadata(path).ok()?;
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                report
+                    .failed
+                    .push(format!("{} could not be read: {error}", path.display()));
+                return None;
+            }
+        };
         if metadata.len() > MAX_FILE_BYTES {
             report.skipped.push(format!(
                 "{} was not examined: {} MB is larger than the {} MB limit",
@@ -264,7 +336,15 @@ impl Engine {
             return None;
         }
 
-        let data = std::fs::read(path).ok()?;
+        let data = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(error) => {
+                report
+                    .failed
+                    .push(format!("{} could not be read: {error}", path.display()));
+                return None;
+            }
+        };
 
         let extension = path
             .extension()
@@ -277,7 +357,24 @@ impl Engine {
         );
         let _ = scanner.set_global("kam_ext", extension.as_str());
 
-        let results = scanner.scan(&data).ok()?;
+        let results = match scanner.scan(&data) {
+            Ok(results) => results,
+            Err(yara_x::errors::ScanError::Timeout) => {
+                report.failed.push(format!(
+                    "{} was not finished: matching it took longer than {} seconds",
+                    path.display(),
+                    SCAN_TIMEOUT.as_secs()
+                ));
+                return None;
+            }
+            Err(error) => {
+                report
+                    .failed
+                    .push(format!("{} could not be matched: {error}", path.display()));
+                return None;
+            }
+        };
+        report.files_scanned += 1;
 
         let matches: Vec<RuleMatch> = results
             .matching_rules()
@@ -318,7 +415,7 @@ impl Engine {
 
                 RuleMatch {
                     evidence,
-                    bundled: self.bundled_rules.contains(&identifier),
+                    bundled: rule.namespace() == BUNDLED_NAMESPACE,
                     rule: identifier,
                     category,
                     confidence,
@@ -354,7 +451,6 @@ impl Engine {
             if !path.is_file() {
                 continue;
             }
-            report.files_scanned += 1;
             if let Some(hit) = self.scan_file(&mut scanner, path, &mut report) {
                 report.matches.push(hit);
             }
@@ -371,9 +467,10 @@ impl Engine {
 
 /// Pull rule identifiers out of source text.
 ///
-/// Only used to tell bundled rules from the user's own. Deliberately crude:
-/// getting it wrong mislabels a badge, and parsing YARA properly to do that
-/// would be absurd.
+/// Only the tests use it now, to walk the bundled rules; bundled and user
+/// rules are told apart by namespace. Deliberately crude: parsing YARA
+/// properly to list names would be absurd.
+#[cfg(test)]
 fn rule_names(source: &str) -> Vec<String> {
     source
         .lines()
@@ -419,7 +516,12 @@ mod tests {
     fn the_bundled_rules_compile() {
         // The single most important test here: a rule file that does not
         // compile takes the whole layer with it.
-        let engine = engine();
+        //
+        // Loaded with no user folder, so that what is checked is the bundled
+        // rules alone. The machine's own folder can rightly add a problem: an
+        // ordinary account cannot list the `ProgramData` folder it sits in.
+        let engine = Engine::load_from(Path::new(r"C:\kam-definitely-absent-rules"))
+            .expect("the bundled rules must compile");
         assert!(
             engine.loaded >= 8,
             "expected the bundled rules, got {}",
@@ -780,6 +882,116 @@ rule probe_version { condition: pe.is_pe and for any k, v in pe.version_info : (
             fired.contains(&"probe_version"),
             "pe.version_info iteration is not working: {fired:?}"
         );
+    }
+
+    /// A scratch folder for user rules, removed when dropped.
+    struct RulesFolder(PathBuf);
+
+    impl Drop for RulesFolder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn rules_folder(tag: &str, files: &[(&str, &str)]) -> RulesFolder {
+        let folder =
+            std::env::temp_dir().join(format!("kam-user-rules-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        for (name, body) in files {
+            std::fs::write(folder.join(name), body).unwrap();
+        }
+        RulesFolder(folder)
+    }
+
+    /// One user file's `global` rule cannot switch off the bundled rules.
+    ///
+    /// User files shared the bundled rules' namespace, and a global rule gates
+    /// every rule in its namespace, so this one file silenced the whole layer.
+    #[test]
+    fn a_users_global_rule_cannot_switch_off_the_bundled_ones() {
+        let folder = rules_folder(
+            "global",
+            &[(
+                "gate.yar",
+                "global rule kam_test_gate { condition: false }\n\
+                 rule kam_test_mine { strings: $a = \"kam-test-marker\" condition: $a }",
+            )],
+        );
+        let engine = Engine::load_from(&folder.0).expect("the rules compile");
+        assert_eq!(engine.user_loaded, 1, "{:?}", engine.problems);
+
+        let path = sample(
+            "gated-miner.cmd",
+            b"config: stratum+tcp://pool.supportxmr.com:3333 --donate-level 1 randomx",
+        );
+        let hits = scan_one(&engine, &path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            hits.contains(&"cryptocurrency_miner".to_owned()),
+            "a user's global rule switched off a bundled one: {hits:?}"
+        );
+    }
+
+    /// Bundled and user rules are told apart by where they were compiled,
+    /// so a user rule that shares a bundled rule's name is still theirs.
+    #[test]
+    fn a_user_rule_is_never_mistaken_for_a_bundled_one() {
+        let folder = rules_folder(
+            "same-name",
+            &[(
+                "mine.yar",
+                "rule cryptocurrency_miner { strings: $a = \"kam-test-own-marker\" condition: $a }",
+            )],
+        );
+        let engine = Engine::load_from(&folder.0).expect("the rules compile");
+        let path = sample("own-marker.cmd", b"kam-test-own-marker");
+        let report = engine.scan(&[path.display().to_string()]);
+        std::fs::remove_file(&path).unwrap();
+        let hit = report.matches.first().expect("the user rule matched");
+        assert!(hit.matches.iter().all(|m| !m.bundled), "{:?}", hit.matches);
+    }
+
+    /// A rules folder that is there and will not open is said, not skipped.
+    #[test]
+    fn a_rules_folder_that_will_not_open_is_reported() {
+        // A file where the folder should be will not list.
+        let not_a_folder =
+            std::env::temp_dir().join(format!("kam-user-rules-file-{}", std::process::id()));
+        std::fs::write(&not_a_folder, b"x").unwrap();
+        let engine = Engine::load_from(&not_a_folder);
+        std::fs::remove_file(&not_a_folder).unwrap();
+        let engine = engine.expect("the bundled rules still load");
+        assert!(
+            engine
+                .problems
+                .iter()
+                .any(|problem| problem.contains("could not be read")),
+            "{:?}",
+            engine.problems
+        );
+
+        // No folder at all is no rules, which is not a problem.
+        let engine = Engine::load_from(Path::new(r"C:\kam-definitely-absent-rules")).unwrap();
+        assert!(engine.problems.is_empty(), "{:?}", engine.problems);
+    }
+
+    /// A file that could not be read is not counted as scanned.
+    #[test]
+    fn a_file_that_could_not_be_read_is_counted_apart() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let path = sample("locked.cmd", b"echo locked");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let report = engine().scan(&[path.display().to_string()]);
+        drop(held);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(report.files_scanned, 0, "{report:?}");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
     }
 
     #[test]

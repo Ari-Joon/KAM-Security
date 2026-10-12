@@ -585,8 +585,12 @@ export type FileMatches = {
 
 export type RuleReport = {
   matches: FileMatches[];
+  /** Files the rules were run over to the end. */
   files_scanned: number;
+  /** Files passed over for being too large, each with its reason. */
   skipped: string[];
+  /** Files that could not be read or whose matching did not finish. Not in `files_scanned`. */
+  failed: string[];
   rules_loaded: number;
   user_rules_directory: string;
   user_rules_loaded: number;
