@@ -33,7 +33,13 @@ kam-virustotal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { version = "2", features = ["tray-icon"] }
-windows = { workspace = true }
+# Windows' own notification interfaces, used only here: the window is what
+# tells the person a download has landed.
+windows = { workspace = true, features = ["Data_Xml_Dom", "Foundation", "UI_Notifications"] }
+# Taking zip archives apart, as the person, never in the agent. Reading needs
+# only deflate; any other compression method is reported as one this cannot
+# unpack rather than pulled in.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 

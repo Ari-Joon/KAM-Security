@@ -8,7 +8,11 @@
 //! Nothing in this process is privileged. It runs as the desktop user and gets
 //! served only because it is installed alongside the agent.
 
+mod archive;
 pub mod consent;
+mod context_menu;
+mod downloads;
+mod notice;
 mod recycle;
 mod startup;
 mod uninstall;
@@ -1035,6 +1039,107 @@ async fn run_uninstaller(name: String, command: String) -> Result<(), String> {
     .await
 }
 
+/// Everything the Downloads page draws: the history from the agent, the files
+/// in the folder with no check yet, and what the watcher is doing.
+///
+/// Off the window's thread: it asks the agent and lists a folder.
+#[tauri::command]
+async fn downloads_page(app: tauri::AppHandle) -> Result<downloads::Page, String> {
+    off_the_window(move || Ok(downloads::page(&app.state::<downloads::Downloads>()))).await
+}
+
+/// Check one file the way a new download is checked.
+///
+/// Streams like a Defender scan and can be stopped. Defender is asked to
+/// report, so nothing is moved or deleted by this.
+#[tauri::command]
+async fn check_download(
+    app: tauri::AppHandle,
+    path: String,
+    job: String,
+) -> Result<Option<kam_scanner::downloads::DownloadRecord>, String> {
+    stream_job(
+        app,
+        job.clone(),
+        Request::CheckDownload {
+            path,
+            job,
+            copy_of: None,
+        },
+        |response| match response {
+            Response::DownloadChecked(record) => Ok(Some(*record)),
+            Response::Stopped => Ok(None),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        },
+    )
+    .await
+}
+
+/// Quarantine one download. The agent fences it to the Downloads folder.
+#[tauri::command]
+async fn quarantine_download(path: String) -> Result<Manifest, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::QuarantineDownload { path })
+            .map_err(|error| error.to_string())?
+        {
+            Response::Quarantined(manifest) => Ok(manifest),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
+}
+
+/// Take a zip apart: a private copy, the original quarantined first when
+/// Defender flagged it, and every member with Defender's answer. Nothing is
+/// extracted until [`extract_clean`]. `None` when it was stopped.
+#[tauri::command]
+async fn dissect_archive(
+    app: tauri::AppHandle,
+    path: String,
+    job: String,
+) -> Result<Option<downloads::DissectionView>, String> {
+    off_the_window(move || downloads::dissect(&app, &path, &job)).await
+}
+
+/// Extract what Defender found nothing in, because the person said go.
+#[tauri::command]
+async fn extract_clean(
+    app: tauri::AppHandle,
+    token: String,
+) -> Result<kam_scanner::downloads::Extraction, String> {
+    off_the_window(move || downloads::extract(&app.state::<downloads::Downloads>(), &token)).await
+}
+
+/// Close a taken-apart archive without extracting, deleting the private copy.
+#[tauri::command]
+async fn discard_dissection(app: tauri::AppHandle, token: String) -> Result<(), String> {
+    off_the_window(move || {
+        downloads::discard(&app.state::<downloads::Downloads>(), &token);
+        Ok(())
+    })
+    .await
+}
+
+/// Add or remove the right-click entries.
+#[tauri::command]
+async fn set_context_menu(enabled: bool) -> Result<context_menu::MenuState, String> {
+    off_the_window(move || context_menu::set(enabled)).await
+}
+
+/// A file somebody asked about from outside the window, taken once.
+#[tauri::command]
+async fn take_launch(app: tauri::AppHandle) -> Result<Option<context_menu::Launch>, String> {
+    off_the_window(move || Ok(app.state::<downloads::Downloads>().take_launch())).await
+}
+
+/// Whether such a request is waiting, so the window can open on Downloads.
+#[tauri::command]
+async fn launch_waiting(app: tauri::AppHandle) -> Result<bool, String> {
+    off_the_window(move || Ok(app.state::<downloads::Downloads>().has_launch())).await
+}
+
 /// Version of the protocol this build speaks, so the UI can say plainly when it
 /// and the agent disagree rather than silently mis-rendering.
 #[tauri::command]
@@ -1090,6 +1195,11 @@ mod taskbar_icon;
 mod tray;
 
 pub fn run() {
+    // Before anything else, and before any window exists: the identity
+    // Windows groups this program's windows, shortcuts and notifications
+    // under. See `notice.rs`.
+    notice::claim_identity();
+
     tauri::Builder::default()
         // Registered before anything else, deliberately. A second launch hands
         // its arguments to the instance already running and exits immediately,
@@ -1104,6 +1214,12 @@ pub fn run() {
         // was reported. Two shells also means two pipe clients competing for
         // the agent's connection slots for no benefit whatever.
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // "Check with KAM Security" or "Extract with KAM Security" from
+            // Explorer: open on the Downloads page at that file.
+            if let Some(launch) = context_menu::launch_from(&argv) {
+                downloads::open_on(app, launch);
+                return;
+            }
             // A second start from the sign-in entry (after an update, say)
             // should not open the window; any other second start is somebody
             // clicking the shortcut, and should.
@@ -1114,13 +1230,39 @@ pub fn run() {
         .setup(|app| {
             tray::install(app.handle())?;
             app.manage(FirstRun(startup::apply_first_run_default()));
+            app.manage(downloads::Downloads::default());
+
+            // The first copy can be started from the right-click menu too.
+            let arguments: Vec<String> = std::env::args().collect();
+            let launch = context_menu::launch_from(&arguments);
+            let asked = launch.is_some();
+            if let Some(launch) = launch {
+                app.state::<downloads::Downloads>().set_launch(launch);
+            }
+
+            // Watching Downloads, on threads of its own. It waits on Windows
+            // and costs nothing while nothing arrives.
+            downloads::start_watching(app.handle().clone());
+
+            // Registry and file work kept off the window's thread: the
+            // right-click entries, the Start menu shortcut notifications need,
+            // and any working copy a previous run left behind.
+            let _ = std::thread::Builder::new()
+                .name("kam-first-run".to_owned())
+                .spawn(|| {
+                    context_menu::apply_at_start();
+                    if let Err(error) = notice::ensure_shortcut() {
+                        eprintln!("{error}");
+                    }
+                    archive::discard_leftovers();
+                });
 
             // Started at sign-in: the icon only, no window, which is what makes
             // being there from sign-in cost nothing. Otherwise open the window
             // as usual. It is not created from the configuration, so that a
             // background start never builds a WebView just to destroy it.
             let background = std::env::args().any(|arg| arg == startup::BACKGROUND);
-            if !background {
+            if !background || asked {
                 tray::show_window(app.handle());
             }
             Ok(())
@@ -1182,7 +1324,16 @@ pub fn run() {
             check_for_update,
             open_release_page,
             start_at_sign_in,
-            set_start_at_sign_in
+            set_start_at_sign_in,
+            downloads_page,
+            check_download,
+            quarantine_download,
+            dissect_archive,
+            extract_clean,
+            discard_dissection,
+            set_context_menu,
+            take_launch,
+            launch_waiting
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| {
