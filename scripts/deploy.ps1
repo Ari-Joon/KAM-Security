@@ -248,6 +248,18 @@ try {
         Say ("  {0,-16} {1}  {2} MB" -f $name, $stamp, $mb) 'Green'
     }
 
+    # Explorer caches the icon it drew for a file and does not notice the file
+    # being replaced in place, so a pinned or desktop shortcut can go on
+    # showing whatever it cached mid-copy -- a blank page, for the owner after
+    # one deploy. Tell it each binary changed, then that icons in general did.
+    Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class KamDeployShell { [DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern void SHChangeNotify(int e, uint f, string a, IntPtr b); [DllImport("shell32.dll")] public static extern void SHChangeNotify(int e, uint f, IntPtr a, IntPtr b); }'
+    foreach ($name in $binaries) {
+        # SHCNE_UPDATEITEM with SHCNF_PATHW
+        [KamDeployShell]::SHChangeNotify(0x00002000, 0x0005, (Join-Path $root "dist\$name"), [IntPtr]::Zero)
+    }
+    # SHCNE_ASSOCCHANGED with SHCNF_IDLIST, the same as setup.ps1
+    [KamDeployShell]::SHChangeNotify(0x08000000, 0x0000, [IntPtr]::Zero, [IntPtr]::Zero)
+
     # --- start and verify ----------------------------------------------------
     if ($svc) {
         Say 'Starting the service...'

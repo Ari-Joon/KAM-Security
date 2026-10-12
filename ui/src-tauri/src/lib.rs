@@ -957,6 +957,7 @@ fn open_release_page(app: tauri::AppHandle, url: String) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+mod taskbar_icon;
 mod tray;
 
 pub fn run() {

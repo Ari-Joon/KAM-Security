@@ -58,6 +58,7 @@ pub fn show_window(app: &AppHandle) {
 
     match built {
         Ok(window) => {
+            crate::taskbar_icon::apply(&window);
             let _ = window.set_focus();
         }
         Err(error) => eprintln!("could not reopen the window: {error}"),
