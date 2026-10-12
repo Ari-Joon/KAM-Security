@@ -150,6 +150,22 @@ pub(crate) fn resolved_root(root: &str) -> Option<String> {
     existing_plain(root.trim_end_matches(['\\', '/']))
 }
 
+/// The components of `path` below `directory`, or `None` when it is not at or
+/// below it.
+///
+/// Both are expected in [`plain`] form. Compared a component at a time, so
+/// `c:\users\me\downloads2` is not below `c:\users\me\downloads`, which a
+/// string prefix would have said it was.
+pub(crate) fn below<'a>(path: &'a str, directory: &str) -> Option<Vec<&'a str>> {
+    let mut parts = path.trim_end_matches('\\').split('\\');
+    for expected in directory.trim_end_matches('\\').split('\\') {
+        if parts.next()? != expected {
+            return None;
+        }
+    }
+    Some(parts.collect())
+}
+
 /// The real path of something that must already be there.
 ///
 /// Stricter than [`resolved`], and the difference matters. `resolved` answers
