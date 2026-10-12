@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, reason } from "../lib/api";
 import ProgressBar from "../components/ProgressBar";
 import { runJob, stopJob, type Progress } from "../lib/jobs";
 import * as fmt from "../lib/format";
 import { useRecyclable } from "../lib/recyclable";
 import ReclaimMap, {
-  RECLAIM_LEGEND,
+  reclaimLegend,
   type ReclaimNode,
 } from "../components/ReclaimMap";
 import { GridLegend } from "../components/StateGrid";
@@ -32,6 +32,32 @@ import type {
 
 type Props = { volumes: Volume[]; onChanged: () => void };
 
+/**
+ * A set of identical files as this page holds it.
+ *
+ * `id` names the set for as long as it is on screen. It was the first copy's
+ * path, read afresh on every render, so removing that copy renamed the set
+ * and the person's choice of keeper, stored under the old name, was lost.
+ *
+ * `suggestedPath` is the agent's suggested keeper by path. The agent sends it
+ * as an index into `copies`, and `copies` is filtered here as copies are
+ * removed, so the same index came to point at a different file.
+ */
+type DupeSet = DuplicateGroup & { id: string; suggestedPath: string | null };
+
+function asSets(groups: DuplicateGroup[]): DupeSet[] {
+  return groups.map((group, index) => ({
+    ...group,
+    id: group.copies[0]?.path ?? `set-${index}`,
+    suggestedPath:
+      group.suggested_keep === null
+        ? null
+        : (group.copies[group.suggested_keep]?.path ?? null),
+  }));
+}
+
+/** What the window reported about something it sent to the Recycle Bin. */
+type RecycleOutcome = { in_bin: boolean; warning: string | null };
 
 /** What the interface calls each verdict. */
 const VERDICT_LABEL: Record<DuplicateVerdict, string> = {
@@ -182,7 +208,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const [summary, setSummary] = useState<OrphanSummary | null>(null);
   const [downloads, setDownloads] = useState<Download[] | null>(null);
   const [downloadSummary, setDownloadSummary] = useState<DownloadSummary | null>(null);
-  const [duplicates, setDuplicates] = useState<DuplicateGroup[] | null>(null);
+  const [duplicates, setDuplicates] = useState<DupeSet[] | null>(null);
   const [duplicateSummary, setDuplicateSummary] = useState<DuplicateSummary | null>(null);
   const [findingDuplicates, setFindingDuplicates] = useState(false);
   const [duplicateProgress, setDuplicateProgress] = useState<Progress | null>(null);
@@ -193,7 +219,21 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const [moves, setMoves] = useState<MoveRecord[]>([]);
   const [held, setHeld] = useState<Manifest[]>([]);
   const [running, setRunning] = useState(false);
-  const [busyPath, setBusyPath] = useState<string | null>(null);
+  /**
+   * Every row with an action in flight, by key.
+   *
+   * This was one slot, `busyPath`, and three of the actions never set it --
+   * Move, Put back and Restore -- so the double-click guard their buttons
+   * relied on did not exist. And one slot cannot hold two actions: whichever
+   * finished first emptied it, re-enabling a row whose own action was still
+   * running.
+   *
+   * The ref is the guard and the state is the drawing. The ref is read and
+   * written in the same event as the click, so a second click on the same row
+   * is turned away even before React has redrawn the button as disabled.
+   */
+  const inFlightRef = useRef<Set<string>>(new Set());
+  const [inFlight, setInFlight] = useState<ReadonlySet<string>>(new Set());
   const [onlyActionable, setOnlyActionable] = useState(true);
   const [caches, setCaches] = useState<Cache[] | null>(null);
   const [measuringCaches, setMeasuringCaches] = useState(false);
@@ -221,12 +261,61 @@ export default function Cleanup({ volumes, onChanged }: Props) {
    */
   const [keeping, setKeeping] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
+  /**
+   * The line under the controls, and whether it is good news.
+   *
+   * A Recycle Bin outcome that did not reach the bin, or could not be
+   * confirmed to have, is a caution rather than a success, and was drawn in
+   * the same green as one.
+   */
+  const [notice, setNotice] = useState<{ text: string; caution: boolean } | null>(null);
+  const setNote = (text: string | null) =>
+    setNotice(text === null ? null : { text, caution: false });
+  const setCaution = (text: string) => setNotice({ text, caution: true });
   const [explaining, setExplaining] = useState(false);
-  /** The block being looked inside, or null for the whole picture. */
-  const [mapInto, setMapInto] = useState<ReclaimNode | null>(null);
+  /**
+   * The block being looked inside, by key, or null for the whole picture.
+   *
+   * A key rather than the node: the node was a copy taken at the click, so
+   * after a removal or a fresh measurement the drilled-in map went on drawing
+   * blocks for bytes that were gone. The children are now read from the
+   * current data on every render.
+   */
+  const [mapIntoKey, setMapIntoKey] = useState<string | null>(null);
+  const duplicatesPanel = useRef<HTMLElement>(null);
   const [heldError, setHeldError] = useState<string | null>(null);
   const [movesError, setMovesError] = useState<string | null>(null);
+
+  /** Mark a row busy, or say it already is. */
+  function claim(key: string): boolean {
+    if (inFlightRef.current.has(key)) return false;
+    inFlightRef.current.add(key);
+    setInFlight(new Set(inFlightRef.current));
+    return true;
+  }
+
+  function release(key: string) {
+    inFlightRef.current.delete(key);
+    setInFlight(new Set(inFlightRef.current));
+  }
+
+  /** True while anything on the page is being acted on. */
+  const anyBusy = inFlight.size > 0;
+
+  /**
+   * Say what happened to something sent to the Recycle Bin.
+   *
+   * Three answers, not two. It arrived; it did not, because Windows deleted it
+   * outright; or the bin could not be counted, so nobody knows. The last was
+   * reported as the first.
+   */
+  function reportRecycle(outcome: RecycleOutcome, sent: string, missed: string) {
+    if (outcome.in_bin && !outcome.warning) {
+      setNote(sent);
+    } else {
+      setCaution(outcome.warning ?? missed);
+    }
+  }
 
   /**
    * What is being held, or why that could not be read.
@@ -263,8 +352,13 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       setDownloadSummary(report.download_summary);
     } catch (cause) {
       setError(reason(cause));
+      // Everything this run would have replaced goes, the totals included.
+      // The totals stayed, so a failed re-run left the last run's numbers on
+      // screen as though they were this one's.
       setOrphans(null);
+      setSummary(null);
       setDownloads(null);
+      setDownloadSummary(null);
     } finally {
       setRunning(false);
       onChanged();
@@ -291,12 +385,15 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     } catch (cause) {
       setError(reason(cause));
       setProposals(null);
+      setOrganiseSummary(null);
     } finally {
       setOrganising(false);
     }
   }
 
   async function applyMove(proposal: Proposal) {
+    const key = `move:${proposal.from}`;
+    if (!claim(key)) return;
     setError(null);
     try {
       await api.applyMove(proposal.from, proposal.to);
@@ -308,11 +405,14 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     } catch (cause) {
       setError(reason(cause));
     } finally {
+      release(key);
       onChanged();
     }
   }
 
   async function undoMove(id: string) {
+    const key = `moved:${id}`;
+    if (!claim(key)) return;
     setError(null);
     try {
       const record = await api.undoMove(id);
@@ -321,6 +421,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     } catch (cause) {
       setError(reason(cause));
     } finally {
+      release(key);
       onChanged();
     }
   }
@@ -347,11 +448,14 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         setDuplicateSummary(null);
         return;
       }
-      setDuplicates(result.groups);
+      setDuplicates(asSets(result.groups));
       setDuplicateSummary(result.summary);
     } catch (cause) {
       setError(reason(cause));
+      // The summary feeds the stat row and the block on the map, and both went
+      // on showing the previous run's figures after this one failed.
       setDuplicates(null);
+      setDuplicateSummary(null);
     } finally {
       setDuplicateProgress(null);
       setDuplicateJob(null);
@@ -393,6 +497,9 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       setCaches(await api.caches());
     } catch (cause) {
       setError(reason(cause));
+      // Same as the other searches: a failed measurement does not leave the
+      // last one's figures standing in for it.
+      setCaches(null);
     } finally {
       setMeasuringCaches(false);
     }
@@ -424,7 +531,14 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       // Measure again rather than subtracting: what was in use stayed, and
       // guessing at the new figure would put a number on screen that nothing
       // checked.
-      setCaches(await api.caches());
+      try {
+        setCaches(await api.caches());
+      } catch (cause) {
+        // The clear happened; the figures from before it are now wrong, so
+        // they go rather than stay.
+        setCaches(null);
+        setError(`Measuring again after the clear failed: ${reason(cause)}`);
+      }
     } catch (cause) {
       setError(reason(cause));
     } finally {
@@ -446,7 +560,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
    * looked at the set. Windows' own files are refused either way.
    */
   async function holdCopy(path: string, bytes: number, chosen: boolean) {
-    setBusyPath(path);
+    const key = `copy:${path}`;
+    if (!claim(key)) return;
     setError(null);
     try {
       await api.quarantineCopy(
@@ -474,7 +589,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     } catch (cause) {
       setError(reason(cause));
     } finally {
-      setBusyPath(null);
+      release(key);
       onChanged();
     }
   }
@@ -488,14 +603,15 @@ export default function Cleanup({ volumes, onChanged }: Props) {
    * removing a file they own.
    */
   async function recycleCopy(path: string, bytes: number) {
-    setBusyPath(path);
+    const key = `copy:${path}`;
+    if (!claim(key)) return;
     setError(null);
     try {
       const outcome = await api.recycleItem(path);
-      setNote(
-        outcome.in_bin
-          ? `Sent ${fmt.bytes(bytes)} to the Recycle Bin: ${path}`
-          : (outcome.warning ?? `${path} was removed but did not reach the Recycle Bin.`),
+      reportRecycle(
+        outcome,
+        `Sent ${fmt.bytes(bytes)} to the Recycle Bin: ${path}`,
+        `${path} was removed but did not reach the Recycle Bin.`,
       );
       setDuplicates((current) =>
         current
@@ -513,7 +629,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           `and it can be put back for 30 days.`,
       );
     } finally {
-      setBusyPath(null);
+      release(key);
       onChanged();
     }
   }
@@ -526,7 +642,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
    * words. The agent does the deleting; nothing here removes a file.
    */
   async function deleteOne(id: string, bytes: number) {
-    setBusyPath(id);
+    const key = `held:${id}`;
+    if (!claim(key)) return;
     setError(null);
     try {
       const removal = await api.deleteQuarantined(id);
@@ -543,13 +660,14 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       setError(reason(cause));
     } finally {
       setConfirming(null);
-      setBusyPath(null);
+      release(key);
       onChanged();
     }
   }
 
   async function emptyAll() {
-    setBusyPath("all");
+    const key = "held:all";
+    if (!claim(key)) return;
     setError(null);
     try {
       const removal = await api.emptyQuarantine();
@@ -565,7 +683,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       setError(reason(cause));
     } finally {
       setEmptying(false);
-      setBusyPath(null);
+      release(key);
       onChanged();
     }
   }
@@ -579,7 +697,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   }
 
   async function quarantine(orphan: Orphan) {
-    setBusyPath(orphan.path);
+    const key = `orphan:${orphan.path}`;
+    if (!claim(key)) return;
     setError(null);
     try {
       const manifest = await api.quarantine(
@@ -597,7 +716,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     } catch (cause) {
       setError(reason(cause));
     } finally {
-      setBusyPath(null);
+      release(key);
       onChanged();
     }
   }
@@ -615,16 +734,16 @@ export default function Cleanup({ volumes, onChanged }: Props) {
    * quarantine, never a privileged delete standing in for a recycle.
    */
   async function recycleOrphan(orphan: Orphan) {
-    setBusyPath(orphan.path);
+    const key = `orphan:${orphan.path}`;
+    if (!claim(key)) return;
     setError(null);
     try {
       const outcome = await api.recycleItem(orphan.path);
-      setNote(
-        outcome.in_bin
-          ? `Sent ${orphan.name} (${fmt.bytes(orphan.bytes)}) to the Recycle Bin. ` +
-              `It is in there until you empty it.`
-          : (outcome.warning ??
-            `${orphan.name} was removed but did not reach the Recycle Bin.`),
+      reportRecycle(
+        outcome,
+        `Sent ${orphan.name} (${fmt.bytes(orphan.bytes)}) to the Recycle Bin. ` +
+          `It is in there until you empty it.`,
+        `${orphan.name} was removed but did not reach the Recycle Bin.`,
       );
       setOrphans((current) =>
         current ? current.filter((item) => item.path !== orphan.path) : current,
@@ -635,12 +754,14 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           `instead and it can be put back for 30 days.`,
       );
     } finally {
-      setBusyPath(null);
+      release(key);
       onChanged();
     }
   }
 
   async function restore(id: string) {
+    const key = `held:${id}`;
+    if (!claim(key)) return;
     setError(null);
     try {
       const manifest = await api.restore(id);
@@ -649,6 +770,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     } catch (cause) {
       setError(reason(cause));
     } finally {
+      release(key);
       onChanged();
     }
   }
@@ -680,6 +802,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         bytes: orphan.bytes,
         reversal: "quarantine" as const,
         detail: CONFIDENCE_LABEL[orphan.confidence].toLowerCase(),
+        path: orphan.path,
       })),
     });
   }
@@ -697,18 +820,50 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         label: cache.name,
         bytes: cache.bytes,
         reversal: "permanent" as const,
-        detail: cache.cost || "costs nothing to clear",
+        detail:
+          (cache.cost || "costs nothing to clear") +
+          (cache.locations.length > 1
+            ? ` (a click opens the first of its ${cache.locations.length} folders)`
+            : ""),
+        // A cache is an id, not a place; its first folder is the place.
+        path: cache.locations[0]?.path,
       })),
     });
   }
   if (duplicateSummary && duplicateSummary.reclaimable_bytes > 0) {
     reclaim.push({
+      // No single folder holds these, so a click goes to the list of them.
       key: "duplicates",
       label: "Duplicate copies",
       bytes: duplicateSummary.reclaimable_bytes,
       reversal: "quarantine",
       detail: `${fmt.count(duplicateSummary.actionable)} sets you can choose between`,
     });
+  }
+
+  // The drilled-in block as it is now, not as it was when it was clicked. If
+  // it has gone -- everything in it removed, or its search failed -- the map
+  // goes back to the whole picture rather than drawing what is no longer there.
+  const drilled =
+    mapIntoKey === null
+      ? null
+      : (reclaim.find(
+          (node) => node.key === mapIntoKey && (node.children?.length ?? 0) > 0,
+        ) ?? null);
+  const drilledGone = mapIntoKey !== null && drilled === null;
+  useEffect(() => {
+    if (drilledGone) setMapIntoKey(null);
+  }, [drilledGone]);
+  const drawn = drilled ? (drilled.children ?? []) : reclaim;
+
+  function openBlock(node: ReclaimNode) {
+    if (node.children && node.children.length > 0) {
+      setMapIntoKey(node.key);
+    } else if (node.path) {
+      void reveal(node.path);
+    } else if (node.key === "duplicates") {
+      duplicatesPanel.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
   }
 
   // Asked once per directory rather than once per file, because the probe
@@ -726,9 +881,11 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         <div>
           <h1>Cleanup</h1>
           <p className="lede">
-            Directories left behind by software that is no longer installed.
-            Nothing here is destroyed: quarantine holds it where this program
-            can put it back, the Recycle Bin holds it where Windows can.
+            Directories left behind by software that is no longer installed,
+            and other space worth a look. Quarantine holds what you move where
+            this program can put it back, and the Recycle Bin holds it where
+            Windows can. Two things here are permanent and say so: clearing a
+            cache, and deleting from quarantine.
           </p>
         </div>
       </div>
@@ -768,7 +925,11 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         </div>
 
         {error && <pre className="error">{error}</pre>}
-        {note && <div className="notice notice-ok">{note}</div>}
+        {notice && (
+          <div className={`notice ${notice.caution ? "notice-warn" : "notice-ok"}`}>
+            {notice.text}
+          </div>
+        )}
 
         {summary && (
           <div className="stat-row tight">
@@ -803,17 +964,10 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             never the ratio — and the question on a full drive is not what is on
             it, it is what is worth your time.
           </p>
-          <ReclaimMap
-            nodes={mapInto ? (mapInto.children ?? []) : reclaim}
-            onOpen={(node) =>
-              node.children && node.children.length > 0
-                ? setMapInto(node)
-                : void reveal(node.key)
-            }
-          />
-          <GridLegend entries={RECLAIM_LEGEND} />
-          {mapInto && (
-            <button className="link-button" onClick={() => setMapInto(null)}>
+          <ReclaimMap nodes={drawn} onOpen={openBlock} />
+          <GridLegend entries={reclaimLegend(drawn)} />
+          {drilled && (
+            <button className="link-button" onClick={() => setMapIntoKey(null)}>
               Back to everything
             </button>
           )}
@@ -835,7 +989,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                 <OrphanRow
                   key={orphan.path}
                   orphan={orphan}
-                  busy={busyPath === orphan.path}
+                  busy={inFlight.has(`orphan:${orphan.path}`)}
                   recyclable={canRecycle(orphan.path)}
                   onQuarantine={(item) => void quarantine(item)}
                   onDelete={(item) => void recycleOrphan(item)}
@@ -853,7 +1007,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           {active.length > 0 && (
             <button
               className="ghost"
-              disabled={busyPath !== null}
+              disabled={anyBusy}
               onClick={() => setEmptying(true)}
             >
               Empty it
@@ -891,7 +1045,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
               )}
             </p>
             <div className="confirm-actions">
-              <button onClick={() => void emptyAll()} disabled={busyPath !== null}>
+              <button onClick={() => void emptyAll()} disabled={anyBusy}>
                 Delete them
               </button>
               <button className="ghost" onClick={() => setEmptying(false)}>
@@ -935,7 +1089,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                   <>
                     <span className="held-warn">Delete for good?</span>
                     <button
-                      disabled={busyPath !== null}
+                      disabled={anyBusy}
                       onClick={() => void deleteOne(item.id, item.bytes)}
                     >
                       Yes
@@ -947,7 +1101,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                 ) : (
                   <>
                     <button
-                      disabled={busyPath !== null}
+                      disabled={anyBusy}
                       onClick={() => void restore(item.id)}
                     >
                       Restore
@@ -967,7 +1121,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         )}
       </section>
 
-      <section className="panel">
+      <section className="panel" ref={duplicatesPanel}>
         <div className="panel-head">
           <h2>Identical copies</h2>
           <button onClick={() => void findDuplicates()} disabled={findingDuplicates}>
@@ -981,7 +1135,10 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           Windows keeps several copies of the same library on purpose, every
           installer keeps a second copy of itself so it can repair later, and
           two programs that ship the same runtime each look for it beside
-          themselves. Only copies in folders of yours are ever offered.
+          themselves. Only copies in folders of yours are suggested for
+          removal. If you pick which copy to keep, the others can be removed
+          wherever they are, except Windows' own files, another account's
+          profile and this program's own store.
         </p>
 
         {findingDuplicates && duplicateProgress && (
@@ -1086,10 +1243,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             ) : (
               <ul className="dupes">
                 {shownDuplicates.slice(0, DUPE_LIMIT).map((group) => (
-                  <li
-                    key={group.copies[0]?.path ?? String(group.bytes)}
-                    className={`dupe dupe-${group.verdict}`}
-                  >
+                  <li key={group.id} className={`dupe dupe-${group.verdict}`}>
                     <div className="dupe-head">
                       <span className="dupe-count">
                         {group.copies.length} copies of {fmt.bytes(group.bytes)}
@@ -1112,16 +1266,18 @@ export default function Cleanup({ volumes, onChanged }: Props) {
 
                     {(() => {
                       // Which copy survives. Our suggestion until somebody
-                      // says otherwise, and then theirs.
-                      const setKey = group.copies[0]?.path ?? "";
-                      const suggested =
-                        group.suggested_keep === null
-                          ? undefined
-                          : group.copies[group.suggested_keep]?.path;
-                      const keeper = keeping[setKey] ?? suggested;
+                      // says otherwise, and then theirs. Both are paths, and
+                      // each counts only while that copy is still in the set.
+                      const setKey = group.id;
+                      const present = (path: string | null | undefined) =>
+                        path && group.copies.some((copy) => copy.path === path)
+                          ? path
+                          : undefined;
+                      const picked = present(keeping[setKey]);
+                      const keeper = picked ?? present(group.suggestedPath);
                       // Whether the *person* picked the survivor, which is the
                       // only thing that may widen the agent's fence.
-                      const theyChose = keeping[setKey] !== undefined;
+                      const theyChose = picked !== undefined;
                       // Windows keeps its own files whatever anybody picks, so
                       // a set made only of those offers no choice at all.
                       const choosable = group.copies.filter(
@@ -1180,7 +1336,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                                         {canChoose && (
                                           <button
                                             className="dupe-take"
-                                            disabled={busyPath !== null}
+                                            disabled={anyBusy}
                                             onClick={(event) => {
                                               event.stopPropagation();
                                               setKeeping((current) => ({
@@ -1194,21 +1350,31 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                                         )}
                                         {keeper && (
                                             <>
-                                              <button
-                                                className="dupe-take"
-                                                disabled={busyPath !== null}
-                                                title={
-                                                  ours
-                                                    ? "Moved to quarantine, and restorable for 30 days."
-                                                    : "This is not a copy we would have offered. It goes to quarantine and comes back with one press for 30 days."
-                                                }
-                                                onClick={(event) => {
-                                                  event.stopPropagation();
-                                                  void holdCopy(copy.path, group.bytes, !ours);
-                                                }}
-                                              >
-                                                Remove this one
-                                              </button>
+                                              {/* Offered only where the agent
+                                                  will take it. Without the
+                                                  person's own pick of keeper
+                                                  the request goes as our
+                                                  suggestion, which only reaches
+                                                  a copy in a folder of theirs,
+                                                  so the button was shown on
+                                                  copies it could only fail on. */}
+                                              {(theyChose || copy.removable) && (
+                                                <button
+                                                  className="dupe-take"
+                                                  disabled={anyBusy}
+                                                  title={
+                                                    ours
+                                                      ? "Moved to quarantine, and restorable for 30 days."
+                                                      : "This is not a copy we would have offered. It goes to quarantine and comes back with one press for 30 days."
+                                                  }
+                                                  onClick={(event) => {
+                                                    event.stopPropagation();
+                                                    void holdCopy(copy.path, group.bytes, !ours);
+                                                  }}
+                                                >
+                                                  Remove this one
+                                                </button>
+                                              )}
                                               {/* Same reasoning as the
                                                   leftovers above: a copy under
                                                   Program Files cannot go to
@@ -1219,7 +1385,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                                               {canRecycle(copy.path) && (
                                                 <button
                                                   className="ghost"
-                                                  disabled={busyPath !== null}
+                                                  disabled={anyBusy}
                                                   title="Send this copy to the Recycle Bin, where Windows can put it back"
                                                   onClick={(event) => {
                                                     event.stopPropagation();
@@ -1456,7 +1622,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                     as a refusal from the agent's fence -- which reads as the
                     move having failed. */}
                 <button
-                  disabled={busyPath !== null}
+                  disabled={anyBusy}
                   onClick={() => void applyMove(proposal)}
                 >
                   Move
@@ -1487,7 +1653,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                       <span className="held-reason">was {move.from}</span>
                     </div>
                     <button
-                      disabled={busyPath !== null}
+                      disabled={anyBusy}
                       onClick={() => void undoMove(move.id)}
                     >
                       Put back
@@ -1591,8 +1757,10 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             identical. Finding them reads file contents rather than the
             filesystem's index, so it has its own button. Each set is then
             judged by where its copies live: Windows and installers keep
-            duplicates deliberately, and only a copy in a folder of yours is
-            ever offered for removal.
+            duplicates deliberately, so only a copy in a folder of yours is
+            suggested for removal. Once you pick which copy to keep, the
+            others can be removed too, unless they are Windows' own, in
+            another account's profile, or in this program's own store.
           </li>
           <li>
             <strong>Caches</strong> are places Windows and a few programs write

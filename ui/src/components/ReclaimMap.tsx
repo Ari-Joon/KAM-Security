@@ -35,6 +35,7 @@ import * as fmt from "../lib/format";
 export type Reversal = "quarantine" | "recycle" | "permanent";
 
 export type ReclaimNode = {
+  /** Unique among its siblings. An identifier, not necessarily a path. */
   key: string;
   label: string;
   /** Size on disk. This is the area, so it must be a real measurement. */
@@ -42,6 +43,12 @@ export type ReclaimNode = {
   reversal: Reversal;
   /** One line of plain fact, shown on hover. */
   detail: string;
+  /**
+   * A real folder to show in Explorer when a leaf is clicked, where there is
+   * one. The key was passed instead, and for a cache that is an id such as
+   * `temp-user`, which Explorer was then asked to open and refused.
+   */
+  path?: string;
   children?: ReclaimNode[];
 };
 
@@ -54,11 +61,25 @@ const REVERSAL_COLOUR: Record<Reversal, string> = {
   permanent: "#a8791f",
 };
 
-export const RECLAIM_LEGEND: [string, string][] = [
-  [REVERSAL_COLOUR.quarantine, "Quarantine holds it, and puts it back for 30 days"],
-  [REVERSAL_COLOUR.recycle, "Goes to the Recycle Bin, where Windows puts it back"],
-  [REVERSAL_COLOUR.permanent, "Removed outright, with no way back"],
-];
+const REVERSAL_MEANING: Record<Reversal, string> = {
+  quarantine: "Quarantine holds it, and puts it back for 30 days",
+  recycle: "Goes to the Recycle Bin, where Windows puts it back",
+  permanent: "Removed outright, with no way back",
+};
+
+/**
+ * The legend for exactly the blocks being drawn.
+ *
+ * A fixed list named a "recycle" colour that no block on the page was ever
+ * given, so the legend described something that was not on screen. Built from
+ * the nodes instead, in a fixed order, so it changes when the picture does.
+ */
+export function reclaimLegend(nodes: ReclaimNode[]): [string, string][] {
+  const drawn = new Set(nodes.filter((node) => node.bytes > 0).map((node) => node.reversal));
+  return (Object.keys(REVERSAL_COLOUR) as Reversal[])
+    .filter((reversal) => drawn.has(reversal))
+    .map((reversal) => [REVERSAL_COLOUR[reversal], REVERSAL_MEANING[reversal]]);
+}
 
 const LABEL_MIN_WIDTH = 64;
 const LABEL_MIN_HEIGHT = 28;
@@ -68,7 +89,7 @@ export default function ReclaimMap({
   onOpen,
 }: {
   nodes: ReclaimNode[];
-  /** A node with children to drill into, or a leaf to reveal. */
+  /** A node with children to drill into, or a leaf to act on. */
   onOpen: (node: ReclaimNode) => void;
 }) {
   const container = useRef<HTMLDivElement>(null);
