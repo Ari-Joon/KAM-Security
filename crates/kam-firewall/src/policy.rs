@@ -142,9 +142,17 @@ impl Default {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileState {
     pub profile: Profile,
-    pub enabled: bool,
-    /// True when this is the profile in force on the current network.
-    pub active: bool,
+    /// Whether the firewall is on for this profile. `None` when Windows would
+    /// not say.
+    ///
+    /// It was a `bool` that read a failure as `false`, so a firewall whose
+    /// state could not be read was reported as "off" -- a finding invented
+    /// from a failed call, and the most alarming one this screen can make.
+    pub enabled: Option<bool>,
+    /// Whether this is the profile in force on the current network. `None`
+    /// when Windows would not say which one is; that used to leave every
+    /// profile reading as not in force.
+    pub active: Option<bool>,
     pub inbound_default: Default,
     pub outbound_default: Default,
 }
@@ -154,12 +162,15 @@ impl ProfileState {
     ///
     /// Deliberately not a score. An inactive profile being off matters far less
     /// than the active one being off, and saying so is more use than a number.
+    ///
+    /// Only what was read. A state that could not be read is not a concern
+    /// about the machine; it is a gap, and [`FirewallReport::unread`] says so.
     pub fn concerns(&self) -> Vec<String> {
         let mut concerns = Vec::new();
         let name = self.profile.label();
 
-        if !self.enabled {
-            concerns.push(if self.active {
+        if self.enabled == Some(false) {
+            concerns.push(if self.active == Some(true) {
                 format!(
                     "The firewall is off for the {name} profile, which is the one \
                      in force on this network right now."
@@ -169,7 +180,7 @@ impl ProfileState {
             });
         }
 
-        if self.enabled && self.inbound_default == Default::Allow {
+        if self.enabled == Some(true) && self.inbound_default == Default::Allow {
             concerns.push(format!(
                 "The {name} profile allows unsolicited incoming connections by \
                  default, which is the opposite of how Windows ships."
@@ -258,6 +269,10 @@ pub struct FirewallReport {
     pub blocking_rules: usize,
     /// Rules this product added.
     pub our_rules: usize,
+    /// What could not be read, phrased for a person. When this is not empty
+    /// the counts above are of what was read, not of everything there is.
+    #[serde(default)]
+    pub unread: Vec<String>,
 }
 
 fn text(value: BSTR) -> Option<String> {
@@ -281,37 +296,73 @@ fn open_policy() -> kam_core::Result<INetFwPolicy2> {
     })
 }
 
-fn read_profiles(policy: &INetFwPolicy2) -> Vec<ProfileState> {
-    let active_mask = unsafe { policy.CurrentProfileTypes() }.unwrap_or(0);
+/// Each profile's state, with every part that would not read named in
+/// `unread` rather than filled in with a guess.
+fn read_profiles(policy: &INetFwPolicy2, unread: &mut Vec<String>) -> Vec<ProfileState> {
+    let active_mask = match unsafe { policy.CurrentProfileTypes() } {
+        Ok(mask) => Some(mask),
+        Err(error) => {
+            unread.push(format!(
+                "Which profile is in force on this network could not be read: {error}"
+            ));
+            None
+        }
+    };
 
-    Profile::all()
-        .into_iter()
-        .map(|profile| {
-            let id = profile.id();
-            ProfileState {
-                profile,
-                enabled: unsafe { policy.get_FirewallEnabled(id) }
-                    .map(|enabled| enabled.as_bool())
-                    .unwrap_or(false),
-                active: active_mask & id.0 != 0,
-                inbound_default: unsafe { policy.get_DefaultInboundAction(id) }
-                    .map(Default::from)
-                    .unwrap_or(Default::Unknown),
-                outbound_default: unsafe { policy.get_DefaultOutboundAction(id) }
-                    .map(Default::from)
-                    .unwrap_or(Default::Unknown),
+    let mut profiles = Vec::new();
+    for profile in Profile::all() {
+        let id = profile.id();
+        let name = profile.label();
+        let enabled = match unsafe { policy.get_FirewallEnabled(id) } {
+            Ok(enabled) => Some(enabled.as_bool()),
+            Err(error) => {
+                unread.push(format!(
+                    "Whether the firewall is on for the {name} profile could not be read: {error}"
+                ));
+                None
             }
-        })
-        .collect()
+        };
+        let inbound_default = match unsafe { policy.get_DefaultInboundAction(id) } {
+            Ok(action) => Default::from(action),
+            Err(error) => {
+                unread.push(format!(
+                    "What the {name} profile does with incoming connections by default \
+                     could not be read: {error}"
+                ));
+                Default::Unknown
+            }
+        };
+        let outbound_default = match unsafe { policy.get_DefaultOutboundAction(id) } {
+            Ok(action) => Default::from(action),
+            Err(error) => {
+                unread.push(format!(
+                    "What the {name} profile does with outgoing connections by default \
+                     could not be read: {error}"
+                ));
+                Default::Unknown
+            }
+        };
+        profiles.push(ProfileState {
+            profile,
+            enabled,
+            active: active_mask.map(|mask| mask & id.0 != 0),
+            inbound_default,
+            outbound_default,
+        });
+    }
+    profiles
 }
 
 /// Read one rule out of its COM object.
 ///
 /// Every property is fetched defensively. A rule left by uninstalled software
 /// can have properties that fail to read, and one bad rule must not take the
-/// whole list with it.
+/// whole list with it. `None` only when even its name would not read, and the
+/// caller counts that rather than dropping it in silence.
 fn read_rule(rule: &INetFwRule) -> Option<Rule> {
-    let raw = unsafe { rule.Name() }.ok().and_then(text)?;
+    // An empty name is still a rule. It used to be dropped as though it were
+    // not there, and left out of every count.
+    let raw = unsafe { rule.Name() }.ok()?.to_string();
 
     // Store applications register their rules under a resource pointer rather
     // than a name — 92 of the 671 rules on the development machine. Showing
@@ -346,19 +397,27 @@ fn read_rule(rule: &INetFwRule) -> Option<Rule> {
     })
 }
 
-/// Walk the rule collection.
+/// Walk the rule collection, handing every entry to `visit`.
 ///
 /// `INetFwRules` is an old-style COM collection, so this goes through
 /// `IEnumVARIANT` rather than an index: the collection has no stable ordering
 /// and `Item()` looks up by name, which is not unique.
-fn read_rules(rules: &INetFwRules) -> kam_core::Result<Vec<Rule>> {
+///
+/// An entry that is not a rule object reaches `visit` as `None`, to be counted
+/// rather than skipped. The answer is what stopped the walk before the end,
+/// when something did: an error from the enumerator used to end the loop and
+/// return as though the list had been read, so a list cut short was shown as
+/// complete.
+fn walk_rules(
+    rules: &INetFwRules,
+    mut visit: impl FnMut(Option<INetFwRule>),
+) -> kam_core::Result<Option<String>> {
     let enumerator: IEnumVARIANT = unsafe { rules._NewEnum() }
         .and_then(|unknown| unknown.cast())
         .map_err(|error| {
             kam_core::Error::Refused(format!("the rule list could not be enumerated: {error}"))
         })?;
 
-    let mut found = Vec::new();
     loop {
         // `Default` on VARIANT is a zeroed struct, which is VT_EMPTY and is
         // what the enumerator expects to overwrite.
@@ -366,26 +425,43 @@ fn read_rules(rules: &INetFwRules) -> kam_core::Result<Vec<Rule>> {
         let mut fetched = 0_u32;
 
         // Returns S_FALSE when fewer than asked for came back, which means the
-        // last batch rather than a failure — so the count is what decides,
-        // not the status.
+        // last batch rather than a failure. A real failure is an error status,
+        // and is said whatever the count.
         let outcome = unsafe { enumerator.Next(&mut batch, &mut fetched) };
-        if fetched == 0 {
-            break;
-        }
-
         for item in batch.iter().take(fetched as usize) {
-            if let Some(rule) = as_rule(item) {
-                if let Some(read) = read_rule(&rule) {
-                    found.push(read);
-                }
-            }
+            visit(as_rule(item));
         }
-
         if outcome.is_err() {
-            break;
+            return Ok(Some(windows::core::Error::from(outcome).to_string()));
+        }
+        if fetched == 0 {
+            return Ok(None);
         }
     }
+}
 
+/// Every rule that could be read, with what could not be named in `unread`.
+fn read_rules(rules: &INetFwRules, unread: &mut Vec<String>) -> kam_core::Result<Vec<Rule>> {
+    let mut found = Vec::new();
+    let mut unreadable = 0_usize;
+    let stopped = walk_rules(rules, |item| match item.as_ref().and_then(read_rule) {
+        Some(rule) => found.push(rule),
+        None => unreadable += 1,
+    })?;
+
+    if unreadable > 0 {
+        unread.push(if unreadable == 1 {
+            "1 rule could not be read, so it is not listed or counted".to_owned()
+        } else {
+            format!("{unreadable} rules could not be read, so they are not listed or counted")
+        });
+    }
+    if let Some(why) = stopped {
+        unread.push(format!(
+            "The list of rules could not be read to the end ({why}), so there may be \
+             rules that are not listed or counted"
+        ));
+    }
     Ok(found)
 }
 
@@ -410,11 +486,12 @@ pub fn survey() -> kam_core::Result<FirewallReport> {
     let _com = ComGuard::enter()?;
     let policy = open_policy()?;
 
-    let profiles = read_profiles(&policy);
+    let mut unread = Vec::new();
+    let profiles = read_profiles(&policy, &mut unread);
     let rules = unsafe { policy.Rules() }.map_err(|error| {
         kam_core::Error::Refused(format!("the firewall's rules could not be opened: {error}"))
     })?;
-    let mut rules = read_rules(&rules)?;
+    let mut rules = read_rules(&rules, &mut unread)?;
 
     // Ours first so they are easy to find and remove, then blocking rules,
     // then alphabetically. A list of several hundred needs an order that puts
@@ -439,6 +516,7 @@ pub fn survey() -> kam_core::Result<FirewallReport> {
         profiles,
         rules,
         concerns,
+        unread,
     })
 }
 
@@ -519,10 +597,22 @@ pub fn block_program(path: &str) -> kam_core::Result<String> {
 
 /// Remove a rule this product created.
 ///
-/// Refuses to touch anything else. The rule is looked up and its group checked
-/// before removal, so a name collision with a Windows rule cannot lead to
-/// deleting it — which is the failure this whole tagging scheme exists to
-/// prevent.
+/// Refuses to touch anything else. Every rule is read and the ones bearing
+/// this name are counted before anything is removed, so a name collision with
+/// a Windows rule cannot lead to deleting it — which is the failure this whole
+/// tagging scheme exists to prevent.
+///
+/// # Why counting, and not looking the name up
+///
+/// This used to ask `Item(name)` for the rule, check that one's group, and
+/// then call `Remove(name)`. Names are not unique -- on the development
+/// machine 462 of 708 rules share a name with another -- so the rule whose
+/// group was checked and the rule `Remove` acts on need not be the same one.
+/// The rules this product makes are named after the program's file name
+/// alone, so two blocked `setup.exe` from different folders already collide
+/// with each other. Removal now goes ahead only when exactly one rule has the
+/// name and it carries this product's group; anything else is refused and
+/// says why.
 pub fn remove_our_rule(name: &str) -> kam_core::Result<()> {
     let _com = ComGuard::enter()?;
     let policy = open_policy()?;
@@ -530,23 +620,61 @@ pub fn remove_our_rule(name: &str) -> kam_core::Result<()> {
         kam_core::Error::Refused(format!("the rules could not be opened: {error}"))
     })?;
 
-    let existing: INetFwRule = unsafe { rules.Item(&BSTR::from(name)) }.map_err(|_| {
-        kam_core::Error::Refused(format!("there is no firewall rule called {name}"))
+    // The group of every rule with this name, compared without regard to case
+    // so that nothing `Remove` might match is left uncounted.
+    let wanted = name.to_lowercase();
+    let mut groups: Vec<Option<String>> = Vec::new();
+    let mut unreadable = 0_usize;
+    let stopped = walk_rules(&rules, |item| {
+        let Some(rule) = item else {
+            unreadable += 1;
+            return;
+        };
+        match unsafe { rule.Name() } {
+            Ok(raw) if raw.to_string().to_lowercase() == wanted => {
+                groups.push(unsafe { rule.Grouping() }.ok().and_then(text));
+            }
+            Ok(_) => {}
+            Err(_) => unreadable += 1,
+        }
     })?;
-
-    let grouping = unsafe { existing.Grouping() }.ok().and_then(text);
-    if grouping.as_deref() != Some(OUR_GROUP) {
+    if stopped.is_some() || unreadable > 0 {
         return Err(kam_core::Error::Refused(format!(
-            "{name} was not created by KAM Security, so it will not be removed here. \
-             Use Windows Firewall to change rules this product did not add."
+            "Not every firewall rule could be read, so whether {name} is the only rule \
+             with that name is not known. Nothing was removed. Use Windows Firewall to \
+             remove it."
         )));
     }
+
+    may_remove(name, &groups)?;
 
     unsafe { rules.Remove(&BSTR::from(name)) }.map_err(|error| {
         kam_core::Error::Privileged(format!("the rule could not be removed: {error}"))
     })?;
 
     Ok(())
+}
+
+/// Whether the rules called `name`, described by their groups, may be removed
+/// by name.
+fn may_remove(name: &str, groups: &[Option<String>]) -> kam_core::Result<()> {
+    match groups {
+        [] => Err(kam_core::Error::Refused(format!(
+            "there is no firewall rule called {name}"
+        ))),
+        [only] if only.as_deref() == Some(OUR_GROUP) => Ok(()),
+        [_] => Err(kam_core::Error::Refused(format!(
+            "{name} was not created by KAM Security, so it will not be removed here. \
+             Use Windows Firewall to change rules this product did not add."
+        ))),
+        several => Err(kam_core::Error::Refused(format!(
+            "{} firewall rules are called {name}. Windows removes rules by name, so \
+             removing it here could remove a rule other than the one you mean, and \
+             nothing was removed. Use Windows Firewall, which lists each of them \
+             separately, to remove the one you mean.",
+            several.len()
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -607,13 +735,13 @@ mod tests {
     fn an_inactive_profile_being_off_reads_differently_from_an_active_one() {
         let inactive = ProfileState {
             profile: Profile::Public,
-            enabled: false,
-            active: false,
+            enabled: Some(false),
+            active: Some(false),
             inbound_default: Default::Block,
             outbound_default: Default::Allow,
         };
         let active = ProfileState {
-            active: true,
+            active: Some(true),
             ..inactive.clone()
         };
 
@@ -625,8 +753,8 @@ mod tests {
     fn a_healthy_profile_has_nothing_to_say() {
         let healthy = ProfileState {
             profile: Profile::Private,
-            enabled: true,
-            active: true,
+            enabled: Some(true),
+            active: Some(true),
             inbound_default: Default::Block,
             outbound_default: Default::Allow,
         };
@@ -637,12 +765,66 @@ mod tests {
     fn allowing_inbound_by_default_is_worth_saying() {
         let permissive = ProfileState {
             profile: Profile::Public,
-            enabled: true,
-            active: true,
+            enabled: Some(true),
+            active: Some(true),
             inbound_default: Default::Allow,
             outbound_default: Default::Allow,
         };
         assert!(permissive.concerns()[0].contains("unsolicited incoming"));
+    }
+
+    /// A firewall whose state could not be read is not reported as off.
+    ///
+    /// `enabled` read a failed call as `false`, so the screen said "the
+    /// firewall is off for the Public profile, which is the one in force"
+    /// about a profile nobody had been able to read. Unknown is unknown.
+    #[test]
+    fn a_profile_that_could_not_be_read_is_not_called_off() {
+        let unread = ProfileState {
+            profile: Profile::Public,
+            enabled: None,
+            active: None,
+            inbound_default: Default::Unknown,
+            outbound_default: Default::Unknown,
+        };
+        assert!(
+            unread
+                .concerns()
+                .iter()
+                .all(|concern| !concern.contains("off")),
+            "an unread profile was called off: {:?}",
+            unread.concerns()
+        );
+    }
+
+    /// Removal by name goes ahead only when the name picks out exactly one
+    /// rule, and that rule is ours.
+    ///
+    /// `Remove` acts on a name, and names are not unique: the group that was
+    /// checked used to belong to whichever rule `Item` returned, which need
+    /// not be the rule `Remove` then deleted. Two blocks of two `setup.exe`
+    /// from different folders share a name already.
+    #[test]
+    fn removal_needs_exactly_one_rule_of_ours_with_that_name() {
+        let ours = || Some(OUR_GROUP.to_owned());
+        let theirs = || Some("Core Networking".to_owned());
+        let name = "KAM Security: block setup.exe";
+
+        assert!(may_remove(name, &[ours()]).is_ok());
+
+        let refused = |groups: &[Option<String>]| match may_remove(name, groups) {
+            Err(kam_core::Error::Refused(message)) => message,
+            other => panic!("{groups:?} was not refused: {other:?}"),
+        };
+        assert!(refused(&[]).contains("no firewall rule"));
+        assert!(refused(&[theirs()]).contains("not created by KAM Security"));
+        assert!(refused(&[None]).contains("not created by KAM Security"));
+        // Ours and somebody else's under one name: the case that deleted the
+        // wrong one.
+        assert!(refused(&[ours(), theirs()]).contains("2 firewall rules"));
+        // Two of ours under one name are refused too: which of them goes is
+        // Windows' choice, not the person's.
+        assert!(refused(&[ours(), ours()]).contains("2 firewall rules"));
     }
 
     #[test]
@@ -846,7 +1028,7 @@ mod tests {
                 );
                 for profile in &report.profiles {
                     println!(
-                        "  {} enabled={} active={} in={:?} out={:?}",
+                        "  {} enabled={:?} active={:?} in={:?} out={:?}",
                         profile.profile.label(),
                         profile.enabled,
                         profile.active,
@@ -855,6 +1037,7 @@ mod tests {
                     );
                 }
                 println!("concerns: {:?}", report.concerns);
+                println!("not read: {:?}", report.unread);
 
                 assert!(
                     report.total_rules > 20,
@@ -862,7 +1045,10 @@ mod tests {
                     report.total_rules
                 );
                 assert!(
-                    report.profiles.iter().any(|profile| profile.active),
+                    report
+                        .profiles
+                        .iter()
+                        .any(|profile| profile.active == Some(true)),
                     "no profile is active, which cannot be true"
                 );
             }

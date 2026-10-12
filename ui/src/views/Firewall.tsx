@@ -31,19 +31,38 @@ function profileLabel(profile: ProfileState["profile"]): string {
   return profile === "domain" ? "Domain" : profile === "private" ? "Private" : "Public";
 }
 
+/**
+ * What a profile does by default with traffic one way, as a sentence.
+ *
+ * An unknown default used to read as "allowed", which is a claim about the
+ * machine made out of a value that was never read.
+ */
+function defaultSentence(way: "Incoming" | "Outgoing", action: ProfileState["inbound_default"]) {
+  switch (action) {
+    case "block":
+      return `${way} is blocked by default.`;
+    case "allow":
+      return `${way} is allowed by default.`;
+    default:
+      return `What happens to ${way.toLowerCase()} traffic by default could not be read.`;
+  }
+}
+
 function Profiles({ profiles }: { profiles: ProfileState[] }) {
   return (
     <ul className="settings">
       {profiles.map((profile) => (
         <li
           key={profile.profile}
-          className={`setting setting-${profile.enabled ? "on" : "off"}`}
+          className={`setting setting-${
+            profile.enabled === null ? "unknown" : profile.enabled ? "on" : "off"
+          }`}
         >
           <span className="setting-dot" />
           <span className="setting-body">
             <span className="setting-label">
               {profileLabel(profile.profile)}
-              {profile.active && <span className="chip">in force now</span>}
+              {profile.active === true && <span className="chip">in force now</span>}
             </span>
             <span className="setting-explain">
               {profile.profile === "domain"
@@ -51,18 +70,21 @@ function Profiles({ profiles }: { profiles: ProfileState[] }) {
                 : profile.profile === "private"
                   ? "Home or work networks you have marked as trusted."
                   : "Cafés, airports, and anything else. Windows locks down hardest here."}
-              {profile.enabled && (
+              {profile.enabled === true && (
                 <>
                   {" "}
-                  Incoming is{" "}
-                  {profile.inbound_default === "block" ? "blocked" : "allowed"} by
-                  default, outgoing is{" "}
-                  {profile.outbound_default === "block" ? "blocked" : "allowed"}.
+                  {defaultSentence("Incoming", profile.inbound_default)}{" "}
+                  {defaultSentence("Outgoing", profile.outbound_default)}
                 </>
+              )}
+              {profile.enabled === null && (
+                <> Whether the firewall is on for this profile could not be read.</>
               )}
             </span>
           </span>
-          <span className="setting-state">{profile.enabled ? "On" : "Off"}</span>
+          <span className="setting-state">
+            {profile.enabled === null ? "Unknown" : profile.enabled ? "On" : "Off"}
+          </span>
         </li>
       ))}
     </ul>
@@ -572,10 +594,17 @@ function RuleRow({ rule, onRemove }: { rule: FirewallRule; onRemove: (name: stri
   return (
     <li className={`fw-rule${rule.ours ? " fw-rule-ours" : ""}`}>
       <div className="fw-rule-head">
+        {/* An action Windows did not report is said as such, not as "allow". */}
         <span className={`badge ${rule.action === "block" ? "attention-unusual" : "attention-ordinary"}`}>
-          {rule.action === "block" ? "block" : "allow"}
+          {rule.action === "block"
+            ? "block"
+            : rule.action === "allow"
+              ? "allow"
+              : "action unknown"}
         </span>
-        <span className="fw-rule-name">{rule.name}</span>
+        <span className="fw-rule-name">
+          {rule.name || <span className="muted">(a rule with no name)</span>}
+        </span>
         {rule.ours ? (
           <button className="link-button" onClick={() => onRemove(rule.name)}>
             Remove
@@ -585,7 +614,13 @@ function RuleRow({ rule, onRemove }: { rule: FirewallRule; onRemove: (name: stri
         )}
       </div>
       <div className="fw-rule-detail">
-        <span>{rule.direction === "in" ? "incoming" : "outgoing"}</span>
+        <span>
+          {rule.direction === "in"
+            ? "incoming"
+            : rule.direction === "out"
+              ? "outgoing"
+              : "direction unknown"}
+        </span>
         {rule.application && <span className="fw-rule-app">{rule.application}</span>}
         {rule.grouping && !rule.ours && <span>{rule.grouping}</span>}
       </div>
@@ -725,6 +760,13 @@ export default function Firewall() {
   const ourRules = report?.rules.filter((rule) => rule.ours) ?? [];
   const otherRules = report?.rules.filter((rule) => !rule.ours) ?? [];
   const shownRules = showAllRules ? otherRules : otherRules.slice(0, 25);
+  // Checked, not inferred from an empty list of concerns: a profile whose
+  // state could not be read raises no concern and is not "on".
+  const allOn =
+    (report?.profiles.length ?? 0) > 0 &&
+    (report?.profiles.every((profile) => profile.enabled === true) ?? false);
+  const inboundBlocked =
+    report?.profiles.every((profile) => profile.inbound_default === "block") ?? false;
 
   return (
     <>
@@ -782,26 +824,49 @@ export default function Firewall() {
 
       {report && (
         <>
-          <div
-            className={`notice ${report.concerns.length === 0 ? "notice-ok" : "notice-warn"}`}
-          >
-            {report.concerns.length === 0 ? (
-              <>
-                <strong>The firewall is on for every profile.</strong> Incoming
-                connections nothing asked for are blocked, which is how Windows
-                ships and how it should be.
-              </>
-            ) : (
-              <>
-                <strong>Worth knowing:</strong>
-                <ul className="concerns">
-                  {report.concerns.map((concern) => (
-                    <li key={concern}>{concern}</li>
-                  ))}
-                </ul>
-              </>
-            )}
-          </div>
+          {/* The headline says only what was read. It used to say "on for
+              every profile" and "incoming is blocked" whenever there were no
+              concerns, which was also the case when neither had been read. */}
+          {report.concerns.length > 0 ? (
+            <div className="notice notice-warn">
+              <strong>Worth knowing:</strong>
+              <ul className="concerns">
+                {report.concerns.map((concern) => (
+                  <li key={concern}>{concern}</li>
+                ))}
+              </ul>
+            </div>
+          ) : allOn && inboundBlocked ? (
+            <div className="notice notice-ok">
+              <strong>The firewall is on for every profile.</strong> Incoming
+              connections nothing asked for are blocked, which is how Windows
+              ships and how it should be.
+            </div>
+          ) : allOn ? (
+            <div className="notice notice-warn">
+              <strong>The firewall is on for every profile.</strong> What every
+              profile does with incoming connections nothing asked for could not
+              be confirmed.
+            </div>
+          ) : (
+            <div className="notice notice-warn">
+              <strong>Whether the firewall is on for every profile could not be
+              confirmed.</strong>
+            </div>
+          )}
+
+          {report.unread.length > 0 && (
+            <div className="notice notice-warn">
+              <strong>Not everything could be read.</strong> Nothing on this
+              screen is claimed about what is listed here, and the counts below
+              are of what was read.
+              <ul className="concerns">
+                {report.unread.map((gap) => (
+                  <li key={gap}>{gap}</li>
+                ))}
+              </ul>
+            </div>
+          )}
 
           <section className="panel">
             <div className="panel-head">
@@ -812,14 +877,19 @@ export default function Firewall() {
 
           <div className="stat-row">
             <div className="stat">
-              <span className="stat-label">Rules</span>
+              <span className="stat-label">
+                {report.unread.length > 0 ? "Rules read" : "Rules"}
+              </span>
               <span className="stat-value">{report.total_rules.toLocaleString()}</span>
-              <span className="stat-sub">{report.enabled_rules.toLocaleString()} enabled</span>
+              <span className="stat-sub">
+                {report.enabled_rules.toLocaleString()} enabled
+                {report.unread.length > 0 ? ", of those that could be read" : ""}
+              </span>
             </div>
             <div className="stat">
               <span className="stat-label">Blocking</span>
               <span className="stat-value">{report.blocking_rules.toLocaleString()}</span>
-              <span className="stat-sub">the rest permit traffic</span>
+              <span className="stat-sub">enabled rules that block traffic</span>
             </div>
             <div className="stat">
               <span className="stat-label">Connected now</span>

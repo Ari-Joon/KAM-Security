@@ -633,8 +633,10 @@ export type RuleDirection = "in" | "out" | "unknown";
 
 export type ProfileState = {
   profile: FirewallProfile;
-  enabled: boolean;
-  active: boolean;
+  /** null when Windows would not say. Never shown as "off". */
+  enabled: boolean | null;
+  /** Whether this profile is in force now; null when that could not be read. */
+  active: boolean | null;
   inbound_default: FirewallDefault;
   outbound_default: FirewallDefault;
 };
@@ -665,6 +667,11 @@ export type FirewallReport = {
   enabled_rules: number;
   blocking_rules: number;
   our_rules: number;
+  /**
+   * What could not be read, in plain words. When this is not empty the counts
+   * above are of what was read, not of everything there is.
+   */
+  unread: string[];
 };
 
 export type ConnectionState =
