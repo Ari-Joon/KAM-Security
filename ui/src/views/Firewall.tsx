@@ -268,7 +268,11 @@ function byPublisher(programs: Program[]): MapGroup[] {
         key,
         label: publisher ?? program.label,
         bytes: 0,
-        tone: "unknown",
+        // Its first program's colour, not "unknown". Starting every group
+        // grey meant a group whose only program was KAM Security itself,
+        // which ranks no higher than unknown, stayed grey: the legend's
+        // colour for it never appeared anywhere on the map.
+        tone: node.tone,
         external: 0,
         share: 0,
         notes: [],
@@ -295,6 +299,14 @@ function byPublisher(programs: Program[]): MapGroup[] {
       group.detail =
         `${group.bytes} sockets across ${group.children.length} programs, ` +
         `${group.share}% of everything open`;
+    } else {
+      // A publisher with one program is that program. It takes the program's
+      // key, so clicking it opens the program's row (rows are keyed by
+      // program, and the group key opened nothing), and its colour, so the
+      // block says what the program is.
+      const [only] = group.children;
+      group.key = only.key;
+      group.tone = only.tone;
     }
   }
 
@@ -472,6 +484,8 @@ function ProgramGroup({
   /** What warrants a look, most notable first. Empty when nothing does. */
   notes: string[];
 }) {
+  // A folder that would not open says so, rather than the click doing nothing.
+  const [revealFailure, setRevealFailure] = useState<string | null>(null);
   return (
     <li
       ref={nodeRef}
@@ -579,10 +593,20 @@ function ProgramGroup({
             <button
               className="conn-path"
               title="Open the containing folder"
-              onClick={() => void api.reveal(program.path ?? "")}
+              onClick={() => {
+                setRevealFailure(null);
+                api
+                  .reveal(program.path ?? "")
+                  .catch((cause) => setRevealFailure(reason(cause)));
+              }}
             >
               {program.path}
             </button>
+          )}
+          {revealFailure && (
+            <p className="small held-warn" role="alert">
+              Could not open it: {revealFailure}
+            </p>
           )}
         </div>
       )}
@@ -590,7 +614,16 @@ function ProgramGroup({
   );
 }
 
-function RuleRow({ rule, onRemove }: { rule: FirewallRule; onRemove: (name: string) => void }) {
+function RuleRow({
+  rule,
+  onRemove,
+  busy,
+}: {
+  rule: FirewallRule;
+  onRemove: (name: string) => void;
+  /** True while a change is on its way, so a second click sends nothing. */
+  busy: boolean;
+}) {
   return (
     <li className={`fw-rule${rule.ours ? " fw-rule-ours" : ""}`}>
       <div className="fw-rule-head">
@@ -606,8 +639,12 @@ function RuleRow({ rule, onRemove }: { rule: FirewallRule; onRemove: (name: stri
           {rule.name || <span className="muted">(a rule with no name)</span>}
         </span>
         {rule.ours ? (
-          <button className="link-button" onClick={() => onRemove(rule.name)}>
-            Remove
+          <button
+            className="link-button"
+            disabled={busy}
+            onClick={() => onRemove(rule.name)}
+          >
+            {busy ? "Working…" : "Remove"}
           </button>
         ) : (
           !rule.enabled && <span className="fw-rule-off">disabled</span>
@@ -728,7 +765,19 @@ export default function Firewall() {
     void load();
   }, [load]);
 
+  /**
+   * Whether a change to the firewall is on its way.
+   *
+   * A ref as well as `busy`, because a second click can land before the
+   * re-render that disables the button. Remove had no guard at all: a double
+   * click sent two requests, each asked for consent, and the second failed
+   * because the first had already removed the rule.
+   */
+  const changing = useRef(false);
+
   async function block(path: string) {
+    if (changing.current) return;
+    changing.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -740,10 +789,13 @@ export default function Firewall() {
     } finally {
       setConfirming(null);
       setBusy(false);
+      changing.current = false;
     }
   }
 
   async function unblock(rule: string) {
+    if (changing.current) return;
+    changing.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -754,6 +806,7 @@ export default function Firewall() {
       setError(reason(cause));
     } finally {
       setBusy(false);
+      changing.current = false;
     }
   }
 
@@ -1069,8 +1122,13 @@ export default function Firewall() {
             not removable here.
           </p>
           <ul className="fw-rules">
-            {ourRules.map((rule) => (
-              <RuleRow key={rule.name} rule={rule} onRemove={(name) => void unblock(name)} />
+            {ourRules.map((rule, index) => (
+              <RuleRow
+                key={`${rule.name}-${index}`}
+                rule={rule}
+                busy={busy}
+                onRemove={(name) => void unblock(name)}
+              />
             ))}
           </ul>
         </section>
@@ -1091,6 +1149,7 @@ export default function Firewall() {
               <RuleRow
                 key={`${rule.name}-${index}`}
                 rule={rule}
+                busy={busy}
                 onRemove={(name) => void unblock(name)}
               />
             ))}
