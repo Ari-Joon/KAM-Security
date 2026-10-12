@@ -89,7 +89,7 @@ impl Zone {
 /// [`find`] answers "what large downloads are on this volume"; this answers
 /// "where did this one file come from", which is the question the scanner asks
 /// about a binary it already has reason to care about.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Origin {
     pub zone: Zone,
     /// Kept whole because it is evidence. Download URLs routinely carry tokens

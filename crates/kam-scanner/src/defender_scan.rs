@@ -54,10 +54,10 @@ use crate::Threat;
 /// A full scan of a large disk genuinely takes an hour or more, so this is
 /// generous. It exists so a wedged child process cannot hold a thread for the
 /// life of the service, not to bound honest work.
-const SCAN_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
+pub(crate) const SCAN_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// How often the child is checked for having finished, or for being cancelled.
-const POLL: Duration = Duration::from_millis(250);
+pub(crate) const POLL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -108,7 +108,7 @@ pub struct ScanOutcome {
 /// administrator-only — which is what makes naming either of them safe, and was
 /// verified rather than assumed — but the stub forwards to whichever platform
 /// version is live, so nothing here has to enumerate versions and pick one.
-fn mp_cmd_run() -> PathBuf {
+pub(crate) fn mp_cmd_run() -> PathBuf {
     let program_files =
         std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_owned());
     PathBuf::from(program_files).join(r"Windows Defender\MpCmdRun.exe")
@@ -120,7 +120,7 @@ fn mp_cmd_run() -> PathBuf {
 /// so handing a child one that a caller influenced is a way of choosing what it
 /// loads. Defender's own binary is signed and loads from its protected
 /// directory, and this costs one line.
-fn safe_working_directory() -> PathBuf {
+pub(crate) fn safe_working_directory() -> PathBuf {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
     PathBuf::from(root).join("System32")
 }
@@ -136,7 +136,7 @@ fn safe_working_directory() -> PathBuf {
 /// arrives from a client, so it is resolved before use like every other path in
 /// this product — see `kam-storage`'s `paths` module for the history behind
 /// that.
-fn checked_target(path: &str) -> std::result::Result<PathBuf, String> {
+pub(crate) fn checked_target(path: &str) -> std::result::Result<PathBuf, String> {
     let resolved = std::fs::canonicalize(path)
         .map_err(|error| format!("{path} could not be found, so it was not scanned: {error}"))?;
 

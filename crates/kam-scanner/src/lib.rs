@@ -13,7 +13,9 @@
 
 pub mod behaviour;
 pub mod defender;
+pub mod defender_file;
 pub mod defender_scan;
+pub mod downloads;
 pub mod extensions;
 pub mod hardening;
 pub mod persistence;
