@@ -171,6 +171,15 @@ fn canary_trips(seen: &mut HashSet<String>, first_pass: bool) -> Vec<Observation
 
     for user in persistence::signed_in_users() {
         let report = kam_canary::status(&user);
+        // A Security log that could not be read means a decoy could have been
+        // read unseen. Said in the agent's own log when it starts and whenever
+        // the reason changes, through the same set that keeps trips from
+        // repeating, rather than on every pass.
+        if let Some(reason) = &report.trips_unread {
+            if seen.insert(format!("unread\u{0}{reason}")) {
+                tracing::warn!(%reason, "reads of the decoys could not be checked");
+            }
+        }
         for trip in report.trips {
             // Windows keeps these events for as long as the Security log holds
             // them, so the first pass learns what is already there rather than
