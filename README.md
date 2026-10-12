@@ -351,6 +351,62 @@ behind it is now signed by someone else, or by nobody. Changes this program
 made itself are labelled rather than hidden, so malware cannot hide by using
 its name.
 
+## Downloads
+
+Most of what ends up running on a machine arrived through the Downloads
+folder, so **Active downloads** watches it. When a file finishes arriving
+(its size has held still and nothing is still writing it), Defender is asked
+about it straight away, and the answer is recorded with the file's size,
+SHA-256, the site it came from and, for a program, who signed it. Defender
+decides what is flagged. The page shows its answer by name and never adds
+anything up into a score, and nothing is moved or deleted unless you press a
+button. The watching waits on Windows to say something changed, so it costs
+nothing while nothing arrives.
+
+The check is report-only, and that turned out to matter. Asked to report
+rather than act, Defender records **nothing**: tested with the EICAR test
+archive, it named the threat and the file inside the zip on its console and
+left no entry in its detection history or its event log. Letting it act so
+that it records would mean letting it act on a path in a folder anybody can
+write to. So the console is read, under rules that cannot make anything look
+cleaner than it is: Defender's exit code decides whether anything was found,
+its own counts must match the list that follows, and a check that did not
+finish is said, never shown as clean.
+
+A zip can be taken apart. If Defender flagged it, the original goes to
+quarantine first. A private copy is checked, every file inside is listed with
+Defender's answer, and one button extracts the files it did not flag into a new
+folder beside it, "name (checked by KAM)". Nothing Defender flagged is ever
+written, and neither is a password-protected file (Defender could not look
+inside it), a link, or a name built to land somewhere else. Every extracted
+file keeps the mark Windows puts on downloads, so SmartScreen still sees it.
+Defender sometimes flags an archive as a whole rather than a file in it, and
+then there are no clean parts to separate, so none are offered. A file
+Defender removes the moment it is written is listed as removed, with the
+detection that took it, and is not counted as extracted.
+
+Defender's names carry their own category, and the page says what each one
+means. `HackTool:` and `PUA:` are Defender saying a program is a dual-use or
+unwanted tool rather than malware, which is common for open-source utilities.
+Whether to keep one is your decision, made in Windows Security under Protection
+history, Allow on device. KAM does not override Defender and has no way to. A
+name ending in `!ml` means Defender's machine-learning model flagged it rather
+than a known signature, and the page says that as a fact.
+
+The extracting is done by the window, as you, never by the service. Writing
+files under names chosen by whoever made an archive is exactly how a hostile
+zip writes outside the folder it is unpacked into, and in a LocalSystem
+process that would mean anywhere. A test fails if an archive reader ever
+reaches the service.
+
+Right-click any file for "Check with KAM Security", or a zip for "Extract with
+KAM Security" (on Windows 11, under "Show more options"). Both are added for
+your account the first time KAM Security runs and can be unticked on the
+page. New downloads also raise a Windows notification, which needs a KAM
+Security shortcut in your Start menu, so the app keeps one there. If Windows
+notifications are switched off, the page says so rather than staying quiet.
+Other archives (7z, RAR, disc images) are checked as a whole.
+
 ## Watching what starts itself
 
 Everything above judges the machine at rest, when someone opens the window and
