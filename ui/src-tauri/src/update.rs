@@ -217,9 +217,15 @@ fn compare(running: &str, published: &str) -> Option<Ordering> {
 /// followed, whatever it says.
 pub fn is_our_release_page(url: &str) -> bool {
     url == RELEASES
-        || url
-            .strip_prefix(RELEASES)
-            .is_some_and(|rest| rest.starts_with('/') && !rest.contains(['?', '#', '\\']))
+        || url.strip_prefix(RELEASES).is_some_and(|rest| {
+            rest.starts_with('/')
+                && !rest.contains(['?', '#', '\\', '%'])
+                // A `..` or `.` segment walks out of the releases page once the
+                // browser normalises the address, which reaches anywhere on
+                // github.com. Percent signs go for the same reason: `%2e%2e` is
+                // a dot segment too, and a release page never needs one.
+                && !rest.split('/').any(|segment| segment == ".." || segment == ".")
+        })
 }
 
 /// A version as three numbers, and whether it carries a pre-release suffix.
@@ -300,6 +306,9 @@ mod tests {
             "https://github.com/Ari-Joon/KAM-Security/releasesX",
             "https://github.com/Ari-Joon/KAM-Security/releases/tag/v9?next=https://example.com",
             "javascript:alert(1)",
+            "https://github.com/Ari-Joon/KAM-Security/releases/../../../someone-else/evil",
+            "https://github.com/Ari-Joon/KAM-Security/releases/%2e%2e/%2e%2e/someone-else",
+            "https://github.com/Ari-Joon/KAM-Security/releases/./tag/v9",
         ] {
             assert!(!is_our_release_page(foreign), "{foreign} was trusted");
         }
