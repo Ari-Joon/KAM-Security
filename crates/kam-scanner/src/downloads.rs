@@ -319,6 +319,19 @@ pub struct RemovedFile {
     pub name: String,
     /// The detection that names it, when Defender's history has one.
     pub threat: Option<String>,
+    /// What that detection's name means. This is the case that matters most
+    /// in practice: an open-source tool Defender classes as a hacking tool,
+    /// deleted as it is written, where keeping it is the person's decision.
+    #[serde(default)]
+    pub note: Option<crate::defender_file::ThreatNote>,
+}
+
+impl RemovedFile {
+    /// A removed file, with the note for the detection that names it.
+    pub fn new(name: String, threat: Option<String>) -> Self {
+        let note = threat.as_deref().map(crate::defender_file::note_for);
+        Self { name, threat, note }
+    }
 }
 
 /// Line Defender's answer up against the archive's own list of members.

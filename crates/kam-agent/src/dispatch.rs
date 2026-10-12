@@ -2413,10 +2413,10 @@ mod tests {
                     left_out: 1,
                     left_out_bytes: 68,
                     failed: Vec::new(),
-                    removed: vec![kam_scanner::downloads::RemovedFile {
-                        name: "tools/scan.exe".to_owned(),
-                        threat: Some("HackTool:Win32/Example".to_owned()),
-                    }],
+                    removed: vec![kam_scanner::downloads::RemovedFile::new(
+                        "tools/scan.exe".to_owned(),
+                        Some("HackTool:Win32/Example".to_owned()),
+                    )],
                 },
             },
             &context,

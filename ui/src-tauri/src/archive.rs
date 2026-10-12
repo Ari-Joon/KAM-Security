@@ -344,7 +344,7 @@ fn name_removals(removed: Vec<(String, PathBuf)>) -> Vec<RemovedFile> {
                     })
                 })
                 .map(|threat| threat.name.clone());
-            RemovedFile { name, threat }
+            RemovedFile::new(name, threat)
         })
         .collect()
 }
