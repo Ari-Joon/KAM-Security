@@ -51,11 +51,42 @@ const FOF_NOERRORUI: u32 = 0x0400;
 const FOFX_RECYCLEONDELETE: u32 = 0x0008_0000;
 
 /// What actually happened to an item.
+///
+/// Three outcomes, carried in two fields so the command that returns this
+/// needs no change to pass them on:
+///
+/// - `in_bin` and no `warning`: the bin was counted before and after, and it
+///   gained the item.
+/// - not `in_bin`, with a `warning`: the bin was counted both times and did not
+///   gain it, so Windows deleted it outright.
+/// - `in_bin` with a `warning`: it was sent to the bin, but the bin could not be
+///   counted, so whether it arrived is not known. The warning says so.
 pub struct Recycled {
-    /// True only when the bin really did gain an item.
+    /// False only when the bin was counted and did not gain the item.
     pub in_bin: bool,
-    /// Present when the item is gone but did not reach the bin.
+    /// Present whenever the item is gone and arriving in the bin was not
+    /// confirmed, whichever way that went.
     pub warning: Option<String>,
+}
+
+/// Whether an item reached the bin, as far as counting the bin can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arrival {
+    /// The bin gained an item.
+    Arrived,
+    /// The bin was counted both times and did not grow.
+    Missed,
+    /// The bin could not be counted, before or after, so nothing is known.
+    Unconfirmed,
+}
+
+/// Read the two counts. Not knowing is its own answer, never a yes.
+fn arrival(before: Option<i64>, after: Option<i64>) -> Arrival {
+    match (before, after) {
+        (Some(before), Some(after)) if after > before => Arrival::Arrived,
+        (Some(_), Some(_)) => Arrival::Missed,
+        _ => Arrival::Unconfirmed,
+    }
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -156,23 +187,33 @@ pub fn to_recycle_bin(path: &Path) -> Result<Recycled, String> {
 
     // Did it actually arrive? See the module note: the one thing this must not
     // do is call something recoverable when it is not.
-    let in_bin = match (before, bin_count()) {
-        (Some(before), Some(after)) => after > before,
-        // Unverifiable rather than false. Saying so is better than either
-        // guess.
-        _ => true,
-    };
-
-    Ok(Recycled {
-        in_bin,
-        warning: (!in_bin).then(|| {
-            format!(
+    //
+    // A bin that could not be counted used to come back as plainly "in the
+    // bin", with nothing said. That is a guess presented as a check, so it is
+    // now its own outcome, and the window says it could not confirm.
+    Ok(match arrival(before, bin_count()) {
+        Arrival::Arrived => Recycled {
+            in_bin: true,
+            warning: None,
+        },
+        Arrival::Missed => Recycled {
+            in_bin: false,
+            warning: Some(format!(
                 "{} was removed, but it did not reach the Recycle Bin — Windows \
                  does that when an item is too large for it. It cannot be \
                  restored from there.",
                 path.display()
-            )
-        }),
+            )),
+        },
+        Arrival::Unconfirmed => Recycled {
+            in_bin: true,
+            warning: Some(format!(
+                "{} was sent to the Recycle Bin, but whether it arrived could not \
+                 be confirmed, because the bin could not be counted. Look in the \
+                 Recycle Bin before relying on getting it back.",
+                path.display()
+            )),
+        },
     })
 }
 
@@ -242,6 +283,20 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A bin that cannot be counted is neither a yes nor a no.
+    ///
+    /// It was read as a yes, so the window said "Sent to the Recycle Bin"
+    /// without having checked.
+    #[test]
+    fn an_uncountable_bin_is_its_own_answer() {
+        assert_eq!(arrival(Some(3), Some(4)), Arrival::Arrived);
+        assert_eq!(arrival(Some(3), Some(3)), Arrival::Missed);
+        assert_eq!(arrival(Some(3), Some(2)), Arrival::Missed);
+        assert_eq!(arrival(None, Some(4)), Arrival::Unconfirmed);
+        assert_eq!(arrival(Some(3), None), Arrival::Unconfirmed);
+        assert_eq!(arrival(None, None), Arrival::Unconfirmed);
     }
 
     #[test]
