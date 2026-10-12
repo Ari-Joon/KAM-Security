@@ -754,7 +754,37 @@ fn one_line(detail: &str) -> String {
         .collect()
 }
 
+/// Every schema step, with the version it brings the store to.
+const MIGRATIONS: [(i64, &str); 5] = [
+    (1, SCHEMA_V1),
+    (2, SCHEMA_V2),
+    (3, SCHEMA_V3),
+    (4, SCHEMA_V4),
+    (5, SCHEMA_V5),
+];
+
 fn migrate(connection: &Connection) -> Result<()> {
+    migrate_through(connection, &MIGRATIONS)
+}
+
+/// Apply each step the store has not had yet, each one whole or not at all.
+///
+/// # Why each step carries its own version bump
+///
+/// The steps and the final `user_version` write used to be separate
+/// statements in no transaction. A service stopped partway through the v4 to
+/// v5 upgrade -- after `ALTER TABLE ... ADD COLUMN trust`, before the version
+/// was written -- left a store that said v4 and already had the column. Every
+/// start after that ran the same `ALTER` again, failed with "duplicate column
+/// name: trust", and the service would not start at all, on that machine,
+/// for good.
+///
+/// So a step and the version it brings the store to commit together. An
+/// interrupted step leaves the store exactly at the version before it, which
+/// the next start simply runs again. The version is read again inside each
+/// step's transaction, so a step another connection has already finished is
+/// not applied twice either.
+fn migrate_through(connection: &Connection, steps: &[(i64, &str)]) -> Result<()> {
     let current: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(to_db_error)?;
@@ -768,25 +798,37 @@ fn migrate(connection: &Connection) -> Result<()> {
         )));
     }
 
-    if current < 1 {
-        connection.execute_batch(SCHEMA_V1).map_err(to_db_error)?;
+    for &(version, schema) in steps {
+        if current >= version {
+            continue;
+        }
+        // `IMMEDIATE` takes the write lock before reading the version, so the
+        // check below and the step it guards cannot be split by another
+        // writer.
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(to_db_error)?;
+        let applied = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .and_then(|now| {
+                if now >= version {
+                    return Ok(());
+                }
+                connection.execute_batch(schema)?;
+                connection.pragma_update(None, "user_version", version)
+            });
+        match applied {
+            Ok(()) => connection.execute_batch("COMMIT").map_err(to_db_error)?,
+            Err(error) => {
+                // Whatever part of the step ran is undone, so the store is
+                // left at the version it says it is.
+                let _ = connection.execute_batch("ROLLBACK");
+                return Err(Error::Database(format!(
+                    "the store could not be brought up to schema {version}: {error}"
+                )));
+            }
+        }
     }
-    if current < 2 {
-        connection.execute_batch(SCHEMA_V2).map_err(to_db_error)?;
-    }
-    if current < 3 {
-        connection.execute_batch(SCHEMA_V3).map_err(to_db_error)?;
-    }
-    if current < 4 {
-        connection.execute_batch(SCHEMA_V4).map_err(to_db_error)?;
-    }
-    if current < 5 {
-        connection.execute_batch(SCHEMA_V5).map_err(to_db_error)?;
-    }
-
-    connection
-        .pragma_update(None, "user_version", SCHEMA_VERSION)
-        .map_err(to_db_error)?;
     Ok(())
 }
 
@@ -1370,5 +1412,40 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// An upgrade interrupted partway is finished by the next start, rather
+    /// than failing it forever.
+    ///
+    /// The steps and the version bump were separate. A store left after
+    /// `ADD COLUMN trust` and before `user_version = 5` said v4, already had
+    /// the column, and failed every later start with "duplicate column name:
+    /// trust" -- so the service would not start again on that machine.
+    #[test]
+    fn an_upgrade_interrupted_partway_is_finished_by_the_next_start() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_through(&connection, &MIGRATIONS[..4]).unwrap();
+
+        // The v5 step, failing after its `ALTER` has run.
+        let interrupted = [(
+            5,
+            "ALTER TABLE sightings ADD COLUMN trust TEXT NOT NULL DEFAULT '';
+             this is where the process was stopped;",
+        )];
+        assert!(migrate_through(&connection, &interrupted).is_err());
+
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4, "the store claims a version it does not have");
+
+        migrate(&connection).expect("the next start should finish the upgrade");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        connection
+            .execute_batch("SELECT trust FROM sightings")
+            .expect("the column the upgrade adds is there");
     }
 }
