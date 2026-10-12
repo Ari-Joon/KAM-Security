@@ -360,7 +360,15 @@ pub fn handle(
             }
         }
 
-        Request::GetSchedule => Response::Schedule(kam_schedule::current()),
+        // A schedule that could not be read is an error, not "nothing is
+        // registered": the window would otherwise offer to turn on a check
+        // that may already be on.
+        Request::GetSchedule => match kam_schedule::current() {
+            Ok(schedule) => Response::Schedule(schedule),
+            Err(error) => Response::Error {
+                message: format!("whether a weekly check is registered could not be read: {error}"),
+            },
+        },
 
         Request::SetSchedule { enabled, day, hour } => {
             if !enabled {
@@ -372,7 +380,15 @@ pub fn handle(
                             Effect::Changed,
                             "removed the weekly check".to_owned(),
                         );
-                        Response::Schedule(kam_schedule::current())
+                        match kam_schedule::current() {
+                            Ok(schedule) => Response::Schedule(schedule),
+                            Err(error) => Response::Error {
+                                message: format!(
+                                    "the weekly check was removed, but reading the schedule \
+                                     back failed: {error}"
+                                ),
+                            },
+                        }
                     }
                     Err(error) => {
                         context.audit(

@@ -38,8 +38,8 @@
 
 use kam_core::{Error, Result};
 use serde::{Deserialize, Serialize};
-use windows::core::{Interface, BSTR};
-use windows::Win32::Foundation::VARIANT_TRUE;
+use windows::core::{Interface, BSTR, HRESULT};
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, VARIANT_TRUE};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
@@ -147,43 +147,76 @@ fn service() -> Result<ITaskService> {
     Ok(service)
 }
 
-/// Our own folder, created if it is not there yet.
-fn folder(service: &ITaskService, create: bool) -> Result<ITaskFolder> {
-    let root = unsafe { service.GetFolder(&BSTR::from("\\")) }
-        .map_err(|error| Error::Privileged(format!("no task folder: {error}")))?;
+/// Whether a Task Scheduler error means "not there" rather than "could not
+/// look".
+///
+/// The two were the same answer. Every failure to reach the scheduler, open
+/// the folder or read the task came back as "nothing is registered", and the
+/// window then offered to turn on a check that might already be on -- a
+/// failure to look presented as an absence.
+fn is_absent(error: &windows::core::Error) -> bool {
+    let code = error.code();
+    code == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)
+        || code == HRESULT::from_win32(ERROR_PATH_NOT_FOUND.0)
+}
 
-    if let Ok(existing) = unsafe { service.GetFolder(&BSTR::from(FOLDER)) } {
-        return Ok(existing);
+/// Our own folder. `None` when it is not there and `create` is false.
+fn folder(service: &ITaskService, create: bool) -> Result<Option<ITaskFolder>> {
+    match unsafe { service.GetFolder(&BSTR::from(FOLDER)) } {
+        Ok(existing) => return Ok(Some(existing)),
+        Err(error) if is_absent(&error) => {}
+        Err(error) => {
+            return Err(Error::Privileged(format!(
+                "the task folder could not be read: {error}"
+            )))
+        }
     }
     if !create {
-        return Err(Error::Refused("no schedule is registered".to_owned()));
+        return Ok(None);
     }
 
+    let root = unsafe { service.GetFolder(&BSTR::from("\\")) }
+        .map_err(|error| Error::Privileged(format!("no task folder: {error}")))?;
     unsafe { root.CreateFolder(&BSTR::from(FOLDER), &VARIANT::default()) }
+        .map(Some)
         .map_err(|error| Error::Privileged(format!("could not create the task folder: {error}")))
 }
 
 /// What is registered right now.
-pub fn current() -> Schedule {
+///
+/// An error when it could not be found out. Nothing registered is an answer,
+/// and only a folder or task that is genuinely not there gives it.
+pub fn current() -> Result<Schedule> {
     let _com = ComGuard::enter();
 
-    let Ok(service) = service() else {
-        return Schedule::off();
+    let service = service()?;
+    let Some(folder) = folder(&service, false)? else {
+        return Ok(Schedule::off());
     };
-    let Ok(folder) = folder(&service, false) else {
-        return Schedule::off();
-    };
-    let Ok(task) = (unsafe { folder.GetTask(&BSTR::from(TASK)) }) else {
-        return Schedule::off();
+    let task = match unsafe { folder.GetTask(&BSTR::from(TASK)) } {
+        Ok(task) => task,
+        Err(error) if is_absent(&error) => return Ok(Schedule::off()),
+        Err(error) => {
+            return Err(Error::Privileged(format!(
+                "the weekly check could not be read: {error}"
+            )))
+        }
     };
 
     // A task that exists but is disabled is not a schedule, and saying it is
     // would be the sort of comforting lie this whole product exists to avoid.
-    let enabled = unsafe { task.Enabled() }.is_ok_and(|value| value == VARIANT_TRUE);
+    // One whose state cannot be read is neither, and is said as such.
+    let enabled = unsafe { task.Enabled() }
+        .map(|value| value == VARIANT_TRUE)
+        .map_err(|error| {
+            Error::Privileged(format!(
+                "whether the weekly check is switched on could not be read: {error}"
+            ))
+        })?;
 
-    let Ok(definition) = (unsafe { task.Definition() }) else {
-        return Schedule::off();
-    };
+    let definition = unsafe { task.Definition() }.map_err(|error| {
+        Error::Privileged(format!("the weekly check could not be read: {error}"))
+    })?;
 
     let mut schedule = Schedule {
         enabled,
@@ -233,7 +266,7 @@ pub fn current() -> Schedule {
         }
     }
 
-    schedule
+    Ok(schedule)
 }
 
 /// Register the weekly check, or replace what is registered.
@@ -245,7 +278,11 @@ pub fn current() -> Schedule {
 pub fn enable(program: &str, account: &str, day: &str, hour: u8) -> Result<Schedule> {
     let _com = ComGuard::enter();
     let service = service()?;
-    let folder = folder(&service, true)?;
+    let Some(folder) = folder(&service, true)? else {
+        return Err(Error::Privileged(
+            "the task folder could not be created".to_owned(),
+        ));
+    };
 
     let definition = unsafe { service.NewTask(0) }
         .map_err(|error| Error::Privileged(format!("could not start a task: {error}")))?;
@@ -340,7 +377,26 @@ pub fn enable(program: &str, account: &str, day: &str, hour: u8) -> Result<Sched
     }
 
     tracing::info!(%day_name, hour, %account, "registered the weekly check");
-    Ok(current())
+    // Read back rather than echoed, so what is shown is what Windows holds.
+    //
+    // If the read-back itself fails, the registration still happened: Windows
+    // accepted it a moment ago. Reporting that as a failure to register would
+    // put a false line in the audit log and leave the window saying nothing
+    // is registered, so what Windows accepted is returned instead, and the
+    // failed read is logged.
+    match current() {
+        Ok(schedule) => Ok(schedule),
+        Err(error) => {
+            tracing::warn!(%error, "registered the weekly check but could not read it back");
+            Ok(Schedule {
+                enabled: true,
+                day: Some(day_name.to_owned()),
+                at: Some(format!("{hour:02}:00")),
+                account: Some(account.to_owned()),
+                command: Some(program.to_owned()),
+            })
+        }
+    }
 }
 
 /// Remove the task, and the folder with it if nothing else is in there.
@@ -352,8 +408,10 @@ pub fn disable() -> Result<()> {
     let _com = ComGuard::enter();
     let service = service()?;
 
-    let Ok(folder) = folder(&service, false) else {
-        // Nothing registered is the state being asked for.
+    let Some(folder) = folder(&service, false)? else {
+        // Nothing registered is the state being asked for. Only a folder that
+        // is genuinely not there says so; one that could not be read is an
+        // error, not a weekly check that has been turned off.
         return Ok(());
     };
 
@@ -418,11 +476,32 @@ mod tests {
 
     #[test]
     fn reading_the_schedule_works_whether_or_not_one_is_registered() {
-        // Runs unprivileged in CI, where the answer is simply "nothing".
-        let schedule = current();
+        // In CI the answer is simply "nothing", and that is an answer rather
+        // than an error.
+        let schedule = current().expect("the task scheduler should answer");
         if !schedule.enabled {
             assert!(schedule.day.is_none() || schedule.at.is_some());
         }
+    }
+
+    /// Only "not there" means nothing is registered.
+    ///
+    /// Every failure used to come back as "off", so a scheduler that would
+    /// not answer, or a folder that could not be read, put "Nothing is
+    /// registered" and a "Turn on" button in front of somebody whose weekly
+    /// check might well be on.
+    #[test]
+    fn only_an_absence_reads_as_nothing_registered() {
+        let absent = windows::core::Error::from(HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0));
+        assert!(is_absent(&absent));
+        let no_path = windows::core::Error::from(HRESULT::from_win32(ERROR_PATH_NOT_FOUND.0));
+        assert!(is_absent(&no_path));
+
+        let refused = windows::core::Error::from(windows::Win32::Foundation::E_ACCESSDENIED);
+        assert!(!is_absent(&refused), "a refusal was read as nothing there");
+        let unreachable =
+            windows::core::Error::from(windows::Win32::Foundation::RPC_E_DISCONNECTED);
+        assert!(!is_absent(&unreachable));
     }
 
     #[test]
@@ -434,7 +513,10 @@ mod tests {
         let program = std::env::current_exe().unwrap().display().to_string();
         let account = std::env::var("USERNAME").unwrap();
 
-        assert!(!current().enabled, "something is already registered");
+        assert!(
+            !current().unwrap().enabled,
+            "something is already registered"
+        );
 
         let registered = enable(&program, &account, "Wednesday", 3).expect("could not register");
         assert!(registered.enabled);
@@ -444,13 +526,13 @@ mod tests {
 
         // Reading it back is a separate call through the same API the window
         // uses, not the value `enable` happened to return.
-        let read = current();
+        let read = current().unwrap();
         assert_eq!(read.day, registered.day);
         assert_eq!(read.at, registered.at);
         assert_eq!(read.command, registered.command);
 
         disable().expect("could not remove");
-        assert!(!current().enabled, "the task is still registered");
+        assert!(!current().unwrap().enabled, "the task is still registered");
         // And removing something already gone is not an error.
         disable().expect("removing nothing should be fine");
     }

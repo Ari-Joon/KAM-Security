@@ -212,6 +212,15 @@ function Protection() {
  */
 function WeeklyCheck() {
   const [schedule, setSchedule] = useState<Schedule | null>(null);
+  /**
+   * Why the schedule could not be read, when it could not.
+   *
+   * It used to be swallowed, which left the panel saying "Nothing is
+   * registered" and offering "Turn on" to somebody whose check might well be
+   * on. The panel is secondary and a failure still must not blank the
+   * Overview, but it is said rather than shown as "off".
+   */
+  const [unread, setUnread] = useState<string | null>(null);
   const [day, setDay] = useState("Sunday");
   const [hour, setHour] = useState(3);
   const [busy, setBusy] = useState(false);
@@ -223,10 +232,16 @@ function WeeklyCheck() {
       try {
         const current = await api.schedule();
         setSchedule(current);
+        setUnread(null);
         if (current.day) setDay(current.day);
-        if (current.at) setHour(parseInt(current.at.slice(0, 2), 10) || 3);
-      } catch {
-        // The panel is secondary; a failure here must not blank the Overview.
+        if (current.at) {
+          // `parseInt("00") || 3` turned midnight into 03:00, and "Change"
+          // then registered it at 03:00. Zero is an hour.
+          const registered = parseInt(current.at.slice(0, 2), 10);
+          if (!Number.isNaN(registered)) setHour(registered);
+        }
+      } catch (cause) {
+        setUnread(reason(cause));
       }
     })();
   }, []);
@@ -236,6 +251,7 @@ function WeeklyCheck() {
     setError(null);
     try {
       setSchedule(await api.setSchedule(enabled, day, hour));
+      setUnread(null);
     } catch (cause) {
       setError(reason(cause));
     } finally {
@@ -299,7 +315,7 @@ function WeeklyCheck() {
           </select>
         </label>
         <button onClick={() => void apply(true)} disabled={busy}>
-          {on ? "Change" : "Turn on"}
+          {on ? "Change" : schedule === null ? "Register this schedule" : "Turn on"}
         </button>
         {on && (
           <button className="ghost" onClick={() => void apply(false)} disabled={busy}>
@@ -310,8 +326,12 @@ function WeeklyCheck() {
 
       <p className={on ? "schedule-state on" : "schedule-state"}>
         {on
-          ? `Registered: every ${schedule?.day ?? day} at ${schedule?.at ?? ""}, only when the machine is idle and on mains power.`
-          : "Nothing is registered. This program reports on what starts itself at boot, so it does not quietly add itself to that list."}
+          ? `Registered: every ${schedule?.day ?? "(day could not be read)"} at ${schedule?.at ?? "(time could not be read)"}, only when the machine is idle and on mains power.`
+          : schedule === null
+            ? unread
+              ? `Whether a weekly check is registered could not be read: ${unread}`
+              : "Reading the schedule."
+            : "Nothing is registered. This program reports on what starts itself at boot, so it does not quietly add itself to that list."}
       </p>
       {on && schedule?.command && (
         <p className="muted small">
