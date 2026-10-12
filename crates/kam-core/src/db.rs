@@ -9,7 +9,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::audit::{AuditLog, Effect, Entry, Record};
 use crate::{Error, Result};
@@ -326,6 +326,15 @@ impl Store {
     /// There is nothing to compare against, so everything would be an
     /// "appearance" and the whole machine would be reported as new. A baseline
     /// records and reports nothing, and says so.
+    ///
+    /// # All of it or none of it
+    ///
+    /// The sweep is one transaction. It used to be a run of separate writes,
+    /// so an error partway through left new sightings inserted and `present`
+    /// cleared for things that had gone, with no `changes` row and no sweep
+    /// recorded. The next sweep then compared against that half-written
+    /// baseline and found nothing: the appearances and disappearances the
+    /// failed sweep had already absorbed were never reported to anybody.
     pub fn sweep(
         &self,
         seen: &[crate::changes::Sighting],
@@ -333,7 +342,11 @@ impl Store {
     ) -> Result<crate::changes::Sweep> {
         use crate::changes::{rank, Change, Difference, FLAPS_BEFORE_RECURRING};
 
-        let connection = self.lock()?;
+        let mut guard = self.lock()?;
+        // Dropped without `commit` on any early return, which rolls back.
+        let connection = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(to_db_error)?;
         let now: String = connection
             .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
                 row.get(0)
@@ -513,6 +526,8 @@ impl Store {
                    FROM sightings WHERE present = 1",
             )
             .map_err(to_db_error)?;
+        // A row that would not read is an error rather than a row skipped: a
+        // skipped row is one whose disappearance can never be reported.
         let candidates: Vec<Recorded> = gone
             .query_map([], |row| {
                 Ok(Recorded {
@@ -528,8 +543,8 @@ impl Store {
                 })
             })
             .map_err(to_db_error)?
-            .filter_map(std::result::Result::ok)
-            .collect();
+            .collect::<std::result::Result<_, _>>()
+            .map_err(to_db_error)?;
         drop(gone);
 
         for Recorded {
@@ -655,6 +670,8 @@ impl Store {
             .collect();
         drop(recent);
 
+        connection.commit().map_err(to_db_error)?;
+
         Ok(crate::changes::Sweep {
             differences,
             unreadable: unreadable
@@ -682,8 +699,10 @@ impl Store {
     /// Poisoning protects invariants that a panic may have left half-built.
     /// There are none here: the value behind the lock is a database connection,
     /// SQLite maintains its own consistency through its journal, and every
-    /// statement this module runs is a single self-contained execute or query.
-    /// A panic mid-statement leaves nothing for the next caller to trip over.
+    /// write this module makes is either a single statement or, for a sweep,
+    /// one transaction that rolls back when it is dropped uncommitted -- which
+    /// unwinding does. A panic midway leaves nothing for the next caller to
+    /// trip over.
     ///
     /// So the guard is taken back. Raised by adversarial review, which put it as
     /// "strictly safer", and that is right: the failure it prevents is certain
@@ -1316,6 +1335,59 @@ mod tests {
                 "a flapping service was announced as though it were new"
             );
         }
+    }
+
+    /// A sweep that fails partway leaves the baseline as it was.
+    ///
+    /// The sweep was a run of separate writes. A failure after the sightings
+    /// had been written left the new one recorded as seen with no `changes`
+    /// row, so the next sweep compared against it, found nothing new, and the
+    /// appearance was never reported to anybody.
+    #[test]
+    fn a_sweep_that_fails_partway_leaves_nothing_behind() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .sweep(&[seen("service", "Old", "C:\\old.exe")], &[])
+            .unwrap();
+
+        // Fail at the last write a sweep makes, after every sighting has been
+        // inserted and every disappearance marked.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_the_sweep BEFORE INSERT ON sweeps
+                 BEGIN SELECT RAISE(ABORT, 'interrupted'); END;",
+            )
+            .unwrap();
+        let after = [seen("service", "New", "C:\\new.exe")];
+        assert!(store.sweep(&after, &[]).is_err(), "the sweep should fail");
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_the_sweep")
+            .unwrap();
+
+        let sweep = store.sweep(&after, &[]).unwrap();
+        let change = |name: &str| {
+            sweep
+                .differences
+                .iter()
+                .find(|d| d.name == name)
+                .map(|d| d.change)
+        };
+        assert_eq!(
+            change("New"),
+            Some(crate::changes::Change::Appeared),
+            "the failed sweep swallowed an appearance: {:?}",
+            sweep.differences
+        );
+        assert_eq!(
+            change("Old"),
+            Some(crate::changes::Change::Vanished),
+            "the failed sweep swallowed a disappearance: {:?}",
+            sweep.differences
+        );
     }
 
     #[test]
