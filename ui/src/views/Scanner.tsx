@@ -371,19 +371,6 @@ export default function Scanner() {
       <BehaviourWatch />
 
       <Provenance />
-
-      <section className="panel">
-        <div className="panel-head">
-          <h2>Still to come</h2>
-        </div>
-        <ul className="planned">
-          <li>
-            YARA rules aimed at what Defender tolerates — bundled adware,
-            scareware optimisers, browser hijackers.
-          </li>
-          <li>Looking a single file up on VirusTotal, with your own API key.</li>
-        </ul>
-      </section>
     </>
   );
 }
