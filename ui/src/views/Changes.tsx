@@ -43,11 +43,17 @@ const KIND_LABEL: Record<string, string> = {
  *
  * They are counted rather than hidden. A number with no rows is honest; a
  * silent filter is not.
+ *
+ * A task's scope is the full path of its definition file, lowercased, such as
+ * `c:\windows\system32\tasks\microsoft\windows\defrag\scheduleddefrag`. The
+ * test used to look for a scope *starting* with `\microsoft`, which no scope
+ * does, so it never matched and every one of these was listed. What it means
+ * is a file under the `Microsoft` folder of the task store, wherever Windows
+ * is installed.
  */
 function isWindowsOwnTask(item: Difference): boolean {
   if (item.kind !== "scheduled_task") return false;
-  const scope = item.scope.toLowerCase();
-  return scope.startsWith("\\microsoft") || scope.startsWith("microsoft");
+  return item.scope.toLowerCase().includes("\\system32\\tasks\\microsoft\\");
 }
 
 function longDate(iso: string): string {
@@ -115,7 +121,16 @@ function Row({ item }: { item: Difference }) {
   );
 }
 
-export default function Changes({ sweep }: { sweep: Sweep | null }) {
+export default function Changes({
+  sweep,
+  error,
+  onRetry,
+}: {
+  sweep: Sweep | null;
+  /** Why the sweep did not answer, when it did not. */
+  error: string | null;
+  onRetry: () => void;
+}) {
   const groups = useMemo(() => {
     if (!sweep) return { shown: [] as Difference[], windowsTasks: 0 };
     const shown: Difference[] = [];
@@ -139,7 +154,19 @@ export default function Changes({ sweep }: { sweep: Sweep | null }) {
           </div>
         </div>
         <section className="panel">
-          <p className="empty">Looking at the machine.</p>
+          {error ? (
+            /* Said, with the reason, rather than left on "looking" for ever. A
+               sweep that could not run has found nothing, which is not the
+               same as having found nothing wrong. */
+            <div className="notice notice-down">
+              <strong>What changed could not be worked out.</strong> Nothing
+              is claimed about the machine either way.
+              <pre className="error">{error}</pre>
+              <button onClick={onRetry}>Try again</button>
+            </div>
+          ) : (
+            <p className="empty">Looking at the machine.</p>
+          )}
         </section>
       </>
     );
@@ -147,6 +174,9 @@ export default function Changes({ sweep }: { sweep: Sweep | null }) {
 
   const { shown, windowsTasks } = groups;
   const total = shown.length;
+  // "Nothing changed" is a claim about everything this looks at, so it is
+  // only made when everything was read.
+  const complete = sweep.unreadable.length === 0;
 
   return (
     <>
@@ -264,9 +294,13 @@ export default function Changes({ sweep }: { sweep: Sweep | null }) {
           <section className="panel">
             <div className="panel-head">
               <h2>
-                {total === 0
-                  ? "Nothing changed"
-                  : `${fmt.count(total)} ${total === 1 ? "thing" : "things"} changed`}
+                {total > 0
+                  ? `${fmt.count(total)} ${total === 1 ? "thing" : "things"} changed`
+                  : !complete
+                    ? "Nothing changed in what could be read"
+                    : windowsTasks > 0
+                      ? "Only Windows' own tasks changed"
+                      : "Nothing changed"}
               </h2>
               {total > 0 ? <span className="panel-count">{total}</span> : null}
             </div>
@@ -303,8 +337,20 @@ export default function Changes({ sweep }: { sweep: Sweep | null }) {
 
             {total === 0 ? (
               <p className="empty">
-                Nothing that starts itself or holds a privilege has changed since{" "}
-                {sweep.previous_at ? longDate(sweep.previous_at) : "the last sweep"}.
+                {complete ? (
+                  <>
+                    Nothing that starts itself or holds a privilege has changed
+                    since{" "}
+                    {sweep.previous_at ? longDate(sweep.previous_at) : "the last sweep"}.
+                  </>
+                ) : (
+                  <>
+                    Nothing that could be read has changed since{" "}
+                    {sweep.previous_at ? longDate(sweep.previous_at) : "the last sweep"}.
+                    What could not be read is listed above, and nothing is
+                    claimed about it.
+                  </>
+                )}
               </p>
             ) : (
               <ul className="entries">

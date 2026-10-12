@@ -12,13 +12,26 @@ const FILTERS: { key: Filter; label: string }[] = [
   { key: "observed", label: "Observations" },
 ];
 
-export default function Activity({ entries }: { entries: AuditRecord[] }) {
+export default function Activity({
+  entries,
+  read,
+  limit,
+}: {
+  entries: AuditRecord[];
+  /** False until the agent has answered once. */
+  read: boolean;
+  /** How many entries were asked for, newest first. */
+  limit: number;
+}) {
   const [filter, setFilter] = useState<Filter>("all");
 
   const shown = useMemo(
     () => (filter === "all" ? entries : entries.filter((e) => e.effect === filter)),
     [entries, filter],
   );
+  // A full page means there may be older entries that were not loaded, so the
+  // counts below are of these and not of the whole log.
+  const capped = entries.length >= limit;
 
   return (
     <>
@@ -33,6 +46,14 @@ export default function Activity({ entries }: { entries: AuditRecord[] }) {
       </div>
 
       <section className="panel">
+        {read && capped && (
+          <p className="muted small">
+            Showing the latest {entries.length.toLocaleString()} entries, newest
+            first. Older entries are kept in the log but not loaded here, so the
+            counts on these tabs are of the latest{" "}
+            {entries.length.toLocaleString()} only.
+          </p>
+        )}
         <div className="tabs">
           {FILTERS.map((option) => (
             <button
@@ -41,16 +62,25 @@ export default function Activity({ entries }: { entries: AuditRecord[] }) {
               onClick={() => setFilter(option.key)}
             >
               {option.label}
-              <span className="tab-count">
-                {option.key === "all"
-                  ? entries.length
-                  : entries.filter((e) => e.effect === option.key).length}
-              </span>
+              {/* No count until the log has been read: a zero here would say
+                  nothing was recorded, which nobody knows yet. */}
+              {read && (
+                <span className="tab-count">
+                  {option.key === "all"
+                    ? entries.length
+                    : entries.filter((e) => e.effect === option.key).length}
+                </span>
+              )}
             </button>
           ))}
         </div>
 
-        {shown.length === 0 ? (
+        {!read ? (
+          <p className="empty">
+            The activity log could not be read, because the agent has not
+            answered. This is not the same as nothing having been recorded.
+          </p>
+        ) : shown.length === 0 ? (
           <p className="empty">Nothing under this filter.</p>
         ) : (
           <ul className="entries">

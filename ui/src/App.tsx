@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import { api, reason } from "./lib/api";
 import type { Sweep as SweepReport } from "./lib/types";
@@ -59,6 +59,14 @@ const NAV: {
   { key: "activity", label: "Activity", hint: "The audit log", Icon: ActivityIcon },
 ];
 
+/**
+ * How many audit entries are read, newest first.
+ *
+ * Passed to the views that count them, so a count of these is never shown as
+ * a count of everything in the log.
+ */
+const AUDIT_LIMIT = 200;
+
 function Mark() {
   return (
     <svg viewBox="0 0 256 256" className="mark" aria-hidden="true">
@@ -89,9 +97,26 @@ export default function App() {
    * answer it had just given.
    */
   const [sweep, setSweep] = useState<SweepReport | null>(null);
+  /** Why the sweep did not answer, kept so it can be shown with a retry. */
+  const [sweepError, setSweepError] = useState<string | null>(null);
+  /**
+   * Whether a sweep has been asked for and not yet answered.
+   *
+   * A ref rather than state, because it has to stop a second request in the
+   * same moment the first is sent. Switching away from Changes and back
+   * before the agent answered used to send another sweep; each one records a
+   * new baseline, so whichever answered second compared the machine with the
+   * first and said nothing had changed.
+   */
+  const sweeping = useRef(false);
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [volumes, setVolumes] = useState<Volume[]>([]);
   const [entries, setEntries] = useState<AuditRecord[]>([]);
+  /**
+   * Whether the activity log has been read at all. An empty list from an
+   * agent that never answered is not "nothing recorded".
+   */
+  const [auditRead, setAuditRead] = useState(false);
   const [shellProtocol, setShellProtocol] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [storageRoot, setStorageRoot] = useState<string | null>(null);
@@ -103,10 +128,11 @@ export default function App() {
       setStatus(next);
       setError(null);
       const [audit, drives] = await Promise.all([
-        api.recentAudit(200),
+        api.recentAudit(AUDIT_LIMIT),
         api.volumes(),
       ]);
       setEntries(audit);
+      setAuditRead(true);
       setVolumes(drives);
     } catch (cause) {
       setStatus(null);
@@ -121,6 +147,26 @@ export default function App() {
     return () => clearInterval(timer);
   }, [refresh]);
 
+  /** Ask for one sweep, unless one is already on its way. */
+  const runSweep = useCallback(() => {
+    if (sweeping.current) return;
+    sweeping.current = true;
+    setSweepError(null);
+    api
+      .sweepForChanges()
+      .then(setSweep)
+      .catch((cause) => {
+        // Kept and shown with its reason, rather than leaving the view on
+        // "looking at the machine" for ever. Not an alarm either: a sweep
+        // that could not run has found nothing, which is not the same as
+        // having found nothing wrong.
+        setSweepError(reason(cause));
+      })
+      .finally(() => {
+        sweeping.current = false;
+      });
+  }, []);
+
   // Swept the first time the section is opened, and not again.
   //
   // Every sweep records a new baseline, so a poll here would erase the answer
@@ -128,15 +174,8 @@ export default function App() {
   // state the first call had already recorded and find nothing.
   useEffect(() => {
     if (section !== "changes" || sweep !== null) return;
-    api
-      .sweepForChanges()
-      .then(setSweep)
-      .catch(() => {
-        // Left as "looking at the machine" rather than replaced with an
-        // alarm: a sweep that could not run has found nothing, which is not
-        // the same as having found nothing wrong.
-      });
-  }, [section, sweep]);
+    runSweep();
+  }, [section, sweep, runSweep]);
 
   const connected = status !== null;
   const mismatched =
@@ -217,6 +256,8 @@ export default function App() {
             status={status}
             volumes={volumes}
             entries={entries}
+            auditRead={auditRead}
+            auditLimit={AUDIT_LIMIT}
             onOpenStorage={openStorage}
           />
         )}
@@ -238,10 +279,12 @@ export default function App() {
         )}
 
         {section === "changes" && (
-          <Changes sweep={sweep} />
+          <Changes sweep={sweep} error={sweepError} onRetry={runSweep} />
         )}
 
-        {section === "activity" && <Activity entries={entries} />}
+        {section === "activity" && (
+          <Activity entries={entries} read={auditRead} limit={AUDIT_LIMIT} />
+        )}
 
         {section === "scanner" && <Scanner />}
 

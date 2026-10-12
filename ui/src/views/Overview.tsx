@@ -26,14 +26,33 @@ type Props = {
   status: SystemStatus | null;
   volumes: Volume[];
   entries: AuditRecord[];
+  /** False until the agent has answered once, so empty is not "nothing". */
+  auditRead: boolean;
+  /** How many of the newest entries were asked for. */
+  auditLimit: number;
   onOpenStorage: (root: string) => void;
 };
 
+type UsageTone = "accent" | "warn" | "danger";
+
+/**
+ * Colour is a statement about headroom, not decoration: red only when the
+ * drive is genuinely close to full. The thresholds are named in the legend
+ * under the drives, because a colour with no key is a verdict nobody can check.
+ */
+function usageTone(pct: number): UsageTone {
+  return pct >= 92 ? "danger" : pct >= 80 ? "warn" : "accent";
+}
+
+const USAGE_LEGEND: [UsageTone, string][] = [
+  ["accent", "Under 80% used"],
+  ["warn", "80% to 92% used"],
+  ["danger", "92% used or more"],
+];
+
 function UsageBar({ used, total }: { used: number; total: number }) {
   const pct = fmt.percent(used, total);
-  // Colour is a judgement about headroom, not decoration: red only when the
-  // drive is genuinely close to full.
-  const tone = pct >= 92 ? "danger" : pct >= 80 ? "warn" : "accent";
+  const tone = usageTone(pct);
   return (
     <div className="usage">
       <div className="usage-track">
@@ -363,10 +382,25 @@ function WeeklyCheck() {
   );
 }
 
-export default function Overview({ status, volumes, entries, onOpenStorage }: Props) {
+export default function Overview({
+  status,
+  volumes,
+  entries,
+  auditRead,
+  auditLimit,
+  onOpenStorage,
+}: Props) {
   const fixed = volumes.filter((volume) => volume.kind === "fixed");
   const totalCapacity = fixed.reduce((sum, v) => sum + v.total_bytes, 0);
   const totalFree = fixed.reduce((sum, v) => sum + v.free_bytes, 0);
+  // Only the tones actually drawn get a key.
+  const tonesDrawn = new Set(
+    volumes.map((volume) =>
+      usageTone(fmt.percent(volume.total_bytes - volume.free_bytes, volume.total_bytes)),
+    ),
+  );
+  // A full page of entries means older ones exist that were not read.
+  const capped = entries.length >= auditLimit;
 
   return (
     <>
@@ -401,8 +435,19 @@ export default function Overview({ status, volumes, entries, onOpenStorage }: Pr
           <span className="stat-value">{fmt.bytes(totalFree)}</span>
         </div>
         <div className="stat">
-          <span className="stat-label">Recorded events</span>
-          <span className="stat-value">{fmt.count(entries.length)}</span>
+          {/* What was read, not the size of the log: only the newest
+              entries are fetched, so a full page is a lower bound. */}
+          <span className="stat-label">Recent events</span>
+          <span className="stat-value">
+            {auditRead ? fmt.count(entries.length) : "?"}
+          </span>
+          <span className="stat-sub">
+            {!auditRead
+              ? "the log could not be read"
+              : capped
+                ? `the latest ${fmt.count(entries.length)}; older ones are kept`
+                : "everything recorded"}
+          </span>
         </div>
       </div>
 
@@ -440,6 +485,16 @@ export default function Overview({ status, volumes, entries, onOpenStorage }: Pr
             ))}
           </div>
         )}
+        {volumes.length > 0 && (
+          <ul className="connmap-legend">
+            {USAGE_LEGEND.filter(([tone]) => tonesDrawn.has(tone)).map(([tone, label]) => (
+              <li key={tone}>
+                <span className={`connmap-swatch usage-${tone}`} />
+                {label}
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       <WeeklyCheck />
@@ -448,7 +503,12 @@ export default function Overview({ status, volumes, entries, onOpenStorage }: Pr
         <div className="panel-head">
           <h2>Recent activity</h2>
         </div>
-        {entries.length === 0 ? (
+        {!auditRead ? (
+          <p className="empty">
+            The activity log could not be read, because the agent has not
+            answered.
+          </p>
+        ) : entries.length === 0 ? (
           <p className="empty">Nothing recorded yet.</p>
         ) : (
           <ul className="entries compact">

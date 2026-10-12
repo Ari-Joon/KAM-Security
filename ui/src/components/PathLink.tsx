@@ -1,4 +1,5 @@
-import { api } from "../lib/api";
+import { useState } from "react";
+import { api, reason } from "../lib/api";
 
 /**
  * A path you can open.
@@ -14,8 +15,9 @@ import { api } from "../lib/api";
  * the only kind that holds.
  *
  * Opening a folder is not a change to anything, so it needs no confirmation.
- * A path that has since been moved or removed simply fails to open, which is
- * its own answer.
+ * A path that has since been moved or removed fails to open, and says so
+ * beside the link. It used to fail in silence, which looked exactly like a
+ * button that did nothing.
  */
 export default function PathLink({
   path,
@@ -30,6 +32,7 @@ export default function PathLink({
   title?: string;
 }) {
   const shown = children ?? path;
+  const [failure, setFailure] = useState<string | null>(null);
 
   // Nothing to open: render the text plainly rather than a control that would
   // do nothing when clicked.
@@ -48,16 +51,25 @@ export default function PathLink({
   }
 
   return (
-    <button
-      type="button"
-      className={`path-link ${className}`.trim()}
-      title={title ?? `Show ${path} in Explorer`}
-      onClick={(event) => {
-        event.stopPropagation();
-        void api.reveal(path);
-      }}
-    >
-      {shown}
-    </button>
+    <>
+      <button
+        type="button"
+        className={`path-link ${className}`.trim()}
+        title={title ?? `Show ${path} in Explorer`}
+        onClick={(event) => {
+          event.stopPropagation();
+          setFailure(null);
+          api.reveal(path).catch((cause) => setFailure(reason(cause)));
+        }}
+      >
+        {shown}
+      </button>
+      {failure && (
+        <span className="small held-warn" role="alert">
+          {" "}
+          Could not open it: {failure}
+        </span>
+      )}
+    </>
   );
 }
