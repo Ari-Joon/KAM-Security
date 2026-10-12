@@ -47,6 +47,9 @@ pub enum Value {
     /// Present but null, which WMI uses freely and which is not the same as
     /// zero or false.
     Empty,
+    /// An array of strings, which is how Defender lists the files a detection
+    /// was about.
+    Texts(Vec<String>),
 }
 
 impl Value {
@@ -63,6 +66,13 @@ impl Value {
             // WMI hands back plenty of numbers as strings, particularly the
             // large ones, and a caller should not have to care which.
             Self::Text(text) => text.parse().ok(),
+            _ => None,
+        }
+    }
+
+    pub fn texts(&self) -> Option<&[String]> {
+        match self {
+            Self::Texts(texts) => Some(texts),
             _ => None,
         }
     }
@@ -118,8 +128,9 @@ fn take_value(variant: &mut VARIANT) -> Value {
         // VT_I8 / VT_UI8
         20 => Value::Number(unsafe { inner.llVal }),
         21 => Value::Number(unsafe { inner.ullVal } as i64),
-        // Arrays and anything else are not read here. Defender uses them only
-        // for exclusion lists, which are handled through their own query.
+        // VT_ARRAY | VT_BSTR: the files and keys a detection names.
+        0x2008 => Value::Texts(unsafe { strings_of(inner.parray) }),
+        // Other arrays and anything else are not read here.
         _ => Value::Empty,
     };
 
@@ -127,6 +138,38 @@ fn take_value(variant: &mut VARIANT) -> Value {
         let _ = VariantClear(variant);
     }
     value
+}
+
+/// The strings in a one-dimensional `SAFEARRAY` of `BSTR`. Each element is
+/// copied out and freed by `BSTR`'s own drop; the array itself is freed with
+/// the variant that holds it.
+///
+/// # Safety
+///
+/// `array` must be null or a valid one-dimensional array of `BSTR`.
+unsafe fn strings_of(array: *mut windows::Win32::System::Com::SAFEARRAY) -> Vec<String> {
+    use windows::Win32::System::Ole::{
+        SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound,
+    };
+    if array.is_null() {
+        return Vec::new();
+    }
+    let (Ok(low), Ok(high)) = (unsafe { SafeArrayGetLBound(array, 1) }, unsafe {
+        SafeArrayGetUBound(array, 1)
+    }) else {
+        return Vec::new();
+    };
+    let mut texts = Vec::new();
+    for index in low..=high {
+        let mut text = BSTR::new();
+        let read = unsafe {
+            SafeArrayGetElement(array, &index, (&raw mut text).cast::<std::ffi::c_void>())
+        };
+        if read.is_ok() {
+            texts.push(text.to_string());
+        }
+    }
+    texts
 }
 
 /// Pull every named property off one WMI object.

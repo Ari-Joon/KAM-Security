@@ -305,6 +305,20 @@ pub struct Extraction {
     /// Members that were offered and could not be written, with why.
     #[serde(default)]
     pub failed: Vec<String>,
+    /// Members that were written and then were not there, or not whole, when
+    /// looked at again: Defender's real-time protection removing them as they
+    /// landed. Never counted in `files`.
+    #[serde(default)]
+    pub removed: Vec<RemovedFile>,
+}
+
+/// A file that was written and then taken away as it landed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovedFile {
+    /// The member's name in the archive.
+    pub name: String,
+    /// The detection that names it, when Defender's history has one.
+    pub threat: Option<String>,
 }
 
 /// Line Defender's answer up against the archive's own list of members.
@@ -323,6 +337,43 @@ pub struct Extraction {
 pub fn dissect(archive: &str, sha256: &str, scan: FileScan, entries: &[Entry]) -> Dissection {
     let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
     let attribution = attribute(&scan.threats, &names);
+
+    // When Defender's answer cannot be pinned to members, no member is known
+    // to be clean just because it was not named, so none is shown as clean.
+    // The first sentence is for the archive, the second for each member.
+    let untrusted: Option<(String, &str)> = if scan.answer == Answer::NotFinished {
+        Some((
+            "Defender did not finish checking the archive, so nothing in it is offered for \
+             extraction."
+                .to_owned(),
+            "Defender did not finish checking the archive, so this file is not known to be clean.",
+        ))
+    } else if scan.answer == Answer::Flagged && !scan.listing_consistent {
+        Some((
+            "Defender flagged something in this archive, and its list of what did not add up, \
+             so nothing in it is offered for extraction."
+                .to_owned(),
+            "Defender's list of what it flagged did not add up, so this file is not known to be \
+             clean.",
+        ))
+    } else if !attribution.whole.is_empty() {
+        Some((
+            "Defender flagged the archive as a whole, not a file inside it, so there are no \
+             clean parts to separate."
+                .to_owned(),
+            "Defender flagged the archive as a whole, so this file is not known to be clean.",
+        ))
+    } else if !attribution.unmatched.is_empty() {
+        Some((
+            "Defender flagged a file this archive's own list does not show by that name, so \
+             which file it meant cannot be told and nothing is offered for extraction."
+                .to_owned(),
+            "Defender flagged a file it could not be matched to, so this file is not known to be \
+             clean.",
+        ))
+    } else {
+        None
+    };
 
     let mut totals = Totals::default();
     let members: Vec<Member> = entries
@@ -351,6 +402,10 @@ pub fn dissect(archive: &str, sha256: &str, scan: FileScan, entries: &[Entry]) -
             } else if let Some(method) = &entry.unsupported {
                 MemberStatus::LeftOut {
                     reason: format!("It is compressed with {method}, which this cannot unpack."),
+                }
+            } else if let Some((_, reason)) = &untrusted {
+                MemberStatus::LeftOut {
+                    reason: (*reason).to_owned(),
                 }
             } else {
                 MemberStatus::NothingFound
@@ -384,30 +439,8 @@ pub fn dissect(archive: &str, sha256: &str, scan: FileScan, entries: &[Entry]) -
         })
         .collect();
 
-    let not_offered = if scan.answer == Answer::NotFinished {
-        Some(
-            "Defender did not finish checking the archive, so nothing in it is offered for \
-             extraction."
-                .to_owned(),
-        )
-    } else if scan.answer == Answer::Flagged && !scan.listing_consistent {
-        Some(
-            "Defender flagged something in this archive, and its list of what did not add up, \
-             so nothing in it is offered for extraction."
-                .to_owned(),
-        )
-    } else if !attribution.whole.is_empty() {
-        Some(format!(
-            "Defender flagged the archive as a whole ({}), not a file inside it, so nothing in \
-             it is offered for extraction.",
-            attribution.whole.join(", ")
-        ))
-    } else if !attribution.unmatched.is_empty() {
-        Some(
-            "Defender flagged a file this archive's own list does not show by that name, so \
-             which file it meant cannot be told and nothing is offered for extraction."
-                .to_owned(),
-        )
+    let not_offered = if let Some((sentence, _)) = untrusted {
+        Some(sentence)
     } else if totals.clean == 0 {
         Some(
             "There is nothing Defender found nothing in, so there is nothing to extract."
@@ -487,6 +520,7 @@ mod tests {
             listing_consistent: true,
             caveat: None,
             definitions: None,
+            notes: Vec::new(),
         }
     }
 
@@ -578,6 +612,47 @@ mod tests {
 
         let whole = flagged(&[r"file:_C:\w.zip"]);
         assert!(!dissect("a", "b", whole, &entries).offered);
+    }
+
+    /// The real case from this machine's own history: an ML detection whose
+    /// only resource is the zip itself. No member is known to be clean just
+    /// because none was named, so none is shown as clean and none is offered.
+    #[test]
+    fn an_archive_flagged_as_a_whole_has_no_clean_parts_to_separate() {
+        let mut scan = flagged(&[r"file:_C:\Users\me\Downloads\WindWakerHD.zip"]);
+        scan.threats[0].name = "Trojan:Script/Wacatac.H!ml".to_owned();
+        let entries = [entry("readme.txt", 10), entry("game.exe", 20)];
+        let dissection = dissect(
+            r"C:\Users\me\Downloads\WindWakerHD.zip",
+            "ab",
+            scan,
+            &entries,
+        );
+
+        assert!(!dissection.offered);
+        assert_eq!(
+            dissection.not_offered.as_deref(),
+            Some(
+                "Defender flagged the archive as a whole, not a file inside it, so there are no \
+                 clean parts to separate."
+            )
+        );
+        assert_eq!(
+            dissection.whole_archive,
+            vec!["Trojan:Script/Wacatac.H!ml".to_owned()]
+        );
+        assert_eq!(
+            dissection.totals.clean, 0,
+            "a file was shown as clean: {:?}",
+            dissection.members
+        );
+        assert_eq!(dissection.totals.left_out, 2);
+        for member in &dissection.members {
+            assert!(
+                matches!(member.status, MemberStatus::LeftOut { .. }),
+                "{member:?}"
+            );
+        }
     }
 
     #[test]

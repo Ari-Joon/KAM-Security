@@ -309,6 +309,7 @@ pub fn threats() -> kam_core::Result<Vec<Threat>> {
         "ThreatStatusID",
         "CleaningActionID",
         "InitialDetectionTime",
+        "Resources",
     ];
     const CATALOGUE: &[&str] = &["ThreatID", "ThreatName", "SeverityID", "CategoryID"];
 
@@ -343,9 +344,15 @@ pub fn threats() -> kam_core::Result<Vec<Threat>> {
                 category: entry.and_then(|entry| number(entry, "CategoryID")),
                 action: number(row, "CleaningActionID"),
                 status: number(row, "ThreatStatusID"),
-                // Resources arrive as a string array, which the reader does not
-                // decode; the name and status are what a person needs.
-                resources: Vec::new(),
+                // The files and keys it was about, as Defender wrote them:
+                // `file:_C:\...\a.zip->tools/x.exe`. Read so a file that
+                // vanished while being extracted can be matched to the
+                // detection that removed it.
+                resources: row
+                    .get("Resources")
+                    .and_then(Value::texts)
+                    .map(<[String]>::to_vec)
+                    .unwrap_or_default(),
                 detected_at: text(row, "InitialDetectionTime"),
                 status_text: String::new(),
                 needs_attention: false,
@@ -544,6 +551,23 @@ mod tests {
         }
         // Found and not yet acted on also needs a person.
         assert!(threat(1).needs_attention());
+    }
+
+    /// The files a detection was about are read, and read in a form the
+    /// resource parser takes. Says nothing about how many detections a
+    /// machine has, which differs from one to the next.
+    #[test]
+    fn detections_name_their_files_in_a_form_that_can_be_read() {
+        let threats = threats().expect("Defender's history should be readable");
+        let named: usize = threats.iter().map(|threat| threat.resources.len()).sum();
+        println!("{} detections naming {named} resources", threats.len());
+        for resource in threats.iter().flat_map(|threat| &threat.resources) {
+            println!("  {resource}");
+            assert!(
+                crate::defender_file::parse_resource(resource).is_some(),
+                "{resource} could not be read"
+            );
+        }
     }
 
     #[test]

@@ -89,7 +89,129 @@ pub struct FileScan {
     /// The definitions Defender looked with, when it said.
     #[serde(default)]
     pub definitions: Option<String>,
+    /// What each name Defender gave means, one per distinct name.
+    #[serde(default)]
+    pub notes: Vec<ThreatNote>,
 }
+
+/// What one of Defender's names says about itself, in plain words.
+///
+/// Defender names a detection `Category:Platform/Family!Suffix`, as in
+/// `HackTool:Win32/Mimikatz` or `Trojan:Script/Wacatac.H!ml`. The category is
+/// Defender's own classification and is shown as Defender gives it, with a
+/// sentence saying what that category means. Nothing here weighs whether
+/// Defender is right: that is Defender's call, and for the kinds of program
+/// Defender itself treats as a matter of choice it is the person's, made in
+/// Windows Security rather than here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreatNote {
+    /// The full name, as Defender gave it.
+    pub name: String,
+    /// The part before the first colon, as Defender gave it: `HackTool`.
+    pub category: Option<String>,
+    /// What that category means, in a sentence.
+    pub meaning: String,
+    /// True for the categories Defender treats as unwanted or dual-use
+    /// software rather than malware, where keeping one is the person's
+    /// decision in Windows Security.
+    pub your_decision: bool,
+    /// True when the name ends in `!ml`: Defender's machine-learning model
+    /// flagged it, rather than a match with a known signature.
+    pub machine_learning: bool,
+}
+
+/// Where the decision about an unwanted or dual-use program is made. KAM does
+/// not override Defender and has no way to.
+pub const WHERE_IT_IS_DECIDED: &str = "Whether to keep one is your decision. It is made in \
+     Windows Security, under Protection history, Allow on device, once Defender has acted on \
+     the file there. KAM Security does not override Defender.";
+
+/// The plain meaning of one of Defender's categories, and whether keeping
+/// such a program is the person's decision.
+fn category_meaning(category: &str) -> (String, bool) {
+    let lower = category.to_ascii_lowercase();
+    let unwanted = |what: &str| {
+        (
+            format!("Defender classes this as {what}, not as malware."),
+            true,
+        )
+    };
+    let malware = |what: &str| (format!("Defender classes this as {what}."), false);
+    match lower.as_str() {
+        "hacktool" => unwanted("a hacking or dual-use tool: something that can be used to attack or get around security"),
+        "puadlin" => unwanted("a download or installer for potentially unwanted software"),
+        "puabundler" => unwanted("an installer that bundles potentially unwanted software"),
+        "puaminer" => unwanted("a potentially unwanted cryptocurrency miner"),
+        "remoteaccess" => unwanted("a remote access tool, which can be used for good or ill"),
+        "monitoringtool" => unwanted("a monitoring tool, which records what is done on a machine"),
+        "tool" => unwanted("a dual-use tool"),
+        "program" => unwanted("an unwanted program"),
+        _ if lower.starts_with("pua") => unwanted("potentially unwanted software"),
+        "trojan" => malware("a trojan: malware that presents itself as something else"),
+        "trojandownloader" => malware("a trojan downloader: malware that fetches and runs other malware"),
+        "trojandropper" => malware("a trojan dropper: malware that carries and installs other malware"),
+        "trojanspy" | "spyware" => malware("spyware: malware that collects information without permission"),
+        "pws" => malware("a password stealer: malware that takes saved passwords and other credentials"),
+        "backdoor" => malware("a backdoor: malware that lets someone else control the machine"),
+        "ransom" => malware("ransomware: malware that locks files away and demands payment"),
+        "virus" => malware("a virus: malware that copies itself into other files"),
+        "worm" => malware("a worm: malware that spreads to other machines by itself"),
+        "exploit" => malware("an exploit: code that attacks a weakness in other software"),
+        "virtool" => malware("a tool used to build or hide malware"),
+        "adware" => malware("adware: software that shows advertising nobody asked for"),
+        "browsermodifier" => malware("a browser modifier: software that changes browser settings without asking"),
+        "softwarebundler" => malware("a software bundler: an installer that adds other software alongside what it claims to install"),
+        "behavior" => malware("suspicious behaviour: it was flagged for what it did rather than for what it is"),
+        _ => (format!("Defender's category for this is {category}."), false),
+    }
+}
+
+/// The notes for every distinct name in a list of threats.
+pub fn notes_for(threats: &[Flagged]) -> Vec<ThreatNote> {
+    let mut notes: Vec<ThreatNote> = Vec::new();
+    for threat in threats {
+        if notes.iter().any(|note| note.name == threat.name) {
+            continue;
+        }
+        notes.push(note_for(&threat.name));
+    }
+    notes
+}
+
+/// The note for one of Defender's names.
+pub fn note_for(name: &str) -> ThreatNote {
+    let category = name
+        .split_once(':')
+        .map(|(category, _)| category.trim())
+        .filter(|category| {
+            !category.is_empty() && category.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+        .map(str::to_owned);
+    let (mut meaning, your_decision) = match &category {
+        Some(category) => category_meaning(category),
+        None => ("Defender did not put this in a category.".to_owned(), false),
+    };
+    if your_decision {
+        meaning.push(' ');
+        meaning.push_str(WHERE_IT_IS_DECIDED);
+    }
+    let machine_learning = name.to_ascii_lowercase().ends_with("!ml");
+    if machine_learning {
+        meaning.push(' ');
+        meaning.push_str(MACHINE_LEARNING);
+    }
+    ThreatNote {
+        name: name.to_owned(),
+        category,
+        meaning,
+        your_decision,
+        machine_learning,
+    }
+}
+
+/// What `!ml` at the end of a name means, stated as the fact it is.
+pub const MACHINE_LEARNING: &str = "The !ml at the end of the name means Defender's \
+     machine-learning model flagged it, rather than a match with a known signature.";
 
 impl FileScan {
     /// The names Defender gave, without repeats, in the order it gave them.
@@ -240,6 +362,7 @@ pub fn check_file(path: &str, cancel: &AtomicBool) -> Result<FileScan> {
             listing_consistent: false,
             caveat: Some(reason),
             definitions: None,
+            notes: Vec::new(),
         },
         None => parse_report(exit_code, &output),
     };
@@ -340,6 +463,7 @@ pub fn parse_report(exit_code: Option<i32>, output: &str) -> FileScan {
         listing_consistent: false,
         caveat: Some(reason),
         definitions: None,
+        notes: Vec::new(),
     };
 
     match exit_code {
@@ -352,10 +476,12 @@ pub fn parse_report(exit_code: Option<i32>, output: &str) -> FileScan {
             listing_consistent: true,
             caveat: None,
             definitions: None,
+            notes: Vec::new(),
         },
         Some(2) => match (summary, found) {
             (Some(at), Some(count)) if count > 0 => {
                 let (threats, consistent) = threat_blocks(&lines[at + 1..], count);
+                let notes = notes_for(&threats);
                 FileScan {
                     answer: Answer::Flagged,
                     completed: true,
@@ -369,6 +495,7 @@ pub fn parse_report(exit_code: Option<i32>, output: &str) -> FileScan {
                     }),
                     threats,
                     definitions: None,
+                    notes,
                 }
             }
             (Some(_), Some(_)) => unfinished(
@@ -945,6 +1072,77 @@ mod tests {
                 "{hostile:?}"
             );
         }
+    }
+
+    /// Defender's category is shown as Defender gives it, with what it means,
+    /// and the ones Defender treats as a matter of choice say where that
+    /// choice is made. Nothing here says Defender is wrong.
+    #[test]
+    fn each_category_reads_as_defender_gives_it_with_a_plain_meaning() {
+        let hacktool = note_for("HackTool:Win32/Mimikatz");
+        assert_eq!(hacktool.category.as_deref(), Some("HackTool"));
+        assert!(hacktool.your_decision);
+        assert!(
+            hacktool.meaning.contains("not as malware"),
+            "{}",
+            hacktool.meaning
+        );
+        assert!(
+            hacktool.meaning.contains("Allow on device"),
+            "{}",
+            hacktool.meaning
+        );
+
+        for unwanted in [
+            "PUA:Win32/Presenoker",
+            "PUADlIn:Win32/Thing",
+            "PUABundler:Win32/X",
+        ] {
+            let note = note_for(unwanted);
+            assert!(note.your_decision, "{unwanted}");
+            assert!(
+                note.meaning.contains("potentially unwanted"),
+                "{unwanted}: {}",
+                note.meaning
+            );
+        }
+
+        let trojan = note_for("Trojan:Script/Wacatac.H!ml");
+        assert_eq!(trojan.category.as_deref(), Some("Trojan"));
+        assert!(!trojan.your_decision);
+        assert!(trojan.machine_learning);
+        assert!(
+            trojan.meaning.contains("machine-learning"),
+            "{}",
+            trojan.meaning
+        );
+        assert!(!trojan.meaning.to_lowercase().contains("false positive"));
+
+        let eicar = note_for("Virus:DOS/EICAR_Test_File");
+        assert!(!eicar.machine_learning && !eicar.your_decision);
+        assert!(eicar
+            .meaning
+            .starts_with("Defender classes this as a virus"));
+
+        assert_eq!(
+            note_for("SomethingNew:Win32/X").meaning,
+            "Defender's category for this is SomethingNew."
+        );
+        assert_eq!(note_for("NoCategoryAtAll").category, None);
+
+        for note in [hacktool, trojan, eicar] {
+            assert!(
+                !note.meaning.contains('—'),
+                "no dashes in what the person reads"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flagged_report_carries_one_note_per_name() {
+        let scan = parse_report(Some(2), &eicar_output(ZIP));
+        assert_eq!(scan.notes.len(), 1);
+        assert_eq!(scan.notes[0].name, "Virus:DOS/EICAR_Test_File");
     }
 
     /// The real thing, end to end, against a copy of the EICAR test archive.

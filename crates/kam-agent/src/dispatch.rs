@@ -2413,6 +2413,10 @@ mod tests {
                     left_out: 1,
                     left_out_bytes: 68,
                     failed: Vec::new(),
+                    removed: vec![kam_scanner::downloads::RemovedFile {
+                        name: "tools/scan.exe".to_owned(),
+                        threat: Some("HackTool:Win32/Example".to_owned()),
+                    }],
                 },
             },
             &context,
@@ -2427,10 +2431,13 @@ mod tests {
             panic!("no history");
         };
         assert!(records[0].dissection.is_some());
+        let said = &records[0].actions[0].what;
+        assert!(said.starts_with("Extracted 2 files"), "{said}");
         assert!(
-            records[0].actions[0].what.starts_with("Extracted 2 files"),
-            "{:?}",
-            records[0].actions
+            said.contains(
+                "1 removed by Defender as it was written: tools/scan.exe (HackTool:Win32/Example)"
+            ),
+            "a file Defender took away was not said: {said}"
         );
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }

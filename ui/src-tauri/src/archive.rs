@@ -33,7 +33,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use kam_scanner::downloads::{Dissection, Entry, Extraction, MemberStatus};
+use kam_scanner::downloads::{Dissection, Entry, Extraction, MemberStatus, RemovedFile};
 use kam_storage::downloads::{extraction_folder_name, lies_within, safe_relative};
 
 /// Most members read from one archive. Past this it is not an archive anybody
@@ -239,6 +239,8 @@ pub fn extract(
         ..Extraction::default()
     };
 
+    let mut written: Vec<(String, PathBuf, u64)> = Vec::new();
+    let mut removed: Vec<(String, PathBuf)> = Vec::new();
     for (index, member) in dissection.members.iter().enumerate() {
         if member.status != MemberStatus::NothingFound {
             continue;
@@ -251,17 +253,104 @@ pub fn extract(
             &destination_real,
             zone,
         ) {
-            Ok(written) => {
-                outcome.files += 1;
-                outcome.bytes += written;
+            Ok((path, size)) => written.push((member.name.clone(), path, size)),
+            Err(Unwritten::Removed(path)) => removed.push((member.name.clone(), path)),
+            Err(Unwritten::Failed(reason)) => {
+                outcome.failed.push(format!("{}: {reason}", member.name));
             }
-            Err(reason) => outcome.failed.push(format!("{}: {reason}", member.name)),
         }
+    }
+
+    // A failure is not an absence: a file that was written is only counted
+    // once it has been looked at again and is still there, whole. Defender's
+    // real-time protection acts on a file as it lands, a moment after it is
+    // closed, so the second look waits for that moment.
+    if !written.is_empty() {
+        std::thread::sleep(SETTLE_AFTER_WRITING);
+    }
+    let (files, bytes, gone) = second_look(written);
+    outcome.files = files;
+    outcome.bytes = bytes;
+    removed.extend(gone);
+    if !removed.is_empty() {
+        outcome.removed = name_removals(removed);
     }
     Ok(outcome)
 }
 
-/// Write one member, under every rule in the module notes.
+/// Look again at every file written: how many are still there and whole, how
+/// many bytes they hold, and which are gone or changed.
+fn second_look(written: Vec<(String, PathBuf, u64)>) -> (u64, u64, Vec<(String, PathBuf)>) {
+    let mut files = 0;
+    let mut bytes = 0;
+    let mut gone = Vec::new();
+    for (name, path, size) in written {
+        let whole = std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == size);
+        if whole {
+            files += 1;
+            bytes += size;
+        } else {
+            gone.push((name, path));
+        }
+    }
+    (files, bytes, gone)
+}
+
+/// How long to wait after writing before looking again. Defender scans a file
+/// when it is closed and removes it moments later.
+const SETTLE_AFTER_WRITING: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Why a member is not among the files extracted.
+enum Unwritten {
+    /// Written, or being written, and then taken away: Windows refused it as
+    /// containing a threat, or it was gone the moment it was closed.
+    Removed(PathBuf),
+    /// Never written, for this reason.
+    Failed(String),
+}
+
+impl From<String> for Unwritten {
+    fn from(reason: String) -> Self {
+        Self::Failed(reason)
+    }
+}
+
+/// Windows' own errors for a file its antivirus refused or deleted.
+fn refused_by_antivirus(error: &std::io::Error) -> bool {
+    // ERROR_VIRUS_INFECTED and ERROR_VIRUS_DELETED.
+    matches!(error.raw_os_error(), Some(225 | 226))
+}
+
+/// Put the detection that took each file away beside it, when Defender's
+/// history names that file. Read as the person, which Defender allows.
+fn name_removals(removed: Vec<(String, PathBuf)>) -> Vec<RemovedFile> {
+    let detections = kam_scanner::defender::threats().unwrap_or_default();
+    removed
+        .into_iter()
+        .map(|(name, path)| {
+            let wanted = plain_text(&path);
+            let threat = detections
+                .iter()
+                .find(|threat| {
+                    threat.resources.iter().any(|resource| {
+                        kam_scanner::defender_file::parse_resource(resource).is_some_and(|named| {
+                            let named = named
+                                .path
+                                .strip_prefix(r"\\?\")
+                                .unwrap_or(&named.path)
+                                .to_owned();
+                            named.eq_ignore_ascii_case(&wanted)
+                        })
+                    })
+                })
+                .map(|threat| threat.name.clone());
+            RemovedFile { name, threat }
+        })
+        .collect()
+}
+
+/// Write one member, under every rule in the module notes. Answers where it
+/// went and how big it was.
 fn write_member(
     zip: &mut zip::ZipArchive<File>,
     index: usize,
@@ -269,10 +358,10 @@ fn write_member(
     declared: u64,
     destination: &Path,
     zone: Option<&[u8]>,
-) -> Result<u64, String> {
+) -> Result<(PathBuf, u64), Unwritten> {
     let parts = safe_relative(name).map_err(|refusal| refusal.sentence())?;
     let Some((file_name, folders)) = parts.split_last() else {
-        return Err("It has no name.".to_owned());
+        return Err(Unwritten::Failed("It has no name.".to_owned()));
     };
 
     let mut folder = destination.to_path_buf();
@@ -281,10 +370,10 @@ fn write_member(
         match std::fs::symlink_metadata(&folder) {
             Ok(existing) if existing.is_dir() && !existing.file_type().is_symlink() => {}
             Ok(_) => {
-                return Err(format!(
+                return Err(Unwritten::Failed(format!(
                     "{} is in the way and is not a plain folder.",
                     folder.display()
-                ))
+                )))
             }
             Err(_) => std::fs::create_dir(&folder)
                 .map_err(|error| format!("its folder could not be made: {error}"))?,
@@ -293,7 +382,9 @@ fn write_member(
     let folder_real = std::fs::canonicalize(&folder)
         .map_err(|error| format!("its folder could not be found again: {error}"))?;
     if folder_real != destination && !lies_within(&folder_real, destination) {
-        return Err("Its folder leads outside the new folder, so it was not written.".to_owned());
+        return Err(Unwritten::Failed(
+            "Its folder leads outside the new folder, so it was not written.".to_owned(),
+        ));
     }
 
     let target = folder_real.join(file_name);
@@ -305,13 +396,23 @@ fn write_member(
         .map(|listed| listed.into_owned())
         .unwrap_or_else(|_| String::from_utf8_lossy(member.name_raw()).into_owned());
     if listed != name {
-        return Err("The archive changed while it was being read.".to_owned());
+        return Err(Unwritten::Failed(
+            "The archive changed while it was being read.".to_owned(),
+        ));
     }
-    let mut out = OpenOptions::new()
+    let mut out = match OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&target)
-        .map_err(|error| format!("it could not be created: {error}"))?;
+    {
+        Ok(out) => out,
+        Err(error) if refused_by_antivirus(&error) => return Err(Unwritten::Removed(target)),
+        Err(error) => {
+            return Err(Unwritten::Failed(format!(
+                "it could not be created: {error}"
+            )))
+        }
+    };
 
     // One byte more than declared is read, so a member that keeps going is
     // noticed rather than written in full.
@@ -321,20 +422,45 @@ fn write_member(
         Ok(copied)
     });
     drop(out);
-    let failure = match copied {
-        Ok(copied) if copied > declared => {
-            Some("It unpacked to more than it declared, so it was not kept.".to_owned())
+    let copied = match copied {
+        Ok(copied) => copied,
+        Err(error) if refused_by_antivirus(&error) => {
+            let _ = std::fs::remove_file(&target);
+            return Err(Unwritten::Removed(target));
         }
-        Ok(_) => None,
-        Err(error) => Some(format!("it could not be unpacked ({error})")),
+        Err(error) => {
+            let _ = std::fs::remove_file(&target);
+            return Err(Unwritten::Failed(format!(
+                "it could not be unpacked ({error})"
+            )));
+        }
     };
-    let escaped =
-        std::fs::canonicalize(&target).map_or(true, |real| !lies_within(&real, destination));
-    if failure.is_some() || escaped {
+    if copied > declared {
         let _ = std::fs::remove_file(&target);
-        return Err(failure.unwrap_or_else(|| {
-            "It would have landed outside the new folder, so it was removed.".to_owned()
-        }));
+        return Err(Unwritten::Failed(
+            "It unpacked to more than it declared, so it was not kept.".to_owned(),
+        ));
+    }
+
+    // Gone the moment it was closed: taken away as it landed, which is not the
+    // same as written.
+    let real = match std::fs::canonicalize(&target) {
+        Ok(real) => real,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Unwritten::Removed(target))
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&target);
+            return Err(Unwritten::Failed(format!(
+                "it was written and could not be found again ({error})"
+            )));
+        }
+    };
+    if !lies_within(&real, destination) {
+        let _ = std::fs::remove_file(&target);
+        return Err(Unwritten::Failed(
+            "It would have landed outside the new folder, so it was removed.".to_owned(),
+        ));
     }
 
     if let Some(zone) = zone {
@@ -342,9 +468,7 @@ fn write_member(
         stream.push(":Zone.Identifier");
         let _ = std::fs::write(PathBuf::from(stream), zone);
     }
-    std::fs::metadata(&target)
-        .map(|metadata| metadata.len())
-        .map_err(|error| format!("it was written and could not be read back: {error}"))
+    Ok((target, copied))
 }
 
 /// Free space where the files would go, when Windows says.
@@ -488,6 +612,7 @@ mod tests {
             listing_consistent: true,
             caveat: None,
             definitions: None,
+            notes: Vec::new(),
         };
         let dissection = dissect("Photos.zip", "ab", scan, &entries(&zip_path).unwrap());
         assert!(dissection.offered, "{dissection:?}");
@@ -594,5 +719,47 @@ mod tests {
         );
         drop(writer);
         assert!(open_shut_to_writers(&path).is_ok());
+    }
+
+    /// A file taken away, or cut short, after it was written is never counted
+    /// as extracted. This is what Defender's real-time protection does to a
+    /// file it objects to as it lands; here the taking away is done by hand.
+    #[test]
+    fn a_file_gone_or_changed_after_writing_is_not_counted_as_extracted() {
+        let scratch = Scratch::new("second-look");
+        let kept = scratch.downloads().join("kept.txt");
+        let taken = scratch.downloads().join("taken.exe");
+        let cut = scratch.downloads().join("cut.dll");
+        for path in [&kept, &taken, &cut] {
+            std::fs::write(path, b"0123456789").unwrap();
+        }
+        std::fs::remove_file(&taken).unwrap();
+        std::fs::write(&cut, b"0").unwrap();
+
+        let (files, bytes, gone) = second_look(vec![
+            ("kept.txt".to_owned(), kept, 10),
+            ("taken.exe".to_owned(), taken, 10),
+            ("cut.dll".to_owned(), cut, 10),
+        ]);
+        assert_eq!((files, bytes), (1, 10));
+        let names: Vec<&str> = gone.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["taken.exe", "cut.dll"]);
+
+        // And without a detection naming them, they are still reported, just
+        // without a name for what took them.
+        let named = name_removals(gone);
+        assert_eq!(named.len(), 2);
+        assert!(named.iter().all(|removal| removal.threat.is_none()));
+    }
+
+    #[test]
+    fn windows_own_antivirus_refusals_are_recognised() {
+        assert!(refused_by_antivirus(&std::io::Error::from_raw_os_error(
+            225
+        )));
+        assert!(refused_by_antivirus(&std::io::Error::from_raw_os_error(
+            226
+        )));
+        assert!(!refused_by_antivirus(&std::io::Error::from_raw_os_error(5)));
     }
 }

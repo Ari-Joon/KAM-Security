@@ -254,6 +254,7 @@ fn record_from_row(row: DownloadRow) -> DownloadRecord {
         listing_consistent: false,
         caveat: Some("The stored answer for this check could not be read back.".to_owned()),
         definitions: None,
+        notes: Vec::new(),
     });
     DownloadRecord {
         check: DownloadCheck {
@@ -544,9 +545,34 @@ pub fn record_extraction(
         };
     };
     let destination = clipped(&extraction.destination, 1024);
+    let removed = if extraction.removed.is_empty() {
+        String::new()
+    } else {
+        let named: Vec<String> = extraction
+            .removed
+            .iter()
+            .take(20)
+            .map(|removal| match &removal.threat {
+                Some(threat) => {
+                    format!("{} ({})", clipped(&removal.name, 200), clipped(threat, 200))
+                }
+                None => clipped(&removal.name, 200),
+            })
+            .collect();
+        format!(
+            "; {} removed by Defender as {} written: {}",
+            extraction.removed.len(),
+            if extraction.removed.len() == 1 {
+                "it was"
+            } else {
+                "they were"
+            },
+            named.join(", ")
+        )
+    };
     let sentence = format!(
         "Extracted {} {} ({}) that Defender did not flag into {destination}; {} {} ({}) left \
-         out{}.",
+         out{}{removed}.",
         extraction.files,
         if extraction.files == 1 {
             "file"
