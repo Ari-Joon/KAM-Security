@@ -19,7 +19,9 @@
     it runs, so it is switched off from the app's Overview, not from here.
 
 .PARAMETER Remove
-    Stop and unregister the service and delete the shortcut.
+    Stop and unregister the service and delete the shortcut. Also removes the
+    right-click entries and the Start menu shortcut the app adds for whoever
+    runs it, when they point at this folder's kam-shell.exe.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File setup.ps1
@@ -54,6 +56,82 @@ foreach ($needed in @($agent, $shell)) {
 
 $shortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'KAM Security.lnk'
 
+# The identity the app gives itself when it starts (see notice.rs), so the
+# window, its taskbar button, its notices and this shortcut are one
+# application to Windows. Written onto the shortcut below.
+$appId = 'com.kamsecurity.shell'
+
+# What the app adds for the person who runs it, in their own hive and Start
+# menu: the right-click entries and the Start menu shortcut notices need. Taken
+# away by -Remove when they point at this folder's kam-shell.exe, and left
+# alone when they belong to another copy.
+function Remove-UserEntries {
+    param([string]$Shell)
+    $removed = @()
+    foreach ($key in @(
+            'HKCU:\Software\Classes\*\shell\KAMSecurity.Check',
+            'HKCU:\Software\Classes\SystemFileAssociations\.zip\shell\KAMSecurity.Extract')) {
+        $command = Get-Item -LiteralPath "$key\command" -ErrorAction SilentlyContinue
+        if ($command -and ([string]$command.GetValue('')).ToLowerInvariant().Contains("`"$($Shell.ToLowerInvariant())`"")) {
+            Remove-Item -LiteralPath $key -Recurse -Force
+            $removed += 'right-click entry'
+        }
+    }
+    $startLink = Join-Path ([Environment]::GetFolderPath('Programs')) 'KAM Security.lnk'
+    if (Test-Path -LiteralPath $startLink) {
+        $target = (New-Object -ComObject WScript.Shell).CreateShortcut($startLink).TargetPath
+        if ($target -and $target -ieq $Shell) {
+            Remove-Item -LiteralPath $startLink -Force
+            $removed += 'Start menu shortcut'
+        }
+    }
+    foreach ($item in $removed) { Write-Host "  $item removed" -ForegroundColor Gray }
+}
+
+# Writes the identity onto a shortcut. WScript.Shell cannot, so this goes
+# through the shortcut's property store, as Windows' own installers do.
+function Set-ShortcutIdentity {
+    param([string]$Link, [string]$Id)
+    if (-not ('KamIdentity' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class KamIdentity {
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    struct PropertyKey { public Guid FormatId; public uint PropertyId; }
+    [StructLayout(LayoutKind.Explicit)]
+    struct PropVariant {
+        [FieldOffset(0)] public ushort Type;
+        [FieldOffset(8)] public IntPtr Pointer;
+        [FieldOffset(16)] public IntPtr Spare;
+    }
+    [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPropertyStore {
+        void GetCount(out uint count);
+        void GetAt(uint index, out PropertyKey key);
+        void GetValue(ref PropertyKey key, out PropVariant value);
+        void SetValue(ref PropertyKey key, ref PropVariant value);
+        void Commit();
+    }
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+    static extern void SHGetPropertyStoreFromParsingName(string path, IntPtr context, int flags, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out IPropertyStore store);
+    [DllImport("ole32.dll")]
+    static extern int PropVariantClear(ref PropVariant value);
+    public static void Set(string link, string id) {
+        Guid iid = new Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99");
+        IPropertyStore store;
+        SHGetPropertyStoreFromParsingName(link, IntPtr.Zero, 2, ref iid, out store);
+        PropertyKey key = new PropertyKey { FormatId = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), PropertyId = 5 };
+        PropVariant value = new PropVariant { Type = 31, Pointer = Marshal.StringToCoTaskMemUni(id) };
+        try { store.SetValue(ref key, ref value); store.Commit(); }
+        finally { PropVariantClear(ref value); Marshal.ReleaseComObject(store); }
+    }
+}
+'@
+    }
+    [KamIdentity]::Set($Link, $Id)
+}
+
 # --- elevation ------------------------------------------------------------
 #
 # Registering a service needs it. The script relaunches itself rather than
@@ -74,6 +152,16 @@ if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrat
         Write-Host 'Administrator rights were not granted, so nothing was changed.' -ForegroundColor Yellow
         exit 1
     }
+
+    # The person's own entries are removed here, in this pass, and not only in
+    # the elevated one. When an administrator elevates on behalf of a standard
+    # account, the elevated pass runs as the administrator, so its HKCU and
+    # Start menu are the administrator's, not this person's. This pass runs as
+    # whoever started the script. Only after the elevated half succeeded, so a
+    # refused or failed removal leaves everything as it was.
+    if ($Remove -and $child.ExitCode -eq 0) {
+        Remove-UserEntries -Shell $shell
+    }
     exit $child.ExitCode
 }
 
@@ -90,6 +178,12 @@ if ($Remove) {
         Remove-Item $shortcut -Force
         Write-Host '  desktop shortcut deleted' -ForegroundColor Gray
     }
+
+    # Started already elevated by the person themselves, this is their hive.
+    # Elevated by somebody else, it is that administrator's, and only entries
+    # pointing at this folder are touched either way; the unelevated pass
+    # above handles the person's own.
+    Remove-UserEntries -Shell $shell
 
     Write-Host ''
     Write-Host 'Done. The folder you unzipped can now be deleted.' -ForegroundColor Green
@@ -179,6 +273,11 @@ $link.WorkingDirectory = $here
 $link.IconLocation = "$shell,0"
 $link.Description = 'KAM Security'
 $link.Save()
+try {
+    Set-ShortcutIdentity -Link $shortcut -Id $appId
+} catch {
+    Write-Host "  the desktop shortcut could not be given the app's identity: $($_.Exception.Message)" -ForegroundColor Yellow
+}
 Write-Host "  desktop shortcut created" -ForegroundColor Gray
 
 # Explorer caches the icon it drew last time, so a shortcut replaced in place
@@ -199,5 +298,8 @@ Write-Host ''
 Write-Host 'The first time you open it:' -ForegroundColor White
 Write-Host '  - KAM Security adds itself to your sign-in items, so its icon sits by the clock' -ForegroundColor Gray
 Write-Host '  - untick "Start KAM Security when I sign in" on the Overview to stop that' -ForegroundColor Gray
+Write-Host '  - it adds "Check with KAM Security" and "Extract with KAM Security" to the right-click menu' -ForegroundColor Gray
+Write-Host '    (untick them on the Active downloads page) and a Start menu shortcut, which' -ForegroundColor Gray
+Write-Host '    Windows needs before it will show the app''s notices' -ForegroundColor Gray
 Write-Host ''
 Write-Host 'Undo what this script did with:  setup.ps1 -Remove  (the sign-in entry is the app''s: untick it first)' -ForegroundColor Gray
