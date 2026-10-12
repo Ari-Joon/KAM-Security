@@ -5,19 +5,40 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Nothing here can write by default. The build runs third-party code (every
+# build script, every proc-macro, vite and its plugins, the Tauri CLI), and a
+# token able to write to this repository in reach of any of it could push to
+# main, move a tag, or swap the release zip and SHA256SUMS together, so the
+# checksum would vouch for whatever replaced it. That zip installs a
+# LocalSystem service.
+#
+# So the build gets a read-only token it does not even keep, and the one job
+# that can write builds nothing: it takes the artifact the build produced and
+# attaches it to a draft release.
+#
+# Actions are pinned by commit, with the release they correspond to beside
+# each, because a tag can be moved and a commit cannot. Dependabot keeps the
+# pins current.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
 
-      - uses: actions/setup-node@v7
+      # No build cache here, unlike CI. A cache restored into the release build
+      # is something other than this commit's source ending up in the shipped
+      # binaries; a release is rare enough to build from nothing.
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
           cache: npm
@@ -25,7 +46,8 @@ jobs:
 
       # Install scripts are ignored so a compromised transitive dependency
       # cannot run code at install time. Nothing in the tree needs one; see the
-      # matching step in ci.yml.
+      # matching step in ci.yml. npm checks every cached package against the
+      # lockfile's integrity hash, which is why that cache is kept.
       - name: Build the frontend
         working-directory: ui
         run: npm ci --ignore-scripts && npm run build
@@ -59,16 +81,26 @@ jobs:
             ForEach-Object { "$($_.Hash.ToLower())  kam-security-windows-x64.zip" } |
             Out-File -FilePath SHA256SUMS.txt -Encoding ascii
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: kam-security-windows-x64
           path: |
             kam-security-windows-x64.zip
             SHA256SUMS.txt
 
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: kam-security-windows-x64
+
       - name: Publish
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           draft: true
           files: |
