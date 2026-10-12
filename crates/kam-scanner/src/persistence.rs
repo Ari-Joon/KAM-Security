@@ -1065,11 +1065,8 @@ fn walk_tasks(
             walk_tasks(root, &path, entries, missed, depth + 1);
             continue;
         }
-        match task_entry_or(root, &path) {
-            Ok(Some(entry)) => entries.push(entry),
-            // Not a task, or a task nothing triggers. Silent on purpose:
-            // neither is persistence and neither is a gap.
-            Ok(None) => {}
+        match task_entries_or(root, &path) {
+            Ok(found) => entries.extend(found),
             Err(error) => missed.push(Unwalked {
                 where_it_is: path.display().to_string(),
                 what: format!("{} ({error})", path.display()),
@@ -1081,9 +1078,107 @@ fn walk_tasks(
 /// Read one task definition file into an entry.
 ///
 /// `None` for a task that runs only when something asks it to — no trigger is
-/// not persistence — and for files that are not task definitions at all.
+/// not persistence — and for files that are not task definitions at all. A
+/// task with several actions has an entry for each; this is the first of them.
+/// [`task_entries`] has them all.
 pub fn task_entry(root: &Path, path: &Path) -> Option<Entry> {
-    task_entry_or(root, path).ok().flatten()
+    task_entries(root, path).into_iter().next()
+}
+
+/// Every action one task definition runs, each as its own entry.
+pub fn task_entries(root: &Path, path: &Path) -> Vec<Entry> {
+    task_entries_or(root, path).unwrap_or_default()
+}
+
+/// One thing a scheduled task does when it fires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TaskAction {
+    /// Runs a program, with its own arguments.
+    Exec {
+        command: String,
+        arguments: Option<String>,
+    },
+    /// Hands the work to a COM class, named by its CLSID, which Windows loads
+    /// into the task host. Windows runs a good share of its own maintenance
+    /// this way.
+    ComHandler { class_id: String },
+}
+
+/// Every action in a task definition, in the order the scheduler runs them.
+///
+/// Each action carries its own arguments. This read the first `<Command>` in
+/// the file and the first `<Arguments>` anywhere in it, so a task whose second
+/// action ran the payload was judged on the first, and a first action with no
+/// arguments was given the second action's.
+fn task_actions(xml: &str) -> Vec<TaskAction> {
+    let Some(start) = xml.find("<Actions") else {
+        return Vec::new();
+    };
+    let mut rest = &xml[start..];
+    if let Some(end) = rest.find("</Actions>") {
+        rest = &rest[..end];
+    }
+
+    let mut actions = Vec::new();
+    loop {
+        let exec = rest.find("<Exec>");
+        let com = rest.find("<ComHandler>");
+        let (at, open, close) = match (exec, com) {
+            (Some(e), Some(c)) if c < e => (c, "<ComHandler>", "</ComHandler>"),
+            (Some(e), _) => (e, "<Exec>", "</Exec>"),
+            (None, Some(c)) => (c, "<ComHandler>", "</ComHandler>"),
+            (None, None) => break,
+        };
+        let body_start = at + open.len();
+        let Some(length) = rest[body_start..].find(close) else {
+            break;
+        };
+        let body = &rest[body_start..body_start + length];
+        if open == "<Exec>" {
+            if let Some(command) = between(body, "<Command>", "</Command>") {
+                actions.push(TaskAction::Exec {
+                    command: unescape(&command),
+                    arguments: between(body, "<Arguments>", "</Arguments>")
+                        .map(|args| unescape(&args)),
+                });
+            }
+        } else if let Some(class_id) = between(body, "<ClassId>", "</ClassId>") {
+            actions.push(TaskAction::ComHandler {
+                class_id: unescape(&class_id),
+            });
+        }
+        rest = &rest[body_start + length + close.len()..];
+    }
+    actions
+}
+
+/// The file a COM class is loaded from, as this machine registers it.
+///
+/// A COM handler names a class rather than a file, and the class names the
+/// file under `InprocServer32` (or `LocalServer32` for one that runs in a
+/// process of its own). Both registry views are read, because a 32-bit class
+/// registers under `WOW6432Node`. `None` when the class is not registered, or
+/// names nothing that is there.
+fn com_server(class_id: &str) -> Option<PathBuf> {
+    let class_id = class_id.trim();
+    for view in [View::Native, View::Wow6432] {
+        for server in ["InprocServer32", "LocalServer32"] {
+            let Some(key) = registry::Key::open(
+                HKEY_LOCAL_MACHINE,
+                &format!(r"SOFTWARE\Classes\CLSID\{class_id}\{server}"),
+                view,
+            ) else {
+                continue;
+            };
+            let Some(value) = key.string("") else {
+                continue;
+            };
+            if let Some(path) = executable_in(&value) {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 /// The same, keeping a failed read apart from a file that is not a task.
@@ -1101,26 +1196,19 @@ pub fn task_entry(root: &Path, path: &Path) -> Option<Entry> {
 /// deny even SYSTEM, which made such a task invisible to this reader *and*
 /// unreported as a gap -- so it never entered the baseline, and its appearance
 /// could never be reported either.
-fn task_entry_or(root: &Path, path: &Path) -> Result<Option<Entry>, std::io::Error> {
+fn task_entries_or(root: &Path, path: &Path) -> Result<Vec<Entry>, std::io::Error> {
     let Some(xml) = read_task(path)? else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
 
     // A task with no trigger runs only when something asks it to, which is
     // not persistence.
     if !xml.contains("<Triggers>") || xml.contains("<Triggers />") {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let Some(command) = between(&xml, "<Command>", "</Command>").map(|text| unescape(&text)) else {
-        // No command is not a task that runs anything, which is a fact about
-        // the file rather than a failure to read it.
-        return Ok(None);
-    };
-    let arguments = between(&xml, "<Arguments>", "</Arguments>").map(|args| unescape(&args));
-    let full = match &arguments {
-        Some(args) if !args.is_empty() => format!("{command} {args}"),
-        _ => command.clone(),
-    };
+    // No action is not a task that runs anything, which is a fact about the
+    // file rather than a failure to read it.
+    let actions = task_actions(&xml);
 
     // Hidden is a request to Task Scheduler not to list it. Windows uses it
     // for a handful of its own maintenance tasks; software that wants to be
@@ -1133,15 +1221,59 @@ fn task_entry_or(root: &Path, path: &Path) -> Result<Option<Entry>, std::io::Err
         .unwrap_or(path)
         .display()
         .to_string();
+    let location = path.display().to_string();
 
-    Ok(Some(entry(
-        name,
-        Anchor::ScheduledTask,
-        path.display().to_string(),
-        full,
-        hidden,
-        None,
-    )))
+    // One action keeps the task's own name, so everything recorded about a
+    // task before its other actions were read still matches. That is the
+    // first program it runs, as it always was, or the first action of any
+    // kind when it runs no program. The rest are named by their place.
+    let bare = actions
+        .iter()
+        .position(|action| matches!(action, TaskAction::Exec { .. }))
+        .unwrap_or(0);
+
+    Ok(actions
+        .into_iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let name = if index == bare {
+                name.clone()
+            } else {
+                format!("{name} (action {})", index + 1)
+            };
+            match action {
+                TaskAction::Exec { command, arguments } => {
+                    let full = match &arguments {
+                        Some(args) if !args.is_empty() => format!("{command} {args}"),
+                        _ => command,
+                    };
+                    entry(
+                        name,
+                        Anchor::ScheduledTask,
+                        location.clone(),
+                        full,
+                        hidden,
+                        None,
+                    )
+                }
+                // Said as what it is. It was dropped as "not a task that runs
+                // anything", which is not true of a COM handler: the class
+                // is loaded into the task host and runs. What is judged is
+                // the file the class is registered to.
+                TaskAction::ComHandler { class_id } => Entry {
+                    name,
+                    anchor: Anchor::ScheduledTask,
+                    location: location.clone(),
+                    command: format!("COM handler {class_id}"),
+                    executable: com_server(&class_id),
+                    payload: None,
+                    host: None,
+                    hidden,
+                    machine_wide: true,
+                },
+            }
+        })
+        .collect())
 }
 
 /// Read a task definition, whatever it is encoded as.
@@ -1527,6 +1659,109 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(&script).unwrap();
+    }
+
+    /// Write a task definition the way the scheduler does, and read it back.
+    fn read_back_task(tag: &str, actions: &str) -> Vec<Entry> {
+        let root = std::env::temp_dir();
+        let path = root.join(format!("kam-task-{tag}-{}", std::process::id()));
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\
+             <Task><Triggers><LogonTrigger/></Triggers>\
+             <Actions Context=\"Author\">{actions}</Actions></Task>"
+        );
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in xml.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let entries = task_entries(&root, &path);
+        std::fs::remove_file(&path).unwrap();
+        entries
+    }
+
+    /// Every action is read, each with its own arguments.
+    ///
+    /// The reader took the first `<Command>` and the first `<Arguments>`
+    /// anywhere, so a task whose second action ran the payload was judged on
+    /// the first, harmless one.
+    #[test]
+    fn a_task_whose_second_action_runs_the_payload_is_judged_on_it() {
+        let script = scratch_script("second-action.cmd");
+        let entries = read_back_task(
+            "pair",
+            &format!(
+                "<Exec><Command>notepad.exe</Command></Exec>\
+                 <Exec><Command>cmd.exe</Command>\
+                 <Arguments>/c &quot;{}&quot;</Arguments></Exec>",
+                script.display()
+            ),
+        );
+        std::fs::remove_file(&script).unwrap();
+
+        assert_eq!(entries.len(), 2, "{entries:#?}");
+        // The first keeps the task's name and is not given the second's
+        // arguments.
+        assert_eq!(entries[0].command, "notepad.exe");
+        assert!(!entries[0].name.contains("action"));
+        assert!(
+            entries[1].name.ends_with("(action 2)"),
+            "{}",
+            entries[1].name
+        );
+        assert_eq!(entries[1].host.as_deref(), Some("cmd.exe"));
+        assert_eq!(entries[1].payload.as_deref(), Some(script.as_path()));
+    }
+
+    /// A COM handler is reported as one, with its class and the file the
+    /// class is registered to, rather than dropped as running nothing.
+    #[test]
+    fn a_com_handler_task_is_reported_as_what_it_is() {
+        // The Task Scheduler's own class, registered on every Windows.
+        let entries = read_back_task(
+            "com",
+            "<ComHandler><ClassId>{0F87369F-A4E5-4CFC-BD3E-73E6154572DD}</ClassId>\
+             <Data>&lt;x/&gt;</Data></ComHandler>",
+        );
+        assert_eq!(entries.len(), 1, "{entries:#?}");
+        let entry = &entries[0];
+        assert_eq!(
+            entry.command,
+            "COM handler {0F87369F-A4E5-4CFC-BD3E-73E6154572DD}"
+        );
+        assert!(!entry.name.contains("action"));
+        let server = entry.executable.as_deref().expect("a registered class");
+        assert!(
+            server
+                .to_string_lossy()
+                .to_lowercase()
+                .ends_with("taskschd.dll"),
+            "{}",
+            server.display()
+        );
+
+        // A class nobody registered is still an action the task has.
+        let entries = read_back_task(
+            "com-unknown",
+            "<ComHandler><ClassId>{00000000-0000-0000-0000-00000000CAFE}</ClassId></ComHandler>",
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].executable, None);
+    }
+
+    /// The first program a task runs keeps the task's name when a COM handler
+    /// comes before it, so what was recorded about that program still matches.
+    #[test]
+    fn the_first_program_keeps_the_tasks_name() {
+        let entries = read_back_task(
+            "com-then-exec",
+            "<ComHandler><ClassId>{0F87369F-A4E5-4CFC-BD3E-73E6154572DD}</ClassId></ComHandler>\
+             <Exec><Command>notepad.exe</Command><Arguments>a.txt</Arguments></Exec>",
+        );
+        assert_eq!(entries.len(), 2, "{entries:#?}");
+        assert!(entries[0].name.ends_with("(action 1)"));
+        assert!(!entries[1].name.contains("action"));
+        assert_eq!(entries[1].command, "notepad.exe a.txt");
     }
 
     #[test]
