@@ -347,16 +347,22 @@ function VirusTotal({ path, hasKey }: { path: string; hasKey: boolean }) {
             <span className="vt-score">
               {verdict.engines > 0
                 ? `${verdict.malicious + verdict.suspicious} of ${verdict.engines}`
-                : "no record"}
+                : verdict.standing === "not_analysed"
+                  ? "no answers yet"
+                  : "no record"}
             </span>
+            {/* Not analysed is drawn like not known: neutral, since no engine
+                has said anything either way. */}
             <span className="vt-standing">
               {verdict.standing === "clean"
                 ? "nothing flagged it"
                 : verdict.standing === "not_known"
                   ? "not known to VirusTotal"
-                  : verdict.standing === "isolated"
-                    ? "a few engines flagged it"
-                    : "many engines flagged it"}
+                  : verdict.standing === "not_analysed"
+                    ? "not yet analysed by any engine"
+                    : verdict.standing === "isolated"
+                      ? "a few engines flagged it"
+                      : "many engines flagged it"}
             </span>
           </div>
 

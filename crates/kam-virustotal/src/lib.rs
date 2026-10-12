@@ -57,6 +57,10 @@ pub enum Standing {
     /// VirusTotal has never seen this file. Common and unalarming: most files
     /// on most machines have never been submitted by anyone.
     NotKnown,
+    /// VirusTotal has a record of the file but no engine has reported on it,
+    /// usually because it was submitted moments ago and is still being
+    /// analysed. Says nothing either way.
+    NotAnalysed,
     /// A handful of engines flagged it, which usually means nothing.
     Isolated,
     /// Enough engines agree that it is worth taking seriously.
@@ -68,6 +72,7 @@ impl Standing {
         match self {
             Self::Clean => "nothing flagged it",
             Self::NotKnown => "not known to VirusTotal",
+            Self::NotAnalysed => "not yet analysed",
             Self::Isolated => "a few engines flagged it",
             Self::Substantial => "many engines flagged it",
         }
@@ -147,6 +152,19 @@ fn timestamp(value: &serde_json::Value, key: &str) -> Option<String> {
 /// others is evidence about that engine.
 fn interpret(malicious: u32, suspicious: u32, engines: u32) -> (Standing, String) {
     let flagged = malicious + suspicious;
+
+    // No engine answered, which is not every engine finding nothing. A report
+    // with empty or zero counts read as "none of the 0 engines flagged it",
+    // drawn green as clean, for a file nothing had yet looked at.
+    if engines == 0 {
+        return (
+            Standing::NotAnalysed,
+            "VirusTotal has a record of this file, but no engine has reported on it yet, \
+             so there is nothing to read either way. It is often still being analysed, \
+             and asking again later may give an answer."
+                .to_owned(),
+        );
+    }
 
     if flagged == 0 {
         return (
@@ -403,6 +421,25 @@ mod tests {
         let (standing, summary) = interpret(0, 0, 72);
         assert_eq!(standing, Standing::Clean);
         assert!(summary.contains("None of the 72"));
+    }
+
+    /// No engine answering is not every engine finding nothing.
+    #[test]
+    fn a_report_no_engine_has_answered_is_not_clean() {
+        let (standing, summary) = interpret(0, 0, 0);
+        assert_eq!(standing, Standing::NotAnalysed);
+        assert!(!summary.contains("None of the"), "{summary}");
+
+        for body in [
+            r#"{"data":{"attributes":{"last_analysis_stats":{}}}}"#,
+            r#"{"data":{"attributes":{"last_analysis_stats":
+                {"malicious":0,"suspicious":0,"harmless":0,"undetected":0}}}}"#,
+            r#"{"data":{"attributes":{}}}"#,
+        ] {
+            let verdict = parse(body, &"a".repeat(64)).unwrap();
+            assert_eq!(verdict.engines, 0);
+            assert_eq!(verdict.standing, Standing::NotAnalysed, "{body}");
+        }
     }
 
     #[test]

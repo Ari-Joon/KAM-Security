@@ -602,7 +602,13 @@ export type RuleReport = {
  * rendering "3 threats found!" from those numbers would be the exact dishonesty
  * this product exists to avoid.
  */
-export type Standing = "clean" | "not_known" | "isolated" | "substantial";
+export type Standing =
+  | "clean"
+  | "not_known"
+  /** VirusTotal has the file but no engine has reported on it yet. Neither clean nor flagged. */
+  | "not_analysed"
+  | "isolated"
+  | "substantial";
 
 export type Detection = {
   engine: string;
