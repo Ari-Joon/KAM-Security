@@ -216,9 +216,9 @@ fn verify_embedded(path: &Path) -> i32 {
 
 /// Open a file for the catalogue hash, sharing freely so a running executable
 /// can still be examined.
-fn open_for_read(path: &Path) -> Option<HANDLE> {
+fn open_for_read(path: &Path) -> windows::core::Result<HANDLE> {
     let file = wide(path);
-    let handle = unsafe {
+    unsafe {
         CreateFileW(
             PCWSTR(file.as_ptr()),
             FILE_GENERIC_READ.0,
@@ -229,16 +229,15 @@ fn open_for_read(path: &Path) -> Option<HANDLE> {
             None,
         )
     }
-    .ok()?;
-    Some(handle)
 }
 
 /// Ask a catalogue administrator for this file's hash, under one algorithm.
-fn catalogue_hash(admin: isize, handle: HANDLE) -> Option<Vec<u8>> {
+fn catalogue_hash(admin: isize, handle: HANDLE) -> Result<Vec<u8>, String> {
     let mut size = 0_u32;
-    unsafe { CryptCATAdminCalcHashFromFileHandle2(admin, handle, &mut size, None, None) }.ok()?;
+    unsafe { CryptCATAdminCalcHashFromFileHandle2(admin, handle, &mut size, None, None) }
+        .map_err(|error| error.message())?;
     if size == 0 {
-        return None;
+        return Err("no hash came back".to_owned());
     }
     let mut hash = vec![0_u8; size as usize];
     unsafe {
@@ -250,8 +249,21 @@ fn catalogue_hash(admin: isize, handle: HANDLE) -> Option<Vec<u8>> {
             None,
         )
     }
-    .ok()?;
-    Some(hash)
+    .map_err(|error| error.message())?;
+    Ok(hash)
+}
+
+/// What looking a file up in the system catalogues came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Catalogue {
+    /// A catalogue lists the file, and this is what the trust provider said
+    /// about it.
+    Listed(i32, PathBuf),
+    /// No catalogue on this machine lists the file.
+    NotListed,
+    /// The lookup itself did not work, so whether a catalogue lists the file
+    /// is not known.
+    Failed(String),
 }
 
 /// Check whether a system catalogue vouches for the file.
@@ -261,30 +273,86 @@ fn catalogue_hash(admin: isize, handle: HANDLE) -> Option<Vec<u8>> {
 /// signatures would report the entire operating system as unsigned, which
 /// would make the whole layer worse than useless — it would bury the handful of
 /// genuinely unsigned binaries in several hundred false ones.
-fn verify_catalogue(path: &Path) -> Option<(i32, PathBuf)> {
-    let handle = open_for_read(path)?;
+///
+/// A lookup that could not be made is kept apart from one that found nothing.
+/// They were the same answer, and the answer was "not signed": a file that
+/// would not open for hashing, or a catalogue service that was not running,
+/// turned a Windows component into an unsigned program.
+fn verify_catalogue(path: &Path) -> Catalogue {
+    let handle = match open_for_read(path) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return Catalogue::Failed(format!(
+                "the file could not be opened to look it up in Windows' catalogues ({})",
+                error.message()
+            ))
+        }
+    };
 
     // SHA-256 for anything current; SHA-1 for catalogues old enough to predate
     // it. Passing no algorithm at all would silently mean SHA-1 only.
-    let result = [w!("SHA256"), w!("SHA1")]
-        .into_iter()
-        .find_map(|algorithm| catalogue_attempt(handle, path, algorithm));
+    let mut failed = None;
+    let mut result = Catalogue::NotListed;
+    for algorithm in [w!("SHA256"), w!("SHA1")] {
+        match catalogue_attempt(handle, path, algorithm) {
+            listed @ Catalogue::Listed(..) => {
+                result = listed;
+                break;
+            }
+            Catalogue::NotListed => {}
+            Catalogue::Failed(why) => {
+                failed.get_or_insert(why);
+            }
+        }
+    }
 
     unsafe {
         let _ = CloseHandle(handle);
     }
-    result
+    match (result, failed) {
+        (listed @ Catalogue::Listed(..), _) => listed,
+        (_, Some(why)) => Catalogue::Failed(why),
+        (other, None) => other,
+    }
 }
 
-fn catalogue_attempt(handle: HANDLE, path: &Path, algorithm: PCWSTR) -> Option<(i32, PathBuf)> {
+/// `ERROR_NOT_FOUND`, which is how the catalogue database says no catalogue
+/// lists a hash.
+const ERROR_NOT_FOUND: u32 = 1168;
+
+fn catalogue_attempt(handle: HANDLE, path: &Path, algorithm: PCWSTR) -> Catalogue {
     let mut admin: isize = 0;
-    unsafe { CryptCATAdminAcquireContext2(&mut admin, None, algorithm, None, None) }.ok()?;
+    if let Err(error) =
+        unsafe { CryptCATAdminAcquireContext2(&mut admin, None, algorithm, None, None) }
+    {
+        return Catalogue::Failed(format!(
+            "Windows' catalogue service could not be asked ({})",
+            error.message()
+        ));
+    }
 
     let outcome = (|| {
-        let hash = catalogue_hash(admin, handle)?;
+        let hash = match catalogue_hash(admin, handle) {
+            Ok(hash) => hash,
+            Err(error) => {
+                return Catalogue::Failed(format!(
+                    "the file could not be hashed to look it up in Windows' catalogues ({error})"
+                ))
+            }
+        };
         let context = unsafe { CryptCATAdminEnumCatalogFromHash(admin, &hash, None, None) };
         if context == 0 {
-            return None;
+            // Not listed is an answer. Anything else, such as the catalogue
+            // service not answering, is not one.
+            let code = unsafe { windows::Win32::Foundation::GetLastError() }.0;
+            return if code == ERROR_NOT_FOUND || code == 0 {
+                Catalogue::NotListed
+            } else {
+                Catalogue::Failed(format!(
+                    "Windows' catalogues could not be searched ({})",
+                    windows::core::Error::from(windows::core::HRESULT::from_win32(code)).message()
+                ))
+            };
         }
 
         let mut info = CATALOG_INFO {
@@ -338,13 +406,17 @@ fn catalogue_attempt(handle: HANDLE, path: &Path, algorithm: PCWSTR) -> Option<(
                 ..Default::default()
             };
 
-            (run_provider(&mut data), catalogue)
+            Catalogue::Listed(run_provider(&mut data), catalogue)
         });
 
         unsafe {
             let _ = CryptCATAdminReleaseCatalogContext(admin, context, 0);
         }
-        verdict
+        verdict.unwrap_or_else(|| {
+            Catalogue::Failed(
+                "Windows' catalogues listed the file but would not say which catalogue".to_owned(),
+            )
+        })
     })();
 
     unsafe {
@@ -355,7 +427,13 @@ fn catalogue_attempt(handle: HANDLE, path: &Path, algorithm: PCWSTR) -> Option<(
 
 /// Ask Windows whether it trusts the file, by either route.
 fn verify_trust(path: &Path) -> Trust {
-    let embedded = verify_embedded(path);
+    settle(verify_embedded(path), || verify_catalogue(path))
+}
+
+/// Decide from the embedded check, asking the catalogues only when the file
+/// itself carried nothing. Apart from the two lookups so the decision can be
+/// tested without a file that makes either of them fail.
+fn settle(embedded: i32, catalogue: impl FnOnce() -> Catalogue) -> Trust {
     if embedded == 0 {
         return Trust::Trusted(None);
     }
@@ -369,14 +447,18 @@ fn verify_trust(path: &Path) -> Trust {
     }
 
     if embedded == TRUST_E_NOSIGNATURE.0 {
-        if let Some((verdict, catalogue)) = verify_catalogue(path) {
-            return match verdict {
-                0 => Trust::Trusted(Some(catalogue)),
-                other => match describe_trust(other) {
+        match catalogue() {
+            Catalogue::Listed(0, catalogue) => return Trust::Trusted(Some(catalogue)),
+            Catalogue::Listed(other, _) => {
+                return match describe_trust(other) {
                     Some(reason) => Trust::Rejected(reason),
                     None => Trust::Absent,
-                },
-            };
+                }
+            }
+            // Not "unsigned". Nothing was established either way, and
+            // Windows signs most of itself through catalogues.
+            Catalogue::Failed(reason) => return Trust::Unreadable(reason),
+            Catalogue::NotListed => {}
         }
     }
 
@@ -570,6 +652,65 @@ mod tests {
     fn a_missing_file_is_unknown_rather_than_unsigned() {
         let signature = of(Path::new(r"C:\this\does\not\exist.exe"));
         assert!(matches!(signature, Signature::Unknown { .. }));
+    }
+
+    /// A catalogue lookup that could not be made is not "unsigned".
+    ///
+    /// It fell through to the same answer as a file no catalogue lists, so a
+    /// file that would not open for hashing, or a catalogue service that was
+    /// not running, turned a Windows component into an unsigned program.
+    #[test]
+    fn a_catalogue_lookup_that_failed_is_could_not_be_checked() {
+        let failed = settle(TRUST_E_NOSIGNATURE.0, || {
+            Catalogue::Failed("the catalogue service did not answer".to_owned())
+        });
+        assert!(
+            matches!(&failed, Trust::Unreadable(reason) if reason.contains("did not answer")),
+            "a failed lookup became a verdict"
+        );
+
+        // The ordinary answers are unchanged.
+        assert!(matches!(
+            settle(TRUST_E_NOSIGNATURE.0, || Catalogue::NotListed),
+            Trust::Absent
+        ));
+        assert!(matches!(
+            settle(TRUST_E_NOSIGNATURE.0, || Catalogue::Listed(
+                0,
+                PathBuf::from("x.cat")
+            )),
+            Trust::Trusted(Some(_))
+        ));
+        // A broken embedded signature never reaches the catalogue at all.
+        assert!(matches!(
+            settle(0x8009_6010_u32 as i32, || panic!("asked the catalogue")),
+            Trust::Rejected(_)
+        ));
+    }
+
+    /// A file another program holds open exclusively cannot be read, and
+    /// that is what is said about it rather than a verdict on its signature.
+    /// A standing guard: the trust provider reports this one itself, before
+    /// any catalogue is asked.
+    #[test]
+    fn a_file_nobody_may_read_is_could_not_be_checked() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let path = std::env::temp_dir().join(format!("kam-sig-locked-{}.exe", std::process::id()));
+        std::fs::write(&path, b"MZ not really a program").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let signature = of(&path);
+        drop(held);
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(
+            matches!(signature, Signature::Unknown { .. }),
+            "a file that could not be read got a verdict: {signature:?}"
+        );
     }
 
     #[test]
