@@ -486,10 +486,15 @@ const SHARED_PROFILE: &str = "public";
 /// a resolved path must meet resolved limits; see `paths::resolved_root` for
 /// why both sides matter.
 struct Limits {
+    /// The caller's SID, lower case, when the caller was identified. Names
+    /// their folder in each volume's Recycle Bin.
+    sid: Option<String>,
     /// The caller's own profile.
     own: Vec<String>,
-    /// Directories that hold profiles: `C:\Users`, as the registry records it
-    /// and as the caller's own profile implies it.
+    /// Directories that hold profiles: `C:\Users`, as the registry records it,
+    /// or as the caller's own profile implies it when the registry cannot say.
+    /// Never a drive's root, which would make every folder on the drive look
+    /// like somebody's profile.
     containers: Vec<String>,
     /// Every other profile Windows lists, wherever it lives. Catches one kept
     /// outside the profiles directory, which the container rule cannot see.
@@ -545,10 +550,19 @@ impl Limits {
             }
         }
         // The caller's profile sits in the profiles directory too, which
-        // covers a machine whose registry could not be read.
-        if let Some(parent) = std::path::Path::new(user.profile()).parent() {
-            both_spellings(&parent.to_string_lossy(), &mut containers);
+        // covers a machine whose registry could not be read. Only then: a
+        // profile kept somewhere else, such as `C:\Ari`, has a parent that is
+        // no profiles directory, and every other profile is named in the list
+        // above anyway.
+        if containers.is_empty() {
+            if let Some(parent) = std::path::Path::new(user.profile()).parent() {
+                both_spellings(&parent.to_string_lossy(), &mut containers);
+            }
         }
+        // A drive's root is never a profiles directory, whatever the registry
+        // or a parent says: taking it for one would refuse every folder on the
+        // drive, Program Files included.
+        containers.retain(|container| container.contains('\\'));
         others.retain(|other| !own.contains(other));
 
         let program_data =
@@ -560,6 +574,7 @@ impl Limits {
         );
 
         Self {
+            sid: user.sid().map(str::to_lowercase),
             own,
             containers,
             others,
@@ -582,6 +597,27 @@ impl Limits {
                  quarantine and the record of what was done. This is refused however \
                  it is asked for."
             ));
+        }
+
+        // Another account's Recycle Bin. Each volume keeps one folder per
+        // account under `$Recycle.Bin`, named by SID and outside every
+        // profile, so the profile rules below never see it -- and a copy in
+        // the bin counts as removable even when only suggested. Only the
+        // caller's own folder is theirs. When the caller was not identified by
+        // SID there is no telling which folder that is, so none is.
+        let parts: Vec<&str> = path.split('\\').collect();
+        if let Some(at) = parts.iter().position(|part| *part == "$recycle.bin") {
+            let theirs = match (&self.sid, parts.get(at + 1)) {
+                (Some(sid), Some(folder)) => folder == sid,
+                _ => false,
+            };
+            if !theirs {
+                return Some(format!(
+                    "{what} is in a Recycle Bin folder that is not yours. The agent acts \
+                     with the system's rights on your behalf, so it does not move another \
+                     account's files, however it is asked."
+                ));
+            }
         }
 
         let foreign = format!(
@@ -1268,6 +1304,7 @@ mod tests {
     /// Limits written out by hand, so the rule itself can be read in one place.
     fn limits(store: &str) -> Limits {
         Limits {
+            sid: Some("s-1-5-21-1-2-3-1001".to_owned()),
             own: vec![r"c:\users\someone".to_owned()],
             containers: vec![r"c:\users".to_owned()],
             others: vec![r"d:\profiles\elsewhere".to_owned()],
@@ -1328,10 +1365,62 @@ mod tests {
             limits.store
         );
         assert!(
-            limits.containers.iter().any(|dir| dir == r"c:\users"),
-            "the caller's profiles directory is missing: {:?}",
+            !limits.containers.is_empty(),
+            "no profiles directory at all, so no other profile would be refused"
+        );
+    }
+
+    /// Only the caller's own folder in a Recycle Bin is theirs.
+    ///
+    /// A copy in the bin counts as removable on a suggestion alone, and the
+    /// bin's folders sit outside every profile, so without this another
+    /// account's deleted files were reachable without even choosing them.
+    #[test]
+    fn another_accounts_recycle_bin_is_refused() {
+        let limits = limits(r"c:\programdata\kam security");
+        let refused = |path: &str| limits.refusal(path, path, path);
+
+        let mine = r"c:\$recycle.bin\s-1-5-21-1-2-3-1001\$r12ab34.mp4";
+        assert_eq!(refused(mine), None, "the caller's own bin was refused");
+
+        for path in [
+            r"c:\$recycle.bin\s-1-5-21-1-2-3-1002\$r12ab34.mp4",
+            r"d:\$recycle.bin\s-1-5-21-9-9-9-500\$rzz.bin",
+            r"c:\$recycle.bin\$r12ab34.mp4",
+        ] {
+            let why = refused(path).unwrap_or_else(|| panic!("{path} was allowed"));
+            assert!(why.contains("Recycle Bin"), "unhelpful refusal: {why}");
+        }
+
+        // A caller nobody identified has no folder to call theirs.
+        let anonymous = Limits {
+            sid: None,
+            ..limits
+        };
+        assert!(anonymous.refusal(mine, mine, mine).is_some());
+    }
+
+    /// A profile kept directly under a drive's root does not turn the drive
+    /// into a profiles directory.
+    ///
+    /// The caller's profile parent was always taken as one, so a profile at
+    /// `C:\Ari` made every folder on C: look like somebody else's profile, and
+    /// a chosen copy in Program Files was refused.
+    #[test]
+    fn a_profile_under_a_drive_root_does_not_fence_the_drive() {
+        let limits = Limits::for_caller(&UserContext::new(None, r"C:\Ari"));
+        assert!(
+            limits.containers.iter().all(|dir| dir.contains('\\')),
+            "a drive root became a profiles directory: {:?}",
             limits.containers
         );
+        for path in [
+            r"c:\program files\thing\shared.dll",
+            r"c:\games\something\data.bin",
+            r"c:\ari\downloads\holiday.mp4",
+        ] {
+            assert_eq!(limits.refusal(path, path, path), None, "{path} was refused");
+        }
     }
 
     /// A folder of somebody else's profile, really on disk.

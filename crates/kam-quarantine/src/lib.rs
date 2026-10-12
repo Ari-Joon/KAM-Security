@@ -1007,24 +1007,30 @@ mod tests {
         let inside = store.root().join(&held.id).join(PAYLOAD);
         assert!(inside.exists(), "the premise: something is held");
 
-        let upper = scratch.join("STORE");
         for path in [
             store.root().to_path_buf(),
             inside.clone(),
             store.root().join(&held.id),
             scratch.0.clone(),
-            // The same places spelled differently.
-            upper,
-            PathBuf::from(format!("\\\\?\\{}", store.root().display())),
+            // The same place spelled differently.
+            scratch.join("STORE"),
         ] {
             let outcome = store.take(&path, 0, "test");
+            // The guard's own words, so a refusal for some other reason --
+            // the volume check also mentions the store -- does not pass.
             assert!(
-                matches!(outcome, Err(Error::Refused(ref why)) if why.contains("quarantine store")),
-                "{} was not refused: {outcome:?}",
+                matches!(outcome, Err(Error::Refused(ref why)) if why.contains("is part of the quarantine store")),
+                "{} was not refused by the store guard: {outcome:?}",
                 path.display()
             );
         }
         assert!(inside.exists(), "the held item was disturbed");
+
+        // The extended-length spelling never reaches the guard through `take`,
+        // because the volume check refuses it first; the guard is asked
+        // directly so its own handling of the prefix is tested too.
+        assert!(store.overlaps(&PathBuf::from(format!("\\\\?\\{}", store.root().display()))));
+        assert!(!store.overlaps(&scratch.join("victim-elsewhere.bin")));
 
         // A sibling whose name merely starts the same way is not the store.
         let sibling = scratch.join("store2");
