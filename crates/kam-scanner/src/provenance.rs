@@ -621,6 +621,21 @@ struct Walked {
     first_unread: Option<String>,
     /// Whether the walk stopped at its cap with more left to look at.
     capped: bool,
+    /// Programs that are only stored online, such as a OneDrive file that is
+    /// not on this machine. Examining one would download it, so they are
+    /// counted and said, not opened.
+    online_only: usize,
+}
+
+/// Whether a file's contents are somewhere else, so that opening it would
+/// fetch them. Read from the directory listing, which opens nothing.
+fn stored_online_only(item: &std::fs::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    /// `FILE_ATTRIBUTE_OFFLINE`, `FILE_ATTRIBUTE_RECALL_ON_OPEN` and
+    /// `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`.
+    const ELSEWHERE: u32 = 0x0000_1000 | 0x0004_0000 | 0x0040_0000;
+    item.metadata()
+        .is_ok_and(|metadata| metadata.file_attributes() & ELSEWHERE != 0)
 }
 
 fn walk(folder: &Path, depth: usize, walked: &mut Walked) {
@@ -665,6 +680,9 @@ fn walk(folder: &Path, depth: usize, walked: &mut Walked) {
             // walk forever, and nothing here needs to cross one.
             Ok(kind) if kind.is_symlink() => continue,
             Ok(kind) if kind.is_dir() => walk(&path, depth + 1, walked),
+            Ok(_) if is_executable(&path) && stored_online_only(&item) => {
+                walked.online_only += 1;
+            }
             Ok(_) if is_executable(&path) => walked.found.push(path),
             _ => {}
         }
@@ -695,6 +713,14 @@ fn sweep(folder: &Path, gaps: &mut Vec<String>) -> Option<Vec<PathBuf>> {
             walked.unread,
             folder.display(),
             walked.first_unread.unwrap_or_default()
+        ));
+    }
+    if walked.online_only > 0 {
+        gaps.push(format!(
+            "{} program(s) in {} are stored only online, and examining them would \
+             download them, so they were not examined.",
+            walked.online_only,
+            folder.display()
         ));
     }
     if walked.capped {
