@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { api, reason } from "../lib/api";
 import type { UpdateCheck as Check } from "../lib/types";
 
@@ -21,7 +22,19 @@ const LAST_KEY = "kam.update.last";
 /** Once a day is plenty for a program that releases every week or two. */
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-type Remembered = { at: number; result: Check };
+/**
+ * A check, and the version of this program that made it.
+ *
+ * `running` is what `getVersion` said when the check was made. Entries saved
+ * before it existed do not have it, and fall back to the version the check
+ * itself reported.
+ */
+type Remembered = { at: number; result: Check; running?: string };
+
+/** Which version of this program a remembered check was made by. */
+function madeBy(entry: Remembered): string {
+  return entry.running ?? entry.result.current;
+}
 
 function read<T>(key: string): T | null {
   try {
@@ -69,13 +82,29 @@ export default function UpdateCheck() {
   const [checking, setChecking] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const [showNotes, setShowNotes] = useState(false);
+  /**
+   * The version of this program that is running. Null until it is known, and
+   * empty if it could not be read.
+   *
+   * A remembered check is about the version that made it. It used to be shown
+   * as it was saved, so after an upgrade the panel said "0.5.0 is available.
+   * You have 0.4.0." to somebody running 0.5.0.
+   */
+  const [running, setRunning] = useState<string | null>(null);
+
+  useEffect(() => {
+    getVersion()
+      .then(setRunning)
+      .catch(() => setRunning(""));
+  }, []);
 
   const check = useCallback(async () => {
+    if (running === null) return;
     setChecking(true);
     setFailure(null);
     try {
       const result = await api.checkForUpdate();
-      const entry = { at: Date.now(), result };
+      const entry: Remembered = { at: Date.now(), result, running };
       setRemembered(entry);
       write(LAST_KEY, entry);
     } catch (cause) {
@@ -84,25 +113,32 @@ export default function UpdateCheck() {
     } finally {
       setChecking(false);
     }
-  }, []);
+  }, [running]);
 
   // Once a day when switched on, and never more: GitHub allows sixty
   // unauthenticated requests an hour from one address, which a household of
-  // machines behind one router can use up.
+  // machines behind one router can use up. A check made by a different
+  // version of this program is not about this one, so it is made again,
+  // once, after an upgrade.
   useEffect(() => {
-    if (!auto) return;
+    if (!auto || running === null) return;
     const last = read<Remembered>(LAST_KEY);
-    if (!last || Date.now() - last.at > DAY_MS) void check();
-  }, [auto, check]);
+    if (!last || madeBy(last) !== running || Date.now() - last.at > DAY_MS) {
+      void check();
+    }
+  }, [auto, check, running]);
 
-  const result = remembered?.result ?? null;
+  // Only a check made by this version is shown. One from before an upgrade,
+  // or one that cannot be matched to the running version, is set aside.
+  const current = remembered !== null && running !== null && madeBy(remembered) === running;
+  const result = current ? remembered.result : null;
   const latest = result?.latest ?? null;
 
   return (
     <section className="panel">
       <div className="panel-head">
         <h2>Updates</h2>
-        <button onClick={() => void check()} disabled={checking}>
+        <button onClick={() => void check()} disabled={checking || running === null}>
           {checking ? "Checking…" : "Check now"}
         </button>
       </div>
@@ -166,7 +202,11 @@ export default function UpdateCheck() {
       )}
 
       <p className="small muted">
-        {remembered ? `Last checked ${ago(remembered.at)}. ` : "Not checked yet. "}
+        {current
+          ? `Last checked ${ago(remembered.at)}. `
+          : remembered
+            ? "Not checked since this version was installed. "
+            : "Not checked yet. "}
         Checking asks GitHub's public API for the newest release and sends
         nothing about this machine. Nothing is downloaded or installed.
       </p>
