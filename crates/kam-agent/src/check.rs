@@ -87,6 +87,13 @@ fn check_firewall(findings: &mut Vec<Finding>) {
             for concern in &report.concerns {
                 findings.push(Finding::serious(concern.clone()));
             }
+            // A profile or rule list that could not be read used to come back
+            // as "off" and land above as a concern. It is now reported as
+            // unknown instead, so it has to be said here or the weekly check
+            // would go quiet about exactly the case it cannot vouch for.
+            for gap in &report.unread {
+                findings.push(Finding::note(gap.clone()));
+            }
         }
         Err(error) => findings.push(Finding::note(format!(
             "the firewall's state could not be read: {error}"
