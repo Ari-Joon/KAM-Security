@@ -22,3 +22,6 @@ ui/src-tauri/gen
 *.user
 Thumbs.db
 desktop.ini
+
+# Claude Code keeps its own working copies here.
+.claude/
