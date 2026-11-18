@@ -59,7 +59,7 @@ pub enum WatchStatus {
 
 /// An archive taken apart and waiting for the person to decide.
 struct Session {
-    copy: PathBuf,
+    copy: crate::archive::WorkingCopy,
     name: String,
     sha256: String,
     zone: Option<Vec<u8>>,
@@ -784,7 +784,11 @@ pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<Dissecti
     let zone = std::fs::read(PathBuf::from(zone_stream)).ok();
 
     emit_stage(app, job, "Making a private copy to take apart");
-    let copy = crate::archive::working_copy(&real)?;
+    // Held open from here until the archive is closed or extracted, and
+    // deleted when it is let go, on every way out of this function.
+    let Some(copy) = crate::archive::working_copy(&real, &|| true)? else {
+        return Ok(None);
+    };
 
     // Quarantined first, as asked, when Defender has already flagged it.
     let mut fate = OriginalFate::default();
@@ -798,7 +802,7 @@ pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<Dissecti
     let channel = format!("job://{job}");
     let checked = kam_ipc::client::call_streaming(
         &Request::CheckDownload {
-            path: copy.to_string_lossy().into_owned(),
+            path: copy.path().to_string_lossy().into_owned(),
             job: job.to_owned(),
             copy_of: Some(original.clone()),
         },
@@ -808,24 +812,14 @@ pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<Dissecti
     );
     let record = match checked {
         Ok(Response::DownloadChecked(record)) => record,
-        Ok(Response::Stopped) => {
-            crate::archive::discard(&copy);
-            return Ok(None);
-        }
-        Ok(Response::Error { message }) => {
-            crate::archive::discard(&copy);
-            return Err(message);
-        }
+        Ok(Response::Stopped) => return Ok(None),
+        Ok(Response::Error { message }) => return Err(message),
         Ok(other) => {
-            crate::archive::discard(&copy);
             return Err(format!(
                 "the agent answered something unexpected: {other:?}"
-            ));
+            ))
         }
-        Err(error) => {
-            crate::archive::discard(&copy);
-            return Err(error.to_string());
-        }
+        Err(error) => return Err(error.to_string()),
     };
 
     // Flagged only now: quarantined before anything is taken apart.
@@ -834,14 +828,18 @@ pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<Dissecti
         fate = quarantine_original(&original);
     }
 
+    // The copy held here has to be the file Defender was asked about, or
+    // nothing in it is listed, let alone extracted.
+    emit_stage(
+        app,
+        job,
+        "Making sure the copy is the file Defender looked at",
+    );
+    copy.is_the_file_checked(&record.check.sha256)?;
+
     emit_stage(app, job, "Reading the archive's list of files");
-    let entries = match crate::archive::entries(&copy) {
-        Ok(entries) => entries,
-        Err(reason) => {
-            crate::archive::discard(&copy);
-            return Err(format!("{name} could not be taken apart: {reason}"));
-        }
-    };
+    let entries = crate::archive::entries(copy.file())
+        .map_err(|reason| format!("{name} could not be taken apart: {reason}"))?;
     let mut dissection = kam_scanner::downloads::dissect(
         &original,
         &record.check.sha256,
@@ -893,15 +891,15 @@ pub fn extract(state: &Downloads, token: &str) -> Result<Extraction, String> {
         .and_then(|mut sessions| sessions.remove(token))
         .ok_or("That archive is no longer open here. Take it apart again to extract from it.")?;
     let parent = known_folder()?;
-    let outcome = crate::archive::extract(
-        &session.copy,
+    // Through the handle held since the copy was made. Letting the session
+    // go afterwards deletes the copy.
+    let extraction = crate::archive::extract(
+        session.copy.file(),
         &session.dissection,
         &parent,
         &session.name,
         session.zone.as_deref(),
-    );
-    crate::archive::discard(&session.copy);
-    let extraction = outcome?;
+    )?;
     if let Err(error) = kam_ipc::client::call(&Request::RecordExtraction {
         path: session.dissection.archive.clone(),
         sha256: session.sha256.clone(),
@@ -914,13 +912,9 @@ pub fn extract(state: &Downloads, token: &str) -> Result<Extraction, String> {
 
 /// Close an archive without extracting, deleting the private copy.
 pub fn discard(state: &Downloads, token: &str) {
-    if let Some(session) = state
-        .sessions
-        .lock()
-        .ok()
-        .and_then(|mut sessions| sessions.remove(token))
-    {
-        crate::archive::discard(&session.copy);
+    // Letting the session go deletes its copy.
+    if let Ok(mut sessions) = state.sessions.lock() {
+        sessions.remove(token);
     }
 }
 

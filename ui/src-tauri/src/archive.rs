@@ -64,16 +64,104 @@ fn fresh_name() -> String {
     )
 }
 
-/// Make the private working copy of an archive.
+/// Deletes one file when it is let go. Permanent, and meant to be: it is only
+/// ever a private duplicate this program made, not anybody's file.
+#[derive(Debug)]
+struct Remove(PathBuf);
+
+impl Drop for Remove {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A private working copy of an archive, held open, and deleted when let go.
+///
+/// # Why it is held open
+///
+/// The copy sits in a folder the person's own account can write to, between
+/// Defender's look at it and the press of Extract. It used to be found again
+/// by name each time: to list it, and again to extract from it. Anything
+/// running as the person could have changed it in between, and this would
+/// then have written out content Defender never saw and recorded it as files
+/// Defender did not flag. Red review found it.
+///
+/// So the copy is opened once, as soon as it is written, in a way that lets
+/// others read (the agent and Defender have to) and nobody write, rename or
+/// delete. Everything this program then does with it (taking its
+/// fingerprint, listing it, extracting from it) goes through that one
+/// handle, for as long as the archive is open here.
+#[derive(Debug)]
+pub struct WorkingCopy {
+    // Declared before `remove`, so the handle is closed before the file it
+    // holds is deleted: fields are let go in this order.
+    file: File,
+    remove: Remove,
+}
+
+impl WorkingCopy {
+    /// The one handle everything is read through.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.remove.0
+    }
+
+    /// Whether this copy is the file Defender was asked about: its
+    /// fingerprint, read through the handle everything else is read through,
+    /// against the one the check came back with.
+    ///
+    /// The agent fingerprints the file it has Defender look at, through one
+    /// open handle of its own. This handle has been open since before that,
+    /// with writers shut out, so equal fingerprints mean what is listed and
+    /// extracted here is what Defender saw.
+    pub fn is_the_file_checked(&self, sha256: &str) -> Result<(), String> {
+        let here = kam_scanner::downloads::fingerprint(&self.file, &kam_core::Reporter::silent())
+            .map_err(|error| match error {
+            kam_scanner::downloads::CheckError::Failed(reason) => {
+                format!("the private copy could not be read back: {reason}")
+            }
+            kam_scanner::downloads::CheckError::Stopped => {
+                "reading the private copy back was stopped".to_owned()
+            }
+        })?;
+        if here.eq_ignore_ascii_case(sha256.trim()) {
+            Ok(())
+        } else {
+            Err(
+                "The private copy is not the file Defender was asked about: it changed after \
+                 it was made. Nothing in it is offered for extraction."
+                    .to_owned(),
+            )
+        }
+    }
+}
+
+/// How much of an archive is copied between looks at whether to go on.
+const COPY_CHUNK: usize = 1024 * 1024;
+
+/// Make the private working copy of an archive. `None` when `keep_going`
+/// said to stop before it was finished, and then nothing is left behind.
 ///
 /// Created new, in a folder that must be a real folder rather than a link,
 /// and read from the original with other writers shut out, so what is copied
 /// is one consistent file.
-pub fn working_copy(original: &Path) -> Result<PathBuf, String> {
-    working_copy_in(original, &work_folder())
+pub fn working_copy(
+    original: &Path,
+    keep_going: &dyn Fn() -> bool,
+) -> Result<Option<WorkingCopy>, String> {
+    working_copy_in(original, &work_folder(), keep_going)
 }
 
-fn working_copy_in(original: &Path, folder: &Path) -> Result<PathBuf, String> {
+fn working_copy_in(
+    original: &Path,
+    folder: &Path,
+    keep_going: &dyn Fn() -> bool,
+) -> Result<Option<WorkingCopy>, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+
     std::fs::create_dir_all(folder)
         .map_err(|error| format!("the private work folder could not be made: {error}"))?;
     let metadata = std::fs::symlink_metadata(folder)
@@ -92,58 +180,92 @@ fn working_copy_in(original: &Path, folder: &Path) -> Result<PathBuf, String> {
         )
     })?;
     let copy = folder.join(fresh_name());
-    let mut target = OpenOptions::new()
+    // Others may read it while it is written; nobody may write or delete.
+    let created = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .share_mode(FILE_SHARE_READ)
         .open(&copy)
         .map_err(|error| format!("the working copy could not be created: {error}"))?;
-    if let Err(error) = std::io::copy(&mut source, &mut target).and_then(|_| target.flush()) {
-        drop(target);
-        let _ = std::fs::remove_file(&copy);
-        return Err(format!("the archive could not be copied: {error}"));
+    // From here every way out deletes what was made. Named after `remove` so
+    // that it is closed first: the file cannot be deleted while it is open.
+    let remove = Remove(copy.clone());
+    let mut target = created;
+
+    let mut buffer = vec![0_u8; COPY_CHUNK];
+    loop {
+        if !keep_going() {
+            drop(target);
+            return Ok(None);
+        }
+        let read = source
+            .read(&mut buffer)
+            .map_err(|error| format!("the archive could not be copied: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        target
+            .write_all(&buffer[..read])
+            .map_err(|error| format!("the archive could not be copied: {error}"))?;
     }
-    Ok(copy)
+    target
+        .flush()
+        .map_err(|error| format!("the archive could not be copied: {error}"))?;
+    drop(target);
+
+    let file = open_shut_to_writers(&copy).map_err(|error| {
+        format!("the working copy could not be opened again once it was written: {error}")
+    })?;
+    Ok(Some(WorkingCopy { file, remove }))
 }
 
-/// Open a file for reading while nobody else may write to it.
+const FILE_SHARE_READ: u32 = 0x1;
+
+/// Open a file for reading while nobody else may write to it, rename it or
+/// delete it.
 ///
 /// Also the watcher's test for "finished": a browser still writing a download
 /// holds it open for writing, and this open then fails.
 pub fn open_shut_to_writers(path: &Path) -> std::io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
-    const FILE_SHARE_READ: u32 = 0x1;
     OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ)
         .open(path)
 }
 
-/// Delete a working copy, which belongs to this program alone. Permanent, and
-/// meant to be: it is a private duplicate, not anybody's file.
-pub fn discard(copy: &Path) {
-    if copy.parent().is_some_and(|parent| parent == work_folder()) {
-        let _ = std::fs::remove_file(copy);
-    }
+/// The start of every working copy's name that this run of the program made.
+fn own_prefix() -> String {
+    format!("{}-", std::process::id())
 }
 
 /// Delete working copies a previous run left behind. Only plain files
 /// directly in the work folder; nothing is followed.
+///
+/// A copy this run made is never one of them, and is recognised by its name.
+/// This runs on its own thread at start-up, and a first start from "Extract
+/// with KAM Security" could otherwise have had its fresh copy deleted from
+/// under it.
 pub fn discard_leftovers() {
-    let Ok(listing) = std::fs::read_dir(work_folder()) else {
+    discard_leftovers_in(&work_folder());
+}
+
+fn discard_leftovers_in(folder: &Path) {
+    let Ok(listing) = std::fs::read_dir(folder) else {
         return;
     };
+    let ours = own_prefix();
     for item in listing.flatten() {
-        if item.file_type().is_ok_and(|kind| kind.is_file()) {
+        let made_now = item.file_name().to_string_lossy().starts_with(&ours);
+        if !made_now && item.file_type().is_ok_and(|kind| kind.is_file()) {
             let _ = std::fs::remove_file(item.path());
         }
     }
 }
 
 /// Every member of a zip, as the zip itself lists it.
-pub fn entries(archive: &Path) -> Result<Vec<Entry>, String> {
-    let file = File::open(archive)
-        .map_err(|error| format!("the working copy could not be opened: {error}"))?;
-    let mut zip = zip::ZipArchive::new(file)
+pub fn entries(archive: &File) -> Result<Vec<Entry>, String> {
+    let mut zip = zip::ZipArchive::new(archive)
         .map_err(|error| format!("it could not be read as a zip archive ({error})"))?;
     if zip.len() > MAX_MEMBERS {
         return Err(format!(
@@ -177,10 +299,15 @@ pub fn entries(archive: &Path) -> Result<Vec<Entry>, String> {
 
 /// Write out what Defender found nothing in, into a new folder in `parent`.
 ///
-/// `parent` is the person's Downloads folder. `zone` is the original's
-/// `Zone.Identifier`, written beside every extracted file when there was one.
+/// `copy` is the working copy's own handle, held since before Defender was
+/// asked about it, so what is unpacked is what was checked. `parent` is the
+/// person's Downloads folder. `zone` is the original's `Zone.Identifier`,
+/// written beside every extracted file when there was one.
+///
+/// An error means nothing was written: every refusal comes before the first
+/// file, so the same archive can simply be tried again.
 pub fn extract(
-    copy: &Path,
+    copy: &File,
     dissection: &Dissection,
     parent: &Path,
     archive_name: &str,
@@ -208,6 +335,10 @@ pub fn extract(
         }
     }
 
+    // Read before the folder is made, so that failing here leaves nothing.
+    let mut zip = zip::ZipArchive::new(copy)
+        .map_err(|error| format!("the working copy could not be read as a zip ({error})"))?;
+
     let name = extraction_folder_name(archive_name, |candidate| {
         std::fs::symlink_metadata(parent_real.join(candidate)).is_ok()
     });
@@ -221,16 +352,12 @@ pub fn extract(
     let destination_real = std::fs::canonicalize(&destination)
         .map_err(|error| format!("the new folder could not be found again: {error}"))?;
     if !lies_within(&destination_real, &parent_real) {
+        let _ = std::fs::remove_dir(&destination);
         return Err(format!(
             "{} does not lead where it was made, so nothing was extracted into it",
             destination.display()
         ));
     }
-
-    let file = File::open(copy)
-        .map_err(|error| format!("the working copy could not be opened: {error}"))?;
-    let mut zip = zip::ZipArchive::new(file)
-        .map_err(|error| format!("the working copy could not be read as a zip ({error})"))?;
 
     let mut outcome = Extraction {
         destination: plain_text(&destination_real),
@@ -352,7 +479,7 @@ fn name_removals(removed: Vec<(String, PathBuf)>) -> Vec<RemovedFile> {
 /// Write one member, under every rule in the module notes. Answers where it
 /// went and how big it was.
 fn write_member(
-    zip: &mut zip::ZipArchive<File>,
+    zip: &mut zip::ZipArchive<&File>,
     index: usize,
     name: &str,
     declared: u64,
@@ -561,12 +688,16 @@ mod tests {
         parse_report(Some(0), "Scanning C:\\w.zip found no threats.")
     }
 
+    fn opened(path: &Path) -> File {
+        File::open(path).unwrap()
+    }
+
     #[test]
     fn every_member_is_listed_as_the_archive_lists_it() {
         let scratch = Scratch::new("list");
         let zip_path = scratch.0.join("a.zip");
         hostile_zip(&zip_path);
-        let listed = entries(&zip_path).unwrap();
+        let listed = entries(&opened(&zip_path)).unwrap();
         let names: Vec<&str> = listed.iter().map(|entry| entry.name.as_str()).collect();
         assert!(names.contains(&"../escaped.txt"), "{names:?}");
         assert!(names.contains(&"empty/"));
@@ -590,7 +721,7 @@ mod tests {
         let scratch = Scratch::new("notzip");
         let fake = scratch.0.join("fake.zip");
         std::fs::write(&fake, b"not a zip at all").unwrap();
-        assert!(entries(&fake).unwrap_err().contains("zip"));
+        assert!(entries(&opened(&fake)).unwrap_err().contains("zip"));
     }
 
     /// The zip-slip test: only what Defender found nothing in is written, and
@@ -614,7 +745,12 @@ mod tests {
             definitions: None,
             notes: Vec::new(),
         };
-        let dissection = dissect("Photos.zip", "ab", scan, &entries(&zip_path).unwrap());
+        let dissection = dissect(
+            "Photos.zip",
+            "ab",
+            scan,
+            &entries(&opened(&zip_path)).unwrap(),
+        );
         assert!(dissection.offered, "{dissection:?}");
         assert_eq!(dissection.totals.clean, 2, "{:?}", dissection.totals);
         assert_eq!(dissection.totals.flagged, 1);
@@ -622,7 +758,7 @@ mod tests {
 
         let zone = b"[ZoneTransfer]\r\nZoneId=3\r\n";
         let done = extract(
-            &zip_path,
+            &opened(&zip_path),
             &dissection,
             &scratch.downloads(),
             "Photos.zip",
@@ -663,7 +799,7 @@ mod tests {
 
         // A second extraction never reuses the first folder.
         let again = extract(
-            &zip_path,
+            &opened(&zip_path),
             &dissection,
             &scratch.downloads(),
             "Photos.zip",
@@ -683,8 +819,20 @@ mod tests {
         let zip_path = scratch.0.join("work").join("copy.zip");
         hostile_zip(&zip_path);
         let unfinished = parse_report(Some(2), "CmdTool: Failed with hr = 0x80070005.");
-        let dissection = dissect("x.zip", "ab", unfinished, &entries(&zip_path).unwrap());
-        assert!(extract(&zip_path, &dissection, &scratch.downloads(), "x.zip", None).is_err());
+        let dissection = dissect(
+            "x.zip",
+            "ab",
+            unfinished,
+            &entries(&opened(&zip_path)).unwrap(),
+        );
+        assert!(extract(
+            &opened(&zip_path),
+            &dissection,
+            &scratch.downloads(),
+            "x.zip",
+            None
+        )
+        .is_err());
         assert_eq!(std::fs::read_dir(scratch.downloads()).unwrap().count(), 0);
         let _ = clean();
     }
@@ -694,13 +842,89 @@ mod tests {
         let scratch = Scratch::new("copy");
         let original = scratch.downloads().join("a.zip");
         hostile_zip(&original);
-        let copy = working_copy_in(&original, &scratch.0.join("work")).unwrap();
-        assert_ne!(copy, original);
+        let copy = working_copy_in(&original, &scratch.0.join("work"), &|| true)
+            .unwrap()
+            .expect("nobody asked it to stop");
+        assert_ne!(copy.path(), original);
         assert_eq!(
-            std::fs::read(&copy).unwrap(),
+            std::fs::read(copy.path()).unwrap(),
             std::fs::read(&original).unwrap()
         );
         assert!(original.exists(), "the original was moved");
+    }
+
+    /// Red review: the copy was found again by name to list it and to
+    /// extract from it, and never compared with what Defender had checked.
+    /// It is held open now, so that nothing can change it in between, and
+    /// its fingerprint through that same handle has to be the one Defender's
+    /// check came back with.
+    #[test]
+    fn a_working_copy_cannot_be_changed_and_must_be_the_file_that_was_checked() {
+        let scratch = Scratch::new("pinned");
+        let original = scratch.downloads().join("a.zip");
+        hostile_zip(&original);
+        let copy = working_copy_in(&original, &scratch.0.join("work"), &|| true)
+            .unwrap()
+            .unwrap();
+        let path = copy.path().to_path_buf();
+
+        assert!(
+            OpenOptions::new().append(true).open(&path).is_err(),
+            "the copy could be written to while it was open here"
+        );
+        assert!(
+            std::fs::rename(&path, path.with_extension("moved")).is_err(),
+            "the copy could be swapped for another while it was open here"
+        );
+        assert!(
+            std::fs::remove_file(&path).is_err(),
+            "the copy could be deleted while it was open here"
+        );
+        // Others can still read it, which the agent and Defender have to.
+        assert!(open_shut_to_writers(&path).is_ok());
+
+        let reporter = kam_core::Reporter::silent();
+        let checked = kam_scanner::downloads::fingerprint(&opened(&original), &reporter).unwrap();
+        assert!(copy.is_the_file_checked(&checked).is_ok());
+        // Listing it afterwards reads the same handle from its start.
+        assert!(entries(copy.file()).is_ok());
+        let refusal = copy
+            .is_the_file_checked(&"0".repeat(64))
+            .expect_err("a copy that is not the file Defender checked was accepted");
+        assert!(
+            refusal.contains("not the file Defender was asked about"),
+            "{refusal}"
+        );
+
+        drop(copy);
+        assert!(!path.exists(), "the private copy was left behind");
+    }
+
+    #[test]
+    fn a_copy_that_is_stopped_part_way_leaves_nothing_behind() {
+        let scratch = Scratch::new("stopped");
+        let original = scratch.downloads().join("a.zip");
+        hostile_zip(&original);
+        let work = scratch.0.join("work");
+        assert!(working_copy_in(&original, &work, &|| false)
+            .unwrap()
+            .is_none());
+        assert_eq!(std::fs::read_dir(&work).unwrap().count(), 0);
+    }
+
+    /// What a previous run left is cleared at start. What this run made is
+    /// not, whether or not it happens to be open at that moment.
+    #[test]
+    fn leftovers_are_cleared_but_never_a_copy_this_run_made() {
+        let scratch = Scratch::new("leftovers");
+        let work = scratch.0.join("work");
+        let old = work.join("1-123-0.zip");
+        let mine = work.join(format!("{}9", fresh_name()));
+        std::fs::write(&old, b"left by another run").unwrap();
+        std::fs::write(&mine, b"made by this one").unwrap();
+        discard_leftovers_in(&work);
+        assert!(!old.exists(), "a leftover was kept");
+        assert!(mine.exists(), "a copy this run made was deleted");
     }
 
     #[test]
