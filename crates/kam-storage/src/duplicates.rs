@@ -103,6 +103,14 @@ pub struct DuplicateSummary {
     pub elapsed_ms: u64,
     /// True when the read ceiling stopped the search early.
     pub truncated: bool,
+    /// The one drive quarantine can hold things from, when that is not the
+    /// drive searched. Quarantine is a rename within its own drive and refuses
+    /// anything else, so on any other drive a button offering it could only
+    /// produce that refusal. `None` when the copies found can be held, and
+    /// from the search itself, which does not know where quarantine lives:
+    /// the agent fills this in.
+    #[serde(default)]
+    pub quarantine_only_on: Option<char>,
 }
 
 /// Who put a copy where it is.
@@ -1030,6 +1038,7 @@ pub fn find(
         fully_hashed: counters.fully_hashed.load(Ordering::Relaxed),
         elapsed_ms: started.elapsed().as_millis() as u64,
         truncated: counters.truncated.load(Ordering::Relaxed) > 0,
+        quarantine_only_on: None,
     };
     Ok((groups, summary))
 }

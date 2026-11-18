@@ -78,6 +78,19 @@ impl VolumeIndex {
         self.snapshot.root
     }
 
+    /// The drive this index describes, as an upper-case letter.
+    pub fn drive(&self) -> char {
+        self.snapshot.drive
+    }
+
+    /// Whether a path is on the drive this index describes.
+    ///
+    /// A question about the path's spelling only. Whether anything is there
+    /// is what [`Self::resolve`] answers.
+    pub fn covers(&self, path: &str) -> bool {
+        components_on(self.snapshot.drive, path).is_some()
+    }
+
     pub fn entries(&self) -> &HashMap<u32, MftEntry> {
         &self.snapshot.entries
     }
@@ -144,11 +157,26 @@ impl VolumeIndex {
 
     /// Find the record for a path, which may name a file or a directory.
     ///
-    /// The drive letter is dropped: an index only ever covers one volume, and
-    /// matching is case-insensitive because NTFS is.
+    /// Matching is case-insensitive because NTFS is.
+    ///
+    /// # Only a path on this drive has an answer
+    ///
+    /// This used to drop the drive letter, on the reasoning that an index only
+    /// ever covers one volume. The paths it is asked about do not: the caller's
+    /// ProgramData and AppData, and every install location in the registry,
+    /// name the drive they are really on. So measuring `D:` looked up
+    /// `C:\ProgramData` and `C:\Users\someone\AppData` by name on `D:`, and on
+    /// a second disk that still holds an earlier Windows those folders exist.
+    /// Their sizes and dates were then shown against the `C:` paths, a leftover
+    /// read "nothing has written to it in 2.5 years" on the strength of the old
+    /// disk, and Quarantine acted on the folder of that name on `C:`, which
+    /// was in use.
+    ///
+    /// A path on another drive, a network path, and a path that does not say
+    /// which drive it is on all resolve to nothing.
     pub fn resolve(&self, path: &str) -> Option<u32> {
         let mut current = self.snapshot.root;
-        for component in split_path(path) {
+        for component in components_on(self.snapshot.drive, path)? {
             let wanted = component.to_lowercase();
             let next = self
                 .children_of(current)
@@ -267,17 +295,32 @@ fn total_directories(snapshot: &MftSnapshot, children: &HashMap<u32, Vec<u32>>) 
     }
 }
 
-/// Split a path into components, dropping the drive letter and any separators.
-fn split_path(path: &str) -> impl Iterator<Item = &str> {
-    let trimmed = path
-        .strip_prefix(r"\\?\")
-        .unwrap_or(path)
-        .trim_start_matches(|c: char| c.is_ascii_alphabetic() && path.get(1..2) == Some(":"));
-    trimmed
-        .split(['\\', '/'])
-        .filter(|part| !part.is_empty() && *part != ":")
-        .map(|part| part.trim_end_matches(':'))
-        .filter(|part| !part.is_empty())
+/// The names along `path`, below the root of drive `drive`.
+///
+/// `None` unless the path is absolute and on that drive. That leaves out a
+/// path on another drive, a network path (`\\server\share`, with or without
+/// the extended-length prefix), and `C:folder`, which Windows reads against
+/// whatever the current directory on `C:` happens to be.
+fn components_on(drive: char, path: &str) -> Option<impl Iterator<Item = &str>> {
+    let text = [r"\\?\", r"\??\"]
+        .iter()
+        .find_map(|prefix| path.strip_prefix(prefix))
+        .unwrap_or(path);
+
+    let mut characters = text.chars();
+    let letter = characters.next()?;
+    if !letter.is_ascii_alphabetic() || characters.next() != Some(':') {
+        return None;
+    }
+    if !letter.eq_ignore_ascii_case(&drive) {
+        return None;
+    }
+    // Both were ASCII, so the rest starts two bytes in.
+    let rest = text.get(2..)?;
+    if !(rest.is_empty() || rest.starts_with(['\\', '/'])) {
+        return None;
+    }
+    Some(rest.split(['\\', '/']).filter(|part| !part.is_empty()))
 }
 
 /// A made-up drive, for tests that need an index without a disk to read.
@@ -301,15 +344,27 @@ pub(crate) mod testing {
     }
 
     pub(crate) struct Drive {
+        letter: char,
         entries: HashMap<u32, MftEntry>,
         next: u32,
     }
 
     impl Drive {
+        /// A made-up `C:`.
         pub(crate) fn new() -> Self {
+            Self::lettered('C')
+        }
+
+        /// A made-up drive with a letter of its own, for what goes wrong when
+        /// there is more than one.
+        pub(crate) fn lettered(letter: char) -> Self {
             let mut entries = HashMap::new();
             entries.insert(5, entry(".", 5, true, 0, 0));
-            Self { entries, next: 100 }
+            Self {
+                letter,
+                entries,
+                next: 100,
+            }
         }
 
         fn child(&self, parent: u32, name: &str) -> Option<u32> {
@@ -360,6 +415,7 @@ pub(crate) mod testing {
 
         pub(crate) fn index(self) -> VolumeIndex {
             VolumeIndex::build(MftSnapshot {
+                drive: self.letter,
                 entries: self.entries,
                 root: 5,
                 skipped: 0,
@@ -420,11 +476,60 @@ mod tests {
         entries.insert(10, file("big.bin", 9, 5000));
 
         MftSnapshot {
+            drive: 'C',
             entries,
             root: 5,
             skipped: 0,
             stats: Default::default(),
         }
+    }
+
+    /// A folder on one drive is not the folder of that name on another.
+    ///
+    /// The test that was missing. The index dropped the drive letter, so on an
+    /// index of `C:` the path `D:\Users` found `C:\Users`, and the other way
+    /// round: measuring a second drive showed its folders' sizes and dates
+    /// against `C:` paths, and Quarantine then acted on the `C:` path.
+    #[test]
+    fn a_path_on_another_drive_resolves_to_nothing() {
+        let index = VolumeIndex::build(snapshot());
+        assert_eq!(index.drive(), 'C');
+        assert_eq!(index.size_of(r"C:\Users"), Some(5000));
+
+        assert_eq!(index.size_of(r"D:\Users"), None);
+        assert_eq!(index.size_of(r"d:\users\akcar"), None);
+        assert_eq!(index.resolve(r"D:\"), None);
+        assert!(!index.covers(r"D:\Users"));
+        assert!(index.covers(r"C:\Nope"), "on the drive, though not there");
+    }
+
+    #[test]
+    fn a_network_path_or_one_with_no_drive_resolves_to_nothing() {
+        let index = VolumeIndex::build(snapshot());
+        for path in [
+            r"\\server\share\Users",
+            r"\\?\UNC\server\share\Users",
+            r"Users\akcar",
+            r"\Users\akcar",
+            // Drive-relative: Windows reads this against the current directory
+            // on C:, whatever that is.
+            r"C:Users",
+            "",
+        ] {
+            assert_eq!(index.resolve(path), None, "{path} was given an answer");
+            assert!(!index.covers(path), "{path} was taken as on this drive");
+        }
+    }
+
+    #[test]
+    fn the_extended_length_form_names_the_same_folder() {
+        // It used to resolve to nothing: the prefix was stripped and the drive
+        // letter was then looked for in the string that still had it.
+        let index = VolumeIndex::build(snapshot());
+        assert_eq!(index.size_of(r"\\?\C:\Users\akcar"), Some(5000));
+        assert_eq!(index.size_of(r"\\?\D:\Users\akcar"), None);
+        assert_eq!(index.resolve(r"C:\"), Some(index.root()));
+        assert_eq!(index.resolve("C:"), Some(index.root()));
     }
 
     #[test]

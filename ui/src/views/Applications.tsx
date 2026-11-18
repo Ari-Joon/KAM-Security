@@ -926,6 +926,18 @@ export default function Applications({ volumes, onMeasured }: Props) {
             {report && <MeasuredAt at={measuredAt} />}
           </div>
         )}
+
+        {summary && (summary.data_roots_elsewhere ?? []).length > 0 && (
+          // A program's data is measured where it really is. Measuring
+          // another drive used to look these folders up by name on the drive
+          // it was given, and show whatever it found there under these paths.
+          <div className="notice notice-warn">
+            These sizes count only what is on the drive that was measured.
+            Program data is kept in {summary.data_roots_elsewhere.join(", ")},
+            on another drive, so none of it is included here. Measure that
+            drive to see it.
+          </div>
+        )}
       </section>
 
       {(report || preview) && (

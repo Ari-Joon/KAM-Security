@@ -353,7 +353,30 @@ pub fn survey(
     }
     let snapshot = crate::mft::read(drive_letter)?;
     let index = VolumeIndex::build(snapshot);
-    Ok(find(&index, profile))
+    looked_for(&index, profile)
+}
+
+/// [`find`], or why there was nowhere on this drive to look.
+///
+/// Loose files are looked for in the caller's own Downloads and Desktop, and
+/// those are on one drive. Asked about another, this used to look up the
+/// profile's folders by name on the drive it was given. Where that drive held
+/// folders of the same names, from an earlier Windows, it proposed moves
+/// between them under the real profile's paths, and Move then acted on
+/// whatever sat at those paths on the real drive. Where it did not, it
+/// answered "nothing loose", which was not something it had looked at.
+fn looked_for(
+    index: &VolumeIndex,
+    profile: &str,
+) -> kam_core::Result<(Vec<Proposal>, OrganiseSummary)> {
+    if !index.covers(profile) {
+        return Err(kam_core::Error::Refused(format!(
+            "your folders are in {profile}, which is not on drive {}. Loose files \
+             are only looked for there, so choose that drive",
+            index.drive()
+        )));
+    }
+    Ok(find(index, profile))
 }
 
 /// Decide whether a move may happen at all, from first principles.
@@ -686,5 +709,62 @@ mod tests {
     #[test]
     fn a_named_match_outranks_a_merely_typical_folder() {
         assert!(Strength::Strong > Strength::Reasonable);
+    }
+
+    /// A drive holding somebody's Downloads and a folder of manuals: one loose
+    /// PDF, and four already filed.
+    fn drive_with_a_loose_file(letter: char) -> VolumeIndex {
+        use crate::index::testing::Drive;
+
+        let mut drive = Drive::lettered(letter);
+        for name in ["one.pdf", "two.pdf", "three.pdf", "four.pdf"] {
+            drive.file(
+                &format!(r"Users\someone\Documents\Manuals\{name}"),
+                2 * MIN_SIZE,
+                0,
+            );
+        }
+        drive.file(r"Users\someone\Downloads\guide.pdf", 2 * MIN_SIZE, 0);
+        drive.index()
+    }
+
+    #[test]
+    fn a_loose_file_on_the_profiles_own_drive_is_given_a_home() {
+        // The control for the test below: this layout does produce a proposal.
+        let index = drive_with_a_loose_file('C');
+        let (proposals, _) = looked_for(&index, r"C:\Users\someone").unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].from, r"C:\Users\someone\Downloads\guide.pdf");
+        assert_eq!(
+            proposals[0].to,
+            r"C:\Users\someone\Documents\Manuals\guide.pdf"
+        );
+    }
+
+    /// Folders of the same names on another drive are not the caller's folders.
+    ///
+    /// A second disk that still holds an earlier Windows has `Users\someone`
+    /// on it too. Asked about that disk, this proposed moving its files under
+    /// the paths of the real profile on `C:`, and Move acts on the path it is
+    /// given.
+    #[test]
+    fn folders_of_the_same_name_on_another_drive_produce_no_proposals() {
+        let index = drive_with_a_loose_file('D');
+
+        let (proposals, summary) = find(&index, r"C:\Users\someone");
+        assert!(
+            proposals.is_empty(),
+            "a file on D: was proposed under a C: path: {proposals:?}"
+        );
+        assert_eq!(summary.examined, 0);
+
+        // And the answer is that nothing here was looked at, in words, not an
+        // empty list that reads as "nothing loose".
+        let refusal = looked_for(&index, r"C:\Users\someone").unwrap_err();
+        let text = refusal.to_string();
+        assert!(
+            text.contains(r"C:\Users\someone") && text.contains("drive D"),
+            "the refusal should name both drives: {text}"
+        );
     }
 }

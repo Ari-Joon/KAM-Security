@@ -262,6 +262,16 @@ function OrphanRow({
 export default function Cleanup({ volumes, onChanged }: Props) {
   const [drive, setDrive] = useState("C:\\");
   const [orphans, setOrphans] = useState<Orphan[] | null>(null);
+  /**
+   * The places leftovers live that the last search could not look in,
+   * because they are on another drive than the one searched.
+   *
+   * Searching a second drive used to answer "Nothing unaccounted for. That is
+   * a good result." about three folders it had not opened. Before that was
+   * fixed in the service it was worse: it found folders of the same names on
+   * the drive it was given and listed them under these paths.
+   */
+  const [rootsElsewhere, setRootsElsewhere] = useState<string[]>([]);
   const [downloads, setDownloads] = useState<Download[] | null>(null);
   const [downloadSummary, setDownloadSummary] = useState<DownloadSummary | null>(null);
   const [duplicates, setDuplicates] = useState<DupeSet[] | null>(null);
@@ -417,6 +427,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     try {
       const report = await api.applications(drive);
       setOrphans(report.orphans);
+      setRootsElsewhere(report.orphan_summary.roots_elsewhere ?? []);
       setDownloads(report.downloads);
       setDownloadSummary(report.download_summary);
       setFoundAt(Date.now());
@@ -426,6 +437,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       // The totals stayed, so a failed re-run left the last run's numbers on
       // screen as though they were this one's.
       setOrphans(null);
+      setRootsElsewhere([]);
       setDownloads(null);
       setDownloadSummary(null);
     } finally {
@@ -963,7 +975,9 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       key: "duplicates",
       label: "Duplicate copies",
       bytes: duplicatesStanding.reclaimable_bytes,
-      reversal: "quarantine",
+      // The colour is what pressing the button does, so on a drive
+      // quarantine cannot hold things from it is the Recycle Bin's.
+      reversal: duplicateSummary?.quarantine_only_on ? "recycle" : "quarantine",
       detail: `${fmt.count(duplicatesStanding.actionable)} ${duplicatesStanding.actionable === 1 ? "set" : "sets"} you can choose between`,
     });
   }
@@ -1109,9 +1123,24 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           <div className="panel-head">
             <h2>Candidates</h2>
           </div>
+          {rootsElsewhere.length > 0 && (
+            <div className="notice notice-warn">
+              Leftovers are looked for in ProgramData and your two AppData
+              folders, on the drive they are really on.{" "}
+              {rootsElsewhere.length === 1
+                ? "One of those is not on the drive that was searched, so it was not looked in: "
+                : `${fmt.count(rootsElsewhere.length)} of those are not on the drive that was searched, so they were not looked in: `}
+              {rootsElsewhere.join(", ")}. Choose that drive above and search
+              again to look there.
+            </div>
+          )}
           {orphans.length === 0 ? (
             <p className="empty">
-              Nothing unaccounted for above 64 MB. That is a good result.
+              {/* "A good result" is only that for folders that were looked
+                  in, so it is not said when some were not. */}
+              {rootsElsewhere.length > 0
+                ? "Nothing unaccounted for above 64 MB was found on the drive that was searched."
+                : "Nothing unaccounted for above 64 MB. That is a good result."}
             </p>
           ) : (
             <ul className="orphans">
@@ -1352,6 +1381,17 @@ export default function Cleanup({ volumes, onChanged }: Props) {
 
         {duplicates && duplicates.length > 0 && (
           <>
+            {duplicateSummary?.quarantine_only_on && (
+              <p className="footnote">
+                {/* Said once, here, instead of a button on every copy that
+                    could only fail. The store's own refusal is deliberate: it
+                    moves by renaming, which works within one drive. */}
+                Quarantine holds things on {duplicateSummary.quarantine_only_on}:
+                only, so "Remove this one" is not offered for copies on this
+                drive. The Recycle Bin works here, where Windows lets this
+                account use it.
+              </p>
+            )}
             <div className="dupe-filter">
               <label>
                 <input
@@ -1423,6 +1463,9 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                         (copy) => copy.owner !== "windows" && copy.owner !== "servicing",
                       );
                       const canChoose = choosable.length > 1;
+                      // Quarantine only holds things from its own drive. On
+                      // any other, its button could only produce a refusal.
+                      const canHold = !duplicateSummary?.quarantine_only_on;
 
                       return (
                         <ul className="files">
@@ -1497,7 +1540,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                                                   a copy in a folder of theirs,
                                                   so the button was shown on
                                                   copies it could only fail on. */}
-                                              {(theyChose || copy.removable) && (
+                                              {canHold && (theyChose || copy.removable) && (
                                                 <button
                                                   className="dupe-take"
                                                   disabled={anyBusy}

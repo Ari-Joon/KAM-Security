@@ -71,6 +71,11 @@ export type FootprintSummary = {
   measured_bytes: number;
   reported_bytes: number;
   without_reported_size: number;
+  /**
+   * Program-data folders on another drive than the one measured, so nothing in
+   * them is counted in any size. Empty when the drive measured holds them.
+   */
+  data_roots_elsewhere: string[];
 };
 
 export type Zone =
@@ -148,6 +153,11 @@ export type DuplicateSummary = {
   fully_hashed: number;
   elapsed_ms: number;
   truncated: boolean;
+  /**
+   * The one drive quarantine holds things from, as a letter, when the drive
+   * searched is another. Null when the copies found can be held.
+   */
+  quarantine_only_on: string | null;
 };
 
 /** What the weekly check is set to, if anything. */
@@ -296,6 +306,11 @@ export type OrphanSummary = {
   found: number;
   total_bytes: number;
   confident_bytes: number;
+  /**
+   * Data roots on another drive than the one searched, so nothing in them was
+   * looked at. "None found" there is not a result.
+   */
+  roots_elsewhere: string[];
 };
 
 export type Manifest = {

@@ -345,6 +345,12 @@ pub struct OrphanSummary {
     /// Bytes in the high-confidence entries only — what could be reclaimed
     /// without much thought.
     pub confident_bytes: u64,
+    /// Data roots that are on another drive than the one searched, so nothing
+    /// in them was looked at. "Nothing found" on a drive that holds none of
+    /// the places leftovers live is not a result, and the page says so from
+    /// this. Empty when the drive searched is the one they are on.
+    #[serde(default)]
+    pub roots_elsewhere: Vec<String>,
 }
 
 pub fn summarise(orphans: &[Orphan]) -> OrphanSummary {
@@ -356,6 +362,7 @@ pub fn summarise(orphans: &[Orphan]) -> OrphanSummary {
             .filter(|o| o.confidence == Confidence::High)
             .map(|o| o.bytes)
             .sum(),
+        roots_elsewhere: Vec::new(),
     }
 }
 
@@ -500,6 +507,56 @@ mod tests {
         // and the folder between them are older or carry no date.
         assert_eq!(found.days_since_modified, Some(800));
         assert_eq!(found.confidence, Confidence::High);
+    }
+
+    /// A folder on another drive is not a leftover in the caller's AppData.
+    ///
+    /// The case that matters most in this crate, because a wrong path here is
+    /// one Quarantine acts on. A second disk kept from an earlier Windows
+    /// still has `Users\someone\AppData\Local` on it. Searched, it used to
+    /// report its old folders under the caller's real `C:` paths: "nothing has
+    /// written to it in 2.5 years" on the strength of the old disk, beside a
+    /// button that moved the folder of that name on `C:`, which was in use.
+    #[test]
+    fn a_folder_on_another_drive_is_never_listed_under_the_callers_own_paths() {
+        use crate::index::testing::{days_ago, Drive, NOW};
+
+        let build = |letter: char| {
+            let mut drive = Drive::lettered(letter);
+            let vendor = r"Users\someone\AppData\Local\OldVendor";
+            drive.folder_written(vendor, days_ago(900));
+            drive.file(
+                &format!(r"{vendor}\data.bin"),
+                300 * MEGABYTE,
+                days_ago(900),
+            );
+            drive.index()
+        };
+
+        // The control: on the drive the profile is really on, it is a leftover.
+        let on_c = find(&build('C'), &[], NOW, &someone());
+        assert_eq!(on_c.len(), 1);
+        assert_eq!(on_c[0].path, r"C:\Users\someone\AppData\Local\OldVendor");
+
+        let on_d = build('D');
+        let listed = find(&on_d, &[], NOW, &someone());
+        assert!(
+            listed.is_empty(),
+            "a folder on D: was listed as {:?}",
+            listed.iter().map(|orphan| &orphan.path).collect::<Vec<_>>()
+        );
+
+        // And the survey can say that the places leftovers live were not
+        // looked in, instead of reporting none found.
+        let elsewhere = crate::apps::data_roots_elsewhere(&on_d, &someone());
+        assert!(elsewhere.contains(&r"C:\Users\someone\AppData\Local".to_owned()));
+        assert!(elsewhere.contains(&r"C:\Users\someone\AppData\Roaming".to_owned()));
+        assert!(
+            !crate::apps::data_roots_elsewhere(&build('C'), &someone())
+                .iter()
+                .any(|root| root.starts_with(r"C:\Users\someone")),
+            "the profile's own drive was reported as another one"
+        );
     }
 
     #[test]

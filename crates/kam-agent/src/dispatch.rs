@@ -338,7 +338,8 @@ pub fn handle(
             }
 
             match outcome {
-                Ok((groups, summary)) => {
+                Ok((groups, mut summary)) => {
+                    summary.quarantine_only_on = quarantine_only_on(context, letter);
                     context.audit(
                         "storage",
                         "find_duplicates",
@@ -1218,6 +1219,26 @@ fn quarantine_path(path: &str, reason: &str, context: &Context, user: &UserConte
     }
 }
 
+/// The one drive quarantine holds things from, when `searched` is another.
+///
+/// The store moves an item in by renaming it, which only works within one
+/// drive, and it refuses anything else on purpose. A duplicate search covers
+/// one drive, so every copy it finds is either within reach or not, and the
+/// answer goes back with the results: the page drew "Remove this one" beside
+/// copies on a second drive, where pressing it could only produce the refusal.
+///
+/// Judged the way the store itself judges, by the first letter of each path.
+fn quarantine_only_on(context: &Context, searched: char) -> Option<char> {
+    let store = context
+        .quarantine
+        .root()
+        .to_str()
+        .and_then(|text| text.chars().next())
+        .filter(char::is_ascii_alphabetic)?
+        .to_ascii_uppercase();
+    (store != searched.to_ascii_uppercase()).then_some(store)
+}
+
 /// Take one redundant copy of a duplicated file.
 ///
 /// The fence is [`kam_storage::duplicates::check_removable`], and it is checked
@@ -1548,6 +1569,32 @@ mod tests {
             quarantine: kam_quarantine::Store::open(&quarantine_root).unwrap(),
             behaviour: Default::default(),
         }
+    }
+
+    /// A duplicate search of another drive says quarantine cannot reach it.
+    ///
+    /// The store renames within its own drive and refuses anything else, and
+    /// the page offered "Remove this one" on a second drive all the same.
+    #[test]
+    fn a_search_of_another_drive_names_the_only_drive_quarantine_holds_from() {
+        let context = context(Mode::Console);
+        let store = context
+            .quarantine
+            .root()
+            .to_string_lossy()
+            .chars()
+            .next()
+            .unwrap()
+            .to_ascii_uppercase();
+        let another = if store == 'Q' { 'R' } else { 'Q' };
+
+        assert_eq!(quarantine_only_on(&context, store), None);
+        assert_eq!(
+            quarantine_only_on(&context, store.to_ascii_lowercase()),
+            None,
+            "the same drive in lower case is still the same drive"
+        );
+        assert_eq!(quarantine_only_on(&context, another), Some(store));
     }
 
     /// A scratch directory sitting directly inside a real data root.

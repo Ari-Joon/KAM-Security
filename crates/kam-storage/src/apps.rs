@@ -512,6 +512,20 @@ pub(crate) fn data_roots(user: &UserContext) -> Vec<(LocationKind, String)> {
     roots
 }
 
+/// The data roots that are not on the drive an index describes.
+///
+/// Program data is looked for where it really is, so a survey of another
+/// drive finds none of it: no data folders to add to an application's size,
+/// and no leftovers. That is a thing not looked at, not a thing found empty,
+/// and the survey carries this list so the page can say which.
+pub(crate) fn data_roots_elsewhere(index: &VolumeIndex, user: &UserContext) -> Vec<String> {
+    data_roots(user)
+        .into_iter()
+        .map(|(_, root)| root)
+        .filter(|root| !index.covers(root))
+        .collect()
+}
+
 /// Drop any location that contains another location of the same application.
 ///
 /// `C:\Vendor` and `C:\Vendor\App` can both match, and the first already
@@ -788,14 +802,18 @@ pub fn survey(drive_letter: char, now_unix: u64, user: &UserContext) -> Result<S
 
     let root = format!("{drive_letter}:");
 
+    let elsewhere = data_roots_elsewhere(&index, user);
+
     let step = std::time::Instant::now();
     let apps = footprints(&index, &root, user)?;
     timings.applications = step.elapsed().as_millis() as u64;
-    let summary = summarise(&apps);
+    let mut summary = summarise(&apps);
+    summary.data_roots_elsewhere = elsewhere.clone();
 
     let step = std::time::Instant::now();
     let orphans = crate::orphans::find(&index, &apps, now_unix, user);
-    let orphan_summary = crate::orphans::summarise(&orphans);
+    let mut orphan_summary = crate::orphans::summarise(&orphans);
+    orphan_summary.roots_elsewhere = elsewhere;
     timings.orphans = step.elapsed().as_millis() as u64;
 
     let step = std::time::Instant::now();
@@ -827,7 +845,8 @@ pub fn measure(
     let snapshot = crate::mft::read(drive_letter)?;
     let index = VolumeIndex::build(snapshot);
     let apps = footprints(&index, &format!("{drive_letter}:"), user)?;
-    let summary = summarise(&apps);
+    let mut summary = summarise(&apps);
+    summary.data_roots_elsewhere = data_roots_elsewhere(&index, user);
     Ok((apps, summary))
 }
 
@@ -839,6 +858,11 @@ pub struct FootprintSummary {
     pub reported_bytes: u64,
     /// Applications whose installer wrote no size at all.
     pub without_reported_size: usize,
+    /// Program-data folders that are on another drive than the one measured,
+    /// so nothing in them is counted in any size here. Empty when the drive
+    /// measured is the one they are on.
+    #[serde(default)]
+    pub data_roots_elsewhere: Vec<String>,
 }
 
 pub fn summarise(apps: &[AppFootprint]) -> FootprintSummary {
@@ -847,6 +871,7 @@ pub fn summarise(apps: &[AppFootprint]) -> FootprintSummary {
         measured_bytes: 0,
         reported_bytes: 0,
         without_reported_size: 0,
+        data_roots_elsewhere: Vec::new(),
     };
     let mut counted: HashMap<&str, ()> = HashMap::new();
     for app in apps {
@@ -1144,6 +1169,48 @@ mod tests {
             installed_on: None,
             last_played: None,
         }
+    }
+
+    /// A program is measured where it is, not where a folder shares its name.
+    ///
+    /// Measuring `D:` used to look every install location and data folder up
+    /// by name on `D:`, whatever drive the registry said. On a second disk
+    /// that still holds an earlier Windows, `Program Files\Thing` and
+    /// `Users\someone\AppData\Local\Thing` exist there too, and their sizes
+    /// were shown against the `C:` paths.
+    #[test]
+    fn a_program_on_one_drive_is_not_measured_from_a_folder_of_that_name_on_another() {
+        use crate::index::testing::Drive;
+
+        let build = |letter: char| {
+            let mut drive = Drive::lettered(letter);
+            drive.file(r"Program Files\Thing\thing.exe", 1000, 0);
+            drive.file(r"Users\someone\AppData\Local\Thing\cache.bin", 500, 0);
+            drive.index()
+        };
+        let mut app = listed("Thing");
+        app.install_location = Some(r"C:\Program Files\Thing".to_owned());
+        let roots = vec![(
+            LocationKind::LocalData,
+            r"C:\Users\someone\AppData\Local".to_owned(),
+        )];
+
+        // The control: on C: both of its folders are found, with their sizes.
+        let on_c = locate(&app, &build('C'), &roots, &[], "C:");
+        assert_eq!(on_c.len(), 2);
+        assert_eq!(
+            on_c.iter().map(|location| location.bytes).sum::<u64>(),
+            1500
+        );
+
+        let on_d = locate(&app, &build('D'), &roots, &[], "D:");
+        assert!(
+            on_d.is_empty(),
+            "sizes read from D: were attributed to {:?}",
+            on_d.iter()
+                .map(|location| &location.path)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

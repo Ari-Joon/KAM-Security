@@ -94,6 +94,11 @@ pub struct MftEntry {
 /// Everything the table yielded, indexed by record number.
 #[derive(Debug)]
 pub struct MftSnapshot {
+    /// The drive this table was read from, as an upper-case letter. A table
+    /// describes one drive and nothing in it says which, so it is carried
+    /// here: the same folder names exist on more than one drive, and a size
+    /// read from one must never be shown against a path on another.
+    pub drive: char,
     pub entries: HashMap<u32, MftEntry>,
     pub root: u32,
     /// Records that were allocated but could not be parsed.
@@ -823,6 +828,7 @@ pub fn read(drive_letter: char) -> Result<MftSnapshot> {
     }
 
     Ok(MftSnapshot {
+        drive: drive_letter.to_ascii_uppercase(),
         entries,
         root: ROOT_RECORD as u32,
         skipped,
