@@ -753,9 +753,9 @@ impl Store {
         let mut unvouched = Vec::new();
 
         for sighting in seen {
-            let existing: Option<(String, i64, i64, i64, String)> = connection
+            let existing: Option<(String, i64, i64, i64, String, String)> = connection
                 .query_row(
-                    "SELECT detail, times_seen, flaps, present, trust FROM sightings
+                    "SELECT detail, times_seen, flaps, present, trust, first_seen FROM sightings
                      WHERE kind = ?1 AND scope = ?2 AND name = ?3",
                     params![sighting.kind, sighting.scope, sighting.name],
                     |row| {
@@ -765,6 +765,7 @@ impl Store {
                             row.get(2)?,
                             row.get(3)?,
                             row.get(4)?,
+                            row.get(5)?,
                         ))
                     },
                 )
@@ -831,7 +832,7 @@ impl Store {
                         });
                     }
                 }
-                Some((detail, times_seen, flaps, present, was_trust)) => {
+                Some((detail, times_seen, flaps, present, was_trust, first_seen)) => {
                     // Coming back after having gone is a flap, not a fresh
                     // appearance.
                     let returned = present == 0;
@@ -899,7 +900,7 @@ impl Store {
                             scope: sighting.scope.clone(),
                             name: sighting.name.clone(),
                             detail: sighting.detail.clone(),
-                            first_seen: String::new(),
+                            first_seen,
                             last_seen: now.clone(),
                             times_seen: times_seen + 1,
                             trust: sighting.trust.clone(),
@@ -1703,6 +1704,36 @@ mod tests {
         // removed is at least as strong a signal, and Windows reports it
         // nowhere.
         assert_eq!(sweep.differences[0].name, "Old");
+    }
+
+    /// A change to something already known says when it was first seen.
+    ///
+    /// The row was read for everything but that, so the window was handed an
+    /// empty date and printed "first seen" with nothing after it beside every
+    /// entry that had changed, which is the one line where how long a thing
+    /// has been here matters most.
+    #[test]
+    fn a_change_to_something_already_known_says_when_it_was_first_seen() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .sweep(&[seen("service", "Thing", "C:\\one.exe")], &[])
+            .unwrap();
+
+        let sweep = store
+            .sweep(&[seen("service", "Thing", "C:\\two.exe")], &[])
+            .unwrap();
+
+        let altered = sweep
+            .differences
+            .iter()
+            .find(|d| d.name == "Thing")
+            .expect("it points somewhere else now");
+        assert_eq!(altered.change, crate::changes::Change::Altered);
+        assert!(
+            !altered.first_seen.is_empty(),
+            "a changed entry was reported with no date it was first seen"
+        );
+        assert_eq!(altered.times_seen, 2);
     }
 
     /// A source that could not be read proves nothing about what is under it.
