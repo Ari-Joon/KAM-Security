@@ -204,7 +204,13 @@ pub fn find(
                 continue;
             }
 
-            let days = days_since(entry.modified, now_unix);
+            // The newest write anywhere inside, not the folder's own date.
+            // Windows moves a folder's own date only when something directly
+            // in it is added, removed or renamed, so a program still writing
+            // to files deeper down left its folder looking idle: an installed
+            // browser's live profile read "last written to 267 days ago" on
+            // the development machine while a file in it was 8 days old.
+            let days = days_since(index.newest_write_in(*child), now_unix);
             let mut reasons = vec![format!(
                 "no installed application matches the name \"{}\"",
                 entry.name
@@ -427,6 +433,73 @@ mod tests {
             written_lately(12),
             "but something wrote to it 12 days ago, so it is probably still in use"
         );
+    }
+
+    const MEGABYTE: u64 = 1024 * 1024;
+
+    fn someone() -> UserContext {
+        UserContext::new(None, r"C:\Users\someone")
+    }
+
+    /// A folder is dated by what is inside it, not by its own date.
+    ///
+    /// The case measured on the development machine: a browser profile whose
+    /// folder was last changed 267 days ago, holding a file written 8 days
+    /// ago. Judged on the folder's own date it was listed as "Possibly
+    /// leftover, last written to 267 days ago", with a Quarantine button, for
+    /// a program that was installed and in use.
+    #[test]
+    fn a_folder_still_being_written_inside_is_not_dated_by_its_own_stale_date() {
+        use crate::index::testing::{days_ago, Drive, NOW};
+
+        let mut drive = Drive::new();
+        let profile = r"Users\someone\AppData\Local\LiveBrowser";
+        drive.folder_written(profile, days_ago(267));
+        drive.folder_written(&format!(r"{profile}\User Data\Default"), days_ago(300));
+        drive.file(
+            &format!(r"{profile}\User Data\Default\History"),
+            200 * MEGABYTE,
+            days_ago(8),
+        );
+
+        let orphans = find(&drive.index(), &[], NOW, &someone());
+        let found = orphans
+            .iter()
+            .find(|orphan| orphan.name == "LiveBrowser")
+            .expect("the folder is unclaimed and over the size floor");
+
+        assert_eq!(found.days_since_modified, Some(8));
+        assert_eq!(found.confidence, Confidence::Low);
+        assert!(
+            found.reasons.contains(&written_lately(8)),
+            "the reason should say something wrote to it 8 days ago: {:?}",
+            found.reasons
+        );
+    }
+
+    #[test]
+    fn a_folder_nothing_has_written_inside_for_years_is_still_very_likely_a_leftover() {
+        use crate::index::testing::{days_ago, Drive, NOW};
+
+        let mut drive = Drive::new();
+        let vendor = r"Users\someone\AppData\Local\DeadVendor";
+        drive.folder_written(vendor, days_ago(900));
+        drive.file(
+            &format!(r"{vendor}\cache\blob.bin"),
+            200 * MEGABYTE,
+            days_ago(800),
+        );
+
+        let orphans = find(&drive.index(), &[], NOW, &someone());
+        let found = orphans
+            .iter()
+            .find(|orphan| orphan.name == "DeadVendor")
+            .expect("the folder is unclaimed and over the size floor");
+
+        // The newest thing in it is the file, at 800 days; the folder itself
+        // and the folder between them are older or carry no date.
+        assert_eq!(found.days_since_modified, Some(800));
+        assert_eq!(found.confidence, Confidence::High);
     }
 
     #[test]
