@@ -797,14 +797,18 @@ mod tests {
         }
     }
 
-    fn scratch_in_projects(name: &str) -> Option<PathBuf> {
+    /// A project file outside every folder the rules call writable, which is
+    /// why it cannot be in the temp folder like the others. Removed when the
+    /// test ends: it was written and left, one file in Documents for every
+    /// run of the tests.
+    fn scratch_in_projects(name: &str) -> Option<Scratch> {
         let dir = PathBuf::from(std::env::var("USERPROFILE").ok()?).join("Documents");
         if !dir.is_dir() {
             return None;
         }
         let path = dir.join(format!("kam-test-{}-{name}", std::process::id()));
         std::fs::write(&path, "<Project/>").ok()?;
-        Some(path)
+        Some(Scratch(path))
     }
 
     #[test]
