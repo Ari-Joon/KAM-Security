@@ -5,7 +5,7 @@
 .DESCRIPTION
     A download is two executables in a folder. Without this, somebody has to
     read the README, open an administrator terminal, and know that the fast disk
-    scan needs a service — which is three steps too many for the first minute of
+    scan needs a service, which is three steps too many for the first minute of
     using something.
 
     This registers the service and puts a shortcut on the desktop. It does not

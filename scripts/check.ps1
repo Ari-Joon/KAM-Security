@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     CI went red four times in one day, and every one was avoidable. The cause
-    was not carelessness about any single check — it was that "what I run" and
+    was not carelessness about any single check. It was that "what I run" and
     "what CI runs" were different in ways that were invisible from here:
 
       - CI sets RUSTFLAGS=-D warnings, so a clippy *warning* fails the build
@@ -17,7 +17,7 @@
 
     So this script is the CI workflow, in order, with the same environment. If
     it passes, the push passes. If it cannot run something, it says so rather
-    than skipping quietly — a check that silently does nothing is worse than no
+    than skipping quietly: a check that silently does nothing is worse than no
     check, because it is trusted.
 
 .PARAMETER SkipFrontend

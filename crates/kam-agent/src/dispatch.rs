@@ -311,7 +311,8 @@ pub fn handle(
                     tracing::info!(%error, "could not survey storage");
                     Response::Error {
                         message: format!(
-                            "application sizes need the master file table, which the agent                              could not read: {error}"
+                            "application sizes need the master file table, which the agent \
+                             could not read: {error}"
                         ),
                     }
                 }

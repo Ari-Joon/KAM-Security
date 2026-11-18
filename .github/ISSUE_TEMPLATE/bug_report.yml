@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Please do not report security vulnerabilities here — use the Security
+        Please do not report security vulnerabilities here. Use the Security
         tab to open a private advisory instead. See SECURITY.md.
 
   - type: textarea
@@ -55,6 +55,6 @@ body:
       description: >
         Console mode prints to the terminal. As a service it writes to
         %ProgramData%\KAM Security\logs\agent.log. Re-run with KAM_LOG=debug for
-        more. Remove anything you would rather not publish — paths can be
+        more. Remove anything you would rather not publish: paths can be
         personal.
       render: text

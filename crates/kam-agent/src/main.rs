@@ -287,7 +287,7 @@ fn run_canaries(set: Option<bool>) -> kam_core::Result<()> {
         if !report.auditing {
             println!(
                 "
-Auditing is off, so reading one of these would go unnoticed.                  Turn it on with --canaries-on."
+Auditing is off, so reading one of these would go unnoticed. Turn it on with --canaries-on."
             );
         }
     }

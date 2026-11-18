@@ -46,6 +46,6 @@ body:
     id: volume
     attributes:
       label: Volume details
-      description: Filesystem, size, and anything unusual — ReFS, BitLocker, dedup, compression, a mounted VHD.
+      description: Filesystem, size, and anything unusual: ReFS, BitLocker, dedup, compression, a mounted VHD.
     validations:
       required: true
