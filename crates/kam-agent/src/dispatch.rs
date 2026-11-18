@@ -983,13 +983,14 @@ pub fn handle(
         Request::SetCanaries { planted } => {
             if planted {
                 let report = kam_canary::plant(user);
-                // Effect::Changed: this writes files into somebody's Documents.
+                // Effect::Changed: this writes files into somebody's Documents
+                // and keys into their registry hive.
                 context.audit(
                     "canary",
                     "plant",
                     Effect::Changed,
                     format!(
-                        "planted {} decoy files for {}; {} armed",
+                        "planted {} decoys for {}; {} armed",
                         report.canaries.len(),
                         user.profile(),
                         report.canaries.iter().filter(|c| c.armed).count()
@@ -1002,7 +1003,7 @@ pub fn handle(
                     "canary",
                     "remove",
                     Effect::Changed,
-                    format!("removed {removed} decoy files for {}", user.profile()),
+                    format!("removed {removed} decoys for {}", user.profile()),
                 );
                 let mut report = kam_canary::status(user);
                 report.problems.extend(refused);

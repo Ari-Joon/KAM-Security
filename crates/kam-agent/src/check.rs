@@ -244,6 +244,8 @@ pub fn run_and_record(store: &Store, user: &UserContext) -> Vec<Finding> {
             effect: Effect::Observed,
             detail: match (findings.len(), serious) {
                 (0, _) => "checked; nothing to report".to_owned(),
+                (1, 0) => "checked; 1 thing worth a look".to_owned(),
+                (1, _) => "checked; 1 thing worth a look, and it is serious".to_owned(),
                 (found, 0) => format!("checked; {found} things worth a look"),
                 (found, bad) => {
                     format!("checked; {found} things worth a look, {bad} of them serious")

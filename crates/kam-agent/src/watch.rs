@@ -383,7 +383,7 @@ fn canary_trips(memory: &Store, said: &mut HashSet<String>) -> Vec<Observation> 
 
         for trip in fresh_trips(memory, &part, report.trips) {
             let mut evidence = vec![
-                "This file is a decoy. It was put there by KAM Security, nothing on this machine \
+                "This is a decoy. It was put there by KAM Security, nothing on this machine \
                  uses it, and no ordinary program has any reason to open it."
                     .to_owned(),
             ];
@@ -404,13 +404,13 @@ fn canary_trips(memory: &Store, said: &mut HashSet<String>) -> Vec<Observation> 
                 concern: behaviour::Concern::Strong,
                 summary: match &trip.process {
                     Some(process) => format!(
-                        "{} read a decoy file",
+                        "{} read a decoy",
                         std::path::Path::new(process)
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_else(|| process.clone())
                     ),
-                    None => "Something read a decoy file".to_owned(),
+                    None => "Something read a decoy".to_owned(),
                 },
                 evidence,
                 subject: trip.path,
