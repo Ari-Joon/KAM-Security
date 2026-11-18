@@ -157,10 +157,31 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
 /// Returning to the tray rather than exiting is what makes the icon useful,
 /// and destroying the window rather than hiding it is what makes it cheap.
 pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
-    if let WindowEvent::CloseRequested { api, .. } = event {
-        // Prevent the default close, then destroy explicitly. `hide` would
-        // keep the WebView and everything it holds resident.
-        api.prevent_close();
-        let _ = window.destroy();
+    match event {
+        WindowEvent::CloseRequested { api, .. } => {
+            // Prevent the default close, then destroy explicitly. `hide` would
+            // keep the WebView and everything it holds resident.
+            api.prevent_close();
+            close_what_the_window_had_open(window);
+            let _ = window.destroy();
+        }
+        // However else the window goes.
+        WindowEvent::Destroyed => close_what_the_window_had_open(window),
+        _ => {}
+    }
+}
+
+/// Let go of what only the window was using: an archive taken apart and not
+/// yet extracted, with the private copy of it on disk.
+///
+/// A destroyed WebView runs none of the page's own clean-up, so this is the
+/// only place it can happen. Without it the copy of an archive Defender had
+/// flagged stayed in the work folder for as long as the icon kept running.
+fn close_what_the_window_had_open(window: &tauri::Window) {
+    if let Some(downloads) = window
+        .app_handle()
+        .try_state::<crate::downloads::Downloads>()
+    {
+        downloads.close_all();
     }
 }

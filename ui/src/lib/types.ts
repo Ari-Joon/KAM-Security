@@ -1096,6 +1096,8 @@ export type PageRecord = DownloadRecord & {
   /** Whether the file is still where it was checked. */
   present: boolean;
   archive: "zip" | "other" | null;
+  /** The quarantine item it can be put back from, when it is being held. */
+  held: string | null;
 };
 
 export type LooseFile = {
@@ -1127,6 +1129,10 @@ export type DownloadsPage = {
   history_error: string | null;
   unchecked: LooseFile[];
   failures: { path: string; message: string }[];
+  /** The archive taken apart and still open, to find again after leaving. */
+  open: { token: string; archive: string } | null;
+  /** Why it could not be told which quarantined downloads can be put back. */
+  quarantine_error: string | null;
   menu: MenuState;
   protection: boolean | null;
   notifications: string | null;
@@ -1135,8 +1141,20 @@ export type DownloadsPage = {
 export type DissectionView = {
   token: string;
   dissection: Dissection;
+  /** The folder the files would go into, as it stands now. */
+  destination: string;
   /** Why extracted files will lack the download mark, when it could not be read. */
   mark_problem: string | null;
+  /** Why what the archive holds is not on its row, when recording it failed. */
+  record_problem: string | null;
+};
+
+/** What came of asking for an archive to be taken apart. */
+export type Dissected = {
+  /** Absent when it was stopped first. */
+  view: DissectionView | null;
+  /** What had happened to the original by then. */
+  original: { quarantined: string | null; refused: string | null };
 };
 
 /** A file somebody asked about from Explorer or a notification. */

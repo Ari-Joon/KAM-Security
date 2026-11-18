@@ -35,6 +35,7 @@ import type {
   DownloadsPage,
   DownloadRecord,
   DissectionView,
+  Dissected,
   Extraction,
   MenuState,
   Launch,
@@ -165,10 +166,16 @@ export const api = {
   quarantineDownload: (path: string) => invoke<Manifest>("quarantine_download", { path }),
   /**
    * Take a zip apart. Quarantines the original first when Defender flagged it.
-   * Nothing is extracted until extractClean. Null when stopped.
+   * Nothing is extracted until extractClean. The answer carries no view when
+   * it was stopped, and says what had become of the original by then.
    */
   dissectArchive: (path: string, job: string) =>
-    invoke<DissectionView | null>("dissect_archive", { path, job }),
+    invoke<Dissected>("dissect_archive", { path, job }),
+  /** Stop taking an archive apart, in this program and in the agent. */
+  stopDissection: (job: string) => invoke<void>("stop_dissection", { job }),
+  /** The archive that is still open, after leaving the page and coming back. */
+  openDissection: (token: string) =>
+    invoke<DissectionView | null>("open_dissection", { token }),
   extractClean: (token: string) => invoke<Extraction>("extract_clean", { token }),
   discardDissection: (token: string) => invoke<void>("discard_dissection", { token }),
   setContextMenu: (enabled: boolean) => invoke<MenuState>("set_context_menu", { enabled }),

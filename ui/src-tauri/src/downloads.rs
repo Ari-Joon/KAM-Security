@@ -25,8 +25,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use kam_core::Progress;
@@ -58,12 +59,20 @@ pub enum WatchStatus {
 }
 
 /// An archive taken apart and waiting for the person to decide.
+///
+/// It holds the private copy, and letting it go deletes that copy. So an
+/// archive is open for exactly as long as something holds this: the slot in
+/// [`Downloads`], and an extraction for as long as it runs.
+#[derive(Debug)]
 struct Session {
     copy: crate::archive::WorkingCopy,
     name: String,
     sha256: String,
     zone: Option<Vec<u8>>,
-    dissection: Dissection,
+    view: DissectionView,
+    /// Set while it is being extracted from, so a second press of the button
+    /// does not start a second extraction beside the first.
+    extracting: AtomicBool,
 }
 
 /// Everything the Downloads half keeps between calls.
@@ -74,7 +83,12 @@ pub struct Downloads {
     /// A file somebody asked about from outside the window, waiting for the
     /// page to pick it up.
     pending: Mutex<Option<Launch>>,
-    sessions: Mutex<HashMap<String, Session>>,
+    /// The archive that is open, if one is. One at a time: taking another
+    /// apart closes it, and so does closing the window.
+    open: Mutex<Option<Arc<Session>>>,
+    /// Jobs somebody asked to stop while the work was this program's own and
+    /// not yet the agent's: copying an archive, or quarantining its original.
+    stopped: Mutex<HashSet<String>>,
 }
 
 impl Default for Downloads {
@@ -83,7 +97,8 @@ impl Default for Downloads {
             watch: Mutex::new(WatchStatus::Starting),
             failures: Mutex::new(HashMap::new()),
             pending: Mutex::new(None),
-            sessions: Mutex::new(HashMap::new()),
+            open: Mutex::new(None),
+            stopped: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -92,6 +107,72 @@ impl Downloads {
     fn set_watch(&self, status: WatchStatus) {
         if let Ok(mut watch) = self.watch.lock() {
             *watch = status;
+        }
+    }
+
+    /// Close whatever archive is open, deleting its private copy.
+    ///
+    /// Called when the window is closed. Closing destroys the window, so the
+    /// page's own clean-up never runs, and a complete copy of an archive
+    /// Defender had flagged used to stay in the work folder until the program
+    /// was next started. It starts at sign-in and lives in the notification
+    /// area, so that could be days.
+    pub fn close_all(&self) {
+        if let Ok(mut open) = self.open.lock() {
+            *open = None;
+        }
+    }
+
+    /// Close one archive, if it is the one that is open.
+    fn close(&self, token: &str) {
+        if let Ok(mut open) = self.open.lock() {
+            if open
+                .as_ref()
+                .is_some_and(|session| session.view.token == token)
+            {
+                *open = None;
+            }
+        }
+    }
+
+    /// Open an archive, closing any that was open before.
+    fn open(&self, session: Session) {
+        if let Ok(mut open) = self.open.lock() {
+            *open = Some(Arc::new(session));
+        }
+    }
+
+    /// The open archive, when `token` names it.
+    fn session(&self, token: &str) -> Option<Arc<Session>> {
+        self.open
+            .lock()
+            .ok()?
+            .as_ref()
+            .filter(|session| session.view.token == token)
+            .cloned()
+    }
+
+    /// What the page draws for the open archive, when `token` names it.
+    pub fn view(&self, token: &str) -> Option<DissectionView> {
+        self.session(token).map(|session| session.view.clone())
+    }
+
+    /// Ask for a job to stop. See [`Downloads::stopped`].
+    pub fn stop(&self, job: &str) {
+        if let Ok(mut stopped) = self.stopped.lock() {
+            stopped.insert(job.to_owned());
+        }
+    }
+
+    fn is_stopped(&self, job: &str) -> bool {
+        self.stopped
+            .lock()
+            .is_ok_and(|stopped| stopped.contains(job))
+    }
+
+    fn forget_stop(&self, job: &str) {
+        if let Ok(mut stopped) = self.stopped.lock() {
+            stopped.remove(job);
         }
     }
 
@@ -156,6 +237,18 @@ pub struct PageRecord {
     /// Whether the file is still where it was checked.
     present: bool,
     archive: Option<&'static str>,
+    /// The quarantine item this file can be put back from, when it is not
+    /// where it was because it is being held there. This is what stops a row
+    /// being a dead end: a file quarantined from here, or by taking it apart,
+    /// can always be put back from its own row.
+    held: Option<String>,
+}
+
+/// The archive that is open, for a page that has just been drawn again.
+#[derive(Debug, Serialize)]
+pub struct OpenArchive {
+    token: String,
+    archive: String,
 }
 
 /// A file in Downloads with no check on record yet.
@@ -190,6 +283,11 @@ pub struct Page {
     history_error: Option<String>,
     unchecked: Vec<LooseFile>,
     failures: Vec<Failure>,
+    /// The archive that was taken apart and is still open, so that leaving
+    /// the page and coming back finds it again.
+    open: Option<OpenArchive>,
+    /// Why it could not be told which quarantined downloads can be put back.
+    quarantine_error: Option<String>,
     menu: MenuState,
     protection: Option<bool>,
     /// Why notices about new downloads will not be seen, when Windows says
@@ -270,14 +368,45 @@ pub fn page(state: &Downloads) -> Page {
     }
     unchecked.sort_by(|a, b| b.arrived_at.cmp(&a.arrived_at));
 
+    // What is being held in quarantine, asked for only when a row could be
+    // about one of them. A failure to read it is said, not taken for "none".
+    let quarantined = records
+        .iter()
+        .any(|record| record.actions.iter().any(|action| action.undo.is_some()));
+    let (held, quarantine_error) = if quarantined {
+        match kam_ipc::client::call(&Request::ListQuarantine) {
+            Ok(Response::QuarantineList { items }) => (items, None),
+            Ok(Response::Error { message }) => (Vec::new(), Some(message)),
+            Ok(other) => (
+                Vec::new(),
+                Some(format!(
+                    "the agent answered something unexpected: {other:?}"
+                )),
+            ),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        }
+    } else {
+        (Vec::new(), None)
+    };
+
     let records = records
         .into_iter()
-        .map(|record| PageRecord {
-            present: Path::new(&record.check.path).is_file(),
-            archive: archive_label(&record.check.name),
-            record,
+        .map(|record| {
+            let present = Path::new(&record.check.path).is_file();
+            PageRecord {
+                held: (!present).then(|| held_as(&record, &held)).flatten(),
+                present,
+                archive: archive_label(&record.check.name),
+                record,
+            }
         })
         .collect();
+    let open = state.open.lock().ok().and_then(|open| {
+        open.as_ref().map(|session| OpenArchive {
+            token: session.view.token.clone(),
+            archive: session.view.dissection.archive.clone(),
+        })
+    });
     let failures = state
         .failures
         .lock()
@@ -308,10 +437,31 @@ pub fn page(state: &Downloads) -> Page {
         history_error,
         unchecked,
         failures,
+        open,
+        quarantine_error,
         menu: crate::context_menu::state(),
         protection,
         notifications: crate::notice::delivery_problem(),
     }
+}
+
+/// The quarantine item a download that is no longer where it was can be put
+/// back from: the newest one its row names that is still held, and that came
+/// from that very path.
+fn held_as(record: &DownloadRecord, held: &[kam_quarantine::Manifest]) -> Option<String> {
+    record
+        .actions
+        .iter()
+        .rev()
+        .filter_map(|action| action.undo.as_deref())
+        .find(|id| {
+            held.iter().any(|item| {
+                item.id == *id
+                    && !item.restored
+                    && item.original_path.eq_ignore_ascii_case(&record.check.path)
+            })
+        })
+        .map(str::to_owned)
 }
 
 // --- watching ----------------------------------------------------------
@@ -700,15 +850,58 @@ pub fn open_on(app: &AppHandle, launch: Launch) {
 
 // --- taking archives apart ------------------------------------------------
 
-/// What the page gets back from taking an archive apart.
-#[derive(Debug, Serialize)]
+/// What the page draws for an archive that has been taken apart.
+#[derive(Debug, Clone, Serialize)]
 pub struct DissectionView {
     token: String,
     dissection: Dissection,
+    /// The folder the files would be extracted into, as it stands now. The
+    /// one really made is named in the result, should this be taken by then.
+    destination: String,
     /// Why the files extracted from this archive will not carry the mark
     /// Windows puts on downloaded files, when the archive's own could not be
     /// read.
     mark_problem: Option<String>,
+    /// Why what the archive holds is not on its row, when recording it
+    /// failed. It used to be missing without a word.
+    record_problem: Option<String>,
+}
+
+/// What came of asking for an archive to be taken apart.
+#[derive(Debug, Serialize)]
+pub struct Dissected {
+    /// The archive, open. Absent when it was stopped first.
+    view: Option<DissectionView>,
+    /// What had happened to the original by then. A flagged original is
+    /// quarantined before anything else, so "stopped" does not always mean
+    /// "nothing was changed", and the page says which it was.
+    original: OriginalFate,
+}
+
+/// A sentence about something that went wrong, with what had already
+/// happened to the original by then. Every way out of [`dissect`] after the
+/// original may have been quarantined goes through this, so that no message
+/// reads as if nothing had been changed when something had.
+fn and_the_original(message: &str, fate: &OriginalFate) -> String {
+    let message = message.trim_end();
+    let stop = if message.ends_with(['.', '!', '?', ')']) {
+        ""
+    } else {
+        "."
+    };
+    if fate.quarantined.is_some() {
+        format!(
+            "{message}{stop} The original had already been quarantined, because Defender \
+             flagged it. It can be put back from its row here, or from Cleanup, for thirty days."
+        )
+    } else if let Some(refused) = &fate.refused {
+        format!(
+            "{message}{stop} The original is still where it was: quarantining it was tried and \
+             did not work ({refused})."
+        )
+    } else {
+        message.to_owned()
+    }
 }
 
 fn emit_stage(app: &AppHandle, job: &str, stage: &str) {
@@ -755,8 +948,31 @@ fn quarantine_original(original: &str) -> OriginalFate {
 const NOT_A_ZIP: &str = "Only zip archives can be taken apart here. Defender was asked about \
      this one as a single file.";
 
-/// Take a zip apart. `None` when it was stopped. See the module notes.
-pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<DissectionView>, String> {
+/// Take a zip apart. See the module notes.
+pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Dissected, String> {
+    let state = app.state::<Downloads>();
+    let outcome = dissect_for(app, &state, path, job);
+    state.forget_stop(job);
+    // The window may have been closed while this ran, and then nobody is
+    // left to close the archive it opened.
+    if app.get_webview_window("main").is_none() {
+        state.close_all();
+    }
+    outcome
+}
+
+fn dissect_for(
+    app: &AppHandle,
+    state: &Downloads,
+    path: &str,
+    job: &str,
+) -> Result<Dissected, String> {
+    let stopped = |original: OriginalFate| {
+        Ok(Dissected {
+            view: None,
+            original,
+        })
+    };
     let given = Path::new(path);
     let name = given
         .file_name()
@@ -801,17 +1017,29 @@ pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<Dissecti
     emit_stage(app, job, "Making a private copy to take apart");
     // Held open from here until the archive is closed or extracted, and
     // deleted when it is let go, on every way out of this function.
-    let Some(copy) = crate::archive::working_copy(&real, &|| true)? else {
-        return Ok(None);
+    //
+    // Stop is honoured here and before the original is quarantined. It used
+    // to be accepted and ignored until Defender was running, because only
+    // the agent was ever told about it.
+    let Some(copy) = crate::archive::working_copy(&real, &|| !state.is_stopped(job))? else {
+        return stopped(OriginalFate::default());
     };
+    if state.is_stopped(job) {
+        return stopped(OriginalFate::default());
+    }
 
     // Quarantined first, as asked, when Defender has already flagged it.
+    // From here on something may have been changed, so every way out says
+    // what became of the original.
     let mut fate = OriginalFate::default();
     let mut tried = false;
     if known_flagged {
         emit_stage(app, job, "Quarantining the original");
         fate = quarantine_original(&original);
         tried = true;
+    }
+    if state.is_stopped(job) {
+        return stopped(fate);
     }
 
     let channel = format!("job://{job}");
@@ -827,14 +1055,15 @@ pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<Dissecti
     );
     let record = match checked {
         Ok(Response::DownloadChecked(record)) => record,
-        Ok(Response::Stopped) => return Ok(None),
-        Ok(Response::Error { message }) => return Err(message),
+        Ok(Response::Stopped) => return stopped(fate),
+        Ok(Response::Error { message }) => return Err(and_the_original(&message, &fate)),
         Ok(other) => {
-            return Err(format!(
-                "the agent answered something unexpected: {other:?}"
+            return Err(and_the_original(
+                &format!("the agent answered something unexpected: {other:?}"),
+                &fate,
             ))
         }
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(and_the_original(&error.to_string(), &fate)),
     };
 
     // Flagged only now: quarantined before anything is taken apart.
@@ -850,11 +1079,13 @@ pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<Dissecti
         job,
         "Making sure the copy is the file Defender looked at",
     );
-    copy.is_the_file_checked(&record.check.sha256)?;
+    copy.is_the_file_checked(&record.check.sha256)
+        .map_err(|refusal| and_the_original(&refusal, &fate))?;
 
     emit_stage(app, job, "Reading the archive's list of files");
-    let entries = crate::archive::entries(copy.file())
-        .map_err(|reason| format!("{name} could not be taken apart: {reason}"))?;
+    let entries = crate::archive::entries(copy.file()).map_err(|reason| {
+        and_the_original(&format!("{name} could not be taken apart: {reason}"), &fate)
+    })?;
     let mut dissection = kam_scanner::downloads::dissect(
         &original,
         &record.check.sha256,
@@ -863,61 +1094,57 @@ pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<Dissecti
     );
     dissection.original = fate;
 
-    if let Err(error) = kam_ipc::client::call(&Request::RecordDissection {
+    let recorded = kam_ipc::client::call(&Request::RecordDissection {
         path: original.clone(),
         sha256: record.check.sha256.clone(),
         // Cut to what a record keeps before it is sent. Whole, the list of a
         // vast archive is larger than one frame of the pipe, and the record
         // of it was then silently never made.
         dissection: Box::new(dissection.for_record(kam_scanner::downloads::RECORDED_MEMBERS)),
-    }) {
-        eprintln!("what the archive holds could not be recorded: {error}");
+    });
+    let record_problem = match recorded {
+        Ok(Response::Error { message }) => Some(message),
+        Err(error) => Some(error.to_string()),
+        Ok(_) => None,
     }
+    .map(|reason| format!("What this archive holds could not be recorded on its row ({reason})."));
 
-    let token = format!(
-        "{job}-{}",
-        record.check.sha256.get(..12).unwrap_or_default()
-    );
+    let destination = known_folder()
+        .map(|folder| {
+            kam_storage::downloads::extraction_folder_name(&name, |candidate| {
+                std::fs::symlink_metadata(folder.join(candidate)).is_ok()
+            })
+        })
+        .unwrap_or_default();
     let view = DissectionView {
-        token: token.clone(),
-        dissection: dissection.clone(),
+        token: format!(
+            "{job}-{}",
+            record.check.sha256.get(..12).unwrap_or_default()
+        ),
+        dissection,
+        destination,
         mark_problem,
+        record_problem,
     };
-    if let Ok(mut sessions) = app.state::<Downloads>().sessions.lock() {
-        sessions.insert(
-            token,
-            Session {
-                copy,
-                name,
-                sha256: record.check.sha256.clone(),
-                zone,
-                dissection,
-            },
-        );
-    }
-    Ok(Some(view))
+    state.open(Session {
+        copy,
+        name,
+        sha256: record.check.sha256.clone(),
+        zone,
+        view: view.clone(),
+        extracting: AtomicBool::new(false),
+    });
+    Ok(Dissected {
+        original: view.dissection.original.clone(),
+        view: Some(view),
+    })
 }
 
-/// Extract what Defender found nothing in, record it, and delete the copy.
+/// Extract what Defender found nothing in, record it, and close the archive.
 pub fn extract(state: &Downloads, token: &str) -> Result<Extraction, String> {
-    let session = state
-        .sessions
-        .lock()
-        .ok()
-        .and_then(|mut sessions| sessions.remove(token))
-        .ok_or("That archive is no longer open here. Take it apart again to extract from it.")?;
-    let parent = known_folder()?;
-    // Through the handle held since the copy was made. Letting the session
-    // go afterwards deletes the copy.
-    let extraction = crate::archive::extract(
-        session.copy.file(),
-        &session.dissection,
-        &parent,
-        &session.name,
-        session.zone.as_deref(),
-    )?;
+    let (session, extraction) = extract_into(state, token, &known_folder()?)?;
     if let Err(error) = kam_ipc::client::call(&Request::RecordExtraction {
-        path: session.dissection.archive.clone(),
+        path: session.view.dissection.archive.clone(),
         sha256: session.sha256.clone(),
         extraction: extraction.clone(),
     }) {
@@ -926,12 +1153,42 @@ pub fn extract(state: &Downloads, token: &str) -> Result<Extraction, String> {
     Ok(extraction)
 }
 
+/// Extract from the open archive into a new folder in `parent`.
+///
+/// The archive is closed, and its private copy deleted, only once files have
+/// been written. A refusal comes before the first file (see
+/// `archive::extract`), so the archive stays open and the button can simply
+/// be pressed again. It used to be closed whatever happened, and after a
+/// refusal for want of free space the only way back to an archive whose
+/// original was in quarantine was to restore it from another page.
+fn extract_into(
+    state: &Downloads,
+    token: &str,
+    parent: &Path,
+) -> Result<(Arc<Session>, Extraction), String> {
+    let session = state
+        .session(token)
+        .ok_or("That archive is no longer open here. Take it apart again to extract from it.")?;
+    if session.extracting.swap(true, Ordering::SeqCst) {
+        return Err("This archive is already being extracted.".to_owned());
+    }
+    // Through the handle held since the copy was made.
+    let outcome = crate::archive::extract(
+        session.copy.file(),
+        &session.view.dissection,
+        parent,
+        &session.name,
+        session.zone.as_deref(),
+    );
+    session.extracting.store(false, Ordering::SeqCst);
+    let extraction = outcome?;
+    state.close(token);
+    Ok((session, extraction))
+}
+
 /// Close an archive without extracting, deleting the private copy.
 pub fn discard(state: &Downloads, token: &str) {
-    // Letting the session go deletes its copy.
-    if let Ok(mut sessions) = state.sessions.lock() {
-        sessions.remove(token);
-    }
+    state.close(token);
 }
 
 #[cfg(test)]
@@ -1043,6 +1300,195 @@ mod tests {
         ] {
             assert!(standalone(wrong), "{wrong} was let through");
         }
+    }
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("kam-downloads-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("Downloads")).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Take a harmless zip apart into `state`, as `dissect` leaves it, and
+    /// say where its private copy is.
+    fn open_archive(state: &Downloads, scratch: &Scratch, token: &str) -> PathBuf {
+        use std::io::Write;
+        let original = scratch.0.join("a.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&original).unwrap());
+        writer
+            .start_file("readme.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"hello").unwrap();
+        writer.finish().unwrap();
+
+        let copy = crate::archive::working_copy_in(&original, &scratch.0.join("work"), &|| true)
+            .unwrap()
+            .unwrap();
+        let path = copy.path().to_path_buf();
+        let nothing = kam_scanner::defender_file::parse_report(Some(0), "");
+        let dissection = kam_scanner::downloads::dissect(
+            "a.zip",
+            "ab",
+            nothing,
+            &crate::archive::entries(copy.file()).unwrap(),
+        );
+        state.open(Session {
+            copy,
+            name: "a.zip".to_owned(),
+            sha256: "ab".to_owned(),
+            zone: None,
+            view: DissectionView {
+                token: token.to_owned(),
+                dissection,
+                destination: String::new(),
+                mark_problem: None,
+                record_problem: None,
+            },
+            extracting: AtomicBool::new(false),
+        });
+        path
+    }
+
+    /// Red review: closing the window destroys it, so the page's own
+    /// clean-up never ran, and the private copy of an archive stayed in the
+    /// work folder until the program was next started.
+    #[test]
+    fn closing_the_window_deletes_the_private_copy_of_an_open_archive() {
+        let scratch = Scratch::new("close");
+        let state = Downloads::default();
+        let copy = open_archive(&state, &scratch, "one");
+        assert!(copy.exists() && state.view("one").is_some());
+
+        // Taking another archive apart closes the first.
+        let second = open_archive(&state, &scratch, "two");
+        assert!(!copy.exists(), "the first archive's copy was left behind");
+        assert!(state.view("one").is_none());
+
+        state.close_all();
+        assert!(!second.exists(), "the copy outlived the window");
+        assert!(state.view("two").is_none());
+    }
+
+    /// An extraction that is refused wrote nothing, so the archive stays
+    /// open and the button can be pressed again. It used to be closed
+    /// whatever happened, which left a row with nothing to press.
+    #[test]
+    fn a_refused_extraction_leaves_the_archive_open_to_try_again() {
+        let scratch = Scratch::new("retry");
+        let state = Downloads::default();
+        let copy = open_archive(&state, &scratch, "one");
+
+        let nowhere = scratch.0.join("no-such-folder");
+        assert!(extract_into(&state, "one", &nowhere).is_err());
+        assert!(
+            state.view("one").is_some() && copy.exists(),
+            "a refused extraction closed the archive"
+        );
+
+        let (_, done) = extract_into(&state, "one", &scratch.0.join("Downloads")).unwrap();
+        assert_eq!(done.files, 1, "{done:?}");
+        assert!(state.view("one").is_none(), "it stayed open once extracted");
+        assert!(extract_into(&state, "one", &nowhere)
+            .unwrap_err()
+            .contains("no longer open"));
+        // The copy goes when the last holder lets go, which is this test.
+        assert!(!copy.exists(), "the private copy outlived the extraction");
+    }
+
+    /// "Taking it apart was stopped, so nothing was changed" was said when
+    /// the original had already been quarantined. Every message after that
+    /// point now says what became of the original.
+    #[test]
+    fn what_went_wrong_says_what_had_already_happened_to_the_original() {
+        let untouched = OriginalFate::default();
+        assert_eq!(and_the_original("It failed", &untouched), "It failed");
+
+        let quarantined = OriginalFate {
+            quarantined: Some("1-0001".to_owned()),
+            refused: None,
+        };
+        let said = and_the_original("a.zip could not be taken apart: not a zip", &quarantined);
+        assert!(
+            said.starts_with("a.zip could not be taken apart: not a zip. The original had already")
+                && said.contains("can be put back"),
+            "{said}"
+        );
+        assert!(and_the_original("It failed.", &quarantined).starts_with("It failed. The"));
+
+        let refused = OriginalFate {
+            quarantined: None,
+            refused: Some("it is in use".to_owned()),
+        };
+        let said = and_the_original("It failed", &refused);
+        assert!(
+            said.contains("still where it was") && said.contains("it is in use"),
+            "{said}"
+        );
+    }
+
+    /// A row whose file is in quarantine names the item it can be put back
+    /// from: the newest one still held that came from that very path.
+    #[test]
+    fn a_quarantined_download_can_be_put_back_from_its_own_row() {
+        let path = r"C:\Users\me\Downloads\a.zip";
+        let action = |undo: &str| kam_scanner::downloads::DownloadAction {
+            at: String::new(),
+            what: "Quarantined.".to_owned(),
+            undo: Some(undo.to_owned()),
+        };
+        let record = DownloadRecord {
+            check: kam_scanner::downloads::DownloadCheck {
+                path: path.to_owned(),
+                name: "a.zip".to_owned(),
+                bytes: 1,
+                sha256: "ab".to_owned(),
+                arrived_at: None,
+                origin: None,
+                signature: None,
+                scan: kam_scanner::defender_file::parse_report(Some(0), ""),
+            },
+            checked_at: String::new(),
+            actions: vec![action("1-0001"), action("2-0002"), action("3-0003")],
+            dissection: None,
+            first_check: false,
+        };
+        let item = |id: &str, from: &str, restored: bool| kam_quarantine::Manifest {
+            id: id.to_owned(),
+            original_path: from.to_owned(),
+            kind: kam_quarantine::ItemKind::File,
+            bytes: 1,
+            quarantined_at: 0,
+            reason: String::new(),
+            restored,
+        };
+
+        let held = [
+            item("1-0001", path, false),
+            item("2-0002", &path.to_uppercase(), false),
+            item("3-0003", path, true),
+        ];
+        assert_eq!(held_as(&record, &held).as_deref(), Some("2-0002"));
+        // Put back already, deleted since, or somebody else's file.
+        assert_eq!(held_as(&record, &[item("3-0003", path, true)]), None);
+        assert_eq!(held_as(&record, &[]), None);
+        assert_eq!(
+            held_as(
+                &record,
+                &[item("1-0001", r"C:\Users\me\Downloads\b.zip", false)]
+            ),
+            None
+        );
     }
 
     #[test]

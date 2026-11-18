@@ -161,8 +161,14 @@ export default function Downloads({ launches }: { launches: number }) {
   const [extracting, setExtracting] = useState(false);
   const [focus, setFocus] = useState<string | null>(null);
   const [menuError, setMenuError] = useState<string | null>(null);
-  /** The open dissection, so leaving the page deletes its private copy. */
+  /** Why the last press of Extract wrote nothing, said beside the button. */
+  const [panelError, setPanelError] = useState<string | null>(null);
+  /** The row whose file is being quarantined or put back, so it is not pressed twice. */
+  const [moving, setMoving] = useState<string | null>(null);
+  /** The open dissection, so it is not fetched again while it is on screen. */
   const openToken = useRef<string | null>(null);
+  /** Archives closed or extracted here, which a reload must not reopen. */
+  const dismissed = useRef<Set<string>>(new Set());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -206,7 +212,9 @@ export default function Downloads({ launches }: { launches: number }) {
     openToken.current = null;
     setView(null);
     setExtraction(null);
+    setPanelError(null);
     if (token) {
+      dismissed.current.add(token);
       try {
         await api.discardDissection(token);
       } catch {
@@ -227,11 +235,22 @@ export default function Downloads({ launches }: { launches: number }) {
           },
           (progress) => setRunning((current) => (current ? { ...current, progress } : current)),
         );
-        if (result) {
-          openToken.current = result.token;
-          setView(result);
+        if (result?.view) {
+          openToken.current = result.view.token;
+          setView(result.view);
+        } else if (result?.original.quarantined) {
+          // Stopped, but not before the original went to quarantine: say so.
+          say(
+            path,
+            "Taking it apart was stopped. The original had already been quarantined, because Defender flagged it. It can be put back from this row, or from Cleanup, for thirty days.",
+          );
+        } else if (result?.original.refused) {
+          say(
+            path,
+            `Taking it apart was stopped. The original is still where it was: quarantining it was tried and did not work (${result.original.refused}).`,
+          );
         } else {
-          say(path, "Taking it apart was stopped, so nothing was changed.");
+          say(path, "Taking it apart was stopped before anything was changed.");
         }
       } catch (cause) {
         say(path, reason(cause));
@@ -246,12 +265,16 @@ export default function Downloads({ launches }: { launches: number }) {
   async function extract() {
     if (!view) return;
     setExtracting(true);
+    setPanelError(null);
     try {
       const done = await api.extractClean(view.token);
+      dismissed.current.add(view.token);
       openToken.current = null;
       setExtraction(done);
     } catch (cause) {
-      say(view.dissection.archive, reason(cause));
+      // Said here, beside the button. Nothing was written, and the archive
+      // is still open, so the button can be pressed again.
+      setPanelError(reason(cause));
     } finally {
       setExtracting(false);
       void load();
@@ -259,12 +282,28 @@ export default function Downloads({ launches }: { launches: number }) {
   }
 
   async function quarantine(path: string) {
+    setMoving(path);
     try {
       await api.quarantineDownload(path);
-      say(path, "Quarantined. It can be put back from Cleanup for thirty days.");
+      say(path, "Quarantined. It can be put back from this row, or from Cleanup, for thirty days.");
     } catch (cause) {
       say(path, `Not quarantined: ${reason(cause)}`);
     } finally {
+      setMoving(null);
+      void load();
+    }
+  }
+
+  /** Put a quarantined download back where it was. */
+  async function putBack(path: string, id: string) {
+    setMoving(path);
+    try {
+      await api.restore(id);
+      say(path, "Put back where it was.");
+    } catch (cause) {
+      say(path, `Not put back: ${reason(cause)}`);
+    } finally {
+      setMoving(null);
       void load();
     }
   }
@@ -282,12 +321,29 @@ export default function Downloads({ launches }: { launches: number }) {
   useEffect(() => {
     void load();
     const unlisten = listen("downloads://changed", () => void load());
+    // An archive that is open stays open when this page is left: the window's
+    // own half keeps it, and closes it when the window closes. Leaving the
+    // page used to delete its private copy, and with the original already in
+    // quarantine that left a row with nothing to press.
     return () => {
       void unlisten.then((stop) => stop());
-      const token = openToken.current;
-      if (token) void api.discardDissection(token).catch(() => {});
     };
   }, [load]);
+
+  // Coming back to the page: find the archive that was left open. One that
+  // was closed here is not brought back by a reload that raced its closing.
+  const stillOpen = page?.open?.token ?? null;
+  useEffect(() => {
+    if (!stillOpen || openToken.current === stillOpen) return;
+    if (dismissed.current.has(stillOpen)) return;
+    openToken.current = stillOpen;
+    api
+      .openDissection(stillOpen)
+      .then((found) => {
+        if (found && openToken.current === stillOpen) setView(found);
+      })
+      .catch(() => {});
+  }, [stillOpen]);
 
   // A file asked about from Explorer or a notification.
   useEffect(() => {
@@ -360,6 +416,12 @@ export default function Downloads({ launches }: { launches: number }) {
       )}
       {page?.notifications && <div className="notice notice-warn">{page.notifications}</div>}
       {page?.folder_error && <div className="notice notice-down">{page.folder_error}</div>}
+      {page?.quarantine_error && (
+        <div className="notice notice-down">
+          What is in quarantine could not be read, so a download that is being held there is
+          not offered to be put back from its row. ({page.quarantine_error})
+        </div>
+      )}
       {page?.history_error && (
         <div className="notice notice-down">
           The history of checked downloads could not be read, so files below
@@ -378,7 +440,17 @@ export default function Downloads({ launches }: { launches: number }) {
           {running.progress ? (
             <ProgressBar
               progress={running.progress}
-              onStop={running.job ? () => void stopJob(running.job ?? "") : undefined}
+              onStop={
+                running.job
+                  ? () => {
+                      const job = running.job ?? "";
+                      // Taking apart is partly this program's own work, so it
+                      // has to be told as well as the agent.
+                      if (running.what === "dissect") void api.stopDissection(job).catch(() => {});
+                      else void stopJob(job);
+                    }
+                  : undefined
+              }
             />
           ) : (
             <p className="muted">Starting…</p>
@@ -398,6 +470,7 @@ export default function Downloads({ launches }: { launches: number }) {
           )}
           extraction={extraction}
           extracting={extracting}
+          error={panelError}
           onExtract={() => void extract()}
           onClose={() => void closeDissection()}
         />
@@ -431,10 +504,11 @@ export default function Downloads({ launches }: { launches: number }) {
                 record={row.record}
                 said={said[row.record.path.toLowerCase()]}
                 focused={focus === row.record.path.toLowerCase()}
-                busy={busy}
+                busy={busy || moving !== null}
                 onCheck={() => void check(row.record.path)}
                 onDissect={() => void dissect(row.record.path)}
                 onQuarantine={() => void quarantine(row.record.path)}
+                onPutBack={(id) => void putBack(row.record.path, id)}
               />
             ) : (
               <LooseRow
@@ -503,6 +577,7 @@ function RecordRow({
   onCheck,
   onDissect,
   onQuarantine,
+  onPutBack,
 }: {
   record: PageRecord;
   said: string | undefined;
@@ -511,6 +586,7 @@ function RecordRow({
   onCheck: () => void;
   onDissect: () => void;
   onQuarantine: () => void;
+  onPutBack: (id: string) => void;
 }) {
   const signer = signatureLabel(record.signature);
   const flaggedProgram =
@@ -611,6 +687,19 @@ function RecordRow({
           </PathLink>
         </div>
       )}
+      {/* Never a dead end: a file that is gone because it is being held in
+          quarantine can be put back from here, and then has its buttons again. */}
+      {!record.present && record.held && (
+        <div className="dl-actions">
+          <button className="ghost" onClick={() => onPutBack(record.held ?? "")} disabled={busy}>
+            Put it back
+          </button>
+          <span className="small muted">
+            It is in quarantine. Putting it back returns it to where it was
+            {record.archive === "zip" && ", where it can be taken apart again"}.
+          </span>
+        </div>
+      )}
     </li>
   );
 }
@@ -688,6 +777,7 @@ function DissectionPanel({
   record,
   extraction,
   extracting,
+  error,
   onExtract,
   onClose,
 }: {
@@ -695,6 +785,7 @@ function DissectionPanel({
   record: PageRecord | undefined;
   extraction: Extraction | null;
   extracting: boolean;
+  error: string | null;
   onExtract: () => void;
   onClose: () => void;
 }) {
@@ -719,9 +810,11 @@ function DissectionPanel({
       {dissection.original.quarantined && (
         <p className="small muted">
           Defender flagged it, so the original was quarantined before it was taken
-          apart. It can be put back from Cleanup for thirty days.
+          apart. It can be put back from its row below, or from Cleanup, for
+          thirty days.
         </p>
       )}
+      {view.record_problem && <p className="small held-warn wrap">{view.record_problem}</p>}
       {dissection.original.refused && (
         <p className="small held-warn wrap">
           The original could not be quarantined, so it is still where it was:{" "}
@@ -775,10 +868,16 @@ function DissectionPanel({
               : `Extract the ${fmt.count(totals.clean)} ${totals.clean === 1 ? "file" : "files"} Defender did not flag`}
           </button>
           <span className="small muted">
-            Into a new folder beside it in Downloads, named "{name.replace(/\.zip$/i, "")} (checked
-            by KAM)".
+            Into a new folder in your Downloads folder
+            {view.destination && <>, named "{view.destination}"</>}.
           </span>
         </div>
+      )}
+      {error && !extraction && (
+        <p className="small held-warn wrap">
+          Nothing was extracted: {error}. The archive is still open here, so this can be tried
+          again.
+        </p>
       )}
 
       {extraction && <ExtractionResult extraction={extraction} />}

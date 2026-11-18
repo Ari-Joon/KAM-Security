@@ -1122,14 +1122,41 @@ async fn quarantine_download(path: String) -> Result<Manifest, String> {
 
 /// Take a zip apart: a private copy, the original quarantined first when
 /// Defender flagged it, and every member with Defender's answer. Nothing is
-/// extracted until [`extract_clean`]. `None` when it was stopped.
+/// extracted until [`extract_clean`]. The answer says what became of the
+/// original whether or not it was stopped first.
 #[tauri::command]
 async fn dissect_archive(
     app: tauri::AppHandle,
     path: String,
     job: String,
-) -> Result<Option<downloads::DissectionView>, String> {
+) -> Result<downloads::Dissected, String> {
     off_the_window(move || downloads::dissect(&app, &path, &job)).await
+}
+
+/// Stop taking an archive apart, whichever half is doing the work.
+///
+/// The agent is told, as for any job, and so is this program: copying the
+/// archive and quarantining its original happen here, before the agent has
+/// heard of the job, and a stop sent only to the agent was accepted and then
+/// ignored until Defender was running.
+#[tauri::command]
+async fn stop_dissection(app: tauri::AppHandle, job: String) -> Result<(), String> {
+    off_the_window(move || {
+        app.state::<downloads::Downloads>().stop(&job);
+        // The job may not have reached the agent yet, or may have finished.
+        let _ = kam_ipc::client::call(&Request::CancelJob { job });
+        Ok(())
+    })
+    .await
+}
+
+/// The archive that is open, for a page that was left and has come back.
+#[tauri::command]
+async fn open_dissection(
+    app: tauri::AppHandle,
+    token: String,
+) -> Result<Option<downloads::DissectionView>, String> {
+    off_the_window(move || Ok(app.state::<downloads::Downloads>().view(&token))).await
 }
 
 /// Extract what Defender found nothing in, because the person said go.
@@ -1359,6 +1386,8 @@ pub fn run() {
             check_download,
             quarantine_download,
             dissect_archive,
+            stop_dissection,
+            open_dissection,
             extract_clean,
             discard_dissection,
             set_context_menu,

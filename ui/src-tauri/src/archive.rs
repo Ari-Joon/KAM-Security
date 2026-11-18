@@ -155,7 +155,7 @@ pub fn working_copy(
     working_copy_in(original, &work_folder(), keep_going)
 }
 
-fn working_copy_in(
+pub(crate) fn working_copy_in(
     original: &Path,
     folder: &Path,
     keep_going: &dyn Fn() -> bool,
