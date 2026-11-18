@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
 import PathLink from "../components/PathLink";
+import MeasuredAt from "../components/MeasuredAt";
 import type {
   AppFootprint,
   ApplicationReport,
@@ -297,6 +298,8 @@ const NO_BOX = { flex: "none", width: 13 } as const;
 export default function Applications({ volumes, onMeasured }: Props) {
   const [drive, setDrive] = useState("C:\\");
   const [report, setReport] = useState<ApplicationReport | null>(null);
+  /** When the measurement on screen arrived, by this window's clock. */
+  const [measuredAt, setMeasuredAt] = useState(0);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
@@ -364,6 +367,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
     try {
       const measured = await api.applications(drive);
       setReport(measured);
+      setMeasuredAt(Date.now());
       setPreview(null);
     } catch (cause) {
       setError(reason(cause));
@@ -919,6 +923,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
                 </span>
               </div>
             )}
+            {report && <MeasuredAt at={measuredAt} />}
           </div>
         )}
       </section>

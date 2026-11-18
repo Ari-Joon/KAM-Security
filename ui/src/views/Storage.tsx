@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Treemap from "../components/Treemap";
 import FileRow from "../components/FileRow";
+import MeasuredAt from "../components/MeasuredAt";
 import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
 import type { Scan, TreeNode, Volume } from "../lib/types";
@@ -14,6 +15,8 @@ type Props = {
 export default function Storage({ volumes, initialRoot, onScanned }: Props) {
   const [target, setTarget] = useState(initialRoot ?? "C:\\");
   const [scan, setScan] = useState<Scan | null>(null);
+  /** When the scan on screen arrived, by this window's clock. */
+  const [scannedAt, setScannedAt] = useState(0);
   const [running, setRunning] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -53,6 +56,7 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
     try {
       const result = await api.scan(target);
       setScan(result);
+      setScannedAt(Date.now());
       setTrail([result.tree]);
     } catch (cause) {
       setError(reason(cause));
@@ -175,6 +179,9 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
               <span className="stat-label">Took</span>
               <span className="stat-value">{fmt.duration(scan.elapsed_ms)}</span>
             </div>
+            {/* "Drive" beside it is refreshed every few seconds and this scan
+                is not, so the scan says how old it is. */}
+            <MeasuredAt at={scannedAt} />
             <div className="stat">
               <span className="stat-label">Unreadable</span>
               <span className="stat-value">{fmt.count(scan.unreadable)}</span>

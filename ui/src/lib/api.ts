@@ -8,6 +8,7 @@ import type {
   CheckFinding,
   Cleared,
   DefenderReport,
+  DuplicateGroup,
   DuplicateReport,
   Manifest,
   MoveRecord,
@@ -58,6 +59,13 @@ export const api = {
   applicationsPreview: () => invoke<AppFootprint[]>("list_applications_preview"),
   duplicates: (drive: string, job: string) =>
     invoke<DuplicateReport | null>("find_duplicates", { drive, job }),
+  /**
+   * A set of identical files as it stands once one copy has gone, or null
+   * when one file is all that is left. Worked out in the shell by the code
+   * that judged the set, so its figures and sentences stay true.
+   */
+  duplicateSetWithout: (group: DuplicateGroup, path: string) =>
+    invoke<DuplicateGroup | null>("duplicate_set_without", { group, path }),
   defenderStatus: () => invoke<DefenderReport>("defender_status"),
   defenderThreats: () => invoke<Threat[]>("defender_threats"),
   behaviourEvents: () => invoke<BehaviourReport>("behaviour_events"),

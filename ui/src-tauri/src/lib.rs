@@ -210,6 +210,17 @@ struct DuplicateReport {
     summary: DuplicateSummary,
 }
 
+/// A set of identical files as it stands once one copy has gone, or nothing
+/// when one file is all that is left of it.
+///
+/// Worked out here, by the code that judged the set to begin with, so the page
+/// never does this arithmetic a second way. It answers from what it is given
+/// and touches nothing, which is why it does not go to the agent.
+#[tauri::command]
+fn duplicate_set_without(group: DuplicateGroup, path: String) -> Option<DuplicateGroup> {
+    kam_storage::duplicates::without(&group, &path)
+}
+
 /// Ask Windows Defender to scan, and bring back what it found.
 ///
 /// Runs in the agent because `MpCmdRun` wants to be LocalSystem, and streams
@@ -1352,6 +1363,7 @@ pub fn run() {
             list_applications,
             list_applications_preview,
             find_duplicates,
+            duplicate_set_without,
             defender_scan,
             defender_status,
             defender_threats,

@@ -11,6 +11,7 @@ import ReclaimMap, {
 import { GridLegend } from "../components/StateGrid";
 import FileRow from "../components/FileRow";
 import PathLink from "../components/PathLink";
+import MeasuredAt from "../components/MeasuredAt";
 import type {
   AccessTimes,
   Cache,
@@ -27,7 +28,6 @@ import type {
   Proposal,
   Manifest,
   Orphan,
-  OrphanSummary,
   Volume,
 } from "../lib/types";
 
@@ -46,14 +46,18 @@ type Props = { volumes: Volume[]; onChanged: () => void };
  */
 type DupeSet = DuplicateGroup & { id: string; suggestedPath: string | null };
 
+/** The agent's suggested keeper, as a path. */
+function suggestedPathOf(group: DuplicateGroup): string | null {
+  return group.suggested_keep === null
+    ? null
+    : (group.copies[group.suggested_keep]?.path ?? null);
+}
+
 function asSets(groups: DuplicateGroup[]): DupeSet[] {
   return groups.map((group, index) => ({
     ...group,
     id: group.copies[0]?.path ?? `set-${index}`,
-    suggestedPath:
-      group.suggested_keep === null
-        ? null
-        : (group.copies[group.suggested_keep]?.path ?? null),
+    suggestedPath: suggestedPathOf(group),
   }));
 }
 
@@ -258,11 +262,24 @@ function OrphanRow({
 export default function Cleanup({ volumes, onChanged }: Props) {
   const [drive, setDrive] = useState("C:\\");
   const [orphans, setOrphans] = useState<Orphan[] | null>(null);
-  const [summary, setSummary] = useState<OrphanSummary | null>(null);
   const [downloads, setDownloads] = useState<Download[] | null>(null);
   const [downloadSummary, setDownloadSummary] = useState<DownloadSummary | null>(null);
   const [duplicates, setDuplicates] = useState<DupeSet[] | null>(null);
   const [duplicateSummary, setDuplicateSummary] = useState<DuplicateSummary | null>(null);
+  /**
+   * When each search on this page last answered, by this window's clock.
+   *
+   * The lists below shrink as things are removed and the figures above them
+   * are worked out from what is left, so those stay true. What cannot stay
+   * true by itself is the search: a folder that has grown since, or a copy
+   * made since, is not here until somebody looks again. So each says when.
+   */
+  const [foundAt, setFoundAt] = useState(0);
+  const [duplicatesAt, setDuplicatesAt] = useState(0);
+  const [cachesAt, setCachesAt] = useState(0);
+  /** The sets as they are now, for a removal that finishes after a redraw. */
+  const duplicatesNow = useRef<DupeSet[] | null>(null);
+  duplicatesNow.current = duplicates;
   const [findingDuplicates, setFindingDuplicates] = useState(false);
   const [duplicateProgress, setDuplicateProgress] = useState<Progress | null>(null);
   const [duplicateJob, setDuplicateJob] = useState<string | null>(null);
@@ -400,16 +417,15 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     try {
       const report = await api.applications(drive);
       setOrphans(report.orphans);
-      setSummary(report.orphan_summary);
       setDownloads(report.downloads);
       setDownloadSummary(report.download_summary);
+      setFoundAt(Date.now());
     } catch (cause) {
       setError(reason(cause));
       // Everything this run would have replaced goes, the totals included.
       // The totals stayed, so a failed re-run left the last run's numbers on
       // screen as though they were this one's.
       setOrphans(null);
-      setSummary(null);
       setDownloads(null);
       setDownloadSummary(null);
     } finally {
@@ -503,6 +519,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       }
       setDuplicates(asSets(result.groups));
       setDuplicateSummary(result.summary);
+      setDuplicatesAt(Date.now());
     } catch (cause) {
       setError(reason(cause));
       // The summary feeds the stat row and the block on the map, and both went
@@ -548,6 +565,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     setError(null);
     try {
       setCaches(await api.caches());
+      setCachesAt(Date.now());
     } catch (cause) {
       setError(reason(cause));
       // Same as the other searches: a failed measurement does not leave the
@@ -586,6 +604,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       // checked.
       try {
         setCaches(await api.caches());
+        setCachesAt(Date.now());
       } catch (cause) {
         // The clear happened; the figures from before it are now wrong, so
         // they go rather than stay.
@@ -598,6 +617,53 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       setClearingCache(null);
       onChanged();
     }
+  }
+
+  /**
+   * Take a copy that has gone out of its set, and settle the set again.
+   *
+   * The set kept every figure the search had sent. With one of three copies
+   * removed it still said "All 3 copies are in folders of yours" and still
+   * counted two copies' worth as reclaimable, and the totals above the list
+   * and the block on the map, which were the search's own summary, never
+   * moved at all.
+   *
+   * The shell settles the set from the copies that are left, with the code
+   * that judged it to begin with, so the arithmetic exists in one place. The
+   * set keeps its id, and with it the person's own pick of keeper.
+   */
+  async function dropCopy(path: string) {
+    const set = duplicatesNow.current?.find((group) =>
+      group.copies.some((copy) => copy.path === path),
+    );
+    if (!set) return;
+
+    // Null is an answer: one file is all that is left, which is not a set.
+    let settled: DuplicateGroup | null = null;
+    try {
+      settled = await api.duplicateSetWithout(set, path);
+    } catch (cause) {
+      // The copy has gone whether or not the set could be settled again. A
+      // set that cannot be settled leaves the list with it, because the only
+      // figures there are for it describe a copy that is no longer there.
+      setCaution(
+        `${path} was removed. The set it belonged to could not be worked out ` +
+          `again (${reason(cause)}), so it is no longer listed. Find duplicates ` +
+          `again to see what is left of it.`,
+      );
+    }
+
+    const next = settled;
+    setDuplicates((current) =>
+      current
+        ? current.flatMap((group): DupeSet[] => {
+            if (group.id !== set.id) return [group];
+            return next === null
+              ? []
+              : [{ ...next, id: group.id, suggestedPath: suggestedPathOf(next) }];
+          })
+        : current,
+    );
   }
 
   /**
@@ -627,17 +693,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       setNote(
         `Held ${fmt.bytes(bytes)}: ${path}. It is in quarantine below and can be put back for 30 days.`,
       );
-      setDuplicates((current) =>
-        current
-          ? current
-              .map((group) => ({
-                ...group,
-                copies: group.copies.filter((copy) => copy.path !== path),
-              }))
-              // A set with one copy left is not a set any more.
-              .filter((group) => group.copies.length > 1)
-          : current,
-      );
+      await dropCopy(path);
       await loadQuarantine();
     } catch (cause) {
       setError(reason(cause));
@@ -666,16 +722,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         `Sent ${fmt.bytes(bytes)} to the Recycle Bin: ${path}`,
         `${path} was removed but did not reach the Recycle Bin.`,
       );
-      setDuplicates((current) =>
-        current
-          ? current
-              .map((group) => ({
-                ...group,
-                copies: group.copies.filter((copy) => copy.path !== path),
-              }))
-              .filter((group) => group.copies.length > 1)
-          : current,
-      );
+      await dropCopy(path);
     } catch (cause) {
       setError(
         `${reason(cause)}. If this copy is not yours to delete, hold it instead ` +
@@ -831,6 +878,33 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const active = held.filter((item) => !item.restored);
 
   /**
+   * What the lists on screen come to, now.
+   *
+   * These were the totals each search sent with its answer, and nothing
+   * touched them afterwards. Remove every duplicate copy and the map still
+   * drew "Duplicate copies" at full size; quarantine a leftover and "Found"
+   * and "Holding" still counted it. A block whose area is a number from
+   * before the last press is not a measurement of anything. So they are added
+   * up from what is still listed, every time the page draws.
+   */
+  const leftoversNow = orphans && {
+    found: orphans.length,
+    total_bytes: orphans.reduce((sum, orphan) => sum + orphan.bytes, 0),
+    confident_bytes: orphans
+      .filter((orphan) => orphan.confidence === "high")
+      .reduce((sum, orphan) => sum + orphan.bytes, 0),
+  };
+  const duplicatesStanding = duplicates && {
+    groups: duplicates.length,
+    wasted_bytes: duplicates.reduce((sum, group) => sum + group.wasted_bytes, 0),
+    reclaimable_bytes: duplicates.reduce(
+      (sum, group) => sum + group.reclaimable_bytes,
+      0,
+    ),
+    actionable: duplicates.filter((group) => group.verdict === "choose").length,
+  };
+
+  /**
    * Everything measured, as one picture with area meaning bytes.
    *
    * Built from whatever has actually been measured rather than from what could
@@ -883,14 +957,14 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       })),
     });
   }
-  if (duplicateSummary && duplicateSummary.reclaimable_bytes > 0) {
+  if (duplicatesStanding && duplicatesStanding.reclaimable_bytes > 0) {
     reclaim.push({
       // No single folder holds these, so a click goes to the list of them.
       key: "duplicates",
       label: "Duplicate copies",
-      bytes: duplicateSummary.reclaimable_bytes,
+      bytes: duplicatesStanding.reclaimable_bytes,
       reversal: "quarantine",
-      detail: `${fmt.count(duplicateSummary.actionable)} ${duplicateSummary.actionable === 1 ? "set" : "sets"} you can choose between`,
+      detail: `${fmt.count(duplicatesStanding.actionable)} ${duplicatesStanding.actionable === 1 ? "set" : "sets"} you can choose between`,
     });
   }
 
@@ -984,20 +1058,23 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           </div>
         )}
 
-        {summary && (
+        {leftoversNow && (
           <div className="stat-row tight">
             <div className="stat">
               <span className="stat-label">Found</span>
-              <span className="stat-value">{fmt.count(summary.found)}</span>
+              <span className="stat-value">{fmt.count(leftoversNow.found)}</span>
             </div>
             <div className="stat">
               <span className="stat-label">Holding</span>
-              <span className="stat-value">{fmt.bytes(summary.total_bytes)}</span>
+              <span className="stat-value">{fmt.bytes(leftoversNow.total_bytes)}</span>
             </div>
             <div className="stat">
               <span className="stat-label">Very likely leftover</span>
-              <span className="stat-value">{fmt.bytes(summary.confident_bytes)}</span>
+              <span className="stat-value">
+                {fmt.bytes(leftoversNow.confident_bytes)}
+              </span>
             </div>
+            <MeasuredAt at={foundAt} />
           </div>
         )}
       </section>
@@ -1208,29 +1285,29 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           />
         )}
 
-        {duplicateSummary && (
+        {duplicateSummary && duplicatesStanding && (
           <div className="stat-row tight">
             <div className="stat">
               <span className="stat-label">Sets</span>
-              <span className="stat-value">{fmt.count(duplicateSummary.groups)}</span>
+              <span className="stat-value">{fmt.count(duplicatesStanding.groups)}</span>
             </div>
             <div className="stat">
               <span className="stat-label">Duplicated</span>
               <span className="stat-value">
-                {fmt.bytes(duplicateSummary.wasted_bytes)}
+                {fmt.bytes(duplicatesStanding.wasted_bytes)}
               </span>
             </div>
             <div className="stat">
               <span className="stat-label">You can reclaim</span>
               <span className="stat-value strong">
-                {fmt.bytes(duplicateSummary.reclaimable_bytes)}
+                {fmt.bytes(duplicatesStanding.reclaimable_bytes)}
               </span>
             </div>
             <div className="stat">
               <span className="stat-label">Worth a look</span>
               <span className="stat-value">
-                {fmt.count(duplicateSummary.actionable)}{" "}
-                {duplicateSummary.actionable === 1 ? "set" : "sets"}
+                {fmt.count(duplicatesStanding.actionable)}{" "}
+                {duplicatesStanding.actionable === 1 ? "set" : "sets"}
               </span>
             </div>
             <div className="stat">
@@ -1239,6 +1316,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                 {fmt.duration(duplicateSummary.elapsed_ms)}
               </span>
             </div>
+            <MeasuredAt at={duplicatesAt} />
           </div>
         )}
 
@@ -1518,6 +1596,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                   )}
                 </span>
               </div>
+              <MeasuredAt at={cachesAt} />
             </div>
 
             <ul className="caches">

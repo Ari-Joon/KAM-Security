@@ -312,7 +312,7 @@ fn keep_rank(copy: &FileCopy) -> (u8, usize) {
 
 /// Judge a set of identical files.
 fn judge(bytes: u64, paths: Vec<String>, user: &UserContext) -> DuplicateGroup {
-    let mut copies: Vec<FileCopy> = paths
+    let copies: Vec<FileCopy> = paths
         .into_iter()
         .map(|path| {
             let owner = owner_of(&path, user);
@@ -323,6 +323,34 @@ fn judge(bytes: u64, paths: Vec<String>, user: &UserContext) -> DuplicateGroup {
             }
         })
         .collect();
+    settle(bytes, copies)
+}
+
+/// A set as it stands once one of its copies has gone.
+///
+/// The page holds a set after the search that found it, and removes copies
+/// from it one at a time. It used to keep every figure the search had sent, so
+/// a set of three with one removed still said "All 3 copies are in folders of
+/// yours" and still counted two copies' worth as reclaimable, and the totals
+/// above the list and the block on the map never moved at all.
+///
+/// So the set is settled again from the copies that remain, by the code that
+/// settled it the first time. Who owns each copy is a fact about where it sits
+/// and has not changed, so nothing is looked up again.
+///
+/// `None` when fewer than two copies remain: one file is not a set.
+pub fn without(group: &DuplicateGroup, gone: &str) -> Option<DuplicateGroup> {
+    let remaining: Vec<FileCopy> = group
+        .copies
+        .iter()
+        .filter(|copy| copy.path != gone)
+        .cloned()
+        .collect();
+    (remaining.len() > 1).then(|| settle(group.bytes, remaining))
+}
+
+/// Work out what a set of copies comes to: which to keep, what can go, and why.
+fn settle(bytes: u64, mut copies: Vec<FileCopy>) -> DuplicateGroup {
     copies.sort_by_key(keep_rank);
 
     let total = copies.len();
@@ -1691,6 +1719,75 @@ mod tests {
         );
         assert_eq!(group.wasted_bytes, 3_000_000_000);
         assert_eq!(group.reclaimable_bytes, 0);
+    }
+
+    /// Removing a copy changes what the set says about itself.
+    ///
+    /// The page kept every figure from the search, so after one of three
+    /// copies went the set still read "All 3 copies" and still counted two
+    /// copies' worth as reclaimable.
+    #[test]
+    fn a_set_with_one_copy_gone_counts_and_describes_the_copies_that_are_left() {
+        let group = judged(
+            2_000_000_000,
+            &[
+                r"C:\Users\someone\Documents\film.mkv",
+                r"C:\Users\someone\Downloads\film.mkv",
+                r"C:\Users\someone\Desktop\film.mkv",
+            ],
+        );
+        assert_eq!(group.wasted_bytes, 4_000_000_000);
+        assert_eq!(group.reclaimable_bytes, 4_000_000_000);
+        assert!(group.reasons[0].starts_with("All 3 copies"));
+
+        let left = without(&group, r"C:\Users\someone\Downloads\film.mkv").unwrap();
+        assert_eq!(left.copies.len(), 2);
+        assert_eq!(left.wasted_bytes, 2_000_000_000);
+        assert_eq!(left.reclaimable_bytes, 2_000_000_000);
+        assert_eq!(left.verdict, Verdict::Choose);
+        assert!(
+            left.reasons[0].starts_with("All 2 copies"),
+            "the reason still counts a copy that has gone: {:?}",
+            left.reasons
+        );
+        assert!(left
+            .copies
+            .iter()
+            .all(|copy| copy.path != r"C:\Users\someone\Downloads\film.mkv"));
+    }
+
+    #[test]
+    fn removing_the_only_spare_copy_leaves_nothing_to_reclaim() {
+        // Two programs each keep the file and one copy was the person's own.
+        // Once theirs has gone, what is left is two programs' own copies.
+        let group = judged(
+            500_000_000,
+            &[
+                r"C:\Program Files\One\runtime.bin",
+                r"C:\Program Files\Two\runtime.bin",
+                r"C:\Users\someone\Downloads\runtime.bin",
+            ],
+        );
+        assert_eq!(group.reclaimable_bytes, 500_000_000);
+        assert_eq!(group.verdict, Verdict::Choose);
+
+        let left = without(&group, r"C:\Users\someone\Downloads\runtime.bin").unwrap();
+        assert_eq!(left.wasted_bytes, 500_000_000);
+        assert_eq!(left.reclaimable_bytes, 0);
+        assert_eq!(left.verdict, Verdict::Deliberate);
+        assert_eq!(left.suggested_keep, None);
+    }
+
+    #[test]
+    fn one_file_left_is_not_a_set() {
+        let group = judged(
+            10_000_000,
+            &[
+                r"C:\Users\someone\Documents\a.bin",
+                r"C:\Users\someone\Downloads\a.bin",
+            ],
+        );
+        assert!(without(&group, r"C:\Users\someone\Downloads\a.bin").is_none());
     }
 
     #[test]
