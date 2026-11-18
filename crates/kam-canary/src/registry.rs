@@ -63,7 +63,7 @@ pub struct RegistryDecoy {
 /// Whether registry decoys are planted at all.
 ///
 /// On again, after ten weeks off. The story is worth keeping, because the
-/// wrong conclusion was drawn from true observations.
+/// wrong conclusion was drawn from true observations, and then a second one.
 ///
 /// What was observed on 7 September 2026, on a machine where the file canaries
 /// work perfectly:
@@ -83,14 +83,32 @@ pub struct RegistryDecoy {
 /// never read, and a canary that is never read is a line in the interface
 /// claiming protection that does not exist.
 ///
-/// Switching it off was right. The explanation was wrong. The keys were there,
-/// and then they were deleted, by this crate's own tests: see [`decoys`]. Each
-/// observation above was true at the moment it was made.
+/// Switching it off was right on that evidence. The explanation was wrong, and
+/// so was the one that replaced it when the flag came back on, that this
+/// crate's tests were deleting the keys. The keys were there the whole time.
+/// The third observation was true only of the place it was made from.
+///
+/// Every tool that reported them missing had been started from one terminal,
+/// and that terminal belonged to a desktop app installed as an MSIX package.
+/// Windows gave that app, and everything started from it, a private view of
+/// the person's hive: what those processes wrote or deleted was kept in the
+/// package's own store and never reached the real registry. This crate's tests
+/// had been run from that terminal, planting and removing keys at the
+/// product's own paths (see [`decoys`]). In reality that touched nothing. In
+/// the terminal's private view it left exactly those paths marked as deleted,
+/// so every later look from there found nothing, while the agent, the kernel
+/// and any program the person started for themselves saw the keys.
+///
+/// It was settled on 18 November 2026 by running the same `reg query` twice,
+/// once from that terminal and once from a process started outside it.
+/// Outside: all three decoys, with their values and their marker. Inside:
+/// none of them, although a key made outside under a new name beside them
+/// showed up inside at once, which leaves only the names the tests had removed.
 ///
 /// The flag stays as the one switch that turns the planting off again, should
-/// a decoy ever be reported planted while `reg.exe` run as the same person
-/// cannot see it. That check, by a program that shares no code with this one,
-/// is the only evidence that counts.
+/// a decoy ever be reported planted while `reg.exe` cannot see it. That check
+/// counts only when the same person runs it from a terminal they opened
+/// themselves. One inside a packaged app answers a different question.
 pub const REGISTRY_DECOYS_ENABLED: bool = true;
 
 /// The decoys, and why each path is the one a thief reads.
@@ -136,20 +154,21 @@ pub const REGISTRY_DECOYS: &[RegistryDecoy] = &[
 /// The decoys this build plants.
 ///
 /// In the shipped program that is [`REGISTRY_DECOYS`]. In this crate's own
-/// tests it is a set of scratch keys under `Software\KAM Security\Tests`, and
-/// that difference is the whole explanation of the keys that vanished in
-/// September 2026.
+/// tests it is a set of scratch keys under `Software\KAM Security\Tests`.
 ///
 /// A hive is not a directory. The tests can give themselves a scratch profile
 /// for the file decoys, but every registry path is in the real hive of whoever
-/// runs them. They used the product's own paths: they planted "their" decoys,
-/// removed them, and asserted that none survived. On a machine where the
-/// product is installed for the same account, those are the product's decoys.
-/// Every run of the test suite deleted what the agent had planted. The agent's
-/// checks agreed the keys were there because, when it made them, they were,
-/// and a test run later `reg.exe` could not find them. The parent keys on the
-/// machine where it happened were last written in the second a test run
-/// finished.
+/// runs them. They used to use the product's own paths: they planted "their"
+/// decoys, removed them, and asserted that none survived. On a machine where
+/// the product is installed for the same account, those are the product's
+/// decoys, and a test run from an ordinary terminal deletes what the agent
+/// planted.
+///
+/// That is not what happened to the keys that could not be found in September
+/// 2026, though it was taken for it. Those test runs were inside a packaged
+/// app's private view of the hive and never reached the real keys: the note on
+/// [`REGISTRY_DECOYS_ENABLED`] has the story. It is how that private view came
+/// to hide them, and from any other terminal the deletion would have been real.
 ///
 /// So a test build gets keys of its own, named for the process so that two
 /// runs at once cannot remove each other's, and a test fails if one is ever
@@ -569,6 +588,13 @@ mod tests {
     ///
     /// So this one asks a program that shares no code with us. `reg.exe` is the
     /// same tool a person would check with, which is the point.
+    ///
+    /// What it cannot catch is what that bug turned out to be. The `reg.exe`
+    /// started here is this process's child and is shown whatever registry
+    /// this process is shown, so if the tests run somewhere Windows gives a
+    /// private view of the hive, the two agree inside it. Whether a key the
+    /// agent planted can be seen by the person is a question for a terminal
+    /// the person opened themselves: see [`REGISTRY_DECOYS_ENABLED`].
     ///
     /// It used to run only when handed a SID. It now runs every time: through
     /// `HKEY_USERS\<sid>` when the caller says who they are, which is the
