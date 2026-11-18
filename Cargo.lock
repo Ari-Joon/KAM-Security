@@ -2711,6 +2711,7 @@ dependencies = [
  "kam-storage",
  "serde",
  "serde_json",
+ "tauri-winres",
  "tracing",
  "tracing-subscriber",
  "windows",

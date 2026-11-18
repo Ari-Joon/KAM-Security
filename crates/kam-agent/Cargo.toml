@@ -25,5 +25,11 @@ tracing-subscriber = { workspace = true }
 windows = { workspace = true }
 windows-service = "0.8.1"
 
+# Build time only: embeds the icon and the description the service shows in
+# Task Manager. It is the crate Tauri's own build step uses for the window, so
+# it is already in the lockfile, and none of it is linked into the agent.
+[build-dependencies]
+tauri-winres = "0.3"
+
 [lints]
 workspace = true
