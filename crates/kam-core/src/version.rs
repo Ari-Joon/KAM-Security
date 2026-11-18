@@ -137,9 +137,30 @@ unsafe fn string_value(block: &[u8], language: &str, name: &str) -> Option<Strin
     // is checked rather than taken.
     let count = fits::<u16>(block, value, length)?;
     let characters = unsafe { std::slice::from_raw_parts(value as *const u16, count) };
-    let text = String::from_utf16_lossy(characters);
-    let text = text.trim_end_matches('\0').trim().to_owned();
+    let text = terminated(characters);
     (!text.is_empty()).then_some(text)
+}
+
+/// The text up to its terminator, whatever length the resource claimed.
+///
+/// A string value is NUL-terminated inside the block, and the length that
+/// comes back is meant to count the characters up to that terminator. Some
+/// resource compilers write the length in bytes instead, so twice as many
+/// characters are reported and the read runs on through the terminator into
+/// the header of the next record. `NVIDIA Overlay.exe` does exactly this: the
+/// Firewall page showed its description as "NVIDIA App", two NULs, three
+/// characters of the next record's header and then "FileVer", and its company
+/// the same way. Only trailing NULs were being trimmed, which assumes an
+/// honest length. `fits` keeps such a read inside the block; this keeps it
+/// inside the string.
+fn terminated(characters: &[u16]) -> String {
+    let end = characters
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(characters.len());
+    String::from_utf16_lossy(&characters[..end])
+        .trim()
+        .to_owned()
 }
 
 /// Read what a file says about itself.
@@ -269,6 +290,25 @@ mod tests {
             None,
             "a pointer from somewhere else was accepted"
         );
+    }
+
+    /// A length written in bytes must not carry the next record in with it.
+    #[test]
+    fn a_string_stops_at_its_terminator_whatever_length_was_claimed() {
+        // What `NVIDIA Overlay.exe` hands back for its description: the text,
+        // its terminator and padding, then the start of the record after it.
+        let mut characters: Vec<u16> = "NVIDIA App".encode_utf16().collect();
+        characters.extend([0, 0, 0x38, 0x18, 0x01]);
+        characters.extend("FileVer".encode_utf16());
+        assert_eq!(terminated(&characters), "NVIDIA App");
+
+        // An honest length ends on the terminator, and a value with no
+        // terminator at all is taken whole.
+        let honest: Vec<u16> = "Notepad\0".encode_utf16().collect();
+        assert_eq!(terminated(&honest), "Notepad");
+        let bare: Vec<u16> = "Notepad".encode_utf16().collect();
+        assert_eq!(terminated(&bare), "Notepad");
+        assert_eq!(terminated(&[0, 0x41]), "");
     }
 
     #[test]
