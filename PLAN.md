@@ -32,8 +32,9 @@ engine that answers questions Windows already knows the answers to but never sur
   layer. We manage Defender Firewall's ruleset and observe traffic; we do not displace it.
 
 ### Non-negotiable product rules
-1. **Nothing is ever deleted.** Everything moves to quarantine with a 30-day undo and a
-   reversible manifest.
+1. **Nothing is deleted without a way back first.** Everything moves to quarantine with a
+   30-day undo and a reversible manifest, and is deleted for good only when the 30 days
+   are up.
 2. **No scareware.** No red badges, no inflated issue counts, no "47 problems found!"
    Findings are ranked by evidence and shown with the reasoning that produced them.
 3. **Every privileged action is logged** to an append-only audit log the user can read.
@@ -227,8 +228,8 @@ code.
 
 One store, shared by every module. A quarantined item records: original path, ACLs,
 timestamps, hash, reason, and the finding that triggered it. Restore is exact. Retention
-30 days, then a purge the user must confirm. Deleting files is never the default path in
-any module.
+30 days, shown counting down on each item, after which the service deletes the item for
+good and records that it did. Deleting files is never the default path in any module.
 
 ---
 

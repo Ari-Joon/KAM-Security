@@ -152,9 +152,11 @@ screen.
 
 ## Design rules
 
-1. Reversible first. Cleanup moves things to a thirty-day quarantine or to the
-   Recycle Bin. Deleting for good is a separate step you ask for, and clearing
-   a cache that costs something says what it costs first.
+1. Reversible first. Cleanup moves things to quarantine or to the Recycle Bin.
+   Quarantine puts a thing back with one press for thirty days and then deletes
+   it for good, and each item says how long it has left. Deleting sooner is a
+   separate step you ask for, and clearing a cache that costs something says
+   what it costs first.
 2. No scareware. No inflated issue counts, no alarming defaults.
 3. Every privileged action is written to an audit log the user can read, and the
    database rejects updates and deletes so it cannot be quietly rewritten.
@@ -541,21 +543,30 @@ a person who finds one in their own PuTTY list can tell at a glance it is not
 theirs. A stealer enumerates every session under those paths rather than opening
 one by name, so a decoy does not need to deceive anybody to be found.
 
-**This half is switched off, and the reason is worth reading.** On the machine it
-was built on, the agent creates the keys and every check it makes agrees they are
-there: the create call succeeds, the key reopens, the marker value reads back,
-and the kernel writes audit events for successful opens of those exact paths.
-Nothing else on the machine can see them. `reg.exe`, `Test-Path` and .NET's
-`OpenSubKey` all report the leaf missing, and `OpenSubKey` returns null rather
-than throwing, so it is genuinely "not found" rather than a permissions problem.
+**This half spent ten weeks switched off, and the reason is worth reading.** On
+the machine it was built on, the agent created the keys and every check it made
+agreed they were there: the create call succeeded, the key reopened, the marker
+value read back, and the kernel wrote audit events for successful opens of those
+exact paths. Yet `reg.exe`, `Test-Path` and .NET's `OpenSubKey` all reported the
+leaf missing, and `OpenSubKey` returned null rather than throwing, so it was
+"not found" rather than a permissions problem.
 
-The cause is not understood. The consequence is: if the account's own tools
-cannot see the key, an infostealer running as that account cannot see it either,
-so the decoy would never be read. A canary that is never read is not protection.
-It is a line in the interface claiming protection that does not exist, which is
-worse than the feature being absent, because it stops somebody looking further.
-So planting is held behind one flag while the disappearing keys are explained.
-The file canaries above are unaffected and verified working.
+If the account's own tools cannot see a key, an infostealer running as that
+account cannot see it either, so the decoy would never be read. A canary that is
+never read is not protection. It is a line in the interface claiming protection
+that does not exist, which is worse than the feature being absent, because it
+stops somebody looking further. So planting was held behind one flag until the
+disappearing keys were explained.
+
+The keys had never disappeared. Every tool that reported them missing had been
+started from the same terminal, and that terminal belonged to a desktop app
+installed as an MSIX package. Windows gives a packaged app, and everything
+started from it, a private view of the registry, and in that view those paths
+had been marked deleted by this project's own tests, which had been run from the
+same terminal. The same query from a process started outside the app showed all
+three decoys, and the Decoys panel reported the read a moment later, naming
+`reg.exe`. Every observation had been true. The mistake was taking the view
+from one place for the state of the machine. Registry decoys are on.
 
 The rules it holds itself to are worth stating, because the decoy paths are
 deliberately chosen to look like things people really keep:

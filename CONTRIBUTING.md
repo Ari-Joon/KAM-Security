@@ -69,9 +69,10 @@ Pull requests for these will be declined regardless of quality:
 - **GPL dependencies**, including libclamav. `cargo deny` enforces this; the
   project ships under Apache-2.0 and is staying permissive.
 - **Anything that deletes by default.** Everything destructive starts out
-  reversible, in quarantine for thirty days or in the Recycle Bin. Deleting for
-  good is a separate step the person asks for. Clearing a cache is the one
-  exception, and it says what it costs before it runs.
+  reversible, in quarantine or in the Recycle Bin. Quarantine keeps a thing for
+  thirty days, says on each item how long is left, and only then deletes it for
+  good. Deleting sooner is a separate step the person asks for. Clearing a
+  cache is the one exception, and it says what it costs before it runs.
 - **Scareware patterns**: inflated issue counts, alarming red states by
   default, "your PC is at risk" language.
 
