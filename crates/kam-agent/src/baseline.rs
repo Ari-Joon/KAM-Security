@@ -232,12 +232,17 @@ pub fn readings() -> Vec<Reading> {
         ),
         // 2: a service that runs inside svchost.exe is recorded as the file
         // it loads there. It was recorded as svchost.exe.
+        // 3: the copies Windows makes of a per-account service at each
+        // sign-in are recorded as that one service. Each was recorded under
+        // the name it had that day.
         Reading::of(
             kind_of(Anchor::Service),
-            2,
+            3,
             "Services are looked at more closely from this version on: for one that runs \
-             inside svchost.exe, what is recorded is the file it loads there. So this time \
-             services were recorded as they are, and not compared with last time.",
+             inside svchost.exe, what is recorded is the file it loads there, and the copies \
+             Windows makes of its per-account services at each sign-in are recorded as the \
+             one service they are copies of. So this time services were recorded as they \
+             are, and not compared with last time.",
         ),
         Reading::of(
             kind_of(Anchor::ScheduledTask),

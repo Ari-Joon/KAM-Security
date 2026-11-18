@@ -984,6 +984,9 @@ fn read_services_in(survey: &mut Survey, root: &registry::Key) {
     // are different concerns, so it does both.
     let mut refused: Vec<String> = Vec::new();
     let hosts = service_hosts();
+    // The keys already made into an entry, by name, so that a per-account
+    // service is one entry however many copies of it there are today.
+    let mut filed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for name in listing.names {
         let service = match root.look_child(&name) {
@@ -1038,81 +1041,40 @@ fn read_services_in(survey: &mut Survey, root: &registry::Key) {
             }
         };
 
-        // The key opened, so a failure here is a failure to read a value in a
-        // key that is there -- not a service without an image. `refused`
-        // counted failed key opens only, which left this one level down from
-        // the counter added to catch it.
-        let image = match service.read_string("ImagePath") {
-            Ok(Some(image)) => image,
-            // A service set to start itself with nothing to run is a
-            // contradiction rather than an ordinary absence: the SCM keeps a
-            // running service's configuration cached, so removing or retyping
-            // `ImagePath` after it starts hides it from this reader without
-            // stopping it. Reached only after `Start` said it starts itself,
-            // which is what makes the absence worth reporting here and not two
-            // values earlier.
-            Ok(None) => {
-                refused.push(format!(r"{SERVICES}\{name}"));
-                continue;
-            }
-            Err(_) => {
-                refused.push(format!(r"{SERVICES}\{name}"));
-                continue;
-            }
-        };
-
-        let mut found = entry(
-            service
-                .string("DisplayName")
-                .map(|display| kam_core::mui::resolve(&display, &name))
-                .unwrap_or_else(|| name.clone()),
-            Anchor::Service,
-            format!(r"HKLM\SYSTEM\CurrentControlSet\Services\{name}"),
-            image,
-            false,
-            None,
-        );
-
-        // Inside svchost.exe, what runs is the file the service has it load.
-        // See `service_library`.
-        let hosted = found
-            .executable
-            .as_deref()
-            .is_some_and(|program| is_service_host(program, &hosts));
-        if hosted {
-            // A copy Windows made of a per-account service is run from its
-            // template's `Parameters`, and has none of its own.
-            let template = if kind & USER_SERVICE_INSTANCE != 0 {
-                match template_of(root, &name) {
-                    Ok(template) => template,
-                    Err(_) => {
-                        refused.push(format!(r"{SERVICES}\{name}"));
-                        continue;
+        // A copy Windows made of a per-account service is that service, under
+        // a name that lasts one sign-in. See `same_as_template`.
+        let mut template = None;
+        if kind & USER_SERVICE_INSTANCE != 0 {
+            match template_of(root, &name) {
+                Ok(Some((original, key))) if same_as_template(&service, &key) => {
+                    // Filed once, however many accounts are signed in, and
+                    // whether or not the template starts itself as well.
+                    if filed.insert(original.to_lowercase()) {
+                        match service_entry(&original, &key, None, &hosts) {
+                            Some(found) => survey.entries.push(found),
+                            None => refused.push(format!(r"{SERVICES}\{original}")),
+                        }
                     }
+                    continue;
                 }
-            } else {
-                None
-            };
-            match service_library(&service, template.as_ref()) {
-                Library::Found(library) => {
-                    found.host = Some(SERVICE_HOST.to_owned());
-                    found.payload = Some(library);
-                }
-                Library::Missing(why) => {
-                    found.host = Some(SERVICE_HOST.to_owned());
-                    found.missing = Some(why);
-                }
-                // The same gap as an `ImagePath` that would not read: the
-                // service is there and what it runs could not be read, so it
-                // is counted with those and nothing about it is concluded.
-                // Listing it as svchost.exe would be an answer nobody read.
-                Library::Unread => {
+                // Not a plain copy of anything, so listed as itself. It is
+                // still run from its template's `Parameters` when it has a
+                // template and no `Parameters` of its own.
+                Ok(found) => template = found.map(|(_, key)| key),
+                Err(_) => {
                     refused.push(format!(r"{SERVICES}\{name}"));
                     continue;
                 }
             }
         }
-        survey.entries.push(found);
+        // A template already filed through one of its copies.
+        if !filed.insert(name.to_lowercase()) {
+            continue;
+        }
+        match service_entry(&name, &service, template.as_ref(), &hosts) {
+            Some(found) => survey.entries.push(found),
+            None => refused.push(format!(r"{SERVICES}\{name}")),
+        }
     }
 
     if !refused.is_empty() {
@@ -1254,14 +1216,17 @@ fn named_library(service: &registry::Key) -> Result<Option<String>, Unopened> {
     service.read_string("ServiceDll")
 }
 
-/// The service a per-account copy was made from.
+/// The service a per-account copy was made from, by name and as a key.
 ///
 /// Windows names the copy after its template, then an underscore and a number
 /// for the sign-in it was made at, and records nowhere else which template
 /// that was. So the name says where to look and nothing more: what makes a
 /// key the template is that it is there, and carries the template's mark and
 /// not the copy's. `Err` when it is there and could not be read.
-fn template_of(root: &registry::Key, copy: &str) -> Result<Option<registry::Key>, Unopened> {
+fn template_of(
+    root: &registry::Key,
+    copy: &str,
+) -> Result<Option<(String, registry::Key)>, Unopened> {
     let Some((template, _)) = copy.rsplit_once('_') else {
         return Ok(None);
     };
@@ -1271,7 +1236,103 @@ fn template_of(root: &registry::Key, copy: &str) -> Result<Option<registry::Key>
         Err(why) => return Err(why),
     };
     let kind = key.read_dword("Type")?.unwrap_or_default();
-    Ok((kind & USER_SERVICE != 0 && kind & USER_SERVICE_INSTANCE == 0).then_some(key))
+    Ok(
+        (kind & USER_SERVICE != 0 && kind & USER_SERVICE_INSTANCE == 0)
+            .then(|| (template.to_owned(), key)),
+    )
+}
+
+/// Whether a per-account copy is no more than a copy: it runs what its
+/// template runs, and names nothing of its own to load.
+///
+/// # Why copies are not listed
+///
+/// At every sign-in Windows makes a fresh copy of each per-account service
+/// and names it after the template and the sign-in: `cbdhsvc_a74e8` one day,
+/// `cbdhsvc_f3160ad` the next. The old one is removed. Listed by their own
+/// names, each sign-in was a service gone and a service appeared for every
+/// one of them: 8 of the 30 changes the owner of the development machine was
+/// shown one month, none of which was a change. A copy is found by the mark
+/// Windows puts in its `Type`, never by the look of its name, and is filed as
+/// the service it is a copy of.
+///
+/// # Why only a plain copy
+///
+/// Windows writes the copy's `ImagePath` from the template's, with the
+/// variables filled in, and gives it no `Parameters`. A key marked as a copy
+/// that runs something else, or names a library of its own, is not Windows
+/// renaming its own service. Filed under the template it would be a
+/// different program hidden behind a trusted name, so it stays listed as
+/// itself, where it is seen to appear.
+fn same_as_template(copy: &registry::Key, template: &registry::Key) -> bool {
+    let image = |key: &registry::Key| {
+        key.string("ImagePath")
+            .map(|image| Expand::Machine.apply(image.trim()).to_lowercase())
+    };
+    matches!(named_library(copy), Ok(None))
+        && image(copy).is_some_and(|runs| Some(runs) == image(template))
+}
+
+/// What one service's key says it runs, as an entry.
+///
+/// `template` is the service this one is a copy of, when it is a per-account
+/// copy that is being listed as itself. `None` back when something that has
+/// to be read would not read, which the caller counts.
+fn service_entry(
+    name: &str,
+    service: &registry::Key,
+    template: Option<&registry::Key>,
+    hosts: &[String],
+) -> Option<Entry> {
+    // The key opened, so a failure here is a failure to read a value in a
+    // key that is there -- not a service without an image. `refused`
+    // counted failed key opens only, which left this one level down from
+    // the counter added to catch it.
+    //
+    // A service set to start itself with nothing to run is a contradiction
+    // rather than an ordinary absence: the SCM keeps a running service's
+    // configuration cached, so removing or retyping `ImagePath` after it
+    // starts hides it from this reader without stopping it. Reached only
+    // after `Start` said it starts itself, which is what makes the absence
+    // worth reporting here and not two values earlier.
+    let image = service.read_string("ImagePath").ok()??;
+
+    let mut found = entry(
+        service
+            .string("DisplayName")
+            .map(|display| kam_core::mui::resolve(&display, name))
+            .unwrap_or_else(|| name.to_owned()),
+        Anchor::Service,
+        format!(r"{SERVICES}\{name}"),
+        image,
+        false,
+        None,
+    );
+
+    // Inside svchost.exe, what runs is the file the service has it load.
+    // See `service_library`.
+    let hosted = found
+        .executable
+        .as_deref()
+        .is_some_and(|program| is_service_host(program, hosts));
+    if hosted {
+        match service_library(service, template) {
+            Library::Found(library) => {
+                found.host = Some(SERVICE_HOST.to_owned());
+                found.payload = Some(library);
+            }
+            Library::Missing(why) => {
+                found.host = Some(SERVICE_HOST.to_owned());
+                found.missing = Some(why);
+            }
+            // The same gap as an `ImagePath` that would not read: the
+            // service is there and what it runs could not be read, so it is
+            // counted with those and nothing about it is concluded. Listing
+            // it as svchost.exe would be an answer nobody read.
+            Library::Unread => return None,
+        }
+    }
+    Some(found)
 }
 
 /// Where the scheduler keeps its task definitions.
@@ -2547,9 +2608,12 @@ mod tests {
         let survey = services.read();
         std::fs::remove_file(&library).unwrap();
 
-        let copy = the_service(&survey, "Clip_1a2b3c");
+        // Filed as the service it is a copy of, though only the copy starts
+        // itself.
+        let copy = the_service(&survey, "Clip");
         assert_eq!(copy.target(), Some(library.as_path()));
         assert_eq!(copy.host.as_deref(), Some("svchost.exe"));
+        assert!(copy.location.ends_with(r"\Clip"), "{}", copy.location);
 
         let odd = the_service(&survey, "Odd_1a2b3c");
         assert_eq!(
@@ -2557,6 +2621,169 @@ mod tests {
             None,
             "a library was borrowed from a service that is not this one's template"
         );
+    }
+
+    /// What identifies an entry to everything that compares entries.
+    fn identities(survey: &Survey) -> Vec<(String, String, String, Option<PathBuf>)> {
+        let mut identities: Vec<_> = survey
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.location.clone(),
+                    entry.name.clone(),
+                    entry.command.clone(),
+                    entry.target().map(Path::to_path_buf),
+                )
+            })
+            .collect();
+        identities.sort();
+        identities
+    }
+
+    /// The template of a made-up per-account service, and a copy of it as
+    /// Windows writes one at a sign-in: the same program with its variables
+    /// filled in, the copy's mark in its `Type`, and no `Parameters`.
+    fn per_account(services: &ScratchServices, library: &Path, sign_ins: &[&str]) {
+        services.service("Clip", 0x60, HOSTED);
+        services.text("Clip", "DisplayName", "Clipboard User Service");
+        services.text(
+            r"Clip\Parameters",
+            "ServiceDll",
+            &library.display().to_string(),
+        );
+        let filled_in = kam_core::env::expand(HOSTED);
+        for sign_in in sign_ins {
+            let copy = format!("Clip_{sign_in}");
+            services.service(&copy, 0xE0, &filled_in);
+            services.text(
+                &copy,
+                "DisplayName",
+                &format!("Clipboard User Service_{sign_in}"),
+            );
+        }
+    }
+
+    /// Windows renaming its own per-account services is not a change.
+    ///
+    /// Each sign-in made a fresh copy under a new name and removed the old
+    /// one, and each was listed under its own name: one service gone and one
+    /// appeared, for every such service, at every sign-in.
+    #[test]
+    fn a_per_account_service_is_the_same_service_whatever_its_copy_is_called() {
+        let library = scratch_script("renamed.dll");
+
+        let monday = ScratchServices::new("monday");
+        per_account(&monday, &library, &["a74e8"]);
+        let tuesday = ScratchServices::new("tuesday");
+        per_account(&tuesday, &library, &["f3160ad"]);
+        // Two people signed in at once, and so two copies.
+        let both = ScratchServices::new("both");
+        per_account(&both, &library, &["a74e8", "f3160ad"]);
+        // Nobody signed in: the template alone.
+        let nobody = ScratchServices::new("nobody");
+        per_account(&nobody, &library, &[]);
+
+        let surveys = [monday.read(), tuesday.read(), both.read(), nobody.read()];
+        std::fs::remove_file(&library).unwrap();
+
+        for survey in &surveys {
+            assert_eq!(survey.entries.len(), 1, "{:#?}", survey.entries);
+            let entry = &survey.entries[0];
+            assert_eq!(entry.name, "Clipboard User Service");
+            assert!(entry.location.ends_with(r"\Clip"), "{}", entry.location);
+            assert_eq!(entry.target(), Some(library.as_path()));
+            assert_eq!(
+                identities(survey),
+                identities(&surveys[0]),
+                "a different sign-in read as a different service"
+            );
+        }
+    }
+
+    /// A key marked as a copy that does not run what its template runs is
+    /// not Windows renaming anything, and is listed as itself. Filed under
+    /// the template it would be another program behind a trusted name.
+    #[test]
+    fn a_copy_that_runs_something_else_is_listed_as_itself() {
+        let library = scratch_script("genuine.dll");
+        let other = scratch_script("other.dll");
+        let services = ScratchServices::new("odd copies");
+        per_account(&services, &library, &["a74e8"]);
+        // Another program altogether.
+        services.service("Clip_bad1", 0xE0, r"%SystemRoot%\System32\notepad.exe");
+        // The same program, with a library of its own to load.
+        services.service("Clip_bad2", 0xE0, &kam_core::env::expand(HOSTED));
+        services.text(
+            r"Clip_bad2\Parameters",
+            "ServiceDll",
+            &other.display().to_string(),
+        );
+        // An underscore in a name is not what makes a copy.
+        services.service("Not_a_copy", 0x10, r"%SystemRoot%\System32\notepad.exe");
+
+        let survey = services.read();
+        std::fs::remove_file(&library).unwrap();
+        std::fs::remove_file(&other).unwrap();
+
+        assert_eq!(survey.entries.len(), 4, "{:#?}", survey.entries);
+        assert_eq!(
+            the_service(&survey, "Clipboard User Service").target(),
+            Some(library.as_path())
+        );
+        let first = the_service(&survey, "Clip_bad1");
+        assert!(
+            first.location.ends_with(r"\Clip_bad1"),
+            "{}",
+            first.location
+        );
+        assert_eq!(
+            first
+                .target()
+                .map(|path| path.to_string_lossy().to_lowercase()),
+            Some(system32("notepad.exe").to_string_lossy().to_lowercase())
+        );
+        assert_eq!(
+            the_service(&survey, "Clip_bad2").target(),
+            Some(other.as_path())
+        );
+        the_service(&survey, "Not_a_copy");
+    }
+
+    /// On the real machine: no plain copy of a per-account service is listed
+    /// under the name it has today.
+    #[test]
+    fn this_machines_per_account_services_are_listed_once_under_their_own_name() {
+        let root = registry::Key::look(
+            HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Services",
+            View::Native,
+        )
+        .expect("the services key opens for reading on every Windows");
+        let mut survey = Survey::default();
+        read_services_in(&mut survey, &root);
+
+        let mut copies = 0;
+        for entry in &survey.entries {
+            let name = entry.location.rsplit('\\').next().unwrap_or_default();
+            let Ok(key) = root.look_child(name) else {
+                continue;
+            };
+            if key.dword("Type").unwrap_or_default() & USER_SERVICE_INSTANCE == 0 {
+                continue;
+            }
+            copies += 1;
+            let plain = matches!(
+                template_of(&root, name),
+                Ok(Some((_, template))) if same_as_template(&key, &template)
+            );
+            assert!(
+                !plain,
+                "{} is a plain copy of its template and is listed under today's name",
+                entry.location
+            );
+        }
+        println!("{copies} per-account copies listed as themselves");
     }
 
     /// The whole way through: a service planted in the shape Windows uses for
