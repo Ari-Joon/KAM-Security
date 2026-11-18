@@ -779,6 +779,12 @@ export type Remnant = QuarantineAnswer & {
 
 export type Remnants = {
   name: string;
+  /**
+   * True when Windows still lists the program: its uninstaller was cancelled
+   * or has not finished, and nothing below is a leftover. Absent from an agent
+   * that did not look, which reads as "not known to be installed".
+   */
+  still_installed?: boolean;
   locations: Remnant[];
   shortcuts: (Shortcut & QuarantineAnswer)[];
   total_bytes: number;

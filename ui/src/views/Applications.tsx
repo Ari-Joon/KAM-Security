@@ -306,6 +306,9 @@ export default function Applications({ volumes, onMeasured }: Props) {
   // measured yet. A ref rather than state because the focus handler below
   // reads it from outside React's render cycle.
   const awaitingUninstall = useRef<AppFootprint | null>(null);
+  // Whether this wait has already said the program is still installed. Said
+  // once: every later return to the window looks again without repeating it.
+  const toldStillInstalled = useRef(false);
   const [remnants, setRemnants] = useState<Remnants | null>(null);
   const [chosen, setChosen] = useState<Set<string>>(new Set());
   const [clearing, setClearing] = useState(false);
@@ -387,6 +390,13 @@ export default function Applications({ volumes, onMeasured }: Props) {
    * Returning to this window is the honest signal that the uninstaller is
    * done with, and it costs nothing to watch for. Polling the registry would
    * be guessing at a moment the person can simply tell us by coming back.
+   *
+   * It is a signal that something may have happened, though, and no more.
+   * The person may have cancelled the uninstaller, or clicked back here while
+   * it was still running. This used to announce "was uninstalled" on that
+   * signal alone and offer the program's own data folders for quarantine. So
+   * the agent now looks the program up again first, and while Windows still
+   * lists it this says so, offers nothing, and goes on waiting.
    */
   useEffect(() => {
     function recheck() {
@@ -395,10 +405,10 @@ export default function Applications({ volumes, onMeasured }: Props) {
         return;
       }
       awaitingUninstall.current = null;
-      setNote(`Checking what ${app.name} left behind…`);
-      setLeftoverWarning(null);
-      setRefusedMoves({});
-      setChosen(new Set());
+      const firstLook = !toldStillInstalled.current;
+      if (firstLook) {
+        setNote(`Checking whether ${app.name} has gone…`);
+      }
 
       // The footprint has to come from before the uninstall: afterwards the
       // registry entry is gone and there is nothing left to measure from.
@@ -409,6 +419,33 @@ export default function Applications({ volumes, onMeasured }: Props) {
           app.locations.map((location) => location.kind),
         )
         .then((left) => {
+          if (left.still_installed) {
+            // Unless another uninstaller was started meanwhile, in which case
+            // that one is what is being waited for.
+            const stillWaiting = awaitingUninstall.current === null;
+            if (stillWaiting) {
+              awaitingUninstall.current = app;
+            }
+            if (firstLook) {
+              toldStillInstalled.current = stillWaiting;
+              setNote(
+                `${app.name} is still installed. Its uninstaller was cancelled ` +
+                  `or has not finished.` +
+                  // Promised only where it is true: one program is waited
+                  // for at a time.
+                  (stillWaiting
+                    ? ` KAM Security will look again when you come back to this window.`
+                    : ""),
+              );
+            }
+            // Nothing changed, so there is nothing to measure again.
+            return false;
+          }
+
+          toldStillInstalled.current = false;
+          setLeftoverWarning(null);
+          setRefusedMoves({});
+          setChosen(new Set());
           const anything = left.locations.length > 0 || left.shortcuts.length > 0;
           // "Left nothing behind" is a claim about every place it used. A
           // place that was not examined makes it a claim nobody checked.
@@ -427,14 +464,21 @@ export default function Applications({ volumes, onMeasured }: Props) {
                 `so whether anything is left there is not known.`,
             );
           }
+          return true;
         })
         .catch((cause) => {
-          setNote(`${app.name} was uninstalled.`);
+          // Neither half is known now: not whether it went, nor what it left.
+          toldStillInstalled.current = false;
+          setNote(null);
           setLeftoverWarning(
-            `What ${app.name} left behind could not be checked: ${reason(cause)}`,
+            `Whether ${app.name} was uninstalled, and what it left behind, ` +
+              `could not be checked: ${reason(cause)}`,
           );
+          return true;
         })
-        .finally(() => void measure());
+        .then((changed) => {
+          if (changed) void measure();
+        });
     }
 
     window.addEventListener("focus", recheck);
@@ -451,6 +495,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
     try {
       await api.uninstall(app.name, app.uninstall_command ?? "");
       awaitingUninstall.current = app;
+      toldStillInstalled.current = false;
       setNote(
         `Started the uninstaller for ${app.name}. This list still shows what ` +
           `was there before it ran, and will measure again when you come back ` +

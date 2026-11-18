@@ -263,6 +263,28 @@ fn with_steam_games(mut apps: Vec<Installed>, steam: &[crate::steam::SteamApp]) 
     apps
 }
 
+/// Whether Windows, or Steam, still lists a program under this name.
+///
+/// Asked after an uninstaller has been launched, before anything says the
+/// program is gone. Launching one proves nothing: the person may have
+/// cancelled it, and it may still be running. The uninstall keys and Steam's
+/// manifests are what the list on screen was built from, so a name that is
+/// still in them is a program that is still installed.
+pub(crate) fn still_listed(name: &str, user: &UserContext) -> bool {
+    let steam = crate::steam::installed_games(user);
+    is_among(&with_steam_games(installed(user), &steam), name)
+}
+
+/// The name as the listing gave it, compared the way the listing itself tells
+/// two entries apart: without regard to case.
+fn is_among(apps: &[Installed], name: &str) -> bool {
+    let wanted = name.trim().to_lowercase();
+    !wanted.is_empty()
+        && apps
+            .iter()
+            .any(|app| app.name.trim().to_lowercase() == wanted)
+}
+
 /// Reduce a name to something comparable: lower case, letters and digits only.
 ///
 /// Vendors are wildly inconsistent between the registry and the folder they
@@ -1109,6 +1131,53 @@ mod tests {
             Some("steam://uninstall/548430"),
             "a Steam title is removed through Steam"
         );
+    }
+
+    fn listed(name: &str) -> Installed {
+        Installed {
+            name: name.to_owned(),
+            publisher: String::new(),
+            version: String::new(),
+            install_location: None,
+            estimated_kilobytes: None,
+            uninstall_command: None,
+            installed_on: None,
+            last_played: None,
+        }
+    }
+
+    #[test]
+    fn a_program_is_still_listed_by_the_name_the_list_showed() {
+        let apps = vec![listed("Discord"), listed("Zoom Workplace")];
+        assert!(is_among(&apps, "Discord"));
+        // The listing tells entries apart without regard to case, so the
+        // check after an uninstall does too.
+        assert!(is_among(&apps, "zoom workplace"));
+        assert!(is_among(&apps, " Discord "));
+    }
+
+    #[test]
+    fn a_program_that_has_gone_is_not_listed_by_a_neighbour_with_a_longer_name() {
+        // Whole names only. "Discord" being gone must not be hidden by
+        // "Discord PTB" still being there, or its leftovers are never offered.
+        let apps = vec![listed("Discord PTB"), listed("Zoom Workplace")];
+        assert!(!is_among(&apps, "Discord"));
+        assert!(!is_among(&apps, ""));
+        assert!(!is_among(&[], "Discord"));
+    }
+
+    #[test]
+    fn a_steam_title_is_still_listed_while_steam_holds_its_manifest() {
+        // Steam titles have no uninstall key, and the page lists them from
+        // Steam's own manifests, so that is where to look for them again.
+        let steam = vec![crate::steam::SteamApp {
+            name: "Deep Rock Galactic".to_owned(),
+            path: r"C:\Steam\steamapps\common\Deep Rock Galactic".to_owned(),
+            app_id: "548430".to_owned(),
+            last_played: None,
+        }];
+        let apps = with_steam_games(Vec::new(), &steam);
+        assert!(is_among(&apps, "Deep Rock Galactic"));
     }
 
     #[test]

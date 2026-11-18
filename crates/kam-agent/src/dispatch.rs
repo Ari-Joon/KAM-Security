@@ -599,6 +599,7 @@ pub fn handle(
             let report = kam_storage::remnants::of(&name, &paths, &kinds, user);
             tracing::info!(
                 %name,
+                still_installed = report.still_installed,
                 locations = report.locations.len(),
                 shortcuts = report.shortcuts.len(),
                 refused = report.refused.len(),

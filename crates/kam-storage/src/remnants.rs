@@ -74,6 +74,12 @@ pub struct LeftoverShortcut {
 pub struct Remnants {
     pub name: String,
 
+    /// True when Windows, or Steam, still lists the program. Its uninstaller
+    /// was cancelled or has not finished, so nothing of it is a leftover and
+    /// every list below is empty: the folders are the program itself.
+    #[serde(default)]
+    pub still_installed: bool,
+
     /// Directories that still exist. Ones the uninstaller did clear are simply
     /// absent, so this is a list of what is left rather than what there was.
     pub locations: Vec<Remnant>,
@@ -253,7 +259,37 @@ fn measure(path: &std::path::Path) -> (u64, usize, bool) {
 
 /// What is still on disk for `name`, given the locations measured for it
 /// before its uninstaller ran.
+///
+/// # Only once the program is really gone
+///
+/// The window asks this when the person comes back to it after launching an
+/// uninstaller, and that is all it knows: the uninstaller started. They may
+/// have cancelled it, or it may still be running behind the window. This used
+/// to answer anyway, and the window then said "was uninstalled" and offered
+/// the program's own data folders for quarantine. For a program that installs
+/// into AppData, the folder on offer was the program.
+///
+/// So the program is looked up again first, in the same places the list on
+/// screen came from. Still listed means nothing here is a leftover, and the
+/// answer says that and offers nothing.
 pub fn of(name: &str, paths: &[String], kinds: &[LocationKind], user: &UserContext) -> Remnants {
+    if crate::apps::still_listed(name, user) {
+        return Remnants {
+            name: name.to_owned(),
+            still_installed: true,
+            ..Default::default()
+        };
+    }
+    left_behind(name, paths, kinds, user)
+}
+
+/// What is on disk at `paths`, for a program already known to be gone.
+fn left_behind(
+    name: &str,
+    paths: &[String],
+    kinds: &[LocationKind],
+    user: &UserContext,
+) -> Remnants {
     let roots = allowed_roots(user);
     let resolved = resolved_roots(&roots);
     let mut remnants = Remnants {
@@ -628,6 +664,52 @@ mod tests {
         let roots = allowed_roots(&UserContext::current());
         let resolved = resolved_roots(&roots);
         assert_eq!(judge(short, &roots, &resolved), Judged::Inside);
+    }
+
+    /// A program Windows still lists has no leftovers, whatever is on disk.
+    ///
+    /// The window asks as soon as the person comes back to it, and an
+    /// uninstaller that was cancelled leaves everything exactly where it was.
+    /// The folder below is what that looks like: the program's own data, in a
+    /// place quarantine would take it from. The name is one this machine
+    /// really has installed, read the way the survey reads it, because the
+    /// question being tested is whether that reading is consulted at all.
+    #[test]
+    fn nothing_is_offered_while_the_program_is_still_installed() {
+        let profile = Profile::new("still-installed");
+        let folder = profile.local().join("StillHere");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("settings.bin"), vec![0_u8; 2048]).unwrap();
+        let paths = [text(&folder)];
+        let kinds = [LocationKind::LocalData];
+
+        let Some(installed) = crate::apps::registry_listing(&profile.user())
+            .into_iter()
+            .map(|app| app.name)
+            .next()
+        else {
+            // A machine with nothing installed cannot show this either way.
+            return;
+        };
+
+        let outcome = of(&installed, &paths, &kinds, &profile.user());
+        assert!(
+            outcome.still_installed,
+            "{installed} is installed here and was reported as gone"
+        );
+        assert!(
+            outcome.locations.is_empty() && outcome.shortcuts.is_empty(),
+            "a folder of a program that is still installed was offered as a leftover"
+        );
+        assert_eq!(outcome.total_bytes, 0);
+        assert!(outcome.refused.is_empty());
+
+        // The control: the same folder, for a name nothing here is installed
+        // under, is a leftover and is found.
+        let gone = of("kam-test-no-such-program", &paths, &kinds, &profile.user());
+        assert!(!gone.still_installed);
+        assert_eq!(gone.locations.len(), 1);
+        assert_eq!(gone.locations[0].bytes, 2048);
     }
 
     #[test]

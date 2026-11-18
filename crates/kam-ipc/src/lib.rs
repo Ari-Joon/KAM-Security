@@ -705,6 +705,7 @@ mod tests {
 
         let report = RemnantReport {
             name: "thing".to_owned(),
+            still_installed: false,
             locations: vec![Remnant {
                 path: r"C:\Users\someone\AppData\Local\Thing".to_owned(),
                 bytes: 4096,
