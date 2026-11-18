@@ -771,7 +771,8 @@ impl Report {
             ));
         } else if on < total {
             concerns.push(format!(
-                "{on} of {total} recommended Attack Surface Reduction rules are switched on."
+                "{on} of {total} recommended Attack Surface Reduction rules {} switched on.",
+                if on == 1 { "is" } else { "are" }
             ));
         }
 
@@ -1292,6 +1293,51 @@ mod tests {
             report.concerns().is_empty(),
             "a hardened machine should be quiet: {:?}",
             report.concerns()
+        );
+    }
+
+    /// One rule is switched on; two are.
+    #[test]
+    fn the_count_of_rules_switched_on_agrees_with_its_verb() {
+        let said_with = |on: usize| {
+            let mut switched = 0;
+            let report = Report {
+                switches: Vec::new(),
+                rules: KNOWN
+                    .iter()
+                    .map(|(id, name, explains, recommended)| {
+                        let block = *recommended && switched < on;
+                        switched += usize::from(block);
+                        Rule {
+                            id: (*id).to_owned(),
+                            name: (*name).to_owned(),
+                            explains: (*explains).to_owned(),
+                            mode: if block { Mode::Block } else { Mode::Off },
+                            recommended: *recommended,
+                        }
+                    })
+                    .collect(),
+                controlled_folder_access: Some(FolderAccess::On),
+                unreadable: Vec::new(),
+            };
+            report.concerns()
+        };
+        let total = KNOWN
+            .iter()
+            .filter(|(.., recommended)| *recommended)
+            .count();
+
+        assert_eq!(
+            said_with(1),
+            [format!(
+                "1 of {total} recommended Attack Surface Reduction rules is switched on."
+            )]
+        );
+        assert_eq!(
+            said_with(2),
+            [format!(
+                "2 of {total} recommended Attack Surface Reduction rules are switched on."
+            )]
         );
     }
 

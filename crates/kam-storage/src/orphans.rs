@@ -120,6 +120,19 @@ fn days_since(filetime: u64, now: u64) -> Option<u64> {
     Some(now.saturating_sub(seconds) / 86_400)
 }
 
+/// Why a folder that was written to lately is probably not a leftover.
+///
+/// Today and yesterday are named, because a bare count reads "1 days ago" for
+/// the folder most likely to be in use.
+fn written_lately(days: u64) -> String {
+    let when = match days {
+        0 => "today".to_owned(),
+        1 => "yesterday".to_owned(),
+        days => format!("{days} days ago"),
+    };
+    format!("but something wrote to it {when}, so it is probably still in use")
+}
+
 /// Names claimed by something currently installed.
 fn claimed_names(apps: &[crate::apps::AppFootprint]) -> HashSet<String> {
     let mut claimed = HashSet::new();
@@ -206,9 +219,7 @@ pub fn find(
                     Confidence::High
                 }
                 Some(days) if (days as f64) < ACTIVE_DAYS => {
-                    reasons.push(format!(
-                        "but something wrote to it {days} days ago, so it is probably still in use"
-                    ));
+                    reasons.push(written_lately(days));
                     Confidence::Low
                 }
                 Some(days) => {
@@ -400,6 +411,22 @@ mod tests {
         let now = 1_704_067_200_u64;
         let ten_days_ago = ((now - 10 * 86_400) + FILETIME_EPOCH_OFFSET) * 10_000_000;
         assert_eq!(days_since(ten_days_ago, now), Some(10));
+    }
+
+    #[test]
+    fn a_folder_written_to_yesterday_is_not_one_days_old() {
+        assert_eq!(
+            written_lately(0),
+            "but something wrote to it today, so it is probably still in use"
+        );
+        assert_eq!(
+            written_lately(1),
+            "but something wrote to it yesterday, so it is probably still in use"
+        );
+        assert_eq!(
+            written_lately(12),
+            "but something wrote to it 12 days ago, so it is probably still in use"
+        );
     }
 
     #[test]
