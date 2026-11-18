@@ -89,6 +89,9 @@ pub struct Downloads {
     /// Jobs somebody asked to stop while the work was this program's own and
     /// not yet the agent's: copying an archive, or quarantining its original.
     stopped: Mutex<HashSet<String>>,
+    /// Where each arriving file has got to. Shared with the watcher's
+    /// threads, which write it.
+    board: Arc<Mutex<Board>>,
 }
 
 impl Default for Downloads {
@@ -99,6 +102,7 @@ impl Default for Downloads {
             pending: Mutex::new(None),
             open: Mutex::new(None),
             stopped: Mutex::new(HashSet::new()),
+            board: Arc::new(Mutex::new(Board::default())),
         }
     }
 }
@@ -174,6 +178,26 @@ impl Downloads {
         if let Ok(mut stopped) = self.stopped.lock() {
             stopped.remove(job);
         }
+    }
+
+    /// Forget why an automatic check of a file did not happen, once a check
+    /// of it has. The note used to stay until a later automatic check
+    /// succeeded, and could reappear under a file checked by hand long since.
+    pub fn forget_failure(&self, path: &str) {
+        if let Ok(mut failures) = self.failures.lock() {
+            failures.retain(|noted, _| !noted.eq_ignore_ascii_case(path));
+        }
+    }
+
+    /// Where a file has got to on its way to being checked, if the watcher
+    /// has it. An empty name with a partial download beside it is still
+    /// arriving whether or not the watcher saw it start.
+    fn in_flight(&self, path: &Path) -> Option<InFlight> {
+        self.board
+            .lock()
+            .ok()
+            .and_then(|board| board.state_of(path))
+            .or_else(|| kam_storage::downloads::is_placeholder(path).then_some(InFlight::Arriving))
     }
 
     /// Remember a file somebody asked about from outside the window.
@@ -262,6 +286,9 @@ pub struct LooseFile {
     /// True when a check of this name is on record but the file has changed
     /// size since, so that check is not about this file.
     changed_since_checked: bool,
+    /// Where it has got to, when it is on its way to being checked and not
+    /// simply unchecked.
+    in_flight: Option<InFlight>,
 }
 
 #[derive(Debug, Serialize)]
@@ -351,10 +378,15 @@ pub fn page(state: &Downloads) -> Page {
 
     let mut unchecked = Vec::new();
     for (path, name, metadata) in present {
-        let latest = records
-            .iter()
-            .find(|record| record.check.path.eq_ignore_ascii_case(&path));
-        if latest.is_some_and(|record| record.check.bytes == metadata.len()) {
+        // A row for a file that was gone before it could be checked is not a
+        // check of whatever is there under that name now.
+        let latest = records.iter().find(|record| {
+            record.check.scan.answer != Answer::GoneBeforeCheck
+                && record.check.path.eq_ignore_ascii_case(&path)
+        });
+        let in_flight = state.in_flight(Path::new(&path));
+        if in_flight.is_none() && latest.is_some_and(|record| record.check.bytes == metadata.len())
+        {
             continue;
         }
         unchecked.push(LooseFile {
@@ -362,6 +394,7 @@ pub fn page(state: &Downloads) -> Page {
             arrived_at: created_iso(&metadata),
             bytes: metadata.len(),
             changed_since_checked: latest.is_some(),
+            in_flight,
             name,
             path,
         });
@@ -392,7 +425,10 @@ pub fn page(state: &Downloads) -> Page {
     let records = records
         .into_iter()
         .map(|record| {
-            let present = Path::new(&record.check.path).is_file();
+            // A file that went before it could be checked is not there,
+            // whatever has since been saved under its name.
+            let present = record.check.scan.answer != Answer::GoneBeforeCheck
+                && Path::new(&record.check.path).is_file();
             PageRecord {
                 held: (!present).then(|| held_as(&record, &held)).flatten(),
                 present,
@@ -468,19 +504,116 @@ fn held_as(record: &DownloadRecord, held: &[kam_quarantine::Manifest]) -> Option
 
 /// What the folder watcher passes on.
 enum Seen {
-    /// A name appeared, or was renamed into place.
-    Arrived(PathBuf),
+    /// A name appeared. `renamed` when it was renamed into place, which is
+    /// how a browser finishes a download and never how it starts one.
+    Arrived { path: PathBuf, renamed: bool },
     /// A name already there was written to.
     Changed(PathBuf),
+    /// A name was given another name in the folder. The file is still
+    /// there, and arrives again under the new one.
+    Renamed(PathBuf),
     /// Windows lost count of what changed; look at everything recent.
     Overflowed,
 }
+
+/// What the settling thread hands on, to be dealt with one at a time.
+#[derive(Debug, PartialEq, Eq)]
+enum Arrival {
+    /// It has stopped changing and nobody is still writing it: check it.
+    Settled(Sighting),
+    /// It arrived and was gone before it could be checked.
+    Vanished(Sighting),
+}
+
+/// One file as it was last seen while arriving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sighting {
+    path: PathBuf,
+    bytes: u64,
+    arrived_at: Option<String>,
+}
+
+/// Where each file the watcher knows about has got to, so that the page can
+/// say "being checked now" where it used to say "Not checked yet" for as long
+/// as the check took.
+#[derive(Debug, Default)]
+pub struct Board {
+    /// Seen arriving, and not yet still.
+    arriving: HashSet<PathBuf>,
+    /// Arrived, and waiting their turn, in order.
+    waiting: Vec<PathBuf>,
+    /// The one being checked now.
+    checking: Option<Checking>,
+}
+
+#[derive(Debug)]
+struct Checking {
+    path: PathBuf,
+    job: String,
+    since: Instant,
+}
+
+/// Where one file has got to on its way to being checked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum InFlight {
+    /// Still arriving: changing, held open by whatever is writing it, or an
+    /// empty name waiting to be filled in.
+    Arriving,
+    /// Arrived, and waiting behind this many others.
+    Waiting { ahead: usize },
+    /// Being checked now, under this job, for this long so far.
+    Checking { job: String, seconds: u64 },
+}
+
+impl Board {
+    fn state_of(&self, path: &Path) -> Option<InFlight> {
+        let same = |other: &PathBuf| {
+            other
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&path.to_string_lossy())
+        };
+        if let Some(checking) = self.checking.as_ref().filter(|now| same(&now.path)) {
+            return Some(InFlight::Checking {
+                job: checking.job.clone(),
+                seconds: checking.since.elapsed().as_secs(),
+            });
+        }
+        if let Some(position) = self.waiting.iter().position(same) {
+            return Some(InFlight::Waiting {
+                ahead: position + usize::from(self.checking.is_some()),
+            });
+        }
+        self.arriving.iter().any(same).then_some(InFlight::Arriving)
+    }
+}
+
+/// The event that carries the progress of an automatic check to the page.
+pub const PROGRESS_EVENT: &str = "downloads://progress";
+
+/// How far an automatic check has got, for the row it is about.
+#[derive(Debug, Clone, Serialize)]
+struct ArrivalProgress {
+    path: String,
+    job: String,
+    progress: Progress,
+}
+
+/// How long one automatic check may keep other downloads waiting behind it.
+///
+/// Checks of arriving files run one at a time, and Defender is given up to
+/// four hours on one file before it is given up on, so one file it stalled
+/// on held every later download unchecked for as long. Past this, and only
+/// while something is waiting, the check is stopped and says so; the file
+/// can still be checked from the page, where a check runs until it finishes
+/// or is stopped. With nothing waiting it holds nobody up and is left to run.
+const ARRIVAL_PATIENCE: Duration = Duration::from_secs(10 * 60);
 
 /// Start watching the Downloads folder. Returns at once; the work happens on
 /// threads of its own and never on the window's.
 pub fn start_watching(app: AppHandle) {
     let (seen_tx, seen_rx) = mpsc::channel::<Seen>();
-    let (ready_tx, ready_rx) = mpsc::channel::<PathBuf>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Arrival>();
 
     let watcher_app = app.clone();
     let spawned = std::thread::Builder::new()
@@ -493,9 +626,15 @@ pub fn start_watching(app: AppHandle) {
             });
         return;
     }
+    let board = Arc::clone(&app.state::<Downloads>().board);
+    let settle_app = app.clone();
     let _ = std::thread::Builder::new()
         .name("kam-downloads-settle".to_owned())
-        .spawn(move || settle(&seen_rx, &ready_tx));
+        .spawn(move || {
+            settle(&seen_rx, &ready_tx, &board, &|| {
+                let _ = settle_app.emit(CHANGED_EVENT, ());
+            })
+        });
     let _ = std::thread::Builder::new()
         .name("kam-downloads-check".to_owned())
         .spawn(move || check_arrivals(&app, &ready_rx));
@@ -616,8 +755,15 @@ fn parse_notifications(bytes: &[u8], folder: &Path) -> Vec<Seen> {
             let path = folder.join(&name);
             match action {
                 // Added, or renamed into this name.
-                1 | 5 => events.push(Seen::Arrived(path)),
+                1 | 5 => events.push(Seen::Arrived {
+                    path,
+                    renamed: action == 5,
+                }),
                 3 => events.push(Seen::Changed(path)),
+                // Renamed away from this name. Removal (2) is not passed on:
+                // the next look finds the file gone, and waits a moment
+                // before believing it.
+                4 => events.push(Seen::Renamed(path)),
                 _ => {}
             }
         }
@@ -634,14 +780,76 @@ struct Settling {
     size: Option<u64>,
     written: Option<SystemTime>,
     looked: Instant,
+    /// Whether it was ever a download and not just a name: it has been seen
+    /// holding something, or it was renamed into place. Only such a file is
+    /// recorded as gone if it goes; an empty name that comes and goes is not.
+    was_something: bool,
+    /// The most it has been seen to hold, and when it was created, for the
+    /// record of it should it go before it can be checked.
+    bytes: u64,
+    arrived_at: Option<String>,
+    /// When it was first found missing. A program that saves by deleting and
+    /// renaming has the name missing for a moment, so it is looked for once
+    /// more before it is called gone.
+    missing: Option<Instant>,
+}
+
+impl Settling {
+    /// Not looked at yet: the first look only records the size.
+    fn fresh() -> Self {
+        Self {
+            size: None,
+            written: None,
+            looked: Instant::now()
+                .checked_sub(SETTLE)
+                .unwrap_or_else(Instant::now),
+            was_something: false,
+            bytes: 0,
+            arrived_at: None,
+            missing: None,
+        }
+    }
+
+    /// Start settling again, keeping what is already known of the file.
+    fn again(&mut self) {
+        let fresh = Self::fresh();
+        self.size = fresh.size;
+        self.written = fresh.written;
+        self.looked = fresh.looked;
+        self.missing = None;
+    }
+
+    fn sighting(&self, path: &Path) -> Sighting {
+        Sighting {
+            path: path.to_path_buf(),
+            bytes: self.bytes,
+            arrived_at: self.arrived_at.clone(),
+        }
+    }
 }
 
 /// Hold each arriving file until it stops changing, then pass it on.
 ///
 /// Waits on the channel with no timeout while nothing is settling, so it
 /// costs nothing when nothing is arriving.
-fn settle(seen: &Receiver<Seen>, ready: &Sender<PathBuf>) {
+///
+/// Two things are not passed on as arrived. An empty name with a partial
+/// download of the same name beside it is a placeholder (see
+/// `kam_storage::downloads::is_placeholder`): it waits, without being looked
+/// at, until Windows says it changed. And a file that goes before it has
+/// settled is passed on as gone, if it ever held anything, so that a
+/// download Defender takes away as it lands leaves a record.
+///
+/// `board` is told where each file has got to, and `changed` is called when
+/// that moves, so the page can say so.
+fn settle(
+    seen: &Receiver<Seen>,
+    ready: &Sender<Arrival>,
+    board: &Mutex<Board>,
+    changed: &dyn Fn(),
+) {
     let mut settling: HashMap<PathBuf, Settling> = HashMap::new();
+    let mut placeholders: HashSet<PathBuf> = HashSet::new();
     loop {
         let event = if settling.is_empty() {
             seen.recv().map_err(|_| RecvTimeoutError::Disconnected)
@@ -649,66 +857,131 @@ fn settle(seen: &Receiver<Seen>, ready: &Sender<PathBuf>) {
             seen.recv_timeout(SETTLE / 2)
         };
         match event {
-            Ok(Seen::Arrived(path)) => {
-                settling.insert(path, fresh());
+            Ok(Seen::Arrived { path, renamed }) => {
+                placeholders.remove(&path);
+                let entry = settling.entry(path).or_insert_with(Settling::fresh);
+                entry.again();
+                entry.was_something |= renamed;
             }
             Ok(Seen::Changed(path)) => {
                 if let Some(entry) = settling.get_mut(&path) {
-                    *entry = fresh();
+                    entry.again();
+                } else if placeholders.remove(&path) {
+                    settling.insert(path, Settling::fresh());
                 }
+            }
+            Ok(Seen::Renamed(path)) => {
+                settling.remove(&path);
+                placeholders.remove(&path);
             }
             Ok(Seen::Overflowed) => {
                 for path in recent_files(Duration::from_secs(600)) {
-                    settling.entry(path).or_insert_with(fresh);
+                    settling.entry(path).or_insert_with(Settling::fresh);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        let mut finished = Vec::new();
-        let mut gone = Vec::new();
+        // A placeholder that has since been filled in, or whose partial
+        // download has gone, settles like any other file. One that is gone
+        // itself is forgotten.
+        let mut filled = Vec::new();
+        placeholders.retain(|path| {
+            let still = kam_storage::downloads::is_placeholder(path);
+            if !still && path.is_file() {
+                filled.push(path.clone());
+            }
+            still
+        });
+        for path in filled {
+            settling.entry(path).or_insert_with(Settling::fresh);
+        }
+
+        let mut passed_on: Vec<Arrival> = Vec::new();
+        let mut dropped = Vec::new();
         for (path, entry) in &mut settling {
             if entry.looked.elapsed() < SETTLE {
                 continue;
             }
             match std::fs::symlink_metadata(path) {
                 Ok(metadata) if metadata.is_file() => {
-                    let size = Some(metadata.len());
+                    entry.missing = None;
+                    let size = metadata.len();
+                    if size > 0 {
+                        entry.was_something = true;
+                        entry.bytes = size;
+                    }
+                    if entry.arrived_at.is_none() {
+                        entry.arrived_at = created_iso(&metadata);
+                    }
+                    if kam_storage::downloads::is_placeholder(path) {
+                        placeholders.insert(path.clone());
+                        dropped.push(path.clone());
+                        continue;
+                    }
                     let written = metadata.modified().ok();
-                    let steady = entry.size == size && entry.written == written;
+                    let steady = entry.size == Some(size) && entry.written == written;
                     if steady && crate::archive::open_shut_to_writers(path).is_ok() {
-                        finished.push(path.clone());
+                        passed_on.push(Arrival::Settled(entry.sighting(path)));
                     } else {
-                        entry.size = size;
+                        entry.size = Some(size);
                         entry.written = written;
                         entry.looked = Instant::now();
                     }
                 }
-                // Gone, a folder, or a link: not a download to check.
-                _ => gone.push(path.clone()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => match entry.missing {
+                    None => {
+                        entry.missing = Some(Instant::now());
+                        entry.looked = Instant::now();
+                    }
+                    Some(since) if since.elapsed() >= SETTLE => {
+                        if entry.was_something {
+                            passed_on.push(Arrival::Vanished(entry.sighting(path)));
+                        } else {
+                            dropped.push(path.clone());
+                        }
+                    }
+                    Some(_) => entry.looked = Instant::now(),
+                },
+                // A folder, a link, or something that cannot be read: not a
+                // download to check.
+                _ => dropped.push(path.clone()),
             }
         }
-        for path in gone {
+        for path in dropped {
             settling.remove(&path);
         }
-        for path in finished {
-            settling.remove(&path);
-            if ready.send(path).is_err() {
+        for arrival in &passed_on {
+            let (Arrival::Settled(sighting) | Arrival::Vanished(sighting)) = arrival;
+            settling.remove(&sighting.path);
+        }
+
+        // Said before anything is handed on, so that a file is never between
+        // "arriving" and "waiting" with the page told neither.
+        let mut moved = false;
+        if let Ok(mut board) = board.lock() {
+            let arriving: HashSet<PathBuf> = settling
+                .keys()
+                .chain(placeholders.iter())
+                .cloned()
+                .collect();
+            moved = board.arriving != arriving || !passed_on.is_empty();
+            board.arriving = arriving;
+            for arrival in &passed_on {
+                if let Arrival::Settled(sighting) = arrival {
+                    board.waiting.push(sighting.path.clone());
+                }
+            }
+        }
+        if moved {
+            changed();
+        }
+        for arrival in passed_on {
+            if ready.send(arrival).is_err() {
                 return;
             }
         }
-    }
-}
-
-/// Not looked at yet: the first look only records the size.
-fn fresh() -> Settling {
-    Settling {
-        size: None,
-        written: None,
-        looked: Instant::now()
-            .checked_sub(SETTLE)
-            .unwrap_or_else(Instant::now),
     }
 }
 
@@ -737,8 +1010,9 @@ fn recent_files(window: Duration) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Ask the agent about each finished file, one at a time.
-fn check_arrivals(app: &AppHandle, ready: &Receiver<PathBuf>) {
+/// Deal with each file the settling thread hands on, one at a time: ask the
+/// agent about one that has arrived, and record one that went first.
+fn check_arrivals(app: &AppHandle, ready: &Receiver<Arrival>) {
     // Windows' notification interfaces want the thread set up for COM.
     unsafe {
         let _ = windows::Win32::System::Com::CoInitializeEx(
@@ -746,27 +1020,123 @@ fn check_arrivals(app: &AppHandle, ready: &Receiver<PathBuf>) {
             windows::Win32::System::Com::COINIT_MULTITHREADED,
         );
     }
+    let state = app.state::<Downloads>();
+    let on_board = |change: &dyn Fn(&mut Board)| {
+        if let Ok(mut board) = state.board.lock() {
+            change(&mut board);
+        }
+        let _ = app.emit(CHANGED_EVENT, ());
+    };
     let mut done: HashSet<(PathBuf, u64, Option<SystemTime>)> = HashSet::new();
     let mut counter = 0_u64;
-    while let Ok(path) = ready.recv() {
+    while let Ok(arrival) = ready.recv() {
+        let sighting = match arrival {
+            Arrival::Vanished(sighting) => {
+                note_vanished(app, &sighting);
+                continue;
+            }
+            Arrival::Settled(sighting) => sighting,
+        };
+        let path = sighting.path.clone();
         let Ok(metadata) = std::fs::metadata(&path) else {
+            // Gone between settling and its turn.
+            on_board(&|board| board.waiting.retain(|waiting| *waiting != path));
+            note_vanished(app, &sighting);
             continue;
         };
         // The same file, unchanged, is not checked twice in one run.
         if !done.insert((path.clone(), metadata.len(), metadata.modified().ok())) {
+            on_board(&|board| board.waiting.retain(|waiting| *waiting != path));
             continue;
         }
         counter += 1;
-        check_one(
-            app,
-            &path,
-            &format!("arrival-{}-{counter}", std::process::id()),
-        );
+        let job = format!("arrival-{}-{counter}", std::process::id());
+        on_board(&|board| {
+            board.waiting.retain(|waiting| *waiting != path);
+            board.checking = Some(Checking {
+                path: path.clone(),
+                job: job.clone(),
+                since: Instant::now(),
+            });
+        });
+        check_one(app, &sighting, &job);
+        on_board(&|board| board.checking = None);
     }
 }
 
-fn check_one(app: &AppHandle, path: &Path, job: &str) {
+/// Run `work`. If it is still running after `patience`, and for as long as
+/// `others_waiting` says something is, ask it once to `give_way`. Answers
+/// with what the work came to and whether it was asked.
+///
+/// The asking is all this does: the work has to be something that stops when
+/// asked, as a check does when its job is cancelled.
+fn with_patience<T>(
+    patience: Duration,
+    others_waiting: &(dyn Fn() -> bool + Sync),
+    give_way: &(dyn Fn() + Sync),
+    work: impl FnOnce() -> T,
+) -> (T, bool) {
+    let asked = AtomicBool::new(false);
+    let asked_here = &asked;
+    // Dropped when the work ends, which wakes the watching thread at once.
+    let (finished, wait) = mpsc::channel::<()>();
+    let look_every = patience
+        .min(Duration::from_secs(1))
+        .max(Duration::from_millis(10));
+    let result = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let started = Instant::now();
+            while let Err(RecvTimeoutError::Timeout) = wait.recv_timeout(look_every) {
+                if started.elapsed() >= patience && others_waiting() {
+                    asked_here.store(true, Ordering::SeqCst);
+                    give_way();
+                    break;
+                }
+            }
+        });
+        let result = work();
+        drop(finished);
+        result
+    });
+    (result, asked.load(Ordering::SeqCst))
+}
+
+/// What is said under a file whose automatic check was stopped so that the
+/// downloads behind it were not kept waiting.
+fn gave_way_sentence() -> String {
+    format!(
+        "The automatic check of this file was stopped after {} minutes, because other downloads \
+         were waiting behind it. It can be checked from here, where a check runs until it \
+         finishes or you stop it.",
+        ARRIVAL_PATIENCE.as_secs() / 60
+    )
+}
+
+/// Record a download that arrived and was gone before it could be checked,
+/// and say so in a notice the first time.
+fn note_vanished(app: &AppHandle, sighting: &Sighting) {
+    let request = Request::NoteVanishedDownload {
+        path: sighting.path.to_string_lossy().into_owned(),
+        bytes: sighting.bytes,
+        arrived_at: sighting.arrived_at.clone(),
+    };
+    match kam_ipc::client::call(&request) {
+        Ok(Response::DownloadChecked(record)) => {
+            if record.first_check {
+                announce(app, &record);
+            }
+        }
+        // Refused (it is there again, say) or the service did not answer.
+        // There is no row to say it on, and nothing was shown as checked.
+        Ok(other) => eprintln!("a download that went missing was not recorded: {other:?}"),
+        Err(error) => eprintln!("a download that went missing was not recorded: {error}"),
+    }
+    let _ = app.emit(CHANGED_EVENT, ());
+}
+
+fn check_one(app: &AppHandle, sighting: &Sighting, job: &str) {
     let state = app.state::<Downloads>();
+    let path = sighting.path.as_path();
     let key = path.to_string_lossy().into_owned();
     let note = |message: Option<String>| {
         if let Ok(mut failures) = state.failures.lock() {
@@ -798,16 +1168,50 @@ fn check_one(app: &AppHandle, path: &Path, job: &str) {
         job: job.to_owned(),
         copy_of: None,
     };
-    match kam_ipc::client::call(&request) {
+    // Its progress goes to the page, on the row it is about. And it is not
+    // left to keep later downloads waiting for as long as it likes: see
+    // `ARRIVAL_PATIENCE`.
+    let others_waiting = || {
+        state
+            .board
+            .lock()
+            .is_ok_and(|board| !board.waiting.is_empty())
+    };
+    let give_way = || {
+        let _ = kam_ipc::client::call(&Request::CancelJob {
+            job: job.to_owned(),
+        });
+    };
+    let (response, gave_way) = with_patience(ARRIVAL_PATIENCE, &others_waiting, &give_way, || {
+        kam_ipc::client::call_streaming(&request, |progress| {
+            let _ = app.emit(
+                PROGRESS_EVENT,
+                ArrivalProgress {
+                    path: key.clone(),
+                    job: job.to_owned(),
+                    progress,
+                },
+            );
+        })
+    });
+    match response {
         Ok(Response::DownloadChecked(record)) => {
             note(None);
             if record.first_check {
                 announce(app, &record);
             }
         }
+        // It went while it was being checked, or just before: that is a
+        // download that was gone before it could be checked, and is recorded
+        // as one. The reason used to be kept for a row that no longer existed.
+        Ok(Response::Error { .. }) if std::fs::symlink_metadata(path).is_err() => {
+            note(None);
+            note_vanished(app, sighting);
+        }
         Ok(Response::Error { message }) => {
             note(Some(format!("Not checked when it arrived: {message}")))
         }
+        Ok(Response::Stopped) if gave_way => note(Some(gave_way_sentence())),
         Ok(Response::Stopped) => note(Some("The check was stopped before it finished.".to_owned())),
         Ok(other) => note(Some(format!(
             "The agent answered something unexpected: {other:?}"
@@ -1217,13 +1621,31 @@ mod tests {
         let mut second = record(5, "setup.exe", 0);
         let second_length = second.len() as u32;
         second[..4].copy_from_slice(&second_length.to_le_bytes());
-        let third = record(3, "notes.txt", 0);
-        let bytes = [first, second, third].concat();
+        let mut third = record(3, "notes.txt", 0);
+        let third_length = third.len() as u32;
+        third[..4].copy_from_slice(&third_length.to_le_bytes());
+        let mut fourth = record(4, "old name.txt", 0);
+        let fourth_length = fourth.len() as u32;
+        fourth[..4].copy_from_slice(&fourth_length.to_le_bytes());
+        let mut fifth = record(1, "new.txt", 0);
+        let fifth_length = fifth.len() as u32;
+        fifth[..4].copy_from_slice(&fifth_length.to_le_bytes());
+        // Removed: found by looking, not passed on.
+        let sixth = record(2, "deleted.txt", 0);
+        let bytes = [first, second, third, fourth, fifth, sixth].concat();
 
         let events = parse_notifications(&bytes, Path::new(r"C:\Users\me\Downloads"));
-        assert_eq!(events.len(), 2, "the partial name should be ignored");
-        assert!(matches!(&events[0], Seen::Arrived(path) if path.ends_with("setup.exe")));
+        assert_eq!(events.len(), 4, "the partial name should be ignored");
+        assert!(matches!(
+            &events[0],
+            Seen::Arrived { path, renamed: true } if path.ends_with("setup.exe")
+        ));
         assert!(matches!(&events[1], Seen::Changed(path) if path.ends_with("notes.txt")));
+        assert!(matches!(&events[2], Seen::Renamed(path) if path.ends_with("old name.txt")));
+        assert!(matches!(
+            &events[3],
+            Seen::Arrived { path, renamed: false } if path.ends_with("new.txt")
+        ));
     }
 
     #[test]
@@ -1246,10 +1668,8 @@ mod tests {
         let path = folder.join("big.bin");
         let mut writer = std::fs::File::create(&path).unwrap();
 
-        let (seen_tx, seen_rx) = mpsc::channel();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let settler = std::thread::spawn(move || settle(&seen_rx, &ready_tx));
-        seen_tx.send(Seen::Arrived(path.clone())).unwrap();
+        let (seen_tx, ready_rx, board, settler) = settling();
+        seen_tx.send(arrived(&path, false)).unwrap();
 
         // Still growing, and held open for writing: nothing comes out.
         for _ in 0..3 {
@@ -1257,15 +1677,224 @@ mod tests {
             writer.flush().unwrap();
             assert!(ready_rx.recv_timeout(Duration::from_millis(1500)).is_err());
         }
+        assert_eq!(
+            board.lock().unwrap().state_of(&path),
+            Some(InFlight::Arriving),
+            "the page was not told it is still arriving"
+        );
         drop(writer);
         let finished = ready_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("it never settled");
-        assert_eq!(finished, path);
+        let Arrival::Settled(sighting) = finished else {
+            panic!("it was passed on as gone: {finished:?}");
+        };
+        assert_eq!(
+            (sighting.path.clone(), sighting.bytes),
+            (path.clone(), 3072)
+        );
+        assert_eq!(
+            board.lock().unwrap().state_of(&path),
+            Some(InFlight::Waiting { ahead: 0 }),
+            "the page was not told it is waiting its turn"
+        );
 
         drop(seen_tx);
         settler.join().unwrap();
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    type Settler = (
+        Sender<Seen>,
+        Receiver<Arrival>,
+        Arc<Mutex<Board>>,
+        std::thread::JoinHandle<()>,
+    );
+
+    /// The settling thread, on channels and a board of its own.
+    fn settling() -> Settler {
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let board = Arc::new(Mutex::new(Board::default()));
+        let shared = Arc::clone(&board);
+        let settler = std::thread::spawn(move || settle(&seen_rx, &ready_tx, &shared, &|| {}));
+        (seen_tx, ready_rx, board, settler)
+    }
+
+    fn arrived(path: &Path, renamed: bool) -> Seen {
+        Seen::Arrived {
+            path: path.to_path_buf(),
+            renamed,
+        }
+    }
+
+    /// Firefox makes the final name, empty, when a download starts. It sat
+    /// still, so it was checked and announced as "Defender found nothing"
+    /// while the real file was still arriving in the partial one beside it.
+    #[test]
+    fn an_empty_name_made_for_a_download_still_arriving_is_not_passed_on() {
+        let scratch = Scratch::new("placeholder");
+        let name = scratch.0.join("Downloads").join("big.iso");
+        let part = scratch.0.join("Downloads").join("big.iso.part");
+        std::fs::write(&name, b"").unwrap();
+        std::fs::write(&part, b"the first megabyte").unwrap();
+
+        let (seen_tx, ready_rx, board, settler) = settling();
+        seen_tx.send(arrived(&name, false)).unwrap();
+        let early = ready_rx.recv_timeout(Duration::from_secs(6));
+        assert!(
+            early.is_err(),
+            "an empty placeholder was passed on as a finished download: {early:?}"
+        );
+        // Something else arriving wakes the thread, which tells the page.
+        let other = scratch.0.join("Downloads").join("other.txt");
+        std::fs::write(&other, b"x").unwrap();
+        seen_tx.send(arrived(&other, false)).unwrap();
+        assert!(matches!(
+            ready_rx.recv_timeout(Duration::from_secs(10)),
+            Ok(Arrival::Settled(sighting)) if sighting.path == other
+        ));
+        assert_eq!(
+            board.lock().unwrap().state_of(&name),
+            Some(InFlight::Arriving)
+        );
+
+        // The browser finishes: the partial file is renamed over the name.
+        std::fs::remove_file(&name).unwrap();
+        std::fs::rename(&part, &name).unwrap();
+        seen_tx.send(arrived(&name, true)).unwrap();
+        let finished = ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the finished download never settled");
+        assert!(
+            matches!(&finished, Arrival::Settled(sighting) if sighting.path == name && sighting.bytes == 18),
+            "{finished:?}"
+        );
+
+        drop(seen_tx);
+        settler.join().unwrap();
+    }
+
+    /// A download that Defender takes away as it lands used to leave no
+    /// trace: it was dropped without a word when it was found missing. It is
+    /// passed on as gone now, to be recorded. A name that never held
+    /// anything, or was only renamed, is not.
+    #[test]
+    fn a_download_that_goes_before_it_settles_is_passed_on_as_gone() {
+        let scratch = Scratch::new("vanish");
+        let folder = scratch.0.join("Downloads");
+        let (seen_tx, ready_rx, _, settler) = settling();
+
+        let taken = folder.join("taken.exe");
+        std::fs::write(&taken, b"0123456789").unwrap();
+        seen_tx.send(arrived(&taken, true)).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        std::fs::remove_file(&taken).unwrap();
+        let gone = ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a download that went was dropped without a word");
+        let Arrival::Vanished(sighting) = gone else {
+            panic!("it was passed on to be checked: {gone:?}");
+        };
+        assert_eq!((sighting.path, sighting.bytes), (taken, 10));
+        assert!(sighting.arrived_at.is_some());
+
+        // An empty name that comes and goes, and a file that was renamed.
+        let empty = folder.join("New Text Document.txt");
+        std::fs::write(&empty, b"").unwrap();
+        seen_tx.send(arrived(&empty, false)).unwrap();
+        let renamed = folder.join("a.txt");
+        std::fs::write(&renamed, b"kept").unwrap();
+        seen_tx.send(arrived(&renamed, false)).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        std::fs::remove_file(&empty).unwrap();
+        std::fs::rename(&renamed, folder.join("b.txt")).unwrap();
+        seen_tx.send(Seen::Renamed(renamed)).unwrap();
+        let nothing = ready_rx.recv_timeout(Duration::from_secs(7));
+        assert!(nothing.is_err(), "{nothing:?} was passed on");
+
+        drop(seen_tx);
+        settler.join().unwrap();
+    }
+
+    /// The page is told where each file has got to, so one that is being
+    /// checked no longer reads "Not checked yet".
+    #[test]
+    fn the_board_says_where_each_file_has_got_to() {
+        let path = |name: &str| PathBuf::from(format!(r"C:\Users\me\Downloads\{name}"));
+        let mut board = Board::default();
+        board.arriving.insert(path("arriving.iso"));
+        board.waiting = vec![path("second.exe"), path("third.exe")];
+        assert_eq!(
+            board.state_of(&path("ARRIVING.iso")),
+            Some(InFlight::Arriving)
+        );
+        assert_eq!(
+            board.state_of(&path("third.exe")),
+            Some(InFlight::Waiting { ahead: 1 })
+        );
+        assert_eq!(board.state_of(&path("unknown.txt")), None);
+
+        board.checking = Some(Checking {
+            path: path("first.exe"),
+            job: "arrival-1-1".to_owned(),
+            since: Instant::now(),
+        });
+        assert!(matches!(
+            board.state_of(&path("first.exe")),
+            Some(InFlight::Checking { job, .. }) if job == "arrival-1-1"
+        ));
+        // The one being checked is ahead of everything waiting.
+        assert_eq!(
+            board.state_of(&path("second.exe")),
+            Some(InFlight::Waiting { ahead: 1 })
+        );
+    }
+
+    /// One file Defender stalls on used to hold every later download
+    /// unchecked, for up to four hours. A check that has had its time is
+    /// asked to give way, but only when something is waiting behind it.
+    #[test]
+    fn a_check_gives_way_only_when_it_has_had_its_time_and_others_are_waiting() {
+        // A check that runs for ten seconds unless it is asked to stop.
+        let stopped = AtomicBool::new(false);
+        let started = Instant::now();
+        let long = || {
+            while !stopped.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let ((), gave_way) = with_patience(
+            Duration::from_millis(100),
+            &|| true,
+            &|| stopped.store(true, Ordering::SeqCst),
+            long,
+        );
+        assert!(gave_way, "it was never asked to give way");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it held the others up for its whole length"
+        );
+
+        // With nothing waiting it holds nobody up, and is left to finish.
+        let asked = AtomicBool::new(false);
+        let (finished, gave_way) = with_patience(
+            Duration::from_millis(50),
+            &|| false,
+            &|| asked.store(true, Ordering::SeqCst),
+            || {
+                std::thread::sleep(Duration::from_millis(400));
+                "finished"
+            },
+        );
+        assert_eq!((finished, gave_way), ("finished", false));
+        assert!(!asked.load(Ordering::SeqCst));
+
+        // One that finishes inside its time is never asked, and is not waited on.
+        let quick = Instant::now();
+        let ((), gave_way) = with_patience(Duration::from_secs(600), &|| true, &|| {}, || ());
+        assert!(!gave_way && quick.elapsed() < Duration::from_secs(1));
+        assert!(gave_way_sentence().contains("after 10 minutes"));
     }
 
     /// Product rule: no "clean" in this product's own voice. The page said

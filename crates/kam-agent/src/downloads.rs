@@ -22,7 +22,7 @@ use kam_core::audit::Effect;
 use kam_core::db::DownloadRow;
 use kam_core::{Reporter, UserContext};
 use kam_ipc::Response;
-use kam_scanner::defender_file::{Answer, FileScan};
+use kam_scanner::defender_file::{Answer, FileScan, Flagged};
 use kam_scanner::downloads::{
     CheckError, Dissection, DownloadAction, DownloadCheck, DownloadRecord, Extraction, Held,
 };
@@ -494,6 +494,189 @@ fn note(
     {
         tracing::error!(%error, "could not note an action on a download");
     }
+}
+
+/// How far back a detection in Defender's history is taken to be about a
+/// file that has just gone. A file of the same name flagged last month is
+/// not the one that vanished a moment ago.
+const RECENT_DETECTION_MILLIS: u64 = 60 * 60 * 1000;
+
+/// `2026-11-18T17:51:37` from WMI's `20261118175137.853000+000`, when it is
+/// that shape and in UTC, which is how Defender writes its detection times.
+fn detection_time(cim: &str) -> Option<String> {
+    let digits = cim.get(..14)?;
+    let utc = cim.ends_with("+000") || cim.ends_with("-000");
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) || !utc {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{}T{}:{}:{}",
+        &digits[..4],
+        &digits[4..6],
+        &digits[6..8],
+        &digits[8..10],
+        &digits[10..12],
+        &digits[12..14]
+    ))
+}
+
+/// Record a download that arrived and was gone before it could be checked.
+///
+/// The window saw it arrive and go. What Defender did is read here, from
+/// Defender's own history, and not taken from the window.
+pub fn vanished(
+    path: &str,
+    bytes: u64,
+    arrived_at: Option<&str>,
+    context: &Context,
+    user: &UserContext,
+) -> Response {
+    let history = kam_scanner::defender::threats().map_err(|error| error.to_string());
+    vanished_with(path, bytes, arrived_at, history, context, user)
+}
+
+/// [`vanished`] against a history given rather than read, so it can be tested
+/// without Defender having detected anything.
+fn vanished_with(
+    path: &str,
+    bytes: u64,
+    arrived_at: Option<&str>,
+    history: Result<Vec<kam_scanner::Threat>, String>,
+    context: &Context,
+    user: &UserContext,
+) -> Response {
+    let path = path.trim();
+    let fenced = plain_paths(path, None)
+        .and_then(|()| {
+            if path.chars().any(char::is_control) {
+                Err("a name with a control character in it was not recorded".to_owned())
+            } else {
+                Ok(())
+            }
+        })
+        .and_then(|()| kam_storage::downloads::check_gone_from(path, user));
+    if let Err(refusal) = fenced {
+        context.audit("downloads", "vanished", Effect::Refused, refusal.clone());
+        return Response::Error { message: refusal };
+    }
+
+    // The detections that name this very path, and are recent enough to be
+    // about the file that has just gone.
+    let names_it = |resource: &String| {
+        kam_scanner::defender_file::parse_resource(resource).is_some_and(|named| {
+            named
+                .path
+                .strip_prefix(r"\\?\")
+                .unwrap_or(&named.path)
+                .eq_ignore_ascii_case(path)
+        })
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64);
+    let earliest =
+        kam_core::clock::iso_from_unix_millis(now.saturating_sub(RECENT_DETECTION_MILLIS));
+    let found = history.map(|threats| {
+        threats
+            .into_iter()
+            .filter(|threat| threat.resources.iter().any(names_it))
+            .filter_map(|threat| {
+                let when = threat.detected_at.as_deref().and_then(detection_time);
+                // A time that cannot be read does not rule a detection out;
+                // it is said to be unread, and the reader can judge.
+                if when
+                    .as_deref()
+                    .is_some_and(|when| when < earliest.get(..19).unwrap_or_default())
+                {
+                    return None;
+                }
+                let status = match when {
+                    Some(when) => format!(
+                        "{}, recorded {} UTC",
+                        threat.status_text,
+                        when.replace('T', " ")
+                    ),
+                    None => format!("{}, at a time that could not be read", threat.status_text),
+                };
+                Some((
+                    Flagged {
+                        resources: threat
+                            .resources
+                            .iter()
+                            .filter(|resource| names_it(resource))
+                            .take(1)
+                            .map(|resource| clipped(resource, 1024))
+                            .collect(),
+                        name: clipped(&threat.name, 200),
+                    },
+                    status,
+                ))
+            })
+            .collect::<Vec<_>>()
+    });
+    let scan = FileScan::gone_before_check(found);
+
+    let name = Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_owned());
+    // What the window says it saw, kept only if it is the shape of a time.
+    let arrived_at = arrived_at.filter(|at| {
+        at.len() <= 32
+            && at
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || b"-:.TZ".contains(&byte))
+    });
+    let row = DownloadRow {
+        sid: caller(user).to_owned(),
+        path: path.to_owned(),
+        // There was never anything to fingerprint. Every other row has one,
+        // so the empty one is this path's "gone before it was checked" row.
+        sha256: String::new(),
+        name: name.clone(),
+        bytes,
+        arrived_at: arrived_at.map(str::to_owned),
+        checked_at: String::new(),
+        origin: None,
+        signature: None,
+        outcome: serde_json::to_string(&scan).unwrap_or_default(),
+        actions: String::new(),
+        dissection: None,
+    };
+    let first = match context.store.record_download_check(&row) {
+        Ok(first) => first,
+        Err(error) => {
+            tracing::error!(%error, "could not record a download that went missing");
+            false
+        }
+    };
+    context.audit(
+        "downloads",
+        "vanished",
+        Effect::Observed,
+        format!(
+            "the window reported that {path} arrived and was gone before it could be checked. \
+             {}",
+            scan.caveat.as_deref().unwrap_or_default()
+        ),
+    );
+
+    Response::DownloadChecked(Box::new(DownloadRecord {
+        check: DownloadCheck {
+            path: path.to_owned(),
+            name,
+            bytes,
+            sha256: String::new(),
+            arrived_at: arrived_at.map(str::to_owned),
+            origin: None,
+            signature: None,
+            scan,
+        },
+        checked_at: kam_core::clock::now_utc_iso(),
+        actions: Vec::new(),
+        dissection: None,
+        first_check: first,
+    }))
 }
 
 /// Move one download into quarantine, through the Downloads fence.
@@ -1172,6 +1355,145 @@ mod tests {
         let mut record = record_from_row(stored(r"C:\D\a.zip", &"0".repeat(64), &nothing));
         record.check.scan = long;
         assert!(fits_in_a_frame(Response::DownloadChecked(Box::new(record))));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn detection(name: &str, path: &str, when: &str, status: &str) -> kam_scanner::Threat {
+        kam_scanner::Threat {
+            name: name.to_owned(),
+            severity: Some(5),
+            category: None,
+            action: None,
+            status: None,
+            resources: vec![format!("file:_{path}")],
+            detected_at: Some(when.to_owned()),
+            status_text: status.to_owned(),
+            needs_attention: false,
+        }
+    }
+
+    /// A download Defender removes before it can be checked used to leave no
+    /// trace on the page at all. It is recorded now, with what Defender's own
+    /// history says about that path, read by the agent and not taken from
+    /// the window.
+    #[test]
+    fn a_download_gone_before_it_was_checked_is_recorded_with_what_defender_did() {
+        let context = context();
+        let (root, user) = scratch_profile("vanished");
+        let path = root.join("Downloads").join("taken.exe");
+        let asked = path.to_string_lossy().into_owned();
+        // Now, as WMI writes a time.
+        let now: String = kam_core::clock::now_utc_iso()
+            .chars()
+            .filter(char::is_ascii_digit)
+            .take(14)
+            .collect();
+        let history = vec![
+            detection(
+                "Trojan:Win32/Example",
+                &asked,
+                &format!("{now}.000000+000"),
+                "quarantined",
+            ),
+            // The same name, flagged long ago: not the file that has just gone.
+            detection(
+                "Old:Win32/Stale",
+                &asked,
+                "20200101000000.000000+000",
+                "removed",
+            ),
+            // Another file altogether.
+            detection(
+                "Other:Win32/Elsewhere",
+                &root.join("Downloads").join("b.exe").to_string_lossy(),
+                &format!("{now}.000000+000"),
+                "quarantined",
+            ),
+        ];
+
+        let response = vanished_with(
+            &asked,
+            4096,
+            Some("2026-11-18T10:02:00.000Z"),
+            Ok(history),
+            &context,
+            &user,
+        );
+        let Response::DownloadChecked(record) = &response else {
+            panic!("it was not recorded: {response:?}");
+        };
+        assert!(record.first_check, "nobody is told about it");
+        assert_eq!(record.check.scan.answer, Answer::GoneBeforeCheck);
+        assert_eq!(record.check.scan.threat_names(), ["Trojan:Win32/Example"]);
+        let caveat = record.check.scan.caveat.as_deref().unwrap_or_default();
+        assert!(
+            caveat.contains("Trojan:Win32/Example (quarantined, recorded "),
+            "{caveat}"
+        );
+        assert_eq!(record.check.bytes, 4096);
+        assert_eq!(
+            record.check.arrived_at.as_deref(),
+            Some("2026-11-18T10:02:00.000Z")
+        );
+
+        // It is on the page's list, once, however often it is reported.
+        let again = vanished_with(&asked, 4096, None, Ok(Vec::new()), &context, &user);
+        let Response::DownloadChecked(again) = again else {
+            panic!("the second report was refused");
+        };
+        assert!(!again.first_check);
+        assert!(again.check.scan.threats.is_empty());
+        assert!(again
+            .check
+            .scan
+            .caveat
+            .as_deref()
+            .unwrap_or_default()
+            .contains("what removed it is not known"));
+        let Response::Downloads { records, .. } = list(&[], 10, &context, &user) else {
+            panic!("the history was not listed");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].check.scan.answer, Answer::GoneBeforeCheck);
+        assert_eq!(records[0].check.path, asked);
+
+        // A history that could not be read is said, not taken for empty.
+        let unread = vanished_with(
+            &asked,
+            0,
+            None,
+            Err("no access".to_owned()),
+            &context,
+            &user,
+        );
+        let Response::DownloadChecked(unread) = unread else {
+            panic!("the report was refused");
+        };
+        assert!(unread
+            .check
+            .scan
+            .caveat
+            .as_deref()
+            .unwrap_or_default()
+            .contains("could not be read (no access)"));
+
+        // Only a missing name directly inside the caller's own Downloads.
+        std::fs::write(&path, b"here after all").unwrap();
+        for refused in [asked.clone(), r"C:\Windows\System32\taken.dll".to_owned()] {
+            let response = vanished_with(&refused, 0, None, Ok(Vec::new()), &context, &user);
+            assert!(
+                matches!(response, Response::Error { .. }),
+                "{refused} was recorded as gone: {response:?}"
+            );
+        }
+        let audited = context.store.recent_audit(20).unwrap();
+        let count = |effect: Effect| {
+            audited
+                .iter()
+                .filter(|entry| entry.action == "vanished" && entry.effect == effect)
+                .count()
+        };
+        assert_eq!((count(Effect::Observed), count(Effect::Refused)), (3, 2));
         let _ = std::fs::remove_dir_all(&root);
     }
 

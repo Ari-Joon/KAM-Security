@@ -95,6 +95,67 @@ pub fn is_partial(name: &str) -> bool {
     }
 }
 
+/// Whether a file is an empty name made for a download that is still
+/// arriving beside it.
+///
+/// Firefox creates the final name, empty, the moment a download starts, and
+/// writes the data to `<name>.part` next to it until it is done. Nobody holds
+/// the empty one open, so it sat still, passed for a finished download, and
+/// was checked and announced as "Defender found nothing" while the real file
+/// was still on its way. An empty file with a partial download of its own
+/// name beside it is that placeholder, and is not a download yet.
+///
+/// An empty file with nothing beside it is just an empty file.
+pub fn is_placeholder(path: &Path) -> bool {
+    let empty =
+        std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0);
+    empty
+        && PARTIAL_EXTENSIONS.iter().any(|extension| {
+            let mut beside = path.as_os_str().to_owned();
+            beside.push(".");
+            beside.push(extension);
+            Path::new(&beside).exists()
+        })
+}
+
+/// Decide whether a file that is no longer there was one of the caller's
+/// downloads: a name directly inside their Downloads folder.
+///
+/// For recording that a download arrived and was gone before it could be
+/// checked. The file cannot be resolved, because it is not there, so the
+/// folder it was in is: that has to be the Downloads folder itself, after
+/// links and short names, which is the only place the watcher looks. A file
+/// that is there is refused, because it can simply be checked.
+pub fn check_gone_from(path: &str, user: &UserContext) -> Result<(), String> {
+    gone_from(path, &folder_for(user))
+}
+
+/// [`check_gone_from`] against a Downloads folder given rather than read.
+pub fn gone_from(path: &str, downloads: &str) -> Result<(), String> {
+    if paths::has_relative_step(path) {
+        return Err(format!(
+            "{path} contains a step up a folder, so it was not taken as one of your downloads"
+        ));
+    }
+    let target = Path::new(path);
+    let folder = target
+        .parent()
+        .and_then(|parent| paths::existing_plain(&parent.to_string_lossy()));
+    let root = paths::resolved_root(downloads);
+    if target.file_name().is_none() || root.is_none() || folder != root {
+        return Err(format!(
+            "{path} is not a file directly inside your Downloads folder ({downloads}), so it \
+             was not recorded as a download that went missing"
+        ));
+    }
+    if std::fs::symlink_metadata(target).is_ok() {
+        return Err(format!(
+            "{path} is there, so it was not recorded as gone before it could be checked"
+        ));
+    }
+    Ok(())
+}
+
 /// What kind of archive a name says a file is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveKind {
@@ -440,6 +501,68 @@ mod tests {
                 "{finished:?} was taken as still arriving"
             );
         }
+    }
+
+    /// Firefox makes the final name empty when a download starts and fills
+    /// it in at the end. That empty name is not a finished download.
+    #[test]
+    fn an_empty_name_beside_its_own_partial_download_is_a_placeholder() {
+        let scratch = Scratch::new("placeholder");
+        let name = scratch.downloads.join("big.iso");
+        std::fs::write(&name, b"").unwrap();
+        assert!(!is_placeholder(&name), "an empty file by itself is a file");
+
+        let part = scratch.downloads.join("big.iso.part");
+        std::fs::write(&part, b"the first megabyte").unwrap();
+        assert!(is_placeholder(&name));
+
+        // Once it holds something it is no longer a placeholder, whatever
+        // is still lying beside it.
+        std::fs::write(&name, b"all of it").unwrap();
+        assert!(!is_placeholder(&name));
+        assert!(!is_placeholder(&scratch.downloads.join("never-there.iso")));
+        assert!(!is_placeholder(&scratch.downloads.join("nested")));
+    }
+
+    /// Only a name directly inside Downloads, that is not there now, can be
+    /// recorded as a download that went missing.
+    #[test]
+    fn only_a_missing_file_directly_in_downloads_is_recorded_as_gone() {
+        let scratch = Scratch::new("gone");
+        let downloads = scratch.downloads();
+        assert_eq!(
+            gone_from(&format!(r"{downloads}\taken.exe"), &downloads),
+            Ok(())
+        );
+        // Spelled another way, it is the same folder.
+        assert!(gone_from(
+            &format!(r"{}\taken.exe", downloads.to_uppercase()),
+            &downloads
+        )
+        .is_ok());
+
+        for refused in [
+            // There, so it can be checked instead.
+            format!(r"{downloads}\setup.exe"),
+            // Not directly inside, not inside at all, or climbing out.
+            format!(r"{downloads}\nested\taken.exe"),
+            format!(r"{}\Documents\taken.exe", scratch.root.display()),
+            format!(r"{downloads}\..\Documents\taken.exe"),
+            format!(r"{}\Downloads2\taken.exe", scratch.root.display()),
+            r"C:\Windows\System32\taken.dll".to_owned(),
+            downloads.clone(),
+        ] {
+            assert!(
+                gone_from(&refused, &downloads).is_err(),
+                "{refused} was taken for a download that went missing"
+            );
+        }
+        let nowhere = scratch.root.join("NoSuchDownloads");
+        assert!(gone_from(
+            &format!(r"{}\taken.exe", nowhere.display()),
+            &nowhere.to_string_lossy()
+        )
+        .is_err());
     }
 
     #[test]

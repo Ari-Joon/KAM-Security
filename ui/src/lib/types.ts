@@ -957,8 +957,19 @@ export type StartState = {
 
 // ---------- Downloads -------------------------------------------------------
 
-/** Defender's answer to a report-only check of one file. */
-export type Answer = "nothing_found" | "flagged" | "not_finished";
+/**
+ * Defender's answer to a report-only check of one file. "gone_before_check"
+ * is not an answer from Defender at all: the file arrived and was gone before
+ * it could be asked, and `threats` then holds what Defender's own history has
+ * for that path, if anything.
+ */
+export type Answer = "nothing_found" | "flagged" | "not_finished" | "gone_before_check";
+
+/** Where a file has got to on its way to being checked automatically. */
+export type InFlight =
+  | { state: "arriving" }
+  | { state: "waiting"; ahead: number }
+  | { state: "checking"; job: string; seconds: number };
 
 /** One threat Defender flagged, with the resources it named. */
 export type FlaggedThreat = {
@@ -1107,6 +1118,8 @@ export type LooseFile = {
   arrived_at: string | null;
   archive: "zip" | "other" | null;
   changed_since_checked: boolean;
+  /** Set when it is on its way to being checked, and not simply unchecked. */
+  in_flight: InFlight | null;
 };
 
 export type WatchStatus =

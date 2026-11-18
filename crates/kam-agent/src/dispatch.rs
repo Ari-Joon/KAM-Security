@@ -175,6 +175,7 @@ pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
         | Request::NoteUninstallLaunched { .. }
         | Request::RecordDissection { .. }
         | Request::RecordExtraction { .. }
+        | Request::NoteVanishedDownload { .. }
         | Request::CancelJob { .. } => false,
 
         // Reading, measuring and scanning. A Defender scan is something any
@@ -1089,6 +1090,12 @@ pub fn handle(
         }
 
         Request::QuarantineDownload { path } => crate::downloads::quarantine(&path, context, user),
+
+        Request::NoteVanishedDownload {
+            path,
+            bytes,
+            arrived_at,
+        } => crate::downloads::vanished(&path, bytes, arrived_at.as_deref(), context, user),
 
         Request::RecordDissection {
             path,

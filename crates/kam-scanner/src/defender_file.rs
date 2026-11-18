@@ -60,6 +60,10 @@ pub enum Answer {
     Flagged,
     /// Defender did not finish, failed, or was stopped. Not a clean result.
     NotFinished,
+    /// The file arrived and was gone before Defender could be asked about
+    /// it. Nothing was checked. `threats` then holds what Defender's own
+    /// history records for that path, if anything, and the caveat says which.
+    GoneBeforeCheck,
 }
 
 /// One threat Defender flagged, with the resources it named.
@@ -356,6 +360,69 @@ impl FileScan {
                 }
             }
             Answer::NotFinished => "Defender could not finish checking it".to_owned(),
+            Answer::GoneBeforeCheck => {
+                let names = self.threat_names();
+                if names.is_empty() {
+                    "it was gone before it could be checked".to_owned()
+                } else {
+                    format!(
+                        "it was gone before it could be checked, and Defender's history has {} \
+                         at that path",
+                        names.join(", ")
+                    )
+                }
+            }
+        }
+    }
+
+    /// The record of a file that arrived and was gone before it could be
+    /// checked.
+    ///
+    /// `found` is what Defender's own history holds for that path: `Ok` with
+    /// the detections that name it (and what Defender did about each, in its
+    /// words), or `Err` with why the history could not be read. A history
+    /// that could not be read is said, and never taken for one with nothing
+    /// in it.
+    pub fn gone_before_check(found: std::result::Result<Vec<(Flagged, String)>, String>) -> Self {
+        let (threats, caveat) = match found {
+            Err(reason) => (
+                Vec::new(),
+                format!(
+                    "Defender's history could not be read ({reason}), so whether Defender \
+                     removed it is not known."
+                ),
+            ),
+            Ok(found) if found.is_empty() => (
+                Vec::new(),
+                "Defender's history has nothing recent for that path, so what removed it is \
+                 not known. It may have been moved or deleted by you or by another program. \
+                 Windows Security's Protection history shows what Defender removed."
+                    .to_owned(),
+            ),
+            Ok(found) => {
+                let said: Vec<String> = found
+                    .iter()
+                    .map(|(threat, status)| format!("{} ({status})", threat.name))
+                    .collect();
+                (
+                    found.into_iter().map(|(threat, _)| threat).collect(),
+                    format!(
+                        "Defender's own history has this at that path: {}.",
+                        said.join(", ")
+                    ),
+                )
+            }
+        };
+        Self {
+            answer: Answer::GoneBeforeCheck,
+            completed: false,
+            exit_code: None,
+            seconds: 0,
+            notes: notes_for(&threats),
+            threats,
+            listing_consistent: true,
+            caveat: Some(caveat),
+            definitions: None,
         }
     }
 }

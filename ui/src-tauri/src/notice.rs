@@ -308,6 +308,15 @@ pub fn sentence(name: &str, scan: &kam_scanner::defender_file::FileScan) -> (Str
         Answer::NotFinished => {
             "Defender could not finish checking it, so this is not a clean result.".to_owned()
         }
+        // Nothing was checked, and the notice must not read as if it had
+        // been. What Defender's own history says about it is the agent's
+        // sentence.
+        Answer::GoneBeforeCheck => format!(
+            "It was gone before it could be checked. {}",
+            scan.caveat.as_deref().unwrap_or_default()
+        )
+        .trim_end()
+        .to_owned(),
     };
     (title, body)
 }
@@ -338,6 +347,17 @@ mod tests {
         let body = sentence("a.zip", &unfinished).1;
         assert!(body.contains("not a clean result"), "{body}");
         assert!(!body.contains('—'), "no dashes in what the person reads");
+
+        // A download that was gone before it could be checked is never
+        // announced as one Defender found nothing in.
+        let gone = kam_scanner::defender_file::FileScan::gone_before_check(Ok(Vec::new()));
+        let body = sentence("a.exe", &gone).1;
+        assert!(
+            body.starts_with("It was gone before it could be checked.")
+                && body.contains("not known"),
+            "{body}"
+        );
+        assert!(!body.contains("found nothing"), "{body}");
     }
 
     /// A shortcut is written with the identity and read back with it.

@@ -1087,6 +1087,8 @@ async fn check_download(
     path: String,
     job: String,
 ) -> Result<Option<kam_scanner::downloads::DownloadRecord>, String> {
+    let asked = path.clone();
+    let checked_app = app.clone();
     stream_job(
         app,
         job.clone(),
@@ -1095,8 +1097,15 @@ async fn check_download(
             job,
             copy_of: None,
         },
-        |response| match response {
-            Response::DownloadChecked(record) => Ok(Some(*record)),
+        move |response| match response {
+            Response::DownloadChecked(record) => {
+                // It has been checked now, so why it was not checked when it
+                // arrived no longer has anything to say.
+                let downloads = checked_app.state::<downloads::Downloads>();
+                downloads.forget_failure(&asked);
+                downloads.forget_failure(&record.check.path);
+                Ok(Some(*record))
+            }
             Response::Stopped => Ok(None),
             Response::Error { message } => Err(message),
             other => Err(unexpected(&other)),

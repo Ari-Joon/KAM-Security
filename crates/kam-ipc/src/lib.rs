@@ -379,6 +379,24 @@ pub enum Request {
         #[serde(default)]
         recent: u32,
     },
+    /// Record that a download arrived and was gone before it could be
+    /// checked, which is what Defender's real-time protection does to a file
+    /// it objects to. Without a record the page showed nothing at all for
+    /// exactly the downloads a person most wants to see afterwards.
+    ///
+    /// The window saw it arrive and go, so that much is its report. What
+    /// Defender did is not: the agent reads Defender's own history for that
+    /// path itself. Fenced to a name directly inside the caller's own
+    /// Downloads folder that is not there now. `bytes` and `arrived_at` are
+    /// what the window last saw, shown as such. Answers with the row, as a
+    /// check does.
+    NoteVanishedDownload {
+        path: String,
+        #[serde(default)]
+        bytes: u64,
+        #[serde(default)]
+        arrived_at: Option<String>,
+    },
     /// Move one download into quarantine.
     ///
     /// Fenced to a file that resolves inside the caller's own Downloads

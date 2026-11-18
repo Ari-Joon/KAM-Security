@@ -142,6 +142,17 @@ function Answer({ scan }: { scan: FileScan }) {
       </div>
     );
   }
+  if (scan.answer === "gone_before_check") {
+    // Nothing was checked, so nothing here reads as an answer from a check.
+    // What Defender's own history has for the path, if anything, is in the
+    // sentence the agent wrote, and amber only when it has something.
+    return (
+      <div className={`dl-answer${scan.threats.length > 0 ? " warn" : ""}`}>
+        Gone before it could be checked
+        {scan.caveat && <p className="small muted wrap">{scan.caveat}</p>}
+      </div>
+    );
+  }
   return (
     <div className="dl-answer warn">
       Defender could not finish checking it, so this is not a clean result
@@ -149,6 +160,9 @@ function Answer({ scan }: { scan: FileScan }) {
     </div>
   );
 }
+
+/** An automatic check under way, as the watcher reports it. */
+type AutoCheck = { path: string; job: string; progress: Progress };
 
 export default function Downloads({ launches }: { launches: number }) {
   const [page, setPage] = useState<DownloadsPage | null>(null);
@@ -165,6 +179,8 @@ export default function Downloads({ launches }: { launches: number }) {
   const [panelError, setPanelError] = useState<string | null>(null);
   /** The row whose file is being quarantined or put back, so it is not pressed twice. */
   const [moving, setMoving] = useState<string | null>(null);
+  /** How far the automatic check of an arriving file has got. */
+  const [auto, setAuto] = useState<AutoCheck | null>(null);
   /** The open dissection, so it is not fetched again while it is on screen. */
   const openToken = useRef<string | null>(null);
   /** Archives closed or extracted here, which a reload must not reopen. */
@@ -321,12 +337,18 @@ export default function Downloads({ launches }: { launches: number }) {
   useEffect(() => {
     void load();
     const unlisten = listen("downloads://changed", () => void load());
+    // Automatic checks say how far they have got, so a file being checked as
+    // it arrives shows that, and not "Not checked yet".
+    const unlistenProgress = listen<AutoCheck>("downloads://progress", (event) =>
+      setAuto(event.payload),
+    );
     // An archive that is open stays open when this page is left: the window's
     // own half keeps it, and closes it when the window closes. Leaving the
     // page used to delete its private copy, and with the original already in
     // quarantine that left a row with nothing to press.
     return () => {
       void unlisten.then((stop) => stop());
+      void unlistenProgress.then((stop) => stop());
     };
   }, [load]);
 
@@ -517,7 +539,12 @@ export default function Downloads({ launches }: { launches: number }) {
                 failure={failures.get(row.file.path.toLowerCase())}
                 said={said[row.file.path.toLowerCase()]}
                 focused={focus === row.file.path.toLowerCase()}
-                busy={busy}
+                progress={
+                  auto && auto.path.toLowerCase() === row.file.path.toLowerCase()
+                    ? auto.progress
+                    : null
+                }
+                busy={busy || moving !== null}
                 onCheck={() => void check(row.file.path)}
                 onDissect={() => void dissect(row.file.path)}
               />
@@ -615,17 +642,28 @@ function RecordRow({
         </span>
         <span className="dl-size">{fmt.bytes(record.bytes)}</span>
       </div>
-      <div className="dl-facts small muted">
-        {record.arrived_at ? `arrived ${fmt.timestamp(record.arrived_at)}` : "arrival time not known"}
-        {" · "}
-        {originLabel(record)}
-        {signer && <> · {signer}</>}
-        {" · "}checked {fmt.timestamp(record.checked_at)}
-        {!record.present && <> · no longer where it was</>}
-      </div>
+      {record.scan.answer === "gone_before_check" ? (
+        // Nothing of it was read: no address, no signer, no check.
+        <div className="dl-facts small muted">
+          {record.arrived_at ? `arrived ${fmt.timestamp(record.arrived_at)}` : "arrival time not known"}
+          {" · "}found gone {fmt.timestamp(record.checked_at)}
+          {record.bytes > 0 && <> · the size is what it had grown to when last seen</>}
+        </div>
+      ) : (
+        <div className="dl-facts small muted">
+          {record.arrived_at ? `arrived ${fmt.timestamp(record.arrived_at)}` : "arrival time not known"}
+          {" · "}
+          {originLabel(record)}
+          {signer && <> · {signer}</>}
+          {" · "}checked {fmt.timestamp(record.checked_at)}
+          {!record.present && <> · no longer where it was</>}
+        </div>
+      )}
 
       <Answer scan={record.scan} />
-      {record.scan.answer === "flagged" && <Notes notes={record.scan.notes} />}
+      {(record.scan.answer === "flagged" || record.scan.answer === "gone_before_check") && (
+        <Notes notes={record.scan.notes} />
+      )}
 
       {flaggedProgram && (
         <p className="small muted wrap">
@@ -712,6 +750,7 @@ function LooseRow({
   busy,
   onCheck,
   onDissect,
+  progress,
 }: {
   file: LooseFile;
   failure: string | undefined;
@@ -720,9 +759,16 @@ function LooseRow({
   busy: boolean;
   onCheck: () => void;
   onDissect: () => void;
+  progress: Progress | null;
 }) {
+  const ref = useRef<HTMLLIElement>(null);
+  useEffect(() => {
+    if (focused) ref.current?.scrollIntoView({ block: "center" });
+  }, [focused]);
+  const flight = file.in_flight;
+
   return (
-    <li className={`dl-row${focused ? " dl-focused" : ""}`}>
+    <li ref={ref} className={`dl-row${focused ? " dl-focused" : ""}`}>
       <div className="dl-head">
         <span className="dl-name">
           <PathLink path={file.path}>{file.name}</PathLink>
@@ -732,18 +778,58 @@ function LooseRow({
       <div className="dl-facts small muted">
         {file.arrived_at ? `arrived ${fmt.timestamp(file.arrived_at)}` : "arrival time not known"}
       </div>
-      <div className="dl-answer pending">
-        {file.changed_since_checked
-          ? "Changed since it was checked, so not checked as it is now"
-          : "Not checked yet"}
-        {failure && <p className="small held-warn wrap">{failure}</p>}
-      </div>
+      {/* On its way to being checked is not the same as not checked: it
+          says which, and offers no second check alongside the first. */}
+      {flight?.state === "arriving" && (
+        <div className="dl-answer pending">
+          Still arriving
+          <p className="small muted">
+            It will be checked once it has stopped changing and whatever is writing it has let go.
+          </p>
+        </div>
+      )}
+      {flight?.state === "waiting" && (
+        <div className="dl-answer pending">
+          Waiting its turn to be checked
+          {flight.ahead > 0 && (
+            <>
+              {" "}
+              ({fmt.count(flight.ahead)} ahead of it)
+            </>
+          )}
+        </div>
+      )}
+      {flight?.state === "checking" && (
+        <div className="dl-answer pending">
+          Being checked now
+          {flight.seconds >= 60 && <> (for {fmt.count(Math.floor(flight.seconds / 60))} min so far)</>}
+          {progress ? (
+            <ProgressBar progress={progress} onStop={() => void stopJob(flight.job)} />
+          ) : (
+            <p className="small muted">
+              <button className="link-button" onClick={() => void stopJob(flight.job)}>
+                Stop this check
+              </button>
+            </p>
+          )}
+        </div>
+      )}
+      {!flight && (
+        <div className="dl-answer pending">
+          {file.changed_since_checked
+            ? "Changed since it was checked, so not checked as it is now"
+            : "Not checked yet"}
+          {failure && <p className="small held-warn wrap">{failure}</p>}
+        </div>
+      )}
       {said && <p className="small held-warn wrap">{said}</p>}
       <div className="dl-actions">
-        <button className="ghost" onClick={onCheck} disabled={busy}>
-          Check now
-        </button>
-        {file.archive === "zip" && (
+        {!flight && (
+          <button className="ghost" onClick={onCheck} disabled={busy}>
+            Check now
+          </button>
+        )}
+        {!flight && file.archive === "zip" && (
           <button className="ghost" onClick={onDissect} disabled={busy}>
             Extract what Defender did not flag
           </button>
