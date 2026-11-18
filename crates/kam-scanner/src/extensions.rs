@@ -449,11 +449,11 @@ pub fn survey(user: &UserContext) -> Report {
             if !extensions.is_dir() {
                 continue;
             }
-            report.examined.push(format!("{browser} — {profile}"));
+            report.examined.push(format!("{browser} ({profile})"));
 
             let Ok(ids) = std::fs::read_dir(&extensions) else {
                 report.unreadable.push(format!(
-                    "{browser} — {profile}: the extension folder could not be read"
+                    "{browser} ({profile}): the extension folder could not be read"
                 ));
                 continue;
             };

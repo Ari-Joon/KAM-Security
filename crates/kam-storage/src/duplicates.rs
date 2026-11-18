@@ -426,7 +426,7 @@ fn explain(copies: &[FileCopy], verdict: Verdict, spare: usize) -> Vec<String> {
                 );
             } else {
                 reasons.push(
-                    "The names differ, so this is the same file saved under two names — \
+                    "The names differ, so this is the same file saved under two names, \
                      identical content regardless."
                         .to_owned(),
                 );
@@ -721,7 +721,7 @@ fn check_within(
     match intent {
         Intent::Suggested if !owner.removable() => {
             return Err(format!(
-                "{path} is {} -- only a copy in a folder of yours may be removed this way",
+                "{path} is {}: only a copy in a folder of yours may be removed this way",
                 owner.describes()
             ));
         }
@@ -768,7 +768,7 @@ fn check_within(
     }
     if intent == Intent::Suggested && !real.removable() {
         return Err(format!(
-            "{path} resolves to {resolved}, which is {} -- only a copy in a folder \
+            "{path} resolves to {resolved}, which is {}: only a copy in a folder \
              of yours may be removed this way",
             real.describes()
         ));
@@ -1195,6 +1195,45 @@ mod tests {
         assert!(group.suggested_keep.is_none());
     }
 
+    /// The reasons are shown as written, and nothing a person reads in this
+    /// product carries an em-dash or an en-dash.
+    #[test]
+    fn no_reason_carries_a_dash() {
+        for paths in [
+            // Yours, under two names, and under one.
+            [
+                r"C:\Users\someone\Downloads\report (1).pdf",
+                r"C:\Users\someone\Documents\report.pdf",
+            ],
+            [
+                r"C:\Users\someone\Videos\wedding.mp4",
+                r"C:\Users\someone\Downloads\wedding.mp4",
+            ],
+            // One of the two a program's.
+            [
+                r"C:\Users\someone\Downloads\installer.exe",
+                r"C:\Program Files\Thing\installer.exe",
+            ],
+            // Windows' own, two programs', and nothing recognisable.
+            [
+                r"C:\Windows\WinSxS\one\payload.dll",
+                r"C:\Windows\System32\payload.dll",
+            ],
+            [
+                r"C:\Program Files\Alpha\vcruntime140.dll",
+                r"C:\Program Files\Beta\vcruntime140.dll",
+            ],
+            [r"D:\Archive\one\blob.bin", r"E:\Vault\blob.bin"],
+        ] {
+            for reason in judged(1_000_000, &paths).reasons {
+                assert!(
+                    !reason.contains(['\u{2014}', '\u{2013}']),
+                    "a dash in what the person reads: {reason}"
+                );
+            }
+        }
+    }
+
     /// A chosen copy may be one we would never have suggested.
     ///
     /// The point of the widening: the classifier declines to guess about a
@@ -1211,6 +1250,12 @@ mod tests {
         assert!(
             suggested.contains("only a copy in a folder of yours"),
             "unexpected refusal: {suggested}"
+        );
+        // The rule follows a colon. It was joined on with a double hyphen,
+        // which reads as a dash in the window.
+        assert!(
+            suggested.contains("folder: only a copy"),
+            "unexpected wording: {suggested}"
         );
 
         // Chosen gets past ownership and fails later, on the file not being

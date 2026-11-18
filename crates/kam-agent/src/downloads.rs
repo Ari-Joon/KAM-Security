@@ -465,7 +465,7 @@ pub fn quarantine(path: &str, context: &Context, user: &UserContext) -> Response
                 "quarantine",
                 Effect::Changed,
                 format!(
-                    "quarantined the download {} ({}) -- {reason}",
+                    "quarantined the download {} ({}): {reason}",
                     manifest.original_path,
                     human_bytes(manifest.bytes)
                 ),

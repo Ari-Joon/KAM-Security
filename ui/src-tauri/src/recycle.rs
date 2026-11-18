@@ -199,7 +199,7 @@ pub fn to_recycle_bin(path: &Path) -> Result<Recycled, String> {
         Arrival::Missed => Recycled {
             in_bin: false,
             warning: Some(format!(
-                "{} was removed, but it did not reach the Recycle Bin — Windows \
+                "{} was removed, but it did not reach the Recycle Bin: Windows \
                  does that when an item is too large for it. It cannot be \
                  restored from there.",
                 path.display()

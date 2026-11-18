@@ -157,7 +157,7 @@ const KNOWN: &[(&str, &str, &str, bool)] = &[
     (
         "e6db77e5-3df2-4cf1-b95a-636979351e5b",
         "Block persistence through WMI event subscription",
-        "A way of arranging to be run again that leaves nothing in the startup folders, the Run keys, or the task store — and so is invisible to most tools that list what starts itself, including this one.",
+        "A way of arranging to be run again that leaves nothing in the startup folders, the Run keys, or the task store, and so is invisible to most tools that list what starts itself, including this one.",
         true,
     ),
     (
@@ -422,7 +422,7 @@ fn switches() -> Vec<Switch> {
     found.push(Switch {
         id: PUA_SWITCH.to_owned(),
         name: "Blocking unwanted applications".to_owned(),
-        explains: "Defender can block the software that is not quite malware — bundled toolbars, \
+        explains: "Defender can block the software that is not quite malware: bundled toolbars, \
                    registry cleaners, driver updaters, the things that arrive alongside something \
                    else. It is off unless asked, and it covers the same ground this program's own \
                    rules do, from inside the engine."
@@ -1293,6 +1293,25 @@ mod tests {
             "a hardened machine should be quiet: {:?}",
             report.concerns()
         );
+    }
+
+    /// These are shown as written, and nothing a person reads in this product
+    /// carries an em-dash or an en-dash.
+    #[test]
+    fn no_explanation_carries_a_dash() {
+        let dashed = |text: &str| text.contains(['\u{2014}', '\u{2013}']);
+        for (_, name, explains, _) in KNOWN {
+            assert!(!dashed(name) && !dashed(explains), "{name}: {explains}");
+        }
+        for switch in switches() {
+            assert!(
+                !dashed(&switch.name) && !dashed(&switch.explains) && !dashed(&switch.how),
+                "{}: {} {}",
+                switch.name,
+                switch.explains,
+                switch.how
+            );
+        }
     }
 
     #[test]

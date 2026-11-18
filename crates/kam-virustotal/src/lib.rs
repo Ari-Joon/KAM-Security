@@ -179,7 +179,7 @@ fn interpret(malicious: u32, suspicious: u32, engines: u32) -> (Standing, String
             format!(
                 "{flagged} of {engines} engines flagged this, which on its own usually means \
                  nothing. A small number of detections against a large majority is the normal \
-                 signature of a false positive — installers, packers and less common software \
+                 signature of a false positive: installers, packers and less common software \
                  collect them routinely. Worth reading which engines, and what they called it, \
                  before drawing any conclusion."
             ),
@@ -192,7 +192,7 @@ fn interpret(malicious: u32, suspicious: u32, engines: u32) -> (Standing, String
             format!(
                 "{flagged} of {engines} engines flagged this. That is more than the usual \
                  false-positive noise and worth looking into, though it is still short of \
-                 agreement — check whether the names below describe the same thing."
+                 agreement. Check whether the names below describe the same thing."
             ),
         );
     }
@@ -357,7 +357,7 @@ pub fn look_up(sha256: &str) -> kam_core::Result<Verdict> {
             common_name: None,
             permalink: format!("https://www.virustotal.com/gui/file/{sha256}"),
             summary: "VirusTotal has no record of this file. That is unremarkable on its own \
-                      — most files on most machines have never been submitted by anyone — and \
+                      (most files on most machines have never been submitted by anyone) and \
                       it is not evidence either way."
                 .to_owned(),
         }),
@@ -468,6 +468,21 @@ mod tests {
     fn suspicious_counts_alongside_malicious() {
         let (standing, _) = interpret(0, 5, 70);
         assert_eq!(standing, Standing::Substantial);
+    }
+
+    /// The summaries are shown as written, and nothing a person reads in this
+    /// product carries an em-dash or an en-dash.
+    #[test]
+    fn no_summary_carries_a_dash() {
+        for (malicious, suspicious, engines) in
+            [(0, 0, 0), (0, 0, 70), (2, 0, 70), (6, 1, 70), (48, 3, 70)]
+        {
+            let (_, summary) = interpret(malicious, suspicious, engines);
+            assert!(
+                !summary.contains(['\u{2014}', '\u{2013}']),
+                "a dash in what the person reads: {summary}"
+            );
+        }
     }
 
     #[test]

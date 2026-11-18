@@ -238,7 +238,7 @@ pub fn check_install_directory(path: &Path) -> Result<()> {
         "{} can be written to by: {}.\n\n\
          The agent serves any program that sits in its own directory, so a folder \
          other people can write to is a folder where anyone can drop a program that \
-         drives this service as LocalSystem — or replace the agent itself. That \
+         drives this service as LocalSystem, or replace the agent itself. That \
          includes the account that owns the folder: Windows lets an owner change who \
          may write whenever it likes.\n\n\
          Run setup.ps1, which secures the folder and hands it to Administrators, or \

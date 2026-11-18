@@ -423,7 +423,7 @@ pub fn check_movable(from: &str, to: &str, user: &UserContext) -> std::result::R
     let name = from.rsplit(['\\', '/']).next().unwrap_or_default();
     if !is_movable(name) {
         return Err(format!(
-            "{name} is not a kind of file this will move — executables and \
+            "{name} is not a kind of file this will move: executables and \
              anything that runs are excluded on purpose"
         ));
     }
@@ -561,12 +561,18 @@ mod tests {
     #[test]
     fn the_fence_refuses_executables_even_inside_the_user_folder() {
         let home = Home::new("executables");
-        assert!(check_movable(
+        let refused = check_movable(
             &home.file("Downloads\\setup.exe"),
             &home.path("Documents\\setup.exe"),
-            &home.user()
-        )
-        .is_err());
+            &home.user(),
+        );
+        assert!(refused.is_err());
+        // The reason is read by a person, and follows a colon, not a dash.
+        let reason = refused.unwrap_err();
+        assert!(
+            reason.contains("will move: executables"),
+            "unexpected wording: {reason}"
+        );
     }
 
     #[test]

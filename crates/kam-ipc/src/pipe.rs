@@ -461,7 +461,7 @@ impl PipeListener {
                 self.claim_name.store(true, AtomicOrdering::SeqCst);
                 return Err(Error::Refused(format!(
                     "the agent pipe already exists, so something else is already \
-                     serving it — refusing to share the name: {error}"
+                     serving it. Refusing to share the name: {error}"
                 )));
             }
             return Err(win32(error, "could not create the agent pipe"));

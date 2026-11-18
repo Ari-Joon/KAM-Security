@@ -302,7 +302,7 @@ Auditing is off, so reading one of these would go unnoticed.                  Tu
         );
         for trip in &report.trips {
             println!(
-                "  {} — {} read by {} (as {})",
+                "  {}: {} read by {} (as {})",
                 trip.at,
                 trip.path,
                 trip.process.as_deref().unwrap_or("an unnamed program"),

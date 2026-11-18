@@ -548,6 +548,25 @@ mod tests {
         }
     }
 
+    /// The category and the explanation are put on screen as written, and
+    /// nothing a person reads in this product carries an em-dash or an
+    /// en-dash.
+    #[test]
+    fn no_bundled_rule_explains_itself_with_a_dash() {
+        for name in rule_names(BUNDLED) {
+            let block = BUNDLED
+                .split(&format!("rule {name}"))
+                .nth(1)
+                .unwrap_or_default();
+            let meta = block.split("strings:").next().unwrap_or_default();
+            let meta = meta.split("condition:").next().unwrap_or(meta);
+            assert!(
+                !meta.contains(['\u{2014}', '\u{2013}']),
+                "rule {name} has a dash in what the person reads"
+            );
+        }
+    }
+
     #[test]
     fn miner_strings_are_recognised() {
         let path = sample(

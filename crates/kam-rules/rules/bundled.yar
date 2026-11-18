@@ -90,7 +90,7 @@ rule bundled_installer_wrapper
     meta:
         kam_category = "Bundled software installer"
         kam_confidence = "notable"
-        kam_explains = "This installer is built on a platform whose business is bundling extra software with whatever you meant to install — toolbars, search hijackers, trial antivirus. The bundled offers are usually pre-ticked and are why people end up with software they never chose."
+        kam_explains = "This installer is built on a platform whose business is bundling extra software with whatever you meant to install: toolbars, search hijackers, trial antivirus. The bundled offers are usually pre-ticked and are why people end up with software they never chose."
 
     strings:
         // Named monetisation SDKs. These are product names, not generic words.
@@ -193,7 +193,7 @@ rule downloads_and_executes
     meta:
         kam_category = "Downloads and runs code"
         kam_confidence = "strong"
-        kam_explains = "This fetches code from the internet and runs it immediately, without writing it to disk where anything could examine it first. It is a standard technique for keeping the part that does the real work off the machine until the last moment, and it is also how some legitimate install scripts work — so check where it is downloading from."
+        kam_explains = "This fetches code from the internet and runs it immediately, without writing it to disk where anything could examine it first. It is a standard technique for keeping the part that does the real work off the machine until the last moment, and it is also how some legitimate install scripts work, so check where it is downloading from."
 
     strings:
         $iex_full = "Invoke-Expression" ascii wide nocase
@@ -293,7 +293,7 @@ rule browser_credential_theft
     meta:
         kam_category = "Browser credential theft"
         kam_confidence = "strong"
-        kam_explains = "This reaches directly for the files a browser keeps saved passwords, cookies and card details in — the login database, the cookie store, and the key that decrypts them. Software that legitimately reads those is the browser itself. Anything else opening them by their exact internal paths is an infostealer collecting what to send off the machine, which is how a single unlucky download turns into a hijacked email, Discord or Instagram account."
+        kam_explains = "This reaches directly for the files a browser keeps saved passwords, cookies and card details in: the login database, the cookie store, and the key that decrypts them. Software that legitimately reads those is the browser itself. Anything else opening them by their exact internal paths is an infostealer collecting what to send off the machine, which is how a single unlucky download turns into a hijacked email, Discord or Instagram account."
 
     strings:
         // The exact on-disk names of the credential stores. A program that
@@ -337,7 +337,7 @@ rule build_tool_loader
     meta:
         kam_category = "Build tool used as a loader"
         kam_confidence = "strong"
-        kam_explains = "This is a build project file that carries an inline code task — a program embedded inside what should be a description of how to compile software. MSBuild, which is signed by Microsoft and trusted everywhere, will run that code when handed the file, and antivirus does not read project files. It is a known way to run a payload while the only thing on screen is a trusted Microsoft process, and it is exactly how the infection this tool was hardened against stayed hidden."
+        kam_explains = "This is a build project file that carries an inline code task: a program embedded inside what should be a description of how to compile software. MSBuild, which is signed by Microsoft and trusted everywhere, will run that code when handed the file, and antivirus does not read project files. It is a known way to run a payload while the only thing on screen is a trusted Microsoft process, and it is exactly how the infection this tool was hardened against stayed hidden."
 
     strings:
         // MSBuild's inline-task machinery: a task written in C# compiled and run

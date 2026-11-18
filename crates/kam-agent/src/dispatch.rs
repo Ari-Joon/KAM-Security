@@ -282,7 +282,7 @@ pub fn handle(
                         "survey",
                         Effect::Observed,
                         format!(
-                            "surveyed {letter}: — {} applications using {}, {} leftover directories holding {}, {} downloads holding {}, in {} ms (table {}, index {}, applications {}, leftovers {}, downloads {})",
+                            "surveyed {letter}: {} applications using {}, {} leftover directories holding {}, {} downloads holding {}, in {} ms (table {}, index {}, applications {}, leftovers {}, downloads {})",
                             report.summary.applications,
                             human_bytes(report.summary.measured_bytes),
                             report.orphan_summary.found,
@@ -1162,7 +1162,7 @@ fn quarantine_path(path: &str, reason: &str, context: &Context, user: &UserConte
                 "take",
                 Effect::Changed,
                 format!(
-                    "quarantined {} ({}) -- {reason}",
+                    "quarantined {} ({}): {reason}",
                     manifest.original_path,
                     human_bytes(manifest.bytes)
                 ),
@@ -1316,7 +1316,7 @@ fn scan_path(path: &str, context: &Context) -> Response {
                 "scan",
                 Effect::Observed,
                 format!(
-                    "scanned {} — {} in {} files, {} unreadable, {} ms",
+                    "scanned {}: {} in {} files, {} unreadable, {} ms",
                     scan.root,
                     human_bytes(scan.total_bytes),
                     scan.file_count,
@@ -2008,6 +2008,13 @@ mod tests {
             Some(manifest.id.as_str()),
             "the log records how to undo it"
         );
+        // The reason follows a colon. It was joined on with a double hyphen,
+        // which a person reading the Activity list sees as a dash.
+        assert!(
+            take.detail.ends_with("): left behind by a test"),
+            "unexpected wording: {}",
+            take.detail
+        );
 
         handle(
             Request::RestoreQuarantined {
@@ -2143,6 +2150,13 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].action, "scan");
         assert_eq!(records[0].effect, Effect::Observed);
+        // A person reads this in the Activity list, so the figures follow the
+        // path after a colon, not an em-dash or an en-dash.
+        assert!(
+            !records[0].detail.contains(['\u{2014}', '\u{2013}']),
+            "a dash in what the person reads: {}",
+            records[0].detail
+        );
     }
 
     #[test]
@@ -2352,6 +2366,16 @@ mod tests {
         let row = context.store.downloads_for("", 10).unwrap().remove(0);
         assert!(row.actions.contains(&manifest.id), "{}", row.actions);
         assert_eq!(row.sha256, record.check.sha256);
+        // The Activity entry gives its reason after a colon, not a double
+        // hyphen standing in for a dash.
+        let taken = context
+            .store
+            .recent_audit(20)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.module == "downloads" && entry.action == "quarantine")
+            .expect("the quarantine was not recorded");
+        assert!(taken.detail.contains("): a download"), "{}", taken.detail);
 
         let back = handle(
             Request::RestoreQuarantined {
