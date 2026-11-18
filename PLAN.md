@@ -163,7 +163,7 @@ and executable signer identity to link vendor directories to their owning produc
 **(c) Orphan detection.**
 Directories under ProgramData/LocalAppData/AppData whose owning application is no longer
 installed. Leftovers from software uninstalled months or years ago. On a development
-machine this is routinely 10–40 GB. Ranked by size, last-access time, and confidence
+machine this is routinely 10 to 40 GB. Ranked by size, last-access time, and confidence
 that the owner is truly gone.
 
 **(d) Provenance-aware download intelligence.**
