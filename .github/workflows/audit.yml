@@ -1,0 +1,29 @@
+name: Audit
+
+# An advisory can be published against a dependency on a day when nothing is
+# pushed. The audit in CI only runs on a push or a pull request, so in October
+# 2026 nine advisories sat unnoticed for two weeks, failing every Dependabot
+# pull request, until somebody happened to look. This asks the same question
+# once a week whether or not anything changed, and a failed run is emailed the
+# way any other failed run is.
+on:
+  schedule:
+    # Mondays at 07:17 UTC. Off the hour, because scheduled runs queue up on it.
+    - cron: "17 7 * * 1"
+  workflow_dispatch:
+
+# Read-only. It publishes nothing and needs no token beyond reading the code.
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: advisories published since the last push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check advisories

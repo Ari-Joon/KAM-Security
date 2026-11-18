@@ -10,6 +10,16 @@ updates:
       # noise and would not build in isolation anyway.
       windows:
         patterns: ["windows", "windows-*"]
+      # Tauri's crates move together too, and its npm half (below) has to stay
+      # on the same minor version or `tauri build` refuses to run.
+      tauri:
+        patterns: ["tauri", "tauri-*"]
+      # Everything else that is a minor or patch update arrives as one pull
+      # request a week rather than one each: eleven separate ones were waiting
+      # in November 2026. A major version still gets a pull request of its own,
+      # because that is the one somebody has to read.
+      minor-and-patch:
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: npm
     directory: "/ui"
@@ -21,8 +31,14 @@ updates:
         patterns: ["@tauri-apps/*"]
       react:
         patterns: ["react", "react-dom", "@types/react", "@types/react-dom"]
+      minor-and-patch:
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: monthly
+    groups:
+      # The pinned commits move one action at a time otherwise.
+      actions:
+        patterns: ["*"]
