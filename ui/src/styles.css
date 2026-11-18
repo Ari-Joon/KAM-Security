@@ -1548,6 +1548,16 @@ select {
   flex: none;
 }
 
+/* How long an item has before it is deleted for good. Quiet, beside the size:
+   it is a fact about the row, not a warning. */
+.held-left {
+  font-size: 11.5px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex: none;
+}
+
 .notice-ok {
   color: var(--ok);
   background: rgba(61, 214, 140, 0.08);

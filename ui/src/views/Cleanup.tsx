@@ -114,6 +114,28 @@ const DUPE_LIMIT = 40;
 /** The same, for downloads, which are informational rather than actionable. */
 const DOWNLOAD_LIMIT = 25;
 
+/**
+ * How long quarantine keeps an item before the service deletes it for good.
+ * The service's own figure is `RETENTION_DAYS` in `kam-quarantine`, and it is
+ * the one that decides: this is only what the row says.
+ */
+const RETENTION_DAYS = 30;
+
+/**
+ * How long a quarantined item has left.
+ *
+ * The service looks four times a day, so an item whose thirty days are up can
+ * sit here for a few hours more, still restorable. It is said as what it is,
+ * rather than as nought days left beside a Restore button that still works.
+ */
+function timeLeft(quarantinedAt: number): string {
+  const left = quarantinedAt + RETENTION_DAYS * 86_400 - Date.now() / 1000;
+  if (left <= 0) return "due to be deleted";
+  const days = Math.floor(left / 86_400);
+  if (days >= 1) return `${fmt.count(days)} ${days === 1 ? "day" : "days"} left`;
+  return "less than a day left";
+}
+
 const CONFIDENCE_LABEL: Record<Confidence, string> = {
   high: "Very likely leftover",
   medium: "Possibly leftover",
@@ -1016,9 +1038,10 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         </div>
         <p className="muted">
           Everything here was moved rather than deleted, and goes back where it
-          came from with one press for thirty days. Deleting is the other
-          direction and there is no undo for it, so both ways of doing it ask
-          first.
+          came from with one press for thirty days. After thirty days it is
+          deleted for good, and each item says how long it has left. Deleting
+          sooner is the other direction and there is no undo for it, so both
+          ways of doing that ask first.
         </p>
 
         {emptying && (
@@ -1085,6 +1108,12 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                   <span className="held-reason">{item.reason}</span>
                 </div>
                 <span className="held-size">{fmt.bytes(item.bytes)}</span>
+                <span
+                  className="held-left"
+                  title="Quarantine keeps an item for thirty days, then deletes it for good"
+                >
+                  {timeLeft(item.quarantined_at)}
+                </span>
                 {confirming === item.id ? (
                   <>
                     <span className="held-warn">Delete for good?</span>
