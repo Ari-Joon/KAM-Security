@@ -504,6 +504,32 @@ fn msi_argument(start: &ProcessStart) -> Option<PathBuf> {
         .map(|token| PathBuf::from(start.expand(token.trim())))
 }
 
+/// The line saying a startup entry runs a script, with what was found out
+/// about who signed it.
+///
+/// It said "carries no signature" of every script without looking. Most carry
+/// none. But Windows signs some of its own through a catalogue, a PowerShell
+/// script can hold a signature of its own, and a script that could not be
+/// read has not been shown to hold nothing.
+fn script_line(name: &str, signature: &Signature) -> String {
+    let opening = format!("{name} is a script or project file, which");
+    match signature {
+        Signature::Unsigned => {
+            format!("{opening} carries no signature and is read as code when it runs.")
+        }
+        Signature::Valid { signer, .. } => {
+            format!("{opening} is read as code when it runs. It is signed by {signer}.")
+        }
+        Signature::Invalid { reason, .. } => {
+            format!("{opening} is read as code when it runs. It carries a signature, but {reason}.")
+        }
+        Signature::Unknown { reason } => format!(
+            "{opening} is read as code when it runs. Whether anybody signed it could not be \
+             checked: {reason}."
+        ),
+    }
+}
+
 /// Judge one newly appeared startup entry.
 ///
 /// This is what the agent's snapshot watcher feeds: something that was not
@@ -567,10 +593,7 @@ pub fn judge_entry(entry: &Entry) -> Option<Observation> {
         ));
     }
     if script {
-        evidence.push(format!(
-            "{} is a script or project file, which carries no signature and is read as code when it runs.",
-            file_name(target)
-        ));
+        evidence.push(script_line(&file_name(target), &signature));
     }
     if unsigned && !script {
         evidence.push("Nobody signed the program it runs.".to_owned());
@@ -818,6 +841,62 @@ mod tests {
         assert_eq!(observation.concern, Concern::Strong);
         assert_eq!(observation.kind, Kind::ScheduledTask);
         assert!(observation.summary.to_lowercase().contains("hidden"));
+    }
+
+    /// A script is said to carry no signature only when it carries none.
+    #[test]
+    fn a_script_is_not_called_unsigned_without_looking() {
+        let none = script_line("run.cmd", &Signature::Unsigned);
+        assert!(none.contains("carries no signature"), "{none}");
+
+        let windows = script_line(
+            "winrm.cmd",
+            &Signature::Valid {
+                signer: "Microsoft Windows".to_owned(),
+                catalogue: Some("x.cat".to_owned()),
+            },
+        );
+        assert!(!windows.contains("no signature"), "{windows}");
+        assert!(windows.contains("signed by Microsoft Windows"), "{windows}");
+
+        let unread = script_line(
+            "x.ps1",
+            &Signature::Unknown {
+                reason: "the file could not be read".to_owned(),
+            },
+        );
+        assert!(!unread.contains("carries no signature"), "{unread}");
+        assert!(unread.contains("could not be checked"), "{unread}");
+    }
+
+    /// The same through the whole judgement, on a script Windows signs: a
+    /// copy of it in Temp is still listed in the catalogue, by what it holds.
+    #[test]
+    fn a_windows_script_run_from_a_writable_folder_is_not_called_unsigned() {
+        let root = std::env::var("SystemRoot").unwrap();
+        let body = std::fs::read(Path::new(&root).join(r"System32\winrm.cmd")).unwrap();
+        let copy = scratch("winrm-copy.cmd", "");
+        std::fs::write(&*copy, body).unwrap();
+
+        let command = format!(r#"C:\Windows\system32\cmd.exe /c "{}""#, copy.display());
+        let observation =
+            judge_entry(&entry(Anchor::ScheduledTask, &command, true)).expect("fires");
+        assert!(
+            observation
+                .evidence
+                .iter()
+                .any(|line| line.contains("signed by Microsoft Windows")),
+            "{:#?}",
+            observation.evidence
+        );
+        assert!(
+            !observation
+                .evidence
+                .iter()
+                .any(|line| line.contains("carries no signature")),
+            "{:#?}",
+            observation.evidence
+        );
     }
 
     /// A new entry whose program cannot be found is written down as that,

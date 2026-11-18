@@ -45,8 +45,8 @@ use windows::Win32::Security::WinTrust::{
     WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, GetFileSizeEx, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
 /// What is known about a file's signature.
@@ -139,15 +139,37 @@ fn unreadable(code: i32) -> Option<&'static str> {
     }
 }
 
+/// Whether the check of the file itself found no signature there to judge.
+///
+/// Three answers mean that, and they are kept in one place because two
+/// decisions hang off them: that this is not a rejection, and that the
+/// catalogues have to be asked before anything is said.
+///
+/// - `TRUST_E_NOSIGNATURE` (0x800B0100): a kind of file that could hold a
+///   signature, and does not.
+/// - `TRUST_E_SUBJECT_FORM_UNKNOWN` (0x800B0003): a kind that cannot hold one
+///   at all. A `.cmd`, a `.bat`, a text file, and anything named `.exe` that
+///   is not really a program.
+/// - `TRUST_E_PROVIDER_UNKNOWN` (0x800B0001): a kind nothing on this machine
+///   knows how to check.
+///
+/// None of them says the file is unsigned. Windows signs files of every kind
+/// through its catalogues, its own scripts among them.
+fn carries_nothing(code: i32) -> bool {
+    matches!(code as u32, 0x800B_0100 | 0x800B_0003 | 0x800B_0001)
+}
+
 fn describe_trust(code: i32) -> Option<String> {
+    // Nothing was signed, or the file is not a form trust understands (a text
+    // file, a data blob). Neither is a rejection.
+    if carries_nothing(code) {
+        return None;
+    }
+
     // Documented WinVerifyTrust returns. Written as raw values because the
     // bindings spell these constants differently in every crate version, and a
     // wrong constant here would silently mis-describe a real finding.
     let message = match code as u32 {
-        // Nothing was signed, or the file is not a form trust understands (a
-        // text file, a data blob). Neither is a rejection.
-        0x800B_0100 | 0x800B_0003 | 0x800B_0001 => return None,
-
         0x8009_6010 => "the file has been altered since it was signed",
         0x8009_600E => "the file is not signed in a way that can be checked",
         0x8009_6002 => "the certificate that signed this could not be found",
@@ -261,9 +283,34 @@ enum Catalogue {
     Listed(i32, PathBuf),
     /// No catalogue on this machine lists the file.
     NotListed,
-    /// The lookup itself did not work, so whether a catalogue lists the file
-    /// is not known.
+    /// The lookup itself did not work, or was not made, so whether a catalogue
+    /// lists the file is not known.
     Failed(String),
+}
+
+/// The largest file that cannot hold a signature of its own that is still
+/// looked up in the catalogues.
+///
+/// The lookup hashes the whole file, and hashes it twice when nothing lists
+/// it. For a file that could hold a signature and does not, that has always
+/// been done whatever its size, and is left alone. A file that cannot hold one
+/// is anything at all: a script of a few kilobytes, or several gigabytes with
+/// a program's name on it, and this is called from places that must answer in
+/// a moment. What Windows signs this way is small (its own two `.cmd` files in
+/// `System32` are 33 bytes and 7 KB), so the limit costs those nothing.
+///
+/// Above it the answer is that the signature could not be checked, with the
+/// reason. Not "unsigned": the catalogues were not asked, so that has not been
+/// established.
+const UNSIGNABLE_LOOKUP_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// Why a file over the limit was not looked up, for the person reading.
+fn too_large(bytes: u64) -> String {
+    format!(
+        "the file holds no signature of its own, and at {} MB it is too large to be \
+         looked up in Windows' catalogues",
+        bytes.div_ceil(1024 * 1024)
+    )
 }
 
 /// Check whether a system catalogue vouches for the file.
@@ -278,7 +325,10 @@ enum Catalogue {
 /// They were the same answer, and the answer was "not signed": a file that
 /// would not open for hashing, or a catalogue service that was not running,
 /// turned a Windows component into an unsigned program.
-fn verify_catalogue(path: &Path) -> Catalogue {
+///
+/// `limit` is the largest file that is looked up, when there is one. See
+/// [`UNSIGNABLE_LOOKUP_LIMIT`] for which files have one and why.
+fn verify_catalogue(path: &Path, limit: Option<u64>) -> Catalogue {
     let handle = match open_for_read(path) {
         Ok(handle) => handle,
         Err(error) => {
@@ -288,6 +338,26 @@ fn verify_catalogue(path: &Path) -> Catalogue {
             ))
         }
     };
+
+    let mut length = 0_i64;
+    if unsafe { GetFileSizeEx(handle, &mut length) }.is_ok() {
+        let settled = if length == 0 {
+            // Windows cannot hash a file with nothing in it, and says so with
+            // an error about the volume having been altered. Nothing vouches
+            // for nothing, so this is answered without asking.
+            Some(Catalogue::NotListed)
+        } else {
+            limit
+                .filter(|limit| length as u64 > *limit)
+                .map(|_| Catalogue::Failed(too_large(length as u64)))
+        };
+        if let Some(settled) = settled {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return settled;
+        }
+    }
 
     // SHA-256 for anything current; SHA-1 for catalogues old enough to predate
     // it. Passing no algorithm at all would silently mean SHA-1 only.
@@ -427,7 +497,11 @@ fn catalogue_attempt(handle: HANDLE, path: &Path, algorithm: PCWSTR) -> Catalogu
 
 /// Ask Windows whether it trusts the file, by either route.
 fn verify_trust(path: &Path) -> Trust {
-    settle(verify_embedded(path), || verify_catalogue(path))
+    let embedded = verify_embedded(path);
+    // Only the files that could not have held a signature are held to the
+    // limit. See `UNSIGNABLE_LOOKUP_LIMIT`.
+    let limit = (embedded != TRUST_E_NOSIGNATURE.0).then_some(UNSIGNABLE_LOOKUP_LIMIT);
+    settle(embedded, || verify_catalogue(path, limit))
 }
 
 /// Decide from the embedded check, asking the catalogues only when the file
@@ -446,7 +520,13 @@ fn settle(embedded: i32, catalogue: impl FnOnce() -> Catalogue) -> Trust {
         return Trust::Unreadable(reason.to_owned());
     }
 
-    if embedded == TRUST_E_NOSIGNATURE.0 {
+    // Every answer that means "nothing here to judge", not only the one for a
+    // file that could have been signed. The catalogues were asked on
+    // `TRUST_E_NOSIGNATURE` alone, and a `.cmd` answers
+    // `TRUST_E_SUBJECT_FORM_UNKNOWN`, so they were never asked about one:
+    // `hpatchmonTask.cmd` and `winrm.cmd`, which Windows signs through a
+    // catalogue, were reported as carrying no signature.
+    if carries_nothing(embedded) {
         match catalogue() {
             Catalogue::Listed(0, catalogue) => return Trust::Trusted(Some(catalogue)),
             Catalogue::Listed(other, _) => {
@@ -686,6 +766,103 @@ mod tests {
             settle(0x8009_6010_u32 as i32, || panic!("asked the catalogue")),
             Trust::Rejected(_)
         ));
+    }
+
+    /// A file of a kind that cannot hold a signature is still looked up.
+    ///
+    /// The catalogues were asked only when the file's own check answered "no
+    /// signature". A `.cmd` cannot hold one, so its check answers "not a form
+    /// I know" instead, the catalogues were never asked, and the scripts
+    /// Windows signs that way were reported as unsigned.
+    #[test]
+    fn a_file_that_cannot_hold_a_signature_is_still_looked_up() {
+        const SUBJECT_FORM_UNKNOWN: i32 = 0x800B_0003_u32 as i32;
+        const PROVIDER_UNKNOWN: i32 = 0x800B_0001_u32 as i32;
+        const EXPIRED: i32 = 0x800B_0101_u32 as i32;
+
+        for embedded in [SUBJECT_FORM_UNKNOWN, PROVIDER_UNKNOWN] {
+            assert!(
+                matches!(
+                    settle(embedded, || Catalogue::Listed(0, PathBuf::from("x.cat"))),
+                    Trust::Trusted(Some(catalogue)) if catalogue == Path::new("x.cat")
+                ),
+                "a catalogue vouched for the file and it was not believed (0x{:08X})",
+                embedded as u32
+            );
+            // Asked, and nothing lists it: that is what "not signed" means.
+            assert!(matches!(
+                settle(embedded, || Catalogue::NotListed),
+                Trust::Absent
+            ));
+            // Not answered is not "not signed".
+            assert!(matches!(
+                settle(embedded, || Catalogue::Failed("no answer".to_owned())),
+                Trust::Unreadable(_)
+            ));
+            // Listed by a catalogue Windows will not accept is a rejection.
+            assert!(matches!(
+                settle(embedded, || Catalogue::Listed(
+                    EXPIRED,
+                    PathBuf::from("x.cat")
+                )),
+                Trust::Rejected(_)
+            ));
+        }
+    }
+
+    /// The real thing: a script that ships with every Windows, desktop and
+    /// server, and that Windows signs through a catalogue.
+    #[test]
+    fn a_script_windows_signs_through_a_catalogue_is_signed() {
+        let root = std::env::var("SystemRoot").unwrap();
+        let script = Path::new(&root).join(r"System32\winrm.cmd");
+        match of(&script) {
+            Signature::Valid { signer, catalogue } => {
+                assert!(is_windows_signer(&signer), "unexpected signer: {signer}");
+                assert!(
+                    catalogue.is_some(),
+                    "a .cmd cannot hold a signature, so a catalogue must have vouched for it"
+                );
+            }
+            other => panic!(
+                "{} is signed by Windows through a catalogue, and came back as {other:?}",
+                script.display()
+            ),
+        }
+    }
+
+    /// Over the limit nothing is looked up, and that is what is said.
+    ///
+    /// Not "unsigned": the catalogues were not asked. The file is made by
+    /// setting its length, so nothing is written and nothing is read.
+    #[test]
+    fn a_plain_file_too_large_to_look_up_is_could_not_be_checked() {
+        let path = std::env::temp_dir().join(format!("kam-sig-large-{}.cmd", std::process::id()));
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(UNSIGNABLE_LOOKUP_LIMIT + 1)
+            .unwrap();
+        let signature = of(&path);
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(
+            matches!(&signature, Signature::Unknown { reason } if reason.contains("too large")),
+            "a file that was not looked up got a verdict: {signature:?}"
+        );
+    }
+
+    /// A file with nothing in it is unsigned, and is not looked up: Windows
+    /// cannot hash one, and answers with an error about the volume.
+    #[test]
+    fn an_empty_file_is_unsigned() {
+        for extension in ["cmd", "ps1"] {
+            let path = std::env::temp_dir()
+                .join(format!("kam-sig-empty-{}.{extension}", std::process::id()));
+            std::fs::write(&path, b"").unwrap();
+            let signature = of(&path);
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(signature, Signature::Unsigned, "an empty .{extension}");
+        }
     }
 
     /// A file another program holds open exclusively cannot be read, and

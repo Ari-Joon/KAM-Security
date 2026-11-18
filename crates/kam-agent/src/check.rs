@@ -166,16 +166,7 @@ fn check_startup(findings: &mut Vec<Finding>, user: &UserContext) {
 
     if !unsigned.is_empty() {
         unsigned.sort();
-        findings.push(Finding::note(format!(
-            "{} startup {} carry no signature: {}",
-            unsigned.len(),
-            if unsigned.len() == 1 {
-                "entry"
-            } else {
-                "entries"
-            },
-            unsigned.join(", ")
-        )));
+        findings.push(Finding::note(unsigned_line(&unsigned)));
     }
 
     if ourselves {
@@ -189,6 +180,20 @@ fn check_startup(findings: &mut Vec<Finding>, user: &UserContext) {
             "part of the startup survey could not be read: {unreadable}"
         )));
     }
+}
+
+/// The line naming the startup entries nobody signed.
+fn unsigned_line(names: &[String]) -> String {
+    format!(
+        "{} startup {} no signature: {}",
+        names.len(),
+        if names.len() == 1 {
+            "entry carries"
+        } else {
+            "entries carry"
+        },
+        names.join(", ")
+    )
 }
 
 /// Run every check and return what it found.
@@ -266,6 +271,19 @@ mod tests {
         findings.sort_by_key(|finding| !finding.serious);
         assert!(findings[0].serious);
         assert_eq!(findings[0].summary, "something wrong");
+    }
+
+    /// One entry carries, several carry. It read "1 startup entry carry".
+    #[test]
+    fn the_line_about_unsigned_entries_agrees_with_how_many_there_are() {
+        assert_eq!(
+            unsigned_line(&["Updater".to_owned()]),
+            "1 startup entry carries no signature: Updater"
+        );
+        assert_eq!(
+            unsigned_line(&["Helper".to_owned(), "Updater".to_owned()]),
+            "2 startup entries carry no signature: Helper, Updater"
+        );
     }
 
     #[test]
