@@ -293,7 +293,7 @@ rule browser_credential_theft
     meta:
         kam_category = "Browser credential theft"
         kam_confidence = "strong"
-        kam_explains = "This reaches directly for the files a browser keeps saved passwords, cookies and card details in: the login database, the cookie store, and the key that decrypts them. Software that legitimately reads those is the browser itself. Anything else opening them by their exact internal paths is an infostealer collecting what to send off the machine, which is how a single unlucky download turns into a hijacked email, Discord or Instagram account."
+        kam_explains = "This reaches directly for the files a browser keeps saved passwords, cookies and card details in: the login database, the cookie store, and the key that decrypts them. Software that legitimately reads those is the browser itself. Other programs have little reason to name them by their exact internal paths, and it is the method an infostealer uses to collect what it sends off the machine, which is how a single unlucky download turns into a hijacked email, Discord or Instagram account."
 
     strings:
         // The exact on-disk names of the credential stores. A program that

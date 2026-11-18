@@ -201,8 +201,7 @@ fn interpret(malicious: u32, suspicious: u32, engines: u32) -> (Standing, String
         Standing::Substantial,
         format!(
             "{flagged} of {engines} engines flagged this, and that many independent engines \
-             rarely agree by accident. Treat it as malicious unless you have specific reason \
-             to think otherwise."
+             rarely agree by accident. What each of them called it is listed below."
         ),
     )
 }
@@ -462,6 +461,14 @@ mod tests {
         let (standing, summary) = interpret(48, 3, 70);
         assert_eq!(standing, Standing::Substantial);
         assert!(summary.contains("rarely agree by accident"), "{summary}");
+        // It used to end "Treat it as malicious unless you have specific
+        // reason to think otherwise", which is this program reaching a verdict
+        // on VirusTotal's evidence. The count and what it usually means are
+        // the evidence; the conclusion is the reader's.
+        assert!(
+            !summary.contains("Treat it") && !summary.to_lowercase().contains("malicious"),
+            "the summary tells the reader what to conclude: {summary}"
+        );
     }
 
     #[test]
