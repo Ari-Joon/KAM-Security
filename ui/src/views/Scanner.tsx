@@ -868,13 +868,22 @@ function Canaries() {
   // The record of reads could not be checked, so no reads is not the same as
   // nothing having read a decoy.
   const tripsUnread = report?.trips_unread ?? null;
+  // Some planted and some not: a machine that had its file decoys before the
+  // registry ones came back, or one where a decoy was deleted by hand.
+  const missing = known && planted > 0 ? Math.max(0, (report?.expected ?? planted) - planted) : 0;
 
   return (
     <section className="panel">
       <div className="panel-head">
-        <h2>Decoy files</h2>
+        <h2>Decoys</h2>
+        {known && missing > 0 && (
+          <button onClick={() => void act(() => api.setCanaries(true))} disabled={busy}>
+            {busy ? "Working…" : `Plant the ${missing} that ${missing === 1 ? "is" : "are"} missing`}
+          </button>
+        )}
         {known ? (
           <button
+            className={missing > 0 ? "ghost" : undefined}
             onClick={() => void act(() => api.setCanaries(planted === 0))}
             disabled={busy}
           >
@@ -939,15 +948,19 @@ function Canaries() {
               <>Nothing is planted. Decoys are off until you turn them on.</>
             ) : watching ? (
               <>
-                <strong>{planted}</strong> decoys planted and being watched.
+                <strong>{planted}</strong> {planted === 1 ? "decoy" : "decoys"} planted and
+                being watched.
+                {missing > 0 &&
+                  ` ${missing} more can be planted: ${missing === 1 ? "it was" : "they were"} added since, or removed.`}
                 {tripsUnread &&
                   " Whether anything has read one could not be checked, as the next note says."}
               </>
             ) : (
               <>
-                <strong>{planted}</strong> decoys are planted, but Windows is not
-                recording file access, so reading one would go unnoticed. They
-                are inert until auditing is on.
+                <strong>{planted}</strong> {planted === 1 ? "decoy is" : "decoys are"} planted,
+                but Windows is not recording reads of {planted === 1 ? "it" : "them"}, so
+                reading one would go unnoticed. {planted === 1 ? "It is" : "They are"} inert
+                until auditing is on.
               </>
             )}
           </div>
@@ -962,14 +975,12 @@ function Canaries() {
                 onClick={() => void act(() => api.setCanaryAuditing(!report.auditing))}
                 disabled={busy}
               >
-                {report.auditing
-                  ? "Stop recording file access"
-                  : "Record reads of these files"}
+                {report.auditing ? "Stop recording reads of the decoys" : "Record reads of the decoys"}
               </button>
               <span className="muted small">
                 {report.auditing
-                  ? "Windows is recording access to files that ask for it. Turning this off makes the decoys inert."
-                  : "Switches on Windows' File System auditing. It only produces events for files that ask to be watched (these five), so it does not fill your Security log."}
+                  ? "Windows is recording reads of the files and registry keys that ask for it. Turning this off makes the decoys inert."
+                  : "Switches on Windows' auditing of files and of registry keys. It only produces events for the ones that ask to be watched, which is these decoys, so it does not fill your Security log."}
               </span>
             </div>
           )}

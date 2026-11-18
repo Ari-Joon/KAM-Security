@@ -204,6 +204,25 @@ pub struct Report {
     pub auditing: bool,
     /// Anything that stopped this doing its job, in plain words.
     pub problems: Vec<String>,
+    /// How many decoys there would be if every one were planted.
+    ///
+    /// So the window can tell "all planted" from "some planted", and offer to
+    /// plant the rest. It mattered the day registry decoys came back: a
+    /// machine with its five file decoys already in place had no way to get
+    /// the three keys short of removing everything and starting again.
+    #[serde(default)]
+    pub expected: usize,
+}
+
+/// How many decoys this build plants when asked: the files, and the registry
+/// keys while those are switched on.
+fn expected() -> usize {
+    DECOYS.len()
+        + if REGISTRY_DECOYS_ENABLED {
+            registry::decoys().len()
+        } else {
+            0
+        }
 }
 
 impl Report {
@@ -269,6 +288,7 @@ fn is_ours(path: &Path) -> bool {
 pub fn plant(user: &UserContext) -> Report {
     let mut report = Report {
         auditing: audit::auditing_enabled(),
+        expected: expected(),
         ..Default::default()
     };
 
@@ -494,6 +514,7 @@ fn watched_names(user: &UserContext) -> Vec<String> {
 pub fn status(user: &UserContext) -> Report {
     let mut report = Report {
         auditing: audit::auditing_enabled(),
+        expected: expected(),
         ..Default::default()
     };
 

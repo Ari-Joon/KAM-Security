@@ -167,8 +167,8 @@ function Protection() {
       {enabled === true && (
         <div className="notice notice-ok">
           <strong>Protection is on.</strong> The agent watches what newly starts
-          itself, and reports anything that reads one of the decoy files if you
-          have planted them (Scanner, Decoy files). It runs as a Windows service,
+          itself, and reports anything that reads one of the decoys if you have
+          planted them (Scanner, Decoys). It runs as a Windows service,
           so it keeps working when this window is closed and starts again by
           itself after a reboot or a crash.
         </div>

@@ -908,6 +908,11 @@ export type CanaryReport = {
   /** Whether Windows is recording file access at all. Without it, inert. */
   auditing: boolean;
   problems: string[];
+  /**
+   * How many decoys there would be if every one were planted. Absent from
+   * agents older than this field, where "some are missing" cannot be told.
+   */
+  expected?: number;
 };
 
 /** A published release, as GitHub reports it. See ui/src-tauri/src/update.rs. */
