@@ -277,7 +277,11 @@ pub fn handle(
             };
 
             match kam_storage::apps::survey(letter.to_ascii_uppercase(), now_seconds(), user) {
-                Ok(report) => {
+                Ok(mut report) => {
+                    report.downloads = sendable_downloads(
+                        std::mem::take(&mut report.downloads),
+                        &mut report.download_summary,
+                    );
                     context.audit(
                         "storage",
                         "survey",
@@ -340,18 +344,28 @@ pub fn handle(
             match outcome {
                 Ok((groups, mut summary)) => {
                     summary.quarantine_only_on = quarantine_only_on(context, letter);
+                    let (groups, summary) = sendable_duplicates(groups, summary);
                     context.audit(
                         "storage",
                         "find_duplicates",
                         Effect::Observed,
                         format!(
                             "found {} duplicate sets on {letter}: {} duplicated, {} of it \
-                             reclaimable across {} sets, reading {} files in full",
+                             reclaimable across {} sets, reading {} files in full{}",
                             summary.groups,
                             human_bytes(summary.wasted_bytes),
                             human_bytes(summary.reclaimable_bytes),
                             summary.actionable,
-                            summary.fully_hashed
+                            summary.fully_hashed,
+                            if summary.unlisted.groups > 0 {
+                                format!(
+                                    "; the {} smallest were too many to send and were \
+                                     left out of the list",
+                                    summary.unlisted.groups
+                                )
+                            } else {
+                                String::new()
+                            }
                         ),
                     );
                     Response::Duplicates { groups, summary }
@@ -1219,6 +1233,74 @@ fn quarantine_path(path: &str, reason: &str, context: &Context, user: &UserConte
     }
 }
 
+/// How much of a reply the list of duplicate sets may take, as JSON.
+///
+/// A reply is one frame, and a frame over [`kam_ipc::MAX_FRAME_BYTES`] is not
+/// sent at all. Nothing bounded these two lists. A drive with around thirteen
+/// thousand duplicate sets, which a photo archive kept twice reaches, or with
+/// thousands of large downloads, ran its whole search and then lost the
+/// answer: the frame was refused, the connection dropped, and the window
+/// showed a pipe error, every time.
+///
+/// Half a frame holds several thousand sets, and the page draws forty.
+const DUPLICATES_REPLY_BYTES: usize = kam_ipc::MAX_FRAME_BYTES / 2;
+
+/// The same for the list of downloads, of which the page draws twenty-five.
+/// Smaller, because it shares its reply with every application and leftover.
+const DOWNLOADS_REPLY_BYTES: usize = kam_ipc::MAX_FRAME_BYTES / 4;
+
+/// Split a list into the leading items that fit in `budget` bytes once
+/// written as JSON, and the rest.
+///
+/// Both lists this is for arrive with the most useful first, so what is kept
+/// is the largest and what is left out is the tail. The caller says what was
+/// left out; nothing here is dropped without a count.
+fn fitting<T: serde::Serialize>(mut items: Vec<T>, budget: usize) -> (Vec<T>, Vec<T>) {
+    let mut used = 0_usize;
+    let mut keep = items.len();
+    for (position, item) in items.iter().enumerate() {
+        // One more for the comma after it. An item that cannot be written at
+        // all would fail the whole reply, so the list stops before it.
+        let size = serde_json::to_vec(item)
+            .map(|written| written.len() + 1)
+            .unwrap_or(usize::MAX);
+        if used.saturating_add(size) > budget {
+            keep = position;
+            break;
+        }
+        used += size;
+    }
+    let rest = items.split_off(keep);
+    (items, rest)
+}
+
+/// A duplicate search, cut down to an answer that fits in one reply.
+///
+/// The summary goes on counting every set found. What is not in the list is
+/// totalled into it, so the page can say how many were left out and what they
+/// came to.
+fn sendable_duplicates(
+    groups: Vec<kam_storage::DuplicateGroup>,
+    mut summary: kam_storage::DuplicateSummary,
+) -> (
+    Vec<kam_storage::DuplicateGroup>,
+    kam_storage::DuplicateSummary,
+) {
+    let (groups, unlisted) = fitting(groups, DUPLICATES_REPLY_BYTES);
+    summary.unlisted = kam_storage::duplicates::Unlisted::of(&unlisted);
+    (groups, summary)
+}
+
+/// The same for the downloads a survey found.
+fn sendable_downloads(
+    downloads: Vec<kam_storage::Download>,
+    summary: &mut kam_storage::DownloadSummary,
+) -> Vec<kam_storage::Download> {
+    let (downloads, unlisted) = fitting(downloads, DOWNLOADS_REPLY_BYTES);
+    summary.unlisted = unlisted.len();
+    downloads
+}
+
 /// The one drive quarantine holds things from, when `searched` is another.
 ///
 /// The store moves an item in by renaming it, which only works within one
@@ -1569,6 +1651,190 @@ mod tests {
             quarantine: kam_quarantine::Store::open(&quarantine_root).unwrap(),
             behaviour: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_list_is_cut_where_it_stops_fitting_and_keeps_its_order() {
+        // Each of these is 12 bytes as JSON, quotes included, and 13 with the
+        // comma after it.
+        let items: Vec<String> = (0..10).map(|n| format!("item-{n:05}")).collect();
+
+        let (kept, rest) = fitting(items.clone(), 40);
+        assert_eq!(kept, items[..3]);
+        assert_eq!(rest, items[3..]);
+
+        let (kept, rest) = fitting(items.clone(), usize::MAX);
+        assert_eq!(kept.len(), 10);
+        assert!(rest.is_empty());
+
+        let (kept, rest) = fitting(items.clone(), 5);
+        assert!(kept.is_empty(), "nothing fits, so nothing is sent");
+        assert_eq!(rest.len(), 10);
+    }
+
+    /// Two identical files in a folder with a long name, as a photo archive
+    /// kept twice is made of.
+    fn duplicate_pair(number: usize) -> kam_storage::DuplicateGroup {
+        use kam_storage::{FileCopy, Owner, Verdict};
+        let copy = |side: &str| FileCopy {
+            path: format!(
+                r"C:\Users\someone\Pictures\{side}\{}\IMG_{number:06}.CR3",
+                "holiday-album-with-a-long-name-".repeat(8)
+            ),
+            owner: Owner::Yours,
+            removable: true,
+        };
+        kam_storage::DuplicateGroup {
+            bytes: 30_000_000,
+            wasted_bytes: 30_000_000,
+            reclaimable_bytes: 30_000_000,
+            copies: vec![copy("Archive"), copy("Archive (copy)")],
+            verdict: Verdict::Choose,
+            suggested_keep: Some(0),
+            reasons: vec![
+                "All 2 copies are in folders of yours, so keeping one and removing the \
+                 rest loses nothing."
+                    .to_owned(),
+            ],
+        }
+    }
+
+    fn summary_of(groups: &[kam_storage::DuplicateGroup]) -> kam_storage::DuplicateSummary {
+        kam_storage::DuplicateSummary {
+            groups: groups.len(),
+            wasted_bytes: groups.iter().map(|group| group.wasted_bytes).sum(),
+            reclaimable_bytes: groups.iter().map(|group| group.reclaimable_bytes).sum(),
+            actionable: groups.len(),
+            examined: groups.len() * 2,
+            head_hashed: groups.len() * 2,
+            fully_hashed: groups.len() * 2,
+            elapsed_ms: 1,
+            truncated: false,
+            quarantine_only_on: None,
+            unlisted: Default::default(),
+        }
+    }
+
+    /// A search with more duplicate sets than one reply holds still answers.
+    ///
+    /// It used to run to the end and then lose everything: the frame was over
+    /// the limit, the agent closed the connection instead of sending it, and
+    /// the window showed a pipe error. Twenty thousand pairs is a photo
+    /// archive that somebody copied once.
+    #[test]
+    fn a_duplicate_search_too_large_for_one_reply_is_cut_to_fit_and_says_what_was_left_out() {
+        use kam_ipc::frame::write_frame;
+        use kam_ipc::Reply;
+
+        let found: Vec<kam_storage::DuplicateGroup> = (0..20_000).map(duplicate_pair).collect();
+        let whole = summary_of(&found);
+
+        // The premise: as found, this does not fit in a frame at all.
+        let unbounded = Reply::Done(Response::Duplicates {
+            groups: found.clone(),
+            summary: whole.clone(),
+        });
+        assert!(
+            write_frame(&mut Vec::new(), &unbounded).is_err(),
+            "the test's answer is not large enough to show anything"
+        );
+
+        let (groups, summary) = sendable_duplicates(found.clone(), whole.clone());
+        let listed = groups.len();
+        assert!(listed > 0, "nothing at all was sent");
+        assert!(listed < found.len(), "nothing was left out");
+        // The head of the list, in the order it came: the most reclaimable.
+        assert_eq!(groups[0].copies[0].path, found[0].copies[0].path);
+        assert_eq!(
+            groups[listed - 1].copies[0].path,
+            found[listed - 1].copies[0].path
+        );
+
+        // The figures still count everything found, and what was left out is
+        // said, set for set and byte for byte.
+        assert_eq!(summary.groups, 20_000);
+        assert_eq!(summary.wasted_bytes, whole.wasted_bytes);
+        assert_eq!(summary.unlisted.groups, 20_000 - listed);
+        assert_eq!(
+            summary.unlisted.wasted_bytes,
+            30_000_000 * (20_000 - listed) as u64
+        );
+        assert_eq!(
+            summary.unlisted.reclaimable_bytes,
+            summary.unlisted.wasted_bytes
+        );
+        assert_eq!(summary.unlisted.actionable, 20_000 - listed);
+
+        let mut frame = Vec::new();
+        write_frame(
+            &mut frame,
+            &Reply::Done(Response::Duplicates { groups, summary }),
+        )
+        .expect("the answer that is sent must fit in one frame");
+        assert!(frame.len() <= kam_ipc::MAX_FRAME_BYTES + 4);
+    }
+
+    /// The same for a survey that finds thousands of large downloads.
+    ///
+    /// Download addresses are kept whole, and real ones carry signed tokens
+    /// that run to kilobytes each.
+    #[test]
+    fn a_survey_with_too_many_downloads_for_one_reply_is_cut_to_fit_and_counts_the_rest() {
+        use kam_ipc::frame::write_frame;
+        use kam_ipc::Reply;
+        use kam_storage::provenance::{AccessTimes, Zone};
+
+        let token = "t".repeat(1_500);
+        let found: Vec<kam_storage::Download> = (0..6_000_u64)
+            .map(|number| kam_storage::Download {
+                path: format!(r"C:\Users\someone\Downloads\installer-{number:05}.exe"),
+                name: format!("installer-{number:05}.exe"),
+                bytes: 4_000_000_000 - number,
+                zone: Zone::Internet,
+                host_url: Some(format!("https://cdn.example.com/get?signature={token}")),
+                referrer_url: Some(format!("https://example.com/page?session={token}")),
+                days_since_arrival: Some(40),
+                days_since_access: Some(3),
+            })
+            .collect();
+        let summary = kam_storage::DownloadSummary {
+            found: found.len(),
+            total_bytes: found.iter().map(|download| download.bytes).sum(),
+            access_times: AccessTimes::Recorded,
+            examined: 20_000,
+            read_as_opened: 0,
+            unlisted: 0,
+        };
+        let reply = |downloads: Vec<kam_storage::Download>,
+                     download_summary: kam_storage::DownloadSummary| {
+            Reply::Done(Response::Applications {
+                apps: Vec::new(),
+                summary: kam_storage::apps::summarise(&[]),
+                orphans: Vec::new(),
+                orphan_summary: kam_storage::orphans::summarise(&[]),
+                downloads,
+                download_summary: Box::new(download_summary),
+                timings: Box::default(),
+            })
+        };
+
+        // The premise: as found, this does not fit in a frame at all.
+        assert!(
+            write_frame(&mut Vec::new(), &reply(found.clone(), summary.clone())).is_err(),
+            "the test's answer is not large enough to show anything"
+        );
+
+        let mut bounded = summary.clone();
+        let downloads = sendable_downloads(found.clone(), &mut bounded);
+        assert!(!downloads.is_empty() && downloads.len() < found.len());
+        // Largest first, so it is the smallest that are left out.
+        assert_eq!(downloads[0].path, found[0].path);
+        assert_eq!(bounded.unlisted, found.len() - downloads.len());
+        assert_eq!(bounded.found, 6_000, "the count is of everything found");
+        assert_eq!(bounded.total_bytes, summary.total_bytes);
+
+        write_frame(&mut Vec::new(), &reply(downloads, bounded))
+            .expect("the answer that is sent must fit in one frame");
     }
 
     /// A duplicate search of another drive says quarantine cannot reach it.

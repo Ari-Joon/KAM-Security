@@ -203,13 +203,55 @@ fn handle_connection(
         let response = run_job(stream, context, move |context, reporter| {
             crate::downloads::check(opened, &job, context, reporter, &user)
         });
-        return write_frame(stream, &Reply::Done(response));
+        // The answer to one check is cut to fit where it is built, and this
+        // is the net behind that, as for every other answer.
+        return send_final(stream, response);
     }
 
     let response = run_job(stream, context, move |context, reporter| {
         dispatch::handle(request, context, reporter, &user)
     });
-    write_frame(stream, &Reply::Done(response))
+    send_final(stream, response)
+}
+
+/// Send the answer to a request, or say why it could not be sent.
+///
+/// A frame that is too large is refused before a byte of it is written, and
+/// that refusal used to end the connection. The work had been done by then: a
+/// duplicate search could run for minutes, find too much to fit, and leave
+/// the window showing "failed to fill whole buffer" with nothing to say what
+/// had happened or that trying again would do the same.
+///
+/// The lists known to grow are cut to fit before they get here, and say what
+/// they left out. This is for whatever is not: the caller is told, in words,
+/// that there was an answer and it was too large to send.
+fn send_final<W: std::io::Write>(writer: &mut W, response: Response) -> Result<()> {
+    let reply = Reply::Done(response);
+    match write_frame(writer, &reply) {
+        // Refused whole, so nothing of it is on the wire and the connection
+        // is still good for a frame that says so.
+        Err(Error::Protocol(refusal)) => {
+            tracing::warn!(%refusal, "an answer could not be sent");
+            let megabytes = serde_json::to_vec(&reply)
+                .map(|written| written.len().div_ceil(1024 * 1024))
+                .ok();
+            // Only what is known here. Whether the request changed anything,
+            // and whether asking again would differ, depend on the request.
+            let message = match megabytes {
+                Some(megabytes) => format!(
+                    "The work was done, but its answer was too large to send back \
+                     ({megabytes} MB, and one reply carries at most {} MB), so it \
+                     cannot be shown.",
+                    kam_ipc::MAX_FRAME_BYTES / (1024 * 1024)
+                ),
+                None => "The work was done, but its answer could not be sent back, \
+                         so it cannot be shown."
+                    .to_owned(),
+            };
+            write_frame(writer, &Reply::Done(Response::Error { message }))
+        }
+        outcome => outcome,
+    }
 }
 
 /// Run one piece of work, streaming its progress down the same connection.
@@ -420,6 +462,54 @@ mod tests {
         let missing = PathBuf::from(r"C:\this\path\does\not\exist\client.exe");
         let exe = std::env::current_exe().unwrap();
         assert!(!is_trusted_client(&missing, exe.parent().unwrap()));
+    }
+
+    /// An answer too large for a frame is answered with words, not silence.
+    ///
+    /// The frame was refused before anything was written and the connection
+    /// was then dropped, so after a search that had run to its end the window
+    /// saw a read fail and showed "failed to fill whole buffer".
+    #[test]
+    fn an_answer_too_large_to_send_is_replaced_by_one_that_says_so() {
+        let enormous = Response::RecentAudit {
+            entries: (0..40_000)
+                .map(|id| kam_core::audit::Record {
+                    id,
+                    at: "2026-11-18T12:00:00.000Z".to_owned(),
+                    module: "storage".to_owned(),
+                    action: "scan".to_owned(),
+                    effect: Effect::Observed,
+                    detail: "x".repeat(300),
+                    undo_token: None,
+                })
+                .collect(),
+        };
+
+        // The premise: on its own, this frame is refused.
+        assert!(
+            write_frame(&mut Vec::new(), &Reply::Done(enormous.clone())).is_err(),
+            "the test's answer is not large enough to show anything"
+        );
+
+        let mut wire = Vec::new();
+        send_final(&mut wire, enormous).expect("something is always sent");
+
+        let reply: Reply = read_frame(&mut std::io::Cursor::new(wire)).unwrap();
+        let Reply::Done(Response::Error { message }) = reply else {
+            panic!("expected the caller to be told, got {reply:?}");
+        };
+        assert!(
+            message.contains("too large to send") && message.contains("MB"),
+            "the message should say what happened and how large: {message}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_answer_is_sent_as_it_is() {
+        let mut wire = Vec::new();
+        send_final(&mut wire, Response::Acknowledged).unwrap();
+        let reply: Reply = read_frame(&mut std::io::Cursor::new(wire)).unwrap();
+        assert!(matches!(reply, Reply::Done(Response::Acknowledged)));
     }
 
     #[test]

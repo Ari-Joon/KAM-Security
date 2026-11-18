@@ -111,6 +111,40 @@ pub struct DuplicateSummary {
     /// the agent fills this in.
     #[serde(default)]
     pub quarantine_only_on: Option<char>,
+    /// Sets that were found and are counted in the figures above, but are not
+    /// in the list sent with them, because the answer would not have fitted in
+    /// one reply. All zero in the ordinary case.
+    #[serde(default)]
+    pub unlisted: Unlisted,
+}
+
+/// What the sets left out of a list come to.
+///
+/// The list is sent most reclaimable first, so these are always the smallest.
+/// The page shows the totals, so that leaving them out of the list is never
+/// leaving them out of the answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unlisted {
+    pub groups: usize,
+    pub wasted_bytes: u64,
+    pub reclaimable_bytes: u64,
+    /// Of them, sets where there is a choice to make.
+    pub actionable: usize,
+}
+
+impl Unlisted {
+    /// Total the sets that are not going to be sent.
+    pub fn of(groups: &[DuplicateGroup]) -> Self {
+        Self {
+            groups: groups.len(),
+            wasted_bytes: groups.iter().map(|group| group.wasted_bytes).sum(),
+            reclaimable_bytes: groups.iter().map(|group| group.reclaimable_bytes).sum(),
+            actionable: groups
+                .iter()
+                .filter(|group| group.verdict == Verdict::Choose)
+                .count(),
+        }
+    }
 }
 
 /// Who put a copy where it is.
@@ -1039,6 +1073,7 @@ pub fn find(
         elapsed_ms: started.elapsed().as_millis() as u64,
         truncated: counters.truncated.load(Ordering::Relaxed) > 0,
         quarantine_only_on: None,
+        unlisted: Unlisted::default(),
     };
     Ok((groups, summary))
 }

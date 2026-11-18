@@ -186,6 +186,12 @@ pub struct DownloadSummary {
     /// the ordinary case; see [`crate::quiet`] for when it is not.
     #[serde(default)]
     pub read_as_opened: usize,
+    /// Downloads that were found and are counted in `found` and `total_bytes`
+    /// but are not in the list sent with them, because the answer would not
+    /// have fitted in one reply. The list is largest first, so these are the
+    /// smallest. Zero in the ordinary case.
+    #[serde(default)]
+    pub unlisted: usize,
 }
 
 /// Parse the `Zone.Identifier` stream.
@@ -351,6 +357,7 @@ pub fn find(
         access_times: access_times(),
         examined,
         read_as_opened,
+        unlisted: 0,
     };
     (downloads, summary)
 }

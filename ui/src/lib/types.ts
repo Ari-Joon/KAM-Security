@@ -110,6 +110,11 @@ export type DownloadSummary = {
    * opening them, so their last-opened date now shows the search itself.
    */
   read_as_opened: number;
+  /**
+   * Downloads counted in `found` but not in the list, because the answer
+   * would not have fitted in one reply. The smallest ones. Usually zero.
+   */
+  unlisted: number;
 };
 
 /** Who put a copy where it is, which decides whether it can go. */
@@ -158,6 +163,17 @@ export type DuplicateSummary = {
    * searched is another. Null when the copies found can be held.
    */
   quarantine_only_on: string | null;
+  /**
+   * Sets counted in the figures above but not in the list, because the answer
+   * would not have fitted in one reply. The list is most reclaimable first, so
+   * these are the smallest. All zero in the ordinary case.
+   */
+  unlisted: {
+    groups: number;
+    wasted_bytes: number;
+    reclaimable_bytes: number;
+    actionable: number;
+  };
 };
 
 /** What the weekly check is set to, if anything. */

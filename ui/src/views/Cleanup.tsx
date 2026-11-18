@@ -906,14 +906,25 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       .filter((orphan) => orphan.confidence === "high")
       .reduce((sum, orphan) => sum + orphan.bytes, 0),
   };
+  // Sets the search found and counted but could not fit in its answer. They
+  // are not on screen and cannot be acted on, so they stand as they were.
+  const unlisted = duplicateSummary?.unlisted ?? {
+    groups: 0,
+    wasted_bytes: 0,
+    reclaimable_bytes: 0,
+    actionable: 0,
+  };
   const duplicatesStanding = duplicates && {
-    groups: duplicates.length,
-    wasted_bytes: duplicates.reduce((sum, group) => sum + group.wasted_bytes, 0),
-    reclaimable_bytes: duplicates.reduce(
-      (sum, group) => sum + group.reclaimable_bytes,
-      0,
-    ),
-    actionable: duplicates.filter((group) => group.verdict === "choose").length,
+    groups: duplicates.length + unlisted.groups,
+    wasted_bytes:
+      duplicates.reduce((sum, group) => sum + group.wasted_bytes, 0) +
+      unlisted.wasted_bytes,
+    reclaimable_bytes:
+      duplicates.reduce((sum, group) => sum + group.reclaimable_bytes, 0) +
+      unlisted.reclaimable_bytes,
+    actionable:
+      duplicates.filter((group) => group.verdict === "choose").length +
+      unlisted.actionable,
   };
 
   /**
@@ -1371,7 +1382,28 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           </p>
         )}
 
-        {duplicates && duplicates.length === 0 && (
+        {/*
+          An answer has a size limit, and a drive with thousands of sets goes
+          over it. The search used to finish and then show a pipe error. The
+          service now sends as many of the largest as fit and counts the
+          rest, and a list that is not all of what was found says so.
+        */}
+        {duplicates && unlisted.groups > 0 && (
+          <p className="held-warn">
+            The search found more sets than one answer can carry, so the list
+            below holds the ones with the most to reclaim.{" "}
+            {fmt.count(unlisted.groups)} more{" "}
+            {unlisted.groups === 1 ? "set is" : "sets are"} not listed:{" "}
+            {unlisted.groups === 1 ? "it holds" : "they hold"}{" "}
+            {fmt.bytes(unlisted.wasted_bytes)} of duplicates,{" "}
+            {fmt.bytes(unlisted.reclaimable_bytes)} of it reclaimable, and{" "}
+            {unlisted.groups === 1 ? "is" : "are"} counted in the figures
+            above. Search again once some of the listed ones have gone and the
+            next take their place.
+          </p>
+        )}
+
+        {duplicates && duplicates.length === 0 && unlisted.groups === 0 && (
           <p className="empty">
             {duplicateSummary?.truncated
               ? "No identical files were confirmed in the part that was compared."
@@ -1410,7 +1442,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                   works through in a sitting -- so the cap is what gets said.
                 */}
                 {fmt.count(Math.min(shownDuplicates.length, DUPE_LIMIT))} of{" "}
-                {fmt.count(duplicates.length)} shown
+                {fmt.count(duplicates.length + unlisted.groups)} shown
               </span>
             </div>
 
@@ -1886,7 +1918,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
               {/* Said rather than silently cut. A list that stops without
                   saying so is a list claiming to be complete. */}
               Showing the largest {fmt.count(DOWNLOAD_LIMIT)} of{" "}
-              {fmt.count(downloads.length)}.
+              {/* Of everything found, which can be more than was sent. */}
+              {fmt.count(downloadSummary?.found ?? downloads.length)}.
             </p>
           )}
           {downloads.length === 0 ? (
