@@ -176,30 +176,43 @@ fn handle_connection(
         return Ok(());
     }
     // A file is checked only if the caller could open it themselves. The
-    // handler reads it as LocalSystem and hands back its fingerprint, signer
-    // and download address, so without this the service would answer about
-    // files Windows would not let the caller see. Asked as the caller, on this
-    // thread, before any handler runs. Network and device paths are refused
-    // first, because even opening one reaches out over the network.
-    if let Request::CheckDownload { path, copy_of, .. } = &request {
+    // handler hands back its fingerprint, signer and download address, so
+    // without this the service would answer about files Windows would not let
+    // the caller see. So the file is opened here, while acting as the caller,
+    // on this thread, before any handler runs, and that one open handle is
+    // what the check then reads from: asking as the caller and afterwards
+    // reading by name as LocalSystem let the name lead somewhere else in
+    // between. Network and device paths are refused first, because even
+    // opening one reaches out over the network.
+    if let Request::CheckDownload { path, job, copy_of } = &request {
         let copy_of = copy_of.as_deref();
-        let verdict = crate::downloads::plain_paths(path, copy_of).and_then(|()| {
+        let opened = crate::downloads::plain_paths(path, copy_of).and_then(|()| {
             stream
-                .as_client(|| crate::downloads::caller_can_read(path, copy_of))
+                .as_client(|| crate::downloads::open_as_caller(path, copy_of))
                 .unwrap_or_else(|error| Err(format!("{path} was not checked: {error}")))
         });
-        if let Err(message) = verdict {
-            context.audit("downloads", "check", Effect::Refused, message.clone());
-            write_frame(stream, &Reply::Done(Response::Error { message }))?;
-            return Ok(());
-        }
+        let opened = match opened {
+            Ok(opened) => opened,
+            Err(message) => {
+                context.audit("downloads", "check", Effect::Refused, message.clone());
+                write_frame(stream, &Reply::Done(Response::Error { message }))?;
+                return Ok(());
+            }
+        };
+        let job = job.clone();
+        let response = run_job(stream, context, move |context, reporter| {
+            crate::downloads::check(opened, &job, context, reporter, &user)
+        });
+        return write_frame(stream, &Reply::Done(response));
     }
 
-    let response = run_request(stream, request, context, user);
+    let response = run_job(stream, context, move |context, reporter| {
+        dispatch::handle(request, context, reporter, &user)
+    });
     write_frame(stream, &Reply::Done(response))
 }
 
-/// Run one request, streaming its progress down the same connection.
+/// Run one piece of work, streaming its progress down the same connection.
 ///
 /// The work happens on its own thread and reports through a channel, which
 /// this thread drains onto the pipe. It has to be that way round: the reporter
@@ -210,11 +223,10 @@ fn handle_connection(
 /// The channel closes when the last clone of the reporter is dropped, which
 /// happens when the job returns. So draining until the channel is empty *is*
 /// waiting for the job to finish, and there is no separate signal to get wrong.
-fn run_request(
+fn run_job(
     stream: &mut PipeStream,
-    request: Request,
     context: &Arc<Context>,
-    user: kam_core::UserContext,
+    work: impl FnOnce(&Context, &Reporter) -> Response + Send + 'static,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Progress>();
     let reporter = Reporter::new(move |progress| {
@@ -226,7 +238,7 @@ fn run_request(
     let context = Arc::clone(context);
     let worker = std::thread::Builder::new()
         .name("kam-job".to_owned())
-        .spawn(move || dispatch::handle(request, &context, &reporter, &user));
+        .spawn(move || work(&context, &reporter));
 
     let worker = match worker {
         Ok(worker) => worker,

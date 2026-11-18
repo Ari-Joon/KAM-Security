@@ -1058,8 +1058,29 @@ pub fn handle(
 
         // A download is checked when it lands and whenever somebody asks.
         // Audited either way: it reads a file as LocalSystem and records it.
+        //
+        // The service never comes this way. Its server opens the file while
+        // acting as the caller and hands that one handle to
+        // `downloads::check` itself (see `server::handle_connection`). An
+        // open made here would be made as LocalSystem, which is the very
+        // thing that open exists to prevent, so in the service this arm
+        // refuses. What reaches it otherwise is a process asking about files
+        // as itself: the tests.
         Request::CheckDownload { path, job, copy_of } => {
-            crate::downloads::check(&path, &job, copy_of.as_deref(), context, reporter, user)
+            let opened = if context.running_as_service() {
+                Err(format!(
+                    "{path} was not checked, because it was not opened as the account asking"
+                ))
+            } else {
+                crate::downloads::open_as_caller(&path, copy_of.as_deref())
+            };
+            match opened {
+                Ok(opened) => crate::downloads::check(opened, &job, context, reporter, user),
+                Err(refusal) => {
+                    context.audit("downloads", "check", Effect::Refused, refusal.clone());
+                    Response::Error { message: refusal }
+                }
+            }
         }
 
         // Not audited. The page reads it whenever it is opened.
@@ -2218,7 +2239,7 @@ mod tests {
     /// A check is recorded for the caller, audited, and the first one says so.
     #[test]
     fn a_checked_download_is_recorded_for_its_caller_alone() {
-        let context = context(Mode::Service);
+        let context = context(Mode::Console);
         let me = identified("S-1-5-21-0-0-0-4001");
         let them = identified("S-1-5-21-0-0-0-4002");
         let file = scratch_file("record", b"hello");
@@ -2274,10 +2295,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
+    /// In the service a download is opened as the caller, by the server,
+    /// before any handler runs. A check that reached this handler without
+    /// that would be opened as LocalSystem, so it is refused and recorded.
+    #[test]
+    fn the_service_never_opens_a_download_as_itself() {
+        let context = context(Mode::Service);
+        let me = identified("S-1-5-21-0-0-0-4005");
+        let file = scratch_file("as-itself", b"hello");
+        let response = check(&file.to_string_lossy(), &me, &context);
+        let Response::Error { message } = &response else {
+            panic!("the service opened a file itself: {response:?}");
+        };
+        assert!(
+            message.contains("not opened as the account asking"),
+            "{message}"
+        );
+        assert!(context
+            .store
+            .downloads_for("S-1-5-21-0-0-0-4005", 10)
+            .unwrap()
+            .is_empty());
+        let refused = context
+            .store
+            .recent_audit(5)
+            .unwrap()
+            .into_iter()
+            .any(|entry| entry.module == "downloads" && entry.effect == Effect::Refused);
+        assert!(refused, "the refusal was not recorded");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
     /// A working copy is only accepted from the caller's own work folder.
     #[test]
     fn a_working_copy_from_anywhere_else_is_refused() {
-        let context = context(Mode::Service);
+        let context = context(Mode::Console);
         let me = identified("S-1-5-21-0-0-0-4003");
         let file = scratch_file("copy", b"x");
         // The original is under the caller's own profile, so it is the
@@ -2341,7 +2393,7 @@ mod tests {
     /// A download in Downloads is held, the row says so, and it comes back.
     #[test]
     fn a_download_is_quarantined_noted_on_its_row_and_restored() {
-        let context = context(Mode::Service);
+        let context = context(Mode::Console);
         let me = UserContext::current();
         let downloads = std::path::PathBuf::from(kam_storage::downloads::folder_for(&me));
         if !downloads.is_dir() {
@@ -2397,7 +2449,7 @@ mod tests {
     /// lands on that row.
     #[test]
     fn a_dissection_is_recorded_only_against_a_checked_archive() {
-        let context = context(Mode::Service);
+        let context = context(Mode::Console);
         let me = identified("S-1-5-21-0-0-0-4004");
         let file = scratch_file("dissect", b"not really a zip");
         let path = file.to_string_lossy().into_owned();

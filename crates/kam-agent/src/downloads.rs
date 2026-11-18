@@ -3,10 +3,12 @@
 //!
 //! # What the agent does here, and what it never does
 //!
-//! It reads and it asks Defender. It resolves each path it is sent, refuses
-//! one inside another account's profile or its own store, fingerprints the
-//! file, reads its origin and signer, runs a report-only scan, and records
-//! the answer for the caller alone. It quarantines a download only through
+//! It reads and it asks Defender. Each file it is sent is opened once, as the
+//! caller, and kept open: where that handle leads is what is judged (nothing
+//! inside another account's profile or the product's own store), and that
+//! handle is what is fingerprinted. It reads the file's origin and signer,
+//! runs a report-only scan, and records the answer for the caller alone. It
+//! quarantines a download only through
 //! the Downloads fence. It **never extracts anything and never writes into a
 //! folder the person can write to**: taking an archive apart, the private
 //! working copy and the extracted files all belong to the window, which runs
@@ -21,7 +23,7 @@ use kam_core::{Reporter, UserContext};
 use kam_ipc::Response;
 use kam_scanner::defender_file::{Answer, FileScan};
 use kam_scanner::downloads::{
-    CheckError, Dissection, DownloadAction, DownloadCheck, DownloadRecord, Extraction,
+    CheckError, Dissection, DownloadAction, DownloadCheck, DownloadRecord, Extraction, Held,
 };
 
 use crate::dispatch::{human_bytes, Context};
@@ -72,133 +74,170 @@ pub fn plain_paths(path: &str, copy_of: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the caller could open these files themselves.
+/// The original a private working copy was made from, and what was read of
+/// it. All of it is read once, as the caller, when the request arrives.
+#[derive(Debug)]
+struct Original {
+    /// As the window wrote it. The history is kept under this.
+    path: String,
+    /// Where it really is, when it was there to be opened. An original
+    /// already in quarantine is not, and then nothing of it was read.
+    real: Option<String>,
+    arrived_at: Option<String>,
+    origin: Option<kam_storage::provenance::Origin>,
+}
+
+/// A file opened for checking, with everything that has to be read as the
+/// caller already read. See [`open_as_caller`].
+#[derive(Debug)]
+pub struct Opened {
+    /// What the caller asked about, as they wrote it, for messages.
+    asked: String,
+    held: Held,
+    original: Option<Original>,
+}
+
+/// Open the file a check is about, as the caller, and keep it open.
 ///
-/// Run as the caller (`PipeStream::as_client`), before the handler reads
-/// anything as LocalSystem. The handler hands back a file's fingerprint, size,
-/// signer and download address, and for a file the person could not open each
-/// of those is something this service would be telling them that Windows
-/// would not. A list of forbidden folders always misses one; asking Windows on
-/// the person's behalf cannot.
+/// # Why the opening and the reading are one step
 ///
-/// The original of a working copy may already be in quarantine, where it is
-/// simply not found, and then nothing of it is read. Found and refused is a
-/// refusal.
-pub fn caller_can_read(path: &str, copy_of: Option<&str>) -> Result<(), String> {
-    std::fs::File::open(path).map_err(|error| {
-        format!("{path} was not checked, because your account cannot open it ({error})")
-    })?;
-    if let Some(original) = copy_of {
-        match std::fs::File::open(original.trim()) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+/// The handler hands back a file's fingerprint, size, signer and download
+/// address, and for a file the person could not open each of those is
+/// something this service would be telling them that Windows would not. A
+/// list of forbidden folders always misses one; asking Windows on the
+/// person's behalf cannot. So the file is opened while acting as the caller
+/// (`PipeStream::as_client`).
+///
+/// It used to be opened, closed, and then found again by name and read with
+/// the system's rights, and a name can lead somewhere else the second time.
+/// The handle opened here is the one the whole check reads from (see
+/// [`Held`]), so what the caller was allowed to open is what is read.
+///
+/// The original of a working copy is read here too, and nowhere else: its
+/// creation time and its download mark, as the caller, through one open. It
+/// may already be in quarantine, where it is simply not found, and then
+/// nothing of it is read. It used to be read by name after Defender had
+/// finished, seconds later, whatever that name had come to lead to by then.
+/// Found and refused is a refusal.
+pub fn open_as_caller(path: &str, copy_of: Option<&str>) -> Result<Opened, String> {
+    // Before anything is opened: see `on_a_drive`.
+    plain_paths(path, copy_of)?;
+    if !Path::new(path).is_absolute() {
+        return Err(format!("{path} is not a full path, so it was not checked"));
+    }
+    let held = Held::open(path)?;
+
+    let original = match copy_of.map(str::trim) {
+        None => None,
+        Some(original) if !Path::new(original).is_absolute() => {
+            return Err("the original of a working copy has to be a full path".to_owned())
+        }
+        Some(original) => Some(match std::fs::File::open(original) {
+            Ok(file) => {
+                let real = kam_scanner::downloads::real_path(&file).ok_or_else(|| {
+                    format!("{original} is not on a lettered drive, so it was not read")
+                })?;
+                Original {
+                    path: original.to_owned(),
+                    arrived_at: file
+                        .metadata()
+                        .ok()
+                        .and_then(|metadata| kam_scanner::downloads::created_iso(&metadata)),
+                    origin: kam_storage::provenance::origin_of(&real),
+                    real: Some(real),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Original {
+                path: original.to_owned(),
+                real: None,
+                arrived_at: None,
+                origin: None,
+            },
             Err(error) => {
                 return Err(format!(
                     "{original} was not read, because your account cannot open it ({error})"
                 ))
             }
+        }),
+    };
+    Ok(Opened {
+        asked: path.to_owned(),
+        held,
+        original,
+    })
+}
+
+/// Decide whether a file that has been opened may be checked for this caller.
+///
+/// Any file the person chose, on any lettered drive, except inside another
+/// account's profile or Recycle Bin, or this product's own store: the agent
+/// reads it and hands back its fingerprint and download address, which for
+/// somebody else's file is not the caller's to ask, whatever Windows would
+/// let an administrator open. A private working copy must be inside the
+/// caller's own work folder.
+///
+/// Judged on where the open handles really lead, never on the text that
+/// arrived. Only an original that was not there is judged as written, and
+/// nothing was read of that one.
+fn permitted(opened: &Opened, user: &UserContext) -> Result<(), String> {
+    let reach = |real: &str, asked: &str, verb: &str| match kam_storage::duplicates::reach_refusal(
+        real, asked, user,
+    ) {
+        Some(refusal) => Err(format!(
+            "{asked} was not {verb}. {}",
+            refusal.replace(
+                "move another account's files",
+                "read another account's files"
+            )
+        )),
+        None => Ok(()),
+    };
+
+    // The original was the one thing nothing fenced: a copy in the caller's
+    // own work folder could name another account's download as its original.
+    if let Some(original) = &opened.original {
+        reach(
+            original.real.as_deref().unwrap_or(&original.path),
+            &original.path,
+            "read",
+        )?;
+    }
+    reach(opened.held.real(), &opened.asked, "checked")?;
+
+    if opened.original.is_some() {
+        let inside = std::fs::canonicalize(work_folder(user)).is_ok_and(|work| {
+            kam_storage::downloads::lies_within(Path::new(opened.held.real()), &work)
+        });
+        if !inside {
+            return Err(format!(
+                "{} is not in your private KAM Security work folder, so it was not checked as a \
+                 copy of another file",
+                opened.asked
+            ));
         }
     }
     Ok(())
 }
 
-/// Decide whether a path may be checked for this caller, and where it leads.
-///
-/// Any file the person chose, on any lettered drive, except inside another
-/// account's profile or Recycle Bin, or this product's own store: the agent
-/// would be reading it as LocalSystem and handing back its fingerprint and
-/// download address, which for somebody else's file is not the caller's to
-/// ask. A private working copy must be inside the caller's own work folder.
-fn checkable(path: &str, copy_of: Option<&str>, user: &UserContext) -> Result<String, String> {
-    // Before anything is resolved: see `on_a_drive`.
-    plain_paths(path, copy_of)?;
-    let target = Path::new(path);
-    if !target.is_absolute() {
-        return Err(format!("{path} is not a full path, so it was not checked"));
-    }
-
-    // The original of a working copy is read as well (its creation time and
-    // its download address), so it is held to the same rule as the file. It
-    // was the one thing nothing fenced: a copy in the caller's own work folder
-    // could name another account's download as its original.
-    if let Some(original) = copy_of.map(str::trim) {
-        let judged = std::fs::canonicalize(original)
-            .map(|real| {
-                let text = real.to_string_lossy().into_owned();
-                text.strip_prefix(r"\\?\")
-                    .map(str::to_owned)
-                    .unwrap_or(text)
-            })
-            .unwrap_or_else(|_| original.to_owned());
-        if let Some(refusal) = kam_storage::duplicates::reach_refusal(&judged, original, user) {
-            return Err(format!(
-                "{original} was not read. {}",
-                refusal.replace(
-                    "move another account's files",
-                    "read another account's files"
-                )
-            ));
-        }
-    }
-
-    let real = std::fs::canonicalize(target)
-        .map_err(|error| format!("{path} could not be found ({error}), so it was not checked"))?;
-    let text = real.to_string_lossy().into_owned();
-    let resolved = text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned();
-
-    if let Some(refusal) = kam_storage::duplicates::reach_refusal(&resolved, path, user) {
-        return Err(format!(
-            "{path} was not checked. {}",
-            refusal.replace(
-                "move another account's files",
-                "read another account's files"
-            )
-        ));
-    }
-
-    if copy_of.is_some() {
-        let folder = work_folder(user);
-        let inside = std::fs::canonicalize(&folder)
-            .is_ok_and(|work| kam_storage::downloads::lies_within(&real, &work));
-        if !inside {
-            return Err(format!(
-                "{path} is not in your private KAM Security work folder, so it was not checked \
-                 as a copy of another file"
-            ));
-        }
-    }
-    Ok(resolved)
-}
-
-/// Check one file, record it, and answer with its row.
+/// Check one file that was opened as the caller, record it, and answer with
+/// its row. The file stays open, and so cannot be changed or replaced, until
+/// this returns.
 pub fn check(
-    path: &str,
+    opened: Opened,
     job: &str,
-    copy_of: Option<&str>,
     context: &Context,
     reporter: &Reporter,
     user: &UserContext,
 ) -> Response {
-    let resolved = match checkable(path, copy_of, user) {
-        Ok(resolved) => resolved,
-        Err(refusal) => {
-            context.audit("downloads", "check", Effect::Refused, refusal.clone());
-            return Response::Error { message: refusal };
-        }
-    };
-    // The original's path is what the history is kept under. It may already
-    // be in quarantine, so it is taken as written rather than resolved.
-    let original = copy_of
-        .map(str::trim)
-        .filter(|original| Path::new(original).is_absolute());
-    if copy_of.is_some() && original.is_none() {
-        return Response::Error {
-            message: "the original of a working copy has to be a full path".to_owned(),
-        };
+    if let Err(refusal) = permitted(&opened, user) {
+        context.audit("downloads", "check", Effect::Refused, refusal.clone());
+        return Response::Error { message: refusal };
     }
+    let resolved = opened.held.real().to_owned();
+    let original = opened.original.as_ref();
 
     context.register_job(job, reporter.cancel_token());
-    let outcome = kam_scanner::downloads::check(&resolved, reporter);
+    let outcome = kam_scanner::downloads::check(&opened.held, reporter);
     context.finish_job(job);
 
     let mut checked = match outcome {
@@ -225,19 +264,16 @@ pub fn check(
 
     if let Some(original) = original {
         // A private copy carries none of the original's history: its own
-        // creation time is a moment ago. What the original's row already has
-        // is kept by the store.
-        checked.path = original.to_owned();
-        checked.name = Path::new(original)
+        // creation time is a moment ago. What was read of the original when
+        // the request arrived is used, and the original is not touched again
+        // from here. What its row already has is kept by the store.
+        checked.path = original.path.clone();
+        checked.name = Path::new(&original.path)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| original.to_owned());
-        checked.arrived_at = std::fs::metadata(original)
-            .and_then(|metadata| metadata.created())
-            .ok()
-            .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|since| kam_core::clock::iso_from_unix_millis(since.as_millis() as u64));
-        checked.origin = kam_storage::provenance::origin_of(original);
+            .unwrap_or_else(|| original.path.clone());
+        checked.arrived_at = original.arrived_at.clone();
+        checked.origin = original.origin.clone();
     }
 
     let row = DownloadRow {
@@ -746,8 +782,7 @@ mod tests {
         // network, or sign in as the machine to whatever answered. The address
         // is reserved for documentation and never routes.
         let started = std::time::Instant::now();
-        let refusal =
-            checkable(r"\\192.0.2.1\share\x.zip", None, &UserContext::current()).unwrap_err();
+        let refusal = open_as_caller(r"\\192.0.2.1\share\x.zip", None).unwrap_err();
         assert!(
             refusal.contains("not a file on one of this PC's drives"),
             "{refusal}"
@@ -758,18 +793,105 @@ mod tests {
         );
     }
 
+    /// A throwaway profile with a work folder and a Downloads folder, and the
+    /// caller it belongs to, so nothing here touches the real ones.
+    fn scratch_profile(tag: &str) -> (std::path::PathBuf, UserContext) {
+        let root = std::env::temp_dir().join(format!(
+            "kam-downloads-profile-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Downloads")).unwrap();
+        let user = UserContext::new(
+            Some("S-1-5-21-0-0-0-4100".to_owned()),
+            &root.to_string_lossy(),
+        );
+        std::fs::create_dir_all(work_folder(&user)).unwrap();
+        (root, user)
+    }
+
+    fn context() -> Context {
+        let quarantine = std::env::temp_dir().join(format!(
+            "kam-downloads-test-quarantine-{}",
+            std::process::id()
+        ));
+        Context {
+            mode: crate::Mode::Console,
+            store: kam_core::Store::open_in_memory().unwrap(),
+            jobs: Default::default(),
+            quarantine: kam_quarantine::Store::open(&quarantine).unwrap(),
+            behaviour: Default::default(),
+        }
+    }
+
+    const MARK: &[u8] =
+        b"[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://example.test/private?token=1\r\n";
+
+    fn mark(file: &Path) {
+        std::fs::write(format!("{}:Zone.Identifier", file.display()), MARK).unwrap();
+    }
+
     #[test]
     fn the_original_of_a_copy_cannot_be_another_accounts_file() {
         // Red review: a copy in the caller's own work folder could name
         // another account's download as its original, and the agent read that
         // file's download address and creation time as LocalSystem.
-        let refusal = checkable(
-            r"C:\nowhere\copy.zip",
+        let (root, user) = scratch_profile("fence");
+        let copy = Path::new(&work_folder(&user)).join("copy.zip");
+        std::fs::write(&copy, b"a private copy").unwrap();
+        let opened = open_as_caller(
+            &copy.to_string_lossy(),
             Some(r"C:\Users\Default\Downloads\secret.zip"),
-            &UserContext::current(),
         )
-        .unwrap_err();
+        .unwrap();
+        let refusal = permitted(&opened, &user).unwrap_err();
         assert!(refusal.contains("was not read"), "{refusal}");
+        drop(opened);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Red review: the original of a working copy was accepted when it was
+    /// not there, and then read by name with the system's rights once
+    /// Defender had finished, seconds later, with no second look. Whatever
+    /// that name had come to lead to by then was read, and its download
+    /// address was handed back and stored.
+    #[test]
+    fn the_original_of_a_copy_is_read_when_the_request_arrives_and_never_again() {
+        let (root, user) = scratch_profile("original");
+        let copy = Path::new(&work_folder(&user)).join("copy.zip");
+        std::fs::write(&copy, b"a private copy").unwrap();
+        let original = root.join("Downloads").join("a.zip");
+        let asked = original.to_string_lossy().into_owned();
+
+        // Not there when the request arrives, as when it is in quarantine.
+        let opened = open_as_caller(&copy.to_string_lossy(), Some(&asked)).unwrap();
+        // The name comes to lead to a file while the check is under way.
+        std::fs::write(&original, b"not the caller's to ask about").unwrap();
+        mark(&original);
+
+        let response = check(opened, "test-job", &context(), &Reporter::silent(), &user);
+        let Response::DownloadChecked(record) = response else {
+            panic!("the copy was not checked: {response:?}");
+        };
+        assert_eq!(
+            record.check.path, asked,
+            "the row is kept under the original"
+        );
+        assert!(
+            record.check.origin.is_none(),
+            "the original was read after the request had been let in: {:?}",
+            record.check.origin
+        );
+        assert!(record.check.arrived_at.is_none());
+
+        // An original that is there when the request arrives is read then.
+        let opened = open_as_caller(&copy.to_string_lossy(), Some(&asked)).unwrap();
+        let response = check(opened, "test-job", &context(), &Reporter::silent(), &user);
+        let Response::DownloadChecked(record) = response else {
+            panic!("the copy was not checked: {response:?}");
+        };
+        assert!(record.check.origin.is_some() && record.check.arrived_at.is_some());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -779,11 +901,12 @@ mod tests {
         std::fs::write(&scratch, b"private").unwrap();
         let path = scratch.to_string_lossy().into_owned();
         assert!(
-            caller_can_read(&path, None).is_ok(),
+            open_as_caller(&path, None).is_ok(),
             "a readable file was refused"
         );
         // An original already moved into quarantine is simply not found.
-        assert!(caller_can_read(&path, Some(r"C:\nowhere\gone.zip")).is_ok());
+        assert!(open_as_caller(&path, Some(r"C:\nowhere\gone.zip")).is_ok());
+        let caller_can_read = |path: &str, copy_of: Option<&str>| open_as_caller(path, copy_of);
 
         let me = format!(
             "{}\\{}",
@@ -798,8 +921,10 @@ mod tests {
             .args(["/deny", &format!("{me}:(R)")])
             .output()
             .unwrap();
+        let readable = scratch.with_extension("copy");
+        std::fs::write(&readable, b"a copy").unwrap();
         let refused = caller_can_read(&path, None);
-        let refused_as_original = caller_can_read(r"C:\Windows\win.ini", Some(&path));
+        let refused_as_original = caller_can_read(&readable.to_string_lossy(), Some(&path));
 
         // Undo before asserting, so a failure leaves nothing locked behind.
         let _ = std::process::Command::new(&icacls)
@@ -807,6 +932,7 @@ mod tests {
             .args(["/remove:d", &me])
             .output();
         let _ = std::fs::remove_file(&scratch);
+        let _ = std::fs::remove_file(&readable);
 
         assert!(
             denied.status.success(),

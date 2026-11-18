@@ -87,47 +87,155 @@ pub enum CheckError {
 /// How much of a file is read at a time for its fingerprint.
 const CHUNK: usize = 1024 * 1024;
 
-/// Check one file. See the module notes for what that means.
+/// A file opened once and kept open for as long as it is being checked.
 ///
-/// `path` must already be one the caller may have checked; this resolves it
-/// again and refuses anything that is not a plain file on a lettered drive.
-pub fn check(path: &str, reporter: &Reporter) -> Result<DownloadCheck, CheckError> {
-    let real = std::fs::canonicalize(path).map_err(|error| {
-        CheckError::Failed(format!(
-            "{path} could not be found ({error}), so it was not checked"
-        ))
-    })?;
-    let real = plain_drive_path(&real).ok_or_else(|| {
-        CheckError::Failed(format!(
-            "{path} is not on a lettered drive, so it was not checked"
-        ))
-    })?;
-    if real.chars().any(char::is_control) {
-        return Err(CheckError::Failed(format!(
-            "{} has a control character in its name, so it was not checked",
-            real.escape_debug()
-        )));
+/// # Why one handle, and why nobody else may write
+///
+/// A check used to find the file by its name several times: once to ask
+/// whether the caller could open it, again to resolve it, again to read it,
+/// again for Defender. A name can come to lead somewhere else between two of
+/// those, so the file that was asked about and the file that was read did not
+/// have to be the same one, and the service read the second with the system's
+/// rights. Red review found it.
+///
+/// So the file is opened once, by whoever this thread is acting as, which in
+/// the agent is the caller. Its size, its creation time and its real path all
+/// come from that handle, its fingerprint is read through it, and its
+/// download mark is read while still acting as the caller.
+///
+/// Signatures and Defender still have to be given a path. For that the handle
+/// lets others read and nobody write, rename or delete. While it is open the
+/// file cannot be replaced, and nor can any folder above it be renamed or
+/// turned into a link, because Windows refuses both for a folder with an open
+/// file inside it. The real path read from the handle therefore leads to this
+/// file, and to no other, until the handle is closed.
+#[derive(Debug)]
+pub struct Held {
+    file: std::fs::File,
+    real: String,
+    bytes: u64,
+    created: Option<String>,
+    origin: Option<Origin>,
+}
+
+impl Held {
+    /// Open one file for checking, as whoever this thread is acting as.
+    ///
+    /// Refuses, in a sentence for the person, anything that cannot be opened,
+    /// is open somewhere that can still change it, or is not a plain file on
+    /// a lettered drive once links and short names have been followed.
+    pub fn open(path: &str) -> Result<Self, String> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        // ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION.
+        const IN_USE: [i32; 2] = [32, 33];
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    format!("{path} could not be found ({error}), so it was not checked")
+                } else if error
+                    .raw_os_error()
+                    .is_some_and(|code| IN_USE.contains(&code))
+                {
+                    format!(
+                        "{path} is open in another program that can still change it, so it was \
+                         not checked. Check it again once that program has finished with it."
+                    )
+                } else {
+                    format!("{path} was not checked, because your account cannot open it ({error})")
+                }
+            })?;
+        let real = real_path(&file)
+            .ok_or_else(|| format!("{path} is not on a lettered drive, so it was not checked"))?;
+        if real.chars().any(char::is_control) {
+            return Err(format!(
+                "{} has a control character in its name, so it was not checked",
+                real.escape_debug()
+            ));
+        }
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("{real} could not be read: {error}"))?;
+        if !metadata.is_file() {
+            return Err(format!("{real} is not a file"));
+        }
+        Ok(Self {
+            bytes: metadata.len(),
+            created: created_iso(&metadata),
+            origin: kam_storage::provenance::origin_of(&real),
+            real,
+            file,
+        })
     }
-    let metadata = std::fs::metadata(&real)
-        .map_err(|error| CheckError::Failed(format!("{real} could not be read: {error}")))?;
-    if !metadata.is_file() {
-        return Err(CheckError::Failed(format!("{real} is not a file")));
+
+    /// Where the file really is, after links and short names.
+    pub fn real(&self) -> &str {
+        &self.real
     }
-    let name = Path::new(&real)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| real.clone());
-    let bytes = metadata.len();
-    let arrived_at = metadata.created().ok().and_then(|created| {
+}
+
+/// When a file was created, as the store writes times.
+pub fn created_iso(metadata: &std::fs::Metadata) -> Option<String> {
+    metadata.created().ok().and_then(|created| {
         created
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .map(|since| kam_core::clock::iso_from_unix_millis(since.as_millis() as u64))
-    });
+    })
+}
 
-    let sha256 = fingerprint(&real, bytes, reporter)?;
+/// Where an open file really is: `C:\...`, with every link and short name
+/// already followed, read from the handle and not from any name.
+///
+/// `None` when Windows will not say, or when it is not on a lettered drive.
+pub fn real_path(file: &std::fs::File) -> Option<String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, GETFINALPATHNAMEBYHANDLE_FLAGS,
+    };
 
-    let origin = kam_storage::provenance::origin_of(&real);
+    // The longest path Windows has, so one call is always enough. Zero asks
+    // for the normalised name with a drive letter.
+    let mut buffer = vec![0_u16; 32_768];
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            HANDLE(file.as_raw_handle()),
+            &mut buffer,
+            GETFINALPATHNAMEBYHANDLE_FLAGS(0),
+        )
+    } as usize;
+    if length == 0 || length >= buffer.len() {
+        return None;
+    }
+    plain_drive_path(Path::new(&String::from_utf16_lossy(&buffer[..length])))
+}
+
+/// Check one file that is already open. See the module notes for what a
+/// check is, and [`Held`] for why it works from one handle.
+pub fn check(held: &Held, reporter: &Reporter) -> Result<DownloadCheck, CheckError> {
+    let real = held.real.clone();
+    let name = Path::new(&real)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| real.clone());
+
+    let megabytes = held.bytes.div_ceil(1024 * 1024);
+    reporter.stage(
+        "Reading it to take its fingerprint (MB)",
+        (megabytes > 1).then_some(megabytes),
+    );
+    let sha256 = fingerprint(&held.file, reporter).map_err(|error| match error {
+        CheckError::Failed(reason) => {
+            CheckError::Failed(format!("{real} could not be read to the end: {reason}"))
+        }
+        stopped => stopped,
+    })?;
+
     let signature = kam_storage::downloads::is_program(&name).then(|| {
         reporter.stage("Reading who signed it", None);
         crate::signature::of(Path::new(&real))
@@ -143,10 +251,10 @@ pub fn check(path: &str, reporter: &Reporter) -> Result<DownloadCheck, CheckErro
     Ok(DownloadCheck {
         path: real,
         name,
-        bytes,
+        bytes: held.bytes,
         sha256,
-        arrived_at,
-        origin,
+        arrived_at: held.created.clone(),
+        origin: held.origin.clone(),
         signature,
         scan,
     })
@@ -170,26 +278,28 @@ fn plain_drive_path(path: &Path) -> Option<String> {
     drive.then(|| text.to_owned())
 }
 
-/// The file's SHA-256, read a megabyte at a time so a large download shows
-/// its progress and can be stopped.
-fn fingerprint(path: &str, bytes: u64, reporter: &Reporter) -> Result<String, CheckError> {
-    let megabytes = bytes.div_ceil(1024 * 1024);
-    reporter.stage(
-        "Reading it to take its fingerprint (MB)",
-        (megabytes > 1).then_some(megabytes),
-    );
-    let mut file = std::fs::File::open(path).map_err(|error| {
-        CheckError::Failed(format!("{path} could not be opened to read it: {error}"))
-    })?;
+/// The SHA-256 of an open file, from its first byte, read a megabyte at a
+/// time so a large download shows its progress and can be stopped.
+///
+/// Read through the handle it is given and no other, so the bytes
+/// fingerprinted are the bytes of the file that handle holds. The window uses
+/// it as well, to tell that its private copy of an archive is the file
+/// Defender was asked about.
+pub fn fingerprint(file: &std::fs::File, reporter: &Reporter) -> Result<String, CheckError> {
+    use std::io::Seek;
+    let mut reader = file;
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| CheckError::Failed(error.to_string()))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; CHUNK];
     loop {
         if reporter.is_cancelled() {
             return Err(CheckError::Stopped);
         }
-        let read = file.read(&mut buffer).map_err(|error| {
-            CheckError::Failed(format!("{path} could not be read to the end: {error}"))
-        })?;
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| CheckError::Failed(error.to_string()))?;
         if read == 0 {
             break;
         }
@@ -817,7 +927,10 @@ mod tests {
         let file = scratch.join("hello.txt");
         std::fs::write(&file, b"hello").unwrap();
 
-        let checked = check(&file.to_string_lossy(), &Reporter::silent()).unwrap();
+        let held = Held::open(&file.to_string_lossy()).unwrap();
+        let checked = check(&held, &Reporter::silent()).unwrap();
+        drop(held);
+        println!("{:?}", checked.scan);
         assert_eq!(
             checked.sha256,
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
@@ -847,11 +960,112 @@ mod tests {
 
         let reporter = Reporter::silent();
         reporter.cancel();
+        let held = Held::open(&file.to_string_lossy()).unwrap();
+        assert_eq!(check(&held, &reporter), Err(CheckError::Stopped));
+        drop(held);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// While a file is held for checking nobody can write to it, rename it,
+    /// delete it, or rename a folder above it, so the path read from the
+    /// handle leads to that file until the check is over. Others can still
+    /// read it, which is what Defender and the signature check need.
+    #[test]
+    fn a_held_file_cannot_be_changed_or_moved_until_the_check_is_over() {
+        let scratch =
+            std::env::temp_dir().join(format!("kam-download-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let folder = scratch.join("inner");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("a.bin");
+        std::fs::write(&file, b"as it was").unwrap();
+
+        let held = Held::open(&file.to_string_lossy()).unwrap();
+        assert!(!held.real().starts_with(r"\\?\"), "{}", held.real());
+        assert!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file)
+                .is_err(),
+            "it could be written to while held"
+        );
+        assert!(
+            std::fs::rename(&file, folder.join("b.bin")).is_err(),
+            "it could be renamed while held"
+        );
+        assert!(
+            std::fs::remove_file(&file).is_err(),
+            "it could be deleted while held"
+        );
+        assert!(
+            std::fs::rename(&folder, scratch.join("elsewhere")).is_err(),
+            "the folder above it could be renamed while it was held"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"as it was");
+
+        // A second check of the same file at the same time is another reader.
+        assert!(Held::open(&file.to_string_lossy()).is_ok());
+
+        drop(held);
+        std::fs::remove_file(&file).expect("it is free again once the check is over");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Red review: the check found the file by its name more than once, so a
+    /// name that came to lead somewhere else in between had the service read
+    /// a file nobody had asked about. A folder link needs no special rights,
+    /// so that is what moves here: the file is opened through a link, the
+    /// link is pointed at another folder, and the check still reads and names
+    /// the file it opened.
+    #[test]
+    fn a_check_reads_the_file_it_opened_wherever_its_name_leads_afterwards() {
+        let scratch =
+            std::env::temp_dir().join(format!("kam-download-moved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        for (folder, contents) in [("asked", "hello"), ("other", "something else entirely")] {
+            std::fs::create_dir_all(scratch.join(folder)).unwrap();
+            std::fs::write(scratch.join(folder).join("a.txt"), contents).unwrap();
+        }
+        let link = scratch.join("link");
+        let point_at = |folder: &str| {
+            let _ = std::fs::remove_dir(&link);
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(scratch.join(folder))
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        if !point_at("asked") {
+            // The premise could not be set up; nothing was shown either way.
+            let _ = std::fs::remove_dir_all(&scratch);
+            return;
+        }
+        let through = link.join("a.txt").to_string_lossy().into_owned();
+
+        let held = Held::open(&through).unwrap();
+        assert!(point_at("other"), "the link could not be pointed elsewhere");
         assert_eq!(
-            check(&file.to_string_lossy(), &reporter),
-            Err(CheckError::Stopped)
+            std::fs::read_to_string(&through).unwrap(),
+            "something else entirely",
+            "the premise: the name now leads to another file"
         );
 
+        let checked = check(&held, &Reporter::silent()).unwrap();
+        drop(held);
+        assert_eq!(
+            checked.sha256, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "the file read was not the file that was opened"
+        );
+        assert_eq!(checked.bytes, 5);
+        assert!(
+            checked.path.to_lowercase().ends_with(r"\asked\a.txt"),
+            "{}",
+            checked.path
+        );
+
+        let _ = std::fs::remove_dir(&link);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }
