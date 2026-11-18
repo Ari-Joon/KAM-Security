@@ -566,7 +566,8 @@ function RecordRow({
 
       {record.dissection && (
         <p className="small muted">
-          Taken apart: {fmt.count(record.dissection.totals.files)} files,{" "}
+          Taken apart: {fmt.count(record.dissection.totals.files)}{" "}
+          {record.dissection.totals.files === 1 ? "file" : "files"},{" "}
           {fmt.count(record.dissection.totals.flagged)} flagged by Defender,{" "}
           {fmt.count(record.dissection.totals.left_out)} left out for another reason,{" "}
           {fmt.count(record.dissection.totals.clean)} Defender found nothing in.
@@ -742,7 +743,7 @@ function DissectionPanel({
       <Notes notes={dissection.scan.notes} />
 
       <p className="dl-counts">
-        {fmt.count(notOut)} of {fmt.count(totals.files)} files left out,{" "}
+        {fmt.count(notOut)} of {fmt.count(totals.files)} {totals.files === 1 ? "file" : "files"} left out,{" "}
         {fmt.bytes(totals.flagged_bytes + totals.left_out_bytes)} of {fmt.bytes(totals.bytes)}.
       </p>
       <p className="small muted">
@@ -804,8 +805,10 @@ function DissectionPanel({
       )}
       {dissection.members_omitted > 0 && (
         <p className="small muted">
-          {fmt.count(dissection.members_omitted)} members are not listed here,
-          and are counted above.
+          {fmt.count(dissection.members_omitted)}{" "}
+          {dissection.members_omitted === 1 ? "member is" : "members are"} not
+          listed here, and {dissection.members_omitted === 1 ? "is" : "are"}{" "}
+          counted above.
         </p>
       )}
       <p className="small muted">

@@ -1207,7 +1207,7 @@ function Hardening() {
             <strong>
               {on} of {recommended.length}
             </strong>{" "}
-            recommended rules are switched on.
+            recommended rules {on === 1 ? "is" : "are"} switched on.
             {report.controlled_folder_access && (
               <>
                 {" "}
@@ -1446,7 +1446,7 @@ function Extensions() {
             {flagged.length > 0 && (
               <>
                 , <strong>{flagged.length}</strong> of them with broad permissions
-                or no store behind them
+                or no store behind {flagged.length === 1 ? "it" : "them"}
               </>
             )}
             .
@@ -1848,7 +1848,7 @@ function Provenance() {
           >
             Judged <strong>{report.examined}</strong>{" "}
             {report.examined === 1 ? "program" : "programs"}
-            {report.swept_files > 0 && <> after passing over {report.swept_files} files</>}.{" "}
+            {report.swept_files > 0 && <> after passing over {report.swept_files} {report.swept_files === 1 ? "file" : "files"}</>}.{" "}
             {flagged.length === 0 ? (
               report.unreadable.length === 0 ? (
                 <>Nothing stood out.</>
@@ -1874,7 +1874,8 @@ function Provenance() {
                   <>
                     {" "}
                     <strong>{(rules.failed ?? []).length + rules.skipped.length}</strong>{" "}
-                    could not be matched, so the rules say nothing about them.
+                    could not be matched, so the rules say nothing about{" "}
+                    {(rules.failed ?? []).length + rules.skipped.length === 1 ? "it" : "them"}.
                   </>
                 )}
               </>

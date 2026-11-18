@@ -51,6 +51,7 @@ function ago(seconds: number | null): string | null {
   if (days <= 0) return "today";
   if (days === 1) return "yesterday";
   if (days < 30) return `${days} days ago`;
+  if (days < 60) return "a month ago";
   if (days < 365) return `${Math.floor(days / 30)} months ago`;
   const years = Math.floor(days / 365);
   return years === 1 ? "over a year ago" : `over ${years} years ago`;
@@ -112,7 +113,7 @@ function Row({
               title={
                 app.last_used === null
                   ? "Explorer has no record of this account launching it. Something started by a service, a terminal or another account leaves no trace, so this is not proof it was never run."
-                  : `${app.launches ?? 0} launches recorded`
+                  : `${app.launches ?? 0} ${app.launches === 1 ? "launch" : "launches"} recorded`
               }
             >
               {app.last_used === null
@@ -724,7 +725,8 @@ export default function Applications({ volumes, onMeasured }: Props) {
                       <PathLink path={item.path} className="leftover-path" />
                       <span className="leftover-meta">
                         {fmt.bytes(item.bytes)}
-                        {item.partial ? " or more" : ""} · {fmt.count(item.files)} files
+                        {item.partial ? " or more" : ""} · {fmt.count(item.files)}{" "}
+                        {item.files === 1 ? "file" : "files"}
                       </span>
                       <LeftoverRefusal
                         quarantinable={item.quarantinable}

@@ -795,7 +795,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       // reversal that always works -- the Recycle Bin is offered beside it only
       // where this account could actually use it.
       reversal: "quarantine",
-      detail: `${fmt.count(orphans.length)} folders no installed program accounts for`,
+      detail: `${fmt.count(orphans.length)} ${orphans.length === 1 ? "folder" : "folders"} no installed program accounts for`,
       children: orphans.map((orphan) => ({
         key: orphan.path,
         label: orphan.name,
@@ -814,7 +814,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       // The one category on this page removed outright, which is why it is the
       // one colour that says so.
       reversal: "permanent",
-      detail: `${fmt.count(caches.length)} kinds of scratch space`,
+      detail: `${fmt.count(caches.length)} ${caches.length === 1 ? "kind" : "kinds"} of scratch space`,
       children: caches.map((cache) => ({
         key: cache.id,
         label: cache.name,
@@ -837,7 +837,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       label: "Duplicate copies",
       bytes: duplicateSummary.reclaimable_bytes,
       reversal: "quarantine",
-      detail: `${fmt.count(duplicateSummary.actionable)} sets you can choose between`,
+      detail: `${fmt.count(duplicateSummary.actionable)} ${duplicateSummary.actionable === 1 ? "set" : "sets"} you can choose between`,
     });
   }
 
@@ -1169,7 +1169,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             <div className="stat">
               <span className="stat-label">Worth a look</span>
               <span className="stat-value">
-                {fmt.count(duplicateSummary.actionable)} sets
+                {fmt.count(duplicateSummary.actionable)}{" "}
+                {duplicateSummary.actionable === 1 ? "set" : "sets"}
               </span>
             </div>
             <div className="stat">
@@ -1543,7 +1544,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                             onReveal={(target) => void reveal(target)}
                             note={
                               <span>
-                                {fmt.count(location.files)} files
+                                {fmt.count(location.files)}{" "}
+                                {location.files === 1 ? "file" : "files"}
                                 {location.partial && " (measured to a ceiling)"}
                               </span>
                             }
@@ -1556,9 +1558,12 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                   {cleared[cache.id] && (
                     <p className="cache-result">
                       Freed {fmt.bytes(cleared[cache.id].bytes_freed)} across{" "}
-                      {fmt.count(cleared[cache.id].files_removed)} files.
+                      {fmt.count(cleared[cache.id].files_removed)}{" "}
+                      {cleared[cache.id].files_removed === 1 ? "file" : "files"}.
                       {cleared[cache.id].files_in_use > 0 &&
-                        ` ${fmt.count(cleared[cache.id].files_in_use)} were open in another program and were left alone.`}
+                        (cleared[cache.id].files_in_use === 1
+                          ? " 1 was open in another program and was left alone."
+                          : ` ${fmt.count(cleared[cache.id].files_in_use)} were open in another program and were left alone.`)}
                       {cleared[cache.id].refused.length > 0 &&
                         ` ${fmt.count(cleared[cache.id].refused.length)} could not be read.`}
                     </p>
@@ -1587,8 +1592,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         {organiseSummary && (
           <p className="muted">
             {fmt.count(organiseSummary.proposals)} of{" "}
-            {fmt.count(organiseSummary.examined)} loose files have an obvious
-            home.
+            {fmt.count(organiseSummary.examined)} loose files{" "}
+            {organiseSummary.proposals === 1 ? "has" : "have"} an obvious home.
           </p>
         )}
 
@@ -1671,7 +1676,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             <h2>Downloads you may have forgotten</h2>
             {downloadSummary && (
               <span className="muted">
-                {fmt.count(downloadSummary.found)} files ·{" "}
+                {fmt.count(downloadSummary.found)}{" "}
+                {downloadSummary.found === 1 ? "file" : "files"} ·{" "}
                 {fmt.bytes(downloadSummary.total_bytes)}
               </span>
             )}
@@ -1711,7 +1717,11 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                     <>
                       {fmt.host(download.host_url) ?? "source not recorded"}
                       {download.days_since_arrival !== null && (
-                        <> · arrived {download.days_since_arrival} days ago</>
+                        <>
+                          {" "}
+                          · arrived {download.days_since_arrival}{" "}
+                          {download.days_since_arrival === 1 ? "day" : "days"} ago
+                        </>
                       )}
                       {download.zone === "restricted" && (
                         <span className="zone-restricted"> · restricted zone</span>
