@@ -745,9 +745,21 @@ pub fn record_extraction(
             named.join(", ")
         )
     };
+    // Said on the row and in the log, because it decides whether Windows
+    // warns before one of these files is run.
+    let unmarked = match extraction.unmarked.len() {
+        0 => String::new(),
+        1 => "; 1 of those written could not be given the mark Windows puts on downloaded \
+              files, so SmartScreen will not check it"
+            .to_owned(),
+        several => format!(
+            "; {several} of those written could not be given the mark Windows puts on \
+             downloaded files, so SmartScreen will not check them"
+        ),
+    };
     let sentence = format!(
         "Extracted {} {} ({}) that Defender did not flag into {destination}; {} {} ({}) left \
-         out{}{removed}.",
+         out{}{removed}{unmarked}.",
         extraction.files,
         if extraction.files == 1 {
             "file"

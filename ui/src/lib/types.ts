@@ -1069,6 +1069,11 @@ export type Extraction = {
   failed: string[];
   /** Written, then gone or not whole when looked at again. Never counted. */
   removed: RemovedFile[];
+  /**
+   * Written and counted, but without the mark Windows puts on downloaded
+   * files, which the archive carried: "name: why".
+   */
+  unmarked: string[];
 };
 
 /** One row of the download history. */
@@ -1130,6 +1135,8 @@ export type DownloadsPage = {
 export type DissectionView = {
   token: string;
   dissection: Dissection;
+  /** Why extracted files will lack the download mark, when it could not be read. */
+  mark_problem: string | null;
 };
 
 /** A file somebody asked about from Explorer or a notification. */

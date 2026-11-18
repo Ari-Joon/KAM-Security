@@ -705,6 +705,10 @@ pub fn open_on(app: &AppHandle, launch: Launch) {
 pub struct DissectionView {
     token: String,
     dissection: Dissection,
+    /// Why the files extracted from this archive will not carry the mark
+    /// Windows puts on downloaded files, when the archive's own could not be
+    /// read.
+    mark_problem: Option<String>,
 }
 
 fn emit_stage(app: &AppHandle, job: &str, stage: &str) {
@@ -779,9 +783,20 @@ pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<Dissecti
         .as_ref()
         .is_some_and(|record| record.check.scan.answer == Answer::Flagged);
 
-    let mut zone_stream = real.clone().into_os_string();
-    zone_stream.push(":Zone.Identifier");
-    let zone = std::fs::read(PathBuf::from(zone_stream)).ok();
+    // Read before the original can be quarantined. A mark that could not be
+    // read is not the same as no mark: the files extracted will go without
+    // one, which is said beside the button that extracts them.
+    let (zone, mark_problem) = match crate::archive::read_mark(&real) {
+        Ok(zone) => (zone, None),
+        Err(error) => (
+            None,
+            Some(format!(
+                "The mark Windows puts on downloaded files could not be read from this archive \
+                 ({error}). Files extracted from it will not carry the mark, so SmartScreen \
+                 will not check them before they are run."
+            )),
+        ),
+    };
 
     emit_stage(app, job, "Making a private copy to take apart");
     // Held open from here until the archive is closed or extracted, and
@@ -866,6 +881,7 @@ pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<Dissecti
     let view = DissectionView {
         token: token.clone(),
         dissection: dissection.clone(),
+        mark_problem,
     };
     if let Ok(mut sessions) = app.state::<Downloads>().sessions.lock() {
         sessions.insert(

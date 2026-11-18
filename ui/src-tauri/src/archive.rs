@@ -313,6 +313,42 @@ pub fn extract(
     archive_name: &str,
     zone: Option<&[u8]>,
 ) -> Result<Extraction, String> {
+    extract_with(copy, dissection, parent, archive_name, zone, &stamp)
+}
+
+/// The mark Windows puts on a downloaded file, as it was on an archive.
+///
+/// `None` only when the archive carries no mark. Any other failure to read
+/// it is an error and is said: it used to count as "no mark", and the files
+/// extracted then went without one in silence. A file without the mark is a
+/// file SmartScreen does not check before it runs.
+pub fn read_mark(archive: &Path) -> Result<Option<Vec<u8>>, String> {
+    let mut stream = archive.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    match std::fs::read(PathBuf::from(stream)) {
+        Ok(mark) => Ok(Some(mark)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Put the mark on one extracted file.
+fn stamp(target: &Path, zone: &[u8]) -> std::io::Result<()> {
+    let mut stream = target.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    std::fs::write(PathBuf::from(stream), zone)
+}
+
+/// [`extract`] with the marking given rather than done, so that a mark that
+/// cannot be written can be tested on a drive where it always can.
+fn extract_with(
+    copy: &File,
+    dissection: &Dissection,
+    parent: &Path,
+    archive_name: &str,
+    zone: Option<&[u8]>,
+    stamp: &dyn Fn(&Path, &[u8]) -> std::io::Result<()>,
+) -> Result<Extraction, String> {
     if !dissection.offered {
         return Err(dissection
             .not_offered
@@ -368,6 +404,7 @@ pub fn extract(
 
     let mut written: Vec<(String, PathBuf, u64)> = Vec::new();
     let mut removed: Vec<(String, PathBuf)> = Vec::new();
+    let mut unmarked: Vec<(String, String)> = Vec::new();
     for (index, member) in dissection.members.iter().enumerate() {
         if member.status != MemberStatus::NothingFound {
             continue;
@@ -378,9 +415,17 @@ pub fn extract(
             &member.name,
             member.bytes,
             &destination_real,
-            zone,
         ) {
-            Ok((path, size)) => written.push((member.name.clone(), path, size)),
+            Ok((path, size)) => {
+                // A failure is not an absence: the file is there, and it
+                // lacks the mark it should carry, so it is listed.
+                if let Some(zone) = zone {
+                    if let Err(error) = stamp(&path, zone) {
+                        unmarked.push((member.name.clone(), error.to_string()));
+                    }
+                }
+                written.push((member.name.clone(), path, size));
+            }
             Err(Unwritten::Removed(path)) => removed.push((member.name.clone(), path)),
             Err(Unwritten::Failed(reason)) => {
                 outcome.failed.push(format!("{}: {reason}", member.name));
@@ -398,6 +443,12 @@ pub fn extract(
     let (files, bytes, gone) = second_look(written);
     outcome.files = files;
     outcome.bytes = bytes;
+    // A file that is gone is reported as gone, not as lacking a mark.
+    outcome.unmarked = unmarked
+        .into_iter()
+        .filter(|(name, _)| !gone.iter().any(|(taken, _)| taken == name))
+        .map(|(name, reason)| format!("{name}: {reason}"))
+        .collect();
     removed.extend(gone);
     if !removed.is_empty() {
         outcome.removed = name_removals(removed);
@@ -484,7 +535,6 @@ fn write_member(
     name: &str,
     declared: u64,
     destination: &Path,
-    zone: Option<&[u8]>,
 ) -> Result<(PathBuf, u64), Unwritten> {
     let parts = safe_relative(name).map_err(|refusal| refusal.sentence())?;
     let Some((file_name, folders)) = parts.split_last() else {
@@ -590,11 +640,6 @@ fn write_member(
         ));
     }
 
-    if let Some(zone) = zone {
-        let mut stream = target.clone().into_os_string();
-        stream.push(":Zone.Identifier");
-        let _ = std::fs::write(PathBuf::from(stream), zone);
-    }
     Ok((target, copied))
 }
 
@@ -910,6 +955,71 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(std::fs::read_dir(&work).unwrap().count(), 0);
+    }
+
+    /// Red review: a mark that could not be read from the archive counted as
+    /// no mark, and a mark that could not be written onto an extracted file
+    /// was thrown away. Either way a file went without the mark that makes
+    /// SmartScreen check it, and nothing said so.
+    #[test]
+    fn a_mark_that_cannot_be_read_or_written_is_said_and_not_passed_over() {
+        let scratch = Scratch::new("mark");
+        let zip_path = scratch.0.join("work").join("copy.zip");
+        hostile_zip(&zip_path);
+        let zone = b"[ZoneTransfer]\r\nZoneId=3\r\n";
+
+        // Reading: no mark is no mark, and a mark that is there is read.
+        assert_eq!(read_mark(&zip_path), Ok(None));
+        stamp(&zip_path, zone).unwrap();
+        assert_eq!(read_mark(&zip_path), Ok(Some(zone.to_vec())));
+        // Anything else that goes wrong is an error, not "none". A name
+        // Windows will not take fails in a way that is not "not found".
+        let unreadable = scratch.0.join("work").join("what?.zip");
+        assert!(
+            read_mark(&unreadable).is_err(),
+            "a mark that could not be read was taken for no mark"
+        );
+
+        // Writing: the files are written, counted, and listed as unmarked.
+        let dissection = dissect(
+            "Photos.zip",
+            "ab",
+            clean(),
+            &entries(&opened(&zip_path)).unwrap(),
+        );
+        let refuses = |_: &Path, _: &[u8]| -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(5))
+        };
+        let done = extract_with(
+            &opened(&zip_path),
+            &dissection,
+            &scratch.downloads(),
+            "Photos.zip",
+            Some(zone),
+            &refuses,
+        )
+        .unwrap();
+        assert_eq!(done.files, 3, "{done:?}");
+        assert_eq!(done.unmarked.len(), 3, "{:?}", done.unmarked);
+        assert!(
+            done.unmarked
+                .iter()
+                .any(|entry| entry.starts_with("readme.txt: ")),
+            "{:?}",
+            done.unmarked
+        );
+
+        // With no mark on the archive there is none to add, and nothing to say.
+        let done = extract_with(
+            &opened(&zip_path),
+            &dissection,
+            &scratch.downloads(),
+            "Photos.zip",
+            None,
+            &refuses,
+        )
+        .unwrap();
+        assert!(done.unmarked.is_empty());
     }
 
     /// What a previous run left is cleared at start. What this run made is

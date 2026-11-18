@@ -445,6 +445,12 @@ pub struct Extraction {
     /// landed. Never counted in `files`.
     #[serde(default)]
     pub removed: Vec<RemovedFile>,
+    /// Files that were written, and counted in `files`, but could not be
+    /// given the mark Windows puts on downloaded files, with why. The archive
+    /// carried the mark and these do not, so SmartScreen will not check them
+    /// before they run.
+    #[serde(default)]
+    pub unmarked: Vec<String>,
 }
 
 /// A file that was written and then taken away as it landed.

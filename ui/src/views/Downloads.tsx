@@ -763,6 +763,9 @@ function DissectionPanel({
       {!dissection.offered && dissection.not_offered && (
         <div className="notice notice-warn">{dissection.not_offered}</div>
       )}
+      {dissection.offered && view.mark_problem && (
+        <p className="small held-warn wrap">{view.mark_problem}</p>
+      )}
 
       {dissection.offered && !extraction && (
         <div className="dl-actions">
@@ -868,6 +871,25 @@ function ExtractionResult({ extraction }: { extraction: Extraction }) {
           <p className="small muted">
             Windows Security's Protection history shows what Defender did with each.
           </p>
+        </>
+      )}
+      {extraction.unmarked.length > 0 && (
+        <>
+          <p className="held-warn wrap">
+            {fmt.count(extraction.unmarked.length)}{" "}
+            {extraction.unmarked.length === 1 ? "file was" : "files were"} written, but the mark
+            Windows puts on downloaded files could not be added to{" "}
+            {extraction.unmarked.length === 1 ? "it" : "them"}, so SmartScreen will not check{" "}
+            {extraction.unmarked.length === 1 ? "it" : "them"} before{" "}
+            {extraction.unmarked.length === 1 ? "it is" : "they are"} run:
+          </p>
+          <ul className="dl-done">
+            {extraction.unmarked.map((entry) => (
+              <li key={entry} className="small">
+                {entry}
+              </li>
+            ))}
+          </ul>
         </>
       )}
       {extraction.failed.length > 0 && (

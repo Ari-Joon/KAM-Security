@@ -2511,6 +2511,7 @@ mod tests {
                         "tools/scan.exe".to_owned(),
                         Some("HackTool:Win32/Example".to_owned()),
                     )],
+                    unmarked: vec!["docs/a.exe: Access is denied.".to_owned()],
                 },
             },
             &context,
@@ -2532,6 +2533,10 @@ mod tests {
                 "1 removed by Defender as it was written: tools/scan.exe (HackTool:Win32/Example)"
             ),
             "a file Defender took away was not said: {said}"
+        );
+        assert!(
+            said.contains("1 of those written could not be given the mark Windows puts on"),
+            "a file written without its download mark was not said: {said}"
         );
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
