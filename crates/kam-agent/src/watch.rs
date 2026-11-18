@@ -575,7 +575,7 @@ fn record(store: &Store, observation: &Observation) {
             } else {
                 Effect::Observed
             },
-            detail: format!("{} — {}", observation.summary, observation.subject),
+            detail: format!("{} ({})", observation.summary, observation.subject),
             undo_token: None,
         },
     );
@@ -1000,6 +1000,36 @@ mod tests {
             observations[0].summary,
             format!("observation {}", KEEP + 9),
             "newest must be first"
+        );
+    }
+
+    /// What the Activity page shows for an observation: what happened, then
+    /// what it is about in brackets. A dash used to join the two.
+    #[test]
+    fn an_observation_is_written_to_the_log_as_one_plain_line() {
+        let store = Store::open_in_memory().unwrap();
+        record(
+            &store,
+            &Observation {
+                at: "2026-11-18T14:00:00.000Z".to_owned(),
+                kind: kam_scanner::behaviour::Kind::StartupFolder,
+                concern: kam_scanner::behaviour::Concern::Notable,
+                summary: "The Startup folder item \"KAM Clear Voice\" appeared, and what it \
+                          runs could not be told"
+                    .to_owned(),
+                evidence: vec!["because".to_owned()],
+                subject: r"C:\Users\her\Startup".to_owned(),
+                command: String::new(),
+                pid: None,
+            },
+        );
+
+        let written = store.recent_audit(1).unwrap().remove(0);
+        assert_eq!(written.module, "behaviour");
+        assert_eq!(
+            written.detail,
+            "The Startup folder item \"KAM Clear Voice\" appeared, and what it runs could \
+             not be told (C:\\Users\\her\\Startup)"
         );
     }
 

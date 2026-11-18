@@ -287,12 +287,25 @@ fn headless_console(command: &str) -> bool {
     lower.contains("--headless") && !lower.contains("--server") && !lower.contains("--signal")
 }
 
-/// The first letter in upper case, for a label used to open a sentence.
-fn capitalised(text: &str) -> String {
-    let mut characters = text.chars();
-    match characters.next() {
-        Some(first) => first.to_uppercase().chain(characters).collect(),
-        None => String::new(),
+/// One startup entry by name, to open a sentence: `The scheduled task
+/// "Backup"`.
+///
+/// The name was left out of the one sentence written about an entry whose
+/// target could not be told, and the subject of that observation is where the
+/// entry lives. So the line a person read named a folder, or a registry key,
+/// and never the thing in it.
+fn named(kind: Kind, name: &str) -> String {
+    let what = match kind {
+        Kind::ProcessStart => "program",
+        Kind::ScheduledTask => "scheduled task",
+        Kind::SignInEntry => "sign-in entry",
+        Kind::StartupFolder => "Startup folder item",
+        Kind::Service => "service",
+    };
+    if name.trim().is_empty() {
+        format!("A {what} with no name")
+    } else {
+        format!("The {what} \"{name}\"")
     }
 }
 
@@ -352,7 +365,7 @@ pub fn judge_process(start: &ProcessStart) -> Option<Observation> {
     // a drive they work in.
     if BUILD_TOOLS.contains(&name.as_str()) {
         let mut evidence = vec![format!(
-            "{} is a software build tool. It is signed by Microsoft, so antivirus trusts it, and it will run code from a project file — which antivirus does not read.",
+            "{} is a software build tool. It is signed by Microsoft, so antivirus trusts it, and it will run code from a project file, which antivirus does not read.",
             start.name
         )];
         let payload = resolved.payload.as_deref();
@@ -549,8 +562,8 @@ pub fn judge_entry(entry: &Entry) -> Option<Observation> {
             kind,
             Concern::Notable,
             format!(
-                "{}, and what it runs could not be told",
-                capitalised(kind.label())
+                "{} appeared, and what it runs could not be told",
+                named(kind, &entry.name)
             ),
             vec![
                 entry.unresolved().unwrap_or_else(|| {
@@ -926,6 +939,54 @@ mod tests {
             .evidence
             .iter()
             .any(|line| line.contains("kam-gone-for-good")));
+    }
+
+    /// The sentence written about such an entry names it.
+    ///
+    /// It named only the kind of thing, and the observation's subject is the
+    /// folder or key the entry lives in, so the line shown on the Activity
+    /// page never said which item it was about.
+    #[test]
+    fn an_entry_whose_target_could_not_be_told_is_named_in_its_summary() {
+        let mut shortcut = entry(
+            Anchor::StartupFolder,
+            r"C:\Users\me\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\KAM Clear Voice.lnk",
+            false,
+        );
+        shortcut.name = "KAM Clear Voice".to_owned();
+        assert!(shortcut.target().is_none(), "the premise: nothing to judge");
+        assert_eq!(
+            judge_entry(&shortcut).expect("said out loud").summary,
+            "The Startup folder item \"KAM Clear Voice\" appeared, and what it runs could not be told"
+        );
+
+        let mut service = entry(Anchor::Service, r"C:\kam-not-there\svc.exe", false);
+        service.name = "Helper".to_owned();
+        assert_eq!(
+            judge_entry(&service).expect("said out loud").summary,
+            "The service \"Helper\" appeared, and what it runs could not be told"
+        );
+
+        // A value in a Run key can have an empty name.
+        let mut nameless = entry(Anchor::RunKey, r"C:\kam-not-there\upd.exe", false);
+        nameless.name = String::new();
+        assert_eq!(
+            judge_entry(&nameless).expect("said out loud").summary,
+            "A sign-in entry with no name appeared, and what it runs could not be told"
+        );
+    }
+
+    /// Nothing a person reads from here has a dash in it.
+    #[test]
+    fn the_line_about_a_build_tool_has_no_dash_in_it() {
+        let observation =
+            judge_process(&start("MSBuild.exe", "MSBuild.exe")).expect("a build tool fires");
+        for line in &observation.evidence {
+            assert!(
+                !line.contains('\u{2014}') && !line.contains('\u{2013}'),
+                "{line}"
+            );
+        }
     }
 
     #[test]
