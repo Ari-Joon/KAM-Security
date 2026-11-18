@@ -164,6 +164,74 @@ impl Unreadable {
     }
 }
 
+/// How one kind of thing is read, stated by whoever reads it.
+///
+/// # Why a sweep has to be told
+///
+/// What is stored for a thing is what the reader made of it, and readers get
+/// better. A service that runs inside `svchost.exe` was recorded as running
+/// `svchost.exe`; it is now recorded as running the file it loads there.
+/// Nothing on the machine changed, and compared the ordinary way every such
+/// service would be reported as changed on the first sweep after the update:
+/// 58 of them on the machine this was written on.
+///
+/// A kind that was not looked at before has the same problem. Whether a sweep
+/// is "the first look" was decided once for the whole store, so adding a kind
+/// to a store that already held a baseline reported everything of that kind as
+/// having appeared.
+///
+/// So each kind carries a number, raised whenever the way it is read changes
+/// what is recorded, and the store keeps the number each kind was last
+/// recorded under. A kind met for the first time, or under a higher number
+/// than last time, is recorded as it is and not compared. Once.
+///
+/// # What that costs, and where it is said
+///
+/// Something of that kind that really did change since the last sweep is
+/// recorded with the rest and never reported. That is one sweep, for one kind,
+/// and it is not kept quiet: `note` is handed to the person with the sources
+/// that could not be read, since in both cases nothing is being claimed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reading {
+    /// The kind, as the token its sightings are stored under.
+    pub kind: String,
+    /// Raised by one whenever what is recorded for this kind changes without
+    /// the things themselves changing. Never lowered.
+    pub version: i64,
+    /// What to tell the person on the one sweep that records this kind
+    /// without comparing it. A whole sentence, true whether the kind is new to
+    /// the store or newly read.
+    pub note: String,
+}
+
+impl Reading {
+    pub fn of(kind: &str, version: i64, note: impl Into<String>) -> Self {
+        Self {
+            kind: kind.to_owned(),
+            version,
+            note: note.into(),
+        }
+    }
+}
+
+/// The kinds every sweep looked at before the store kept a number for each.
+///
+/// A store from before then says nothing about which kinds it has recorded,
+/// and it must not be taken to have recorded none: the first run-once entry to
+/// appear after the update would be the first of its kind the store had seen
+/// under the new rule, and would be recorded without a word. So the step that
+/// adds the numbers writes these six down for any store that has been swept.
+/// The readers file their sightings under the same tokens, and a test on each
+/// side holds the three spellings together.
+pub const KINDS_BEFORE_READINGS: [&str; 6] = [
+    "run_key",
+    "run_once_key",
+    "startup_item",
+    "service",
+    "scheduled_task",
+    "administrator",
+];
+
 /// What happened to one thing between two sweeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -253,6 +321,11 @@ pub struct Sweep {
     /// Never empty-by-omission: a source that was skipped is said out loud,
     /// because a silently skipped source is a lie by omission in a product
     /// whose whole claim is that it says what it did.
+    ///
+    /// A kind that was recorded this time without being compared is said here
+    /// too, in the words of its [`Reading`]. It was read, but nothing is
+    /// claimed about what changed in it, which is the same thing to somebody
+    /// reading the result.
     pub unreadable: Vec<String>,
     /// True when this was the first sweep, so there was nothing to compare to.
     ///

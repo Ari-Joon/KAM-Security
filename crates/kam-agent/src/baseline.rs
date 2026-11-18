@@ -40,7 +40,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use kam_core::changes::{Sighting, Unreadable};
+use kam_core::changes::{Reading, Sighting, Unreadable};
 use kam_scanner::persistence::{self, Anchor, Entry};
 
 /// The name a sighting is filed under for each kind of thing.
@@ -198,6 +198,54 @@ pub fn collect() -> (Vec<Sighting>, Vec<Unreadable>) {
     }
 
     (sightings, unreadable)
+}
+
+/// How each kind this module files anything under is read, for the store to
+/// hold against how it was read last time. See [`Reading`] for why it asks.
+///
+/// Every kind is named, whether or not the way it is read has ever changed. A
+/// kind that is named is written down as looked at even by a sweep that finds
+/// none of it, which is what makes the first one to turn up an appearance and
+/// not a first look.
+pub fn readings() -> Vec<Reading> {
+    let never_before = |what: &str| {
+        format!(
+            "{what} had not been recorded before, so this time they were recorded as \
+             they are and not compared with anything."
+        )
+    };
+    vec![
+        Reading::of(
+            kind_of(Anchor::RunKey),
+            1,
+            never_before("Sign-in entries in the registry"),
+        ),
+        Reading::of(
+            kind_of(Anchor::RunOnceKey),
+            1,
+            never_before("Run-once entries in the registry"),
+        ),
+        Reading::of(
+            kind_of(Anchor::StartupFolder),
+            1,
+            never_before("Startup folder items"),
+        ),
+        // 2: a service that runs inside svchost.exe is recorded as the file
+        // it loads there. It was recorded as svchost.exe.
+        Reading::of(
+            kind_of(Anchor::Service),
+            2,
+            "Services are looked at more closely from this version on: for one that runs \
+             inside svchost.exe, what is recorded is the file it loads there. So this time \
+             services were recorded as they are, and not compared with last time.",
+        ),
+        Reading::of(
+            kind_of(Anchor::ScheduledTask),
+            1,
+            never_before("Scheduled tasks"),
+        ),
+        Reading::of(ADMINISTRATOR, 1, never_before("The local administrators")),
+    ]
 }
 
 /// The kinds that live inside one person's account rather than the machine's.
@@ -514,6 +562,66 @@ mod tests {
         assert_eq!(kind_of(Anchor::ScheduledTask), "scheduled_task");
         assert_eq!(kind_of(Anchor::StartupFolder), "startup_item");
         assert_eq!(kind_of(Anchor::RunOnceKey), "run_once_key");
+    }
+
+    /// Every kind is told to the store, and under the token the store was
+    /// given for it when it first started keeping count.
+    ///
+    /// Three spellings have to agree: what a sighting is filed under, what
+    /// the sweep is told was read, and what the step that brought an older
+    /// store up to date wrote down as already looked at. A kind missing from
+    /// the second loses its own first look. A kind missing from the third is
+    /// taken for new on a store that has held it for months, and everything
+    /// that changed in it since the last sweep goes unreported.
+    #[test]
+    fn every_kind_is_told_to_the_store_under_the_token_it_knows() {
+        let mut told: Vec<String> = readings().into_iter().map(|one| one.kind).collect();
+        told.sort();
+        let mut known: Vec<String> = kam_core::changes::KINDS_BEFORE_READINGS
+            .iter()
+            .map(|kind| (*kind).to_owned())
+            .collect();
+        known.sort();
+        assert_eq!(told, known);
+
+        for reading in readings() {
+            assert!(reading.version >= 1, "{reading:?}");
+            assert!(
+                reading.note.ends_with('.'),
+                "the note is shown to a person as a sentence: {reading:?}"
+            );
+        }
+    }
+
+    /// What is compared for a service inside svchost.exe is the file it
+    /// loads there, so one swapped for another is a change.
+    #[test]
+    fn a_service_inside_svchost_is_compared_by_the_file_it_loads() {
+        let root = std::env::var("SystemRoot").unwrap();
+        let host = PathBuf::from(&root).join(r"System32\svchost.exe");
+        let hosted = |library: &str| Entry {
+            name: "Task Scheduler".to_owned(),
+            anchor: Anchor::Service,
+            location: r"HKLM\SYSTEM\CurrentControlSet\Services\Schedule".to_owned(),
+            command: format!("{} -k netsvcs -p", host.display()),
+            executable: Some(host.clone()),
+            payload: Some(PathBuf::from(&root).join("System32").join(library)),
+            host: Some("svchost.exe".to_owned()),
+            hidden: false,
+            machine_wide: true,
+            missing: None,
+        };
+
+        let mut trust = HashMap::new();
+        let before = sighting_of(&hosted("schedsvc.dll"), &mut trust);
+        let after = sighting_of(&hosted("kernel32.dll"), &mut trust);
+        assert!(before.detail.to_lowercase().ends_with("schedsvc.dll"));
+        assert_eq!(
+            (&before.kind, &before.scope, &before.name),
+            (&after.kind, &after.scope, &after.name),
+            "the same service"
+        );
+        assert_ne!(before.detail, after.detail, "running something else");
     }
 
     /// An account nobody is signed in as is named, not silently skipped.

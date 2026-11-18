@@ -487,6 +487,11 @@ export type PersistenceEntry = {
   /** A scheduled task marked hidden from Task Scheduler's list. */
   hidden: boolean;
   machine_wide: boolean;
+  /**
+   * Why what this runs could not be told, when the agent knows. An entry
+   * carrying this has no file to judge, so none reaches a finding today.
+   */
+  missing: string | null;
 };
 
 /**

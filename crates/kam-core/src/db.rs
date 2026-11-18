@@ -15,7 +15,7 @@ use crate::audit::{AuditLog, Effect, Entry, Record};
 use crate::{Error, Result};
 
 /// Bumped whenever the schema below changes. Stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE audit (
@@ -192,6 +192,38 @@ CREATE TABLE downloads (
 );
 
 CREATE INDEX downloads_caller_idx ON downloads (sid, checked_at DESC);
+";
+
+/// The way each kind of thing was read when it was last recorded.
+///
+/// See [`crate::changes::Reading`] for what the number is and why a sweep
+/// needs it. One row per kind, written by the sweep that records the kind.
+///
+/// # Why the step fills it in
+///
+/// A store from before this table has recorded every kind there was, under
+/// the only reading there was, and has nowhere said so. Left empty, the table
+/// would have the first sweep after the update take each kind for one it had
+/// never seen, and record it without comparing: every change made since the
+/// last sweep, to anything, absorbed in silence. So a store that has been
+/// swept is given the six kinds that every sweep before this looked at, at
+/// their first reading. A store that has never been swept is given nothing,
+/// because its first sweep compares nothing anyway.
+const SCHEMA_V7: &str = "
+CREATE TABLE readings (
+    kind    TEXT    PRIMARY KEY,
+    version INTEGER NOT NULL
+);
+
+INSERT INTO readings (kind, version)
+SELECT kind, 1
+  FROM (SELECT 'run_key' AS kind
+        UNION ALL SELECT 'run_once_key'
+        UNION ALL SELECT 'startup_item'
+        UNION ALL SELECT 'service'
+        UNION ALL SELECT 'scheduled_task'
+        UNION ALL SELECT 'administrator')
+ WHERE EXISTS (SELECT 1 FROM sweeps);
 ";
 
 /// One checked download as the store keeps it. See [`SCHEMA_V6`].
@@ -575,7 +607,33 @@ impl Store {
         seen: &[crate::changes::Sighting],
         unreadable: &[crate::changes::Unreadable],
     ) -> Result<crate::changes::Sweep> {
-        use crate::changes::{rank, Change, Difference, FLAPS_BEFORE_RECURRING};
+        self.sweep_read_as(seen, unreadable, &[])
+    }
+
+    /// The same, told how each kind of thing was read.
+    ///
+    /// # The first look is per kind
+    ///
+    /// A kind named in `readings` that this store has never recorded, or last
+    /// recorded under a lower number, is recorded as it is and not compared:
+    /// nothing of that kind is reported as appeared, changed or gone this
+    /// time. See [`crate::changes::Reading`] for why, and for what it costs.
+    /// The reading's note comes back among the things the sweep could not
+    /// read, because nothing is claimed about either.
+    ///
+    /// A kind that is not named keeps the old rule, under which only the very
+    /// first sweep of a store goes uncompared. That is every kind when nothing
+    /// is named, which is what [`Store::sweep`] asks for.
+    ///
+    /// A kind whose whole source could not be read this time is not written
+    /// down as recorded. Its first look is the first sweep that can see it.
+    pub fn sweep_read_as(
+        &self,
+        seen: &[crate::changes::Sighting],
+        unreadable: &[crate::changes::Unreadable],
+        readings: &[crate::changes::Reading],
+    ) -> Result<crate::changes::Sweep> {
+        use crate::changes::{rank, Change, Difference, Reading, FLAPS_BEFORE_RECURRING};
 
         let mut guard = self.lock()?;
         // Dropped without `commit` on any early return, which rolls back.
@@ -597,6 +655,30 @@ impl Store {
             .optional()
             .map_err(to_db_error)?;
         let baseline = previous_at.is_none();
+
+        // The kinds being recorded without comparing, this sweep only.
+        let recorded_under: std::collections::HashMap<String, i64> = {
+            let mut stored = connection
+                .prepare("SELECT kind, version FROM readings")
+                .map_err(to_db_error)?;
+            let rows = stored
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(to_db_error)?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(to_db_error)?;
+            rows
+        };
+        let afresh: Vec<&Reading> = readings
+            .iter()
+            .filter(|reading| {
+                recorded_under
+                    .get(&reading.kind)
+                    .is_none_or(|under| *under < reading.version)
+            })
+            .collect();
+        // Whether what this sweep makes of one kind is reported, or only
+        // written down.
+        let compared = |kind: &str| !baseline && !afresh.iter().any(|reading| reading.kind == kind);
 
         // Whether this sweep genuinely looked where this thing lives.
         //
@@ -646,7 +728,7 @@ impl Store {
                             ],
                         )
                         .map_err(to_db_error)?;
-                    if !baseline {
+                    if compared(&sighting.kind) {
                         differences.push(Difference {
                             at: now.clone(),
                             change: Change::Appeared,
@@ -660,7 +742,8 @@ impl Store {
                             trust: sighting.trust.clone(),
                             was_trusted: None,
                         });
-                    } else if !crate::changes::vouched_for(&sighting.trust)
+                    } else if baseline
+                        && !crate::changes::vouched_for(&sighting.trust)
                         && crate::changes::is_a_file(&sighting.trust)
                     {
                         // First sweep. This was already here, and nothing
@@ -712,7 +795,7 @@ impl Store {
                         )
                         .map_err(to_db_error)?;
 
-                    if baseline {
+                    if !compared(&sighting.kind) {
                         continue;
                     }
                     // A trust that was recorded and has since changed. An
@@ -827,7 +910,7 @@ impl Store {
                 )
                 .map_err(to_db_error)?;
 
-            if !baseline {
+            if compared(&kind) {
                 differences.push(Difference {
                     at: now.clone(),
                     change: if flaps >= FLAPS_BEFORE_RECURRING {
@@ -848,17 +931,43 @@ impl Store {
             }
         }
 
+        // What this sweep has to say about what it could not vouch for: the
+        // sources it could not read, and the kinds it recorded without
+        // comparing. Each kind that was recorded is written down under the
+        // number it was read with, so that the next sweep compares it.
+        let mut said: Vec<String> = unreadable
+            .iter()
+            .map(|source| source.what.clone())
+            .collect();
+        for reading in readings {
+            // The whole kind could not be read, so it has not been recorded
+            // and nothing is written down: its first look is still to come.
+            let unseen = unreadable
+                .iter()
+                .any(|source| source.scopes.is_empty() && source.kinds.contains(&reading.kind));
+            if unseen {
+                continue;
+            }
+            // The very first sweep compares nothing at all, and the
+            // interface says so in its own words.
+            let uncompared = afresh.iter().any(|one| one.kind == reading.kind);
+            if uncompared && !baseline && !reading.note.is_empty() {
+                said.push(reading.note.clone());
+            }
+            connection
+                .execute(
+                    "INSERT INTO readings (kind, version) VALUES (?1, ?2)
+                     ON CONFLICT(kind) DO UPDATE
+                        SET version = MAX(version, excluded.version)",
+                    params![reading.kind, reading.version],
+                )
+                .map_err(to_db_error)?;
+        }
+
         connection
             .execute(
                 "INSERT INTO sweeps (at, unreadable) VALUES (?1, ?2)",
-                params![
-                    now,
-                    unreadable
-                        .iter()
-                        .map(|source| source.what.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ],
+                params![now, said.join("\n")],
             )
             .map_err(to_db_error)?;
 
@@ -948,10 +1057,7 @@ impl Store {
 
         Ok(crate::changes::Sweep {
             differences,
-            unreadable: unreadable
-                .iter()
-                .map(|source| source.what.clone())
-                .collect(),
+            unreadable: said,
             baseline,
             previous_at,
             at: now,
@@ -1049,13 +1155,14 @@ fn one_line(detail: &str) -> String {
 }
 
 /// Every schema step, with the version it brings the store to.
-const MIGRATIONS: [(i64, &str); 6] = [
+const MIGRATIONS: [(i64, &str); 7] = [
     (1, SCHEMA_V1),
     (2, SCHEMA_V2),
     (3, SCHEMA_V3),
     (4, SCHEMA_V4),
     (5, SCHEMA_V5),
     (6, SCHEMA_V6),
+    (7, SCHEMA_V7),
 ];
 
 fn migrate(connection: &Connection) -> Result<()> {
@@ -1952,7 +2059,7 @@ mod tests {
             "the premise: a version five store has no downloads table"
         );
 
-        migrate(&connection).expect("the upgrade to six should apply");
+        migrate_through(&connection, &MIGRATIONS[..6]).expect("the upgrade to six should apply");
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
@@ -2075,6 +2182,350 @@ mod tests {
                 )
                 .unwrap(),
             "an action landed on somebody else's row"
+        );
+    }
+
+    /// A store from before readings were kept, as an update finds it: swept,
+    /// with a service recorded the old way, a copy of a per-account service
+    /// under the name it had that day, and a sign-in entry.
+    fn a_swept_version_six_store() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_through(&connection, &MIGRATIONS[..6]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sweeps (at) VALUES ('2026-10-12T09:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        for (kind, name, detail) in [
+            ("service", "Task Scheduler", "svchost.exe"),
+            ("service", "Clipboard User Service_a74e8", "svchost.exe"),
+            ("run_key", "Updater", "up.exe"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sightings
+                       (kind, scope, name, detail, first_seen, last_seen, trust)
+                     VALUES (?1, 'machine', ?2, ?3, '2026-10-12T09:00:00.000Z',
+                             '2026-10-12T09:00:00.000Z', 'signed by Somebody Ltd')",
+                    params![kind, name, detail],
+                )
+                .unwrap();
+        }
+        connection
+    }
+
+    fn read_as(kind: &str, version: i64) -> crate::changes::Reading {
+        crate::changes::Reading::of(kind, version, format!("{kind} was not compared"))
+    }
+
+    fn readings_in(connection: &Connection) -> Vec<(String, i64)> {
+        let mut statement = connection
+            .prepare("SELECT kind, version FROM readings ORDER BY kind")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    /// A store that has been swept is told, by the step that adds readings,
+    /// that it has recorded every kind there was. Without that its next sweep
+    /// would take each kind for one it had never seen and compare nothing.
+    #[test]
+    fn a_version_six_store_that_has_been_swept_is_given_its_readings() {
+        let connection = a_swept_version_six_store();
+        assert!(
+            connection
+                .execute_batch("SELECT kind FROM readings")
+                .is_err(),
+            "the premise: a version six store has no readings table"
+        );
+
+        migrate_through(&connection, &MIGRATIONS[..7]).expect("the upgrade to seven should apply");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
+
+        let mut expected: Vec<(String, i64)> = crate::changes::KINDS_BEFORE_READINGS
+            .iter()
+            .map(|kind| ((*kind).to_owned(), 1))
+            .collect();
+        expected.sort();
+        assert_eq!(readings_in(&connection), expected);
+
+        let kept: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sightings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, 3, "the baseline did not survive the upgrade");
+    }
+
+    /// A store that was never swept has recorded nothing, and is told nothing.
+    #[test]
+    fn a_version_six_store_that_was_never_swept_is_given_no_readings() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_through(&connection, &MIGRATIONS[..6]).unwrap();
+        migrate_through(&connection, &MIGRATIONS[..7]).unwrap();
+        assert!(readings_in(&connection).is_empty());
+    }
+
+    /// The step that adds readings, stopped partway, is finished by the next
+    /// start and does not write the six kinds twice.
+    #[test]
+    fn an_interrupted_upgrade_to_seven_is_finished_by_the_next_start() {
+        let connection = a_swept_version_six_store();
+        let interrupted = [(
+            7,
+            "CREATE TABLE readings (kind TEXT PRIMARY KEY, version INTEGER NOT NULL);
+             INSERT INTO readings (kind, version) VALUES ('service', 1);
+             this is where the process was stopped;",
+        )];
+        assert!(migrate_through(&connection, &interrupted).is_err());
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+
+        migrate_through(&connection, &MIGRATIONS[..7])
+            .expect("the next start should finish the upgrade");
+        assert_eq!(readings_in(&connection).len(), 6);
+    }
+
+    /// The first sweep after a kind starts being read in a new way updates
+    /// what is stored and reports nothing of that kind.
+    ///
+    /// The case this was built for: services inside svchost.exe were recorded
+    /// as svchost.exe and are now recorded as the file they load there, and
+    /// the copies Windows makes of its per-account services stopped being
+    /// recorded under a name that changes at every sign-in. Compared the
+    /// ordinary way that is 58 services "changed" and a handful "gone" on the
+    /// machine this was written on, none of which happened.
+    #[test]
+    fn a_kind_read_in_a_new_way_is_recorded_once_without_being_compared() {
+        use crate::changes::Change;
+
+        let connection = a_swept_version_six_store();
+        migrate(&connection).unwrap();
+        let store = Store {
+            connection: Mutex::new(connection),
+        };
+        let how = [read_as("service", 2), read_as("run_key", 1)];
+
+        let sweep = store
+            .sweep_read_as(
+                &[
+                    // Recorded differently, though nothing about it changed.
+                    seen("service", "Task Scheduler", "schedsvc.dll"),
+                    // New under the new reading. The dated copy is not seen.
+                    seen("service", "Clipboard User Service", "cbdhsvc.dll"),
+                    seen("run_key", "Updater", "up.exe"),
+                    // A different kind, read as it always was.
+                    seen("run_key", "Arrived", "new.exe"),
+                ],
+                &[],
+                &how,
+            )
+            .unwrap();
+
+        assert!(!sweep.baseline, "this store already had a baseline");
+        let reported: Vec<(&str, Change)> = sweep
+            .differences
+            .iter()
+            .map(|one| (one.name.as_str(), one.change))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![("Arrived", Change::Appeared)],
+            "only the kind read as before is compared"
+        );
+        assert_eq!(
+            sweep.unreadable,
+            vec!["service was not compared".to_owned()],
+            "and the person is told which kind was not"
+        );
+
+        // What is stored is what was seen: the next sweep finds nothing to
+        // say about any of it, and says nothing about not comparing.
+        let again = store
+            .sweep_read_as(
+                &[
+                    seen("service", "Task Scheduler", "schedsvc.dll"),
+                    seen("service", "Clipboard User Service", "cbdhsvc.dll"),
+                    seen("run_key", "Updater", "up.exe"),
+                    seen("run_key", "Arrived", "new.exe"),
+                ],
+                &[],
+                &how,
+            )
+            .unwrap();
+        assert!(again.differences.is_empty(), "{:?}", again.differences);
+        assert!(again.unreadable.is_empty(), "{:?}", again.unreadable);
+
+        // And from then on the kind is compared like any other.
+        let swapped = store
+            .sweep_read_as(
+                &[
+                    seen("service", "Task Scheduler", "planted.dll"),
+                    seen("run_key", "Updater", "up.exe"),
+                    seen("run_key", "Arrived", "new.exe"),
+                ],
+                &[],
+                &how,
+            )
+            .unwrap();
+        let change = |name: &str| {
+            swapped
+                .differences
+                .iter()
+                .find(|one| one.name == name)
+                .map(|one| one.change)
+        };
+        assert_eq!(change("Task Scheduler"), Some(Change::Altered));
+        assert_eq!(change("Clipboard User Service"), Some(Change::Vanished));
+    }
+
+    /// A kind that is looked at for the first time on a store that already
+    /// has a baseline is recorded, not reported as having appeared.
+    ///
+    /// The first look used to be decided once for the whole store, so adding
+    /// a kind reported everything of that kind as new.
+    #[test]
+    fn a_kind_looked_at_for_the_first_time_is_recorded_without_a_report() {
+        use crate::changes::Change;
+
+        let store = Store::open_in_memory().unwrap();
+        let old = [read_as("service", 1)];
+        store
+            .sweep_read_as(&[seen("service", "One", "a")], &[], &old)
+            .unwrap();
+
+        let both = [read_as("service", 1), read_as("certificate", 1)];
+        let first = store
+            .sweep_read_as(
+                &[
+                    seen("service", "One", "a"),
+                    seen("certificate", "Root A", "aa"),
+                    seen("certificate", "Root B", "bb"),
+                ],
+                &[],
+                &both,
+            )
+            .unwrap();
+        assert!(first.differences.is_empty(), "{:?}", first.differences);
+        assert_eq!(
+            first.unreadable,
+            vec!["certificate was not compared".to_owned()]
+        );
+
+        let second = store
+            .sweep_read_as(
+                &[
+                    seen("service", "One", "a"),
+                    seen("certificate", "Root A", "aa"),
+                    seen("certificate", "Root B", "bb"),
+                    seen("certificate", "Root C", "cc"),
+                ],
+                &[],
+                &both,
+            )
+            .unwrap();
+        assert_eq!(second.differences.len(), 1, "{:?}", second.differences);
+        assert_eq!(second.differences[0].name, "Root C");
+        assert_eq!(second.differences[0].change, Change::Appeared);
+    }
+
+    /// A kind that was looked at and had nothing in it has still been looked
+    /// at. The first thing of that kind to turn up is an appearance, not a
+    /// first look, or the commonest empty kind (run-once entries) would hand
+    /// its first arrival a free pass.
+    #[test]
+    fn a_kind_with_nothing_in_it_has_still_been_looked_at() {
+        let store = Store::open_in_memory().unwrap();
+        let how = [read_as("service", 1), read_as("run_once_key", 1)];
+        store
+            .sweep_read_as(&[seen("service", "One", "a")], &[], &how)
+            .unwrap();
+
+        let sweep = store
+            .sweep_read_as(
+                &[
+                    seen("service", "One", "a"),
+                    seen("run_once_key", "Planted", "x.exe"),
+                ],
+                &[],
+                &how,
+            )
+            .unwrap();
+        assert_eq!(sweep.differences.len(), 1, "{:?}", sweep.differences);
+        assert_eq!(sweep.differences[0].name, "Planted");
+        assert!(sweep.unreadable.is_empty(), "{:?}", sweep.unreadable);
+    }
+
+    /// A kind whose whole source could not be read has not been looked at,
+    /// so the first sweep that can read it is its first look.
+    #[test]
+    fn a_kind_that_could_not_be_read_at_all_keeps_its_first_look() {
+        let store = Store::open_in_memory().unwrap();
+        let how = [read_as("service", 1), read_as("administrator", 1)];
+        let unread = [crate::changes::Unreadable::of(
+            "administrator",
+            "the group did not answer",
+        )];
+        store
+            .sweep_read_as(&[seen("service", "One", "a")], &unread, &how)
+            .unwrap();
+        store
+            .sweep_read_as(&[seen("service", "One", "a")], &unread, &how)
+            .unwrap();
+
+        let sweep = store
+            .sweep_read_as(
+                &[
+                    seen("service", "One", "a"),
+                    vouched("administrator", "Ari", "can administer", "not a file"),
+                ],
+                &[],
+                &how,
+            )
+            .unwrap();
+        assert!(
+            sweep.differences.is_empty(),
+            "an account that was there all along was reported as new: {:?}",
+            sweep.differences
+        );
+        assert_eq!(
+            sweep.unreadable,
+            vec!["administrator was not compared".to_owned()]
+        );
+    }
+
+    /// The number a kind was recorded under only goes up. A sweep that names a
+    /// lower one compares as usual and leaves the store where it was.
+    #[test]
+    fn a_lower_reading_neither_skips_the_comparison_nor_is_written_down() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .sweep_read_as(
+                &[seen("service", "One", "a")],
+                &[],
+                &[read_as("service", 2)],
+            )
+            .unwrap();
+
+        let sweep = store
+            .sweep_read_as(
+                &[seen("service", "One", "b")],
+                &[],
+                &[read_as("service", 1)],
+            )
+            .unwrap();
+        assert_eq!(sweep.differences.len(), 1, "{:?}", sweep.differences);
+        assert_eq!(
+            readings_in(&store.lock().unwrap()),
+            vec![("service".to_owned(), 2)]
         );
     }
 }

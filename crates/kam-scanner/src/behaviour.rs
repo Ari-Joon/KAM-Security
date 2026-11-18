@@ -833,6 +833,7 @@ mod tests {
             host: resolved.host,
             hidden,
             machine_wide: false,
+            missing: None,
         }
     }
 

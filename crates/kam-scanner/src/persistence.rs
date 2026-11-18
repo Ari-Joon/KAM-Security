@@ -128,8 +128,9 @@ pub struct Entry {
     pub executable: Option<PathBuf>,
     /// What that executable is told to run, when it is a program whose job is
     /// to run other things: the script behind `cmd.exe /c`, the project behind
-    /// `MSBuild.exe`, the library behind `rundll32.exe`. This is the thing to
-    /// judge; the executable is only the vehicle.
+    /// `MSBuild.exe`, the library behind `rundll32.exe`, the library a service
+    /// has `svchost.exe` load. This is the thing to judge; the executable is
+    /// only the vehicle.
     #[serde(default)]
     pub payload: Option<PathBuf>,
     /// The name of that vehicle, such as `cmd.exe`, when there is a payload.
@@ -142,12 +143,29 @@ pub struct Entry {
     /// True for machine-wide entries, which affect every account and need
     /// administrator rights to have been created.
     pub machine_wide: bool,
+    /// Why what this runs could not be told, when the reader that found the
+    /// entry knows more than that its command names nothing: a service that
+    /// runs inside `svchost.exe` and names no file for it to load, say. The
+    /// words finish the sentence [`Entry::unresolved`] begins.
+    ///
+    /// An entry carrying this has no [`Entry::target`], whatever its
+    /// executable is.
+    #[serde(default)]
+    pub missing: Option<String>,
 }
 
 impl Entry {
     /// The file that actually runs: the payload when there is one, otherwise
     /// the executable itself.
+    ///
+    /// Nothing at all when what a host was to run could not be found. The
+    /// host is there and is signed by Microsoft, and handing it back would
+    /// judge the entry on its vehicle, which is the mistake this module's
+    /// notes begin with.
     pub fn target(&self) -> Option<&Path> {
+        if self.missing.is_some() {
+            return None;
+        }
         self.payload.as_deref().or(self.executable.as_deref())
     }
 
@@ -163,6 +181,13 @@ impl Entry {
     pub fn unresolved(&self) -> Option<String> {
         if self.target().is_some() {
             return None;
+        }
+        if let Some(why) = &self.missing {
+            return Some(format!(
+                "Could not tell what {} \"{}\" runs: {why}.",
+                self.anchor.label(),
+                self.name
+            ));
         }
         let mut sentence = format!(
             "Could not tell what {} \"{}\" runs: {} names nothing that could be found.",
@@ -684,6 +709,7 @@ fn entry(
         host: resolved.host,
         hidden,
         machine_wide,
+        missing: None,
     }
 }
 
@@ -811,6 +837,7 @@ fn read_startup_folders(survey: &mut Survey, users: &[UserContext]) {
                 host: resolved.host,
                 hidden: false,
                 machine_wide,
+                missing: None,
             });
         }
     }
@@ -927,7 +954,12 @@ fn read_services(survey: &mut Survey) {
             return;
         }
     };
+    read_services_in(survey, &root);
+}
 
+/// The same, under whichever key holds the services. Apart from the opening
+/// of the real one so that it can be pointed at made-up services in a test.
+fn read_services_in(survey: &mut Survey, root: &registry::Key) {
     let listing = root.subkeys();
     if !listing.whole {
         // Genuinely the whole kind: the enumeration that would have named them
@@ -951,6 +983,7 @@ fn read_services(survey: &mut Survey) {
     // software's own service can be removed in silence. Display and the rule
     // are different concerns, so it does both.
     let mut refused: Vec<String> = Vec::new();
+    let hosts = service_hosts();
 
     for name in listing.names {
         let service = match root.look_child(&name) {
@@ -996,14 +1029,14 @@ fn read_services(survey: &mut Survey) {
 
         // Type 1 and 2 are kernel and file-system drivers, which are a separate
         // subject and would swamp the list.
-        match service.read_dword("Type") {
+        let kind = match service.read_dword("Type") {
             Ok(Some(kind)) if kind < 0x10 => continue,
-            Ok(_) => {}
+            Ok(kind) => kind.unwrap_or_default(),
             Err(_) => {
                 refused.push(format!(r"{SERVICES}\{name}"));
                 continue;
             }
-        }
+        };
 
         // The key opened, so a failure here is a failure to read a value in a
         // key that is there -- not a service without an image. `refused`
@@ -1028,7 +1061,7 @@ fn read_services(survey: &mut Survey) {
             }
         };
 
-        survey.entries.push(entry(
+        let mut found = entry(
             service
                 .string("DisplayName")
                 .map(|display| kam_core::mui::resolve(&display, &name))
@@ -1038,7 +1071,48 @@ fn read_services(survey: &mut Survey) {
             image,
             false,
             None,
-        ));
+        );
+
+        // Inside svchost.exe, what runs is the file the service has it load.
+        // See `service_library`.
+        let hosted = found
+            .executable
+            .as_deref()
+            .is_some_and(|program| is_service_host(program, &hosts));
+        if hosted {
+            // A copy Windows made of a per-account service is run from its
+            // template's `Parameters`, and has none of its own.
+            let template = if kind & USER_SERVICE_INSTANCE != 0 {
+                match template_of(root, &name) {
+                    Ok(template) => template,
+                    Err(_) => {
+                        refused.push(format!(r"{SERVICES}\{name}"));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            match service_library(&service, template.as_ref()) {
+                Library::Found(library) => {
+                    found.host = Some(SERVICE_HOST.to_owned());
+                    found.payload = Some(library);
+                }
+                Library::Missing(why) => {
+                    found.host = Some(SERVICE_HOST.to_owned());
+                    found.missing = Some(why);
+                }
+                // The same gap as an `ImagePath` that would not read: the
+                // service is there and what it runs could not be read, so it
+                // is counted with those and nothing about it is concluded.
+                // Listing it as svchost.exe would be an answer nobody read.
+                Library::Unread => {
+                    refused.push(format!(r"{SERVICES}\{name}"));
+                    continue;
+                }
+            }
+        }
+        survey.entries.push(found);
     }
 
     if !refused.is_empty() {
@@ -1053,6 +1127,152 @@ fn read_services(survey: &mut Survey) {
 
 /// Where the service keys live, named once so the reader and the rule agree.
 const SERVICES: &str = r"HKLM\SYSTEM\CurrentControlSet\Services";
+
+/// The program Windows runs most of its own services inside, as an entry's
+/// host is named.
+const SERVICE_HOST: &str = "svchost.exe";
+
+/// `SERVICE_USER_SERVICE`, in a service's `Type`: a template that Windows
+/// copies for each account when it signs in.
+const USER_SERVICE: u32 = 0x40;
+
+/// `SERVICE_USERSERVICE_INSTANCE`, in a service's `Type`: one of those copies.
+/// Checked on a real machine: every copy carried it (`Type` 0xD0 or 0xE0) and
+/// no template did (0x50 or 0x60).
+const USER_SERVICE_INSTANCE: u32 = 0x80;
+
+/// Where the service host really is, in the spelling [`is_service_host`]
+/// compares. The 32-bit one is there on every 64-bit Windows and hosts
+/// services the same way.
+fn service_hosts() -> Vec<String> {
+    let Ok(root) = std::env::var("SystemRoot") else {
+        return Vec::new();
+    };
+    ["System32", "SysWOW64"]
+        .iter()
+        .filter_map(|folder| {
+            std::fs::canonicalize(PathBuf::from(&root).join(folder).join(SERVICE_HOST)).ok()
+        })
+        .map(|path| crate::places::normalise(&path.to_string_lossy()))
+        .collect()
+}
+
+/// Whether a service's program is the one Windows runs services inside.
+///
+/// Decided by which file it is, never by what it is called. Anything can be
+/// named `svchost.exe`, and a program of that name anywhere else is what runs,
+/// and is judged as itself. Both sides are resolved first, so the real one
+/// reached through a link or an odd spelling of its path is still the real
+/// one, and cannot be used to be read the old way.
+fn is_service_host(program: &Path, hosts: &[String]) -> bool {
+    std::fs::canonicalize(program)
+        .is_ok_and(|real| hosts.contains(&crate::places::normalise(&real.to_string_lossy())))
+}
+
+/// What a service that runs inside `svchost.exe` is told to load there.
+#[derive(Debug, PartialEq, Eq)]
+enum Library {
+    /// The file, which is there.
+    Found(PathBuf),
+    /// Read, and there is no file to judge. The words are what
+    /// [`Entry::missing`] carries.
+    Missing(String),
+    /// A key or value that would have said could not be read.
+    Unread,
+}
+
+/// The file a service inside `svchost.exe` really runs.
+///
+/// `svchost.exe` is the same file for every service it hosts. What differs is
+/// the library each one has it load, named by the `ServiceDll` value in the
+/// service's `Parameters` key. Only `ImagePath` was read, so 58 of the 92
+/// services that start themselves on the machine this was written on were
+/// each "svchost.exe, signed by Microsoft", a service planted in that shape
+/// was one more of them, and swapping the library under a real one changed
+/// nothing that was compared.
+///
+/// `template` is the service a per-account copy was made from, when this is
+/// one. The copy has no `Parameters` of its own, so when it names nothing its
+/// template is asked.
+fn service_library(service: &registry::Key, template: Option<&registry::Key>) -> Library {
+    let named = match named_library(service) {
+        Ok(Some(named)) => Some(named),
+        Ok(None) => match template.map(named_library) {
+            Some(Ok(named)) => named,
+            Some(Err(_)) => return Library::Unread,
+            None => None,
+        },
+        Err(_) => return Library::Unread,
+    };
+    let Some(named) = named else {
+        return Library::Missing(format!(
+            "it runs inside {SERVICE_HOST}, and its registry key does not name the file \
+             {SERVICE_HOST} loads for it"
+        ));
+    };
+
+    // The value is a `REG_EXPAND_SZ`, and the process that expands it is a
+    // service, not anybody signed in: the machine's variables, never a
+    // person's.
+    let expanded = Expand::Machine.apply(named.trim().trim_matches('"'));
+    let library = PathBuf::from(&expanded);
+    // A bare name is found beside the host. A relative path is not looked
+    // for at all: where it led would depend on where this process happens to
+    // be standing.
+    let library = if expanded.contains(['\\', '/']) {
+        library
+    } else {
+        match std::env::var("SystemRoot") {
+            Ok(root) => PathBuf::from(root).join("System32").join(library),
+            Err(_) => library,
+        }
+    };
+    if library.is_absolute() && library.is_file() {
+        Library::Found(library)
+    } else {
+        Library::Missing(format!(
+            "it runs inside {SERVICE_HOST}, which is told to load {expanded}, and no file \
+             was found there"
+        ))
+    }
+}
+
+/// The `ServiceDll` a service's key names. In `Parameters`, which is where
+/// Windows keeps it, or directly in the service's own key, where a few older
+/// services have it. `Err` when a key or value that is there would not read,
+/// which is not the same as naming nothing.
+fn named_library(service: &registry::Key) -> Result<Option<String>, Unopened> {
+    match service.look_child("Parameters") {
+        Ok(parameters) => {
+            if let Some(named) = parameters.read_string("ServiceDll")? {
+                return Ok(Some(named));
+            }
+        }
+        Err(Unopened::Absent) => {}
+        Err(why) => return Err(why),
+    }
+    service.read_string("ServiceDll")
+}
+
+/// The service a per-account copy was made from.
+///
+/// Windows names the copy after its template, then an underscore and a number
+/// for the sign-in it was made at, and records nowhere else which template
+/// that was. So the name says where to look and nothing more: what makes a
+/// key the template is that it is there, and carries the template's mark and
+/// not the copy's. `Err` when it is there and could not be read.
+fn template_of(root: &registry::Key, copy: &str) -> Result<Option<registry::Key>, Unopened> {
+    let Some((template, _)) = copy.rsplit_once('_') else {
+        return Ok(None);
+    };
+    let key = match root.look_child(template) {
+        Ok(key) => key,
+        Err(Unopened::Absent) => return Ok(None),
+        Err(why) => return Err(why),
+    };
+    let kind = key.read_dword("Type")?.unwrap_or_default();
+    Ok((kind & USER_SERVICE != 0 && kind & USER_SERVICE_INSTANCE == 0).then_some(key))
+}
 
 /// Where the scheduler keeps its task definitions.
 pub fn task_store() -> Option<PathBuf> {
@@ -1408,6 +1628,7 @@ fn task_entries_or(root: &Path, path: &Path) -> Result<Vec<Entry>, std::io::Erro
                     host: None,
                     hidden,
                     machine_wide: true,
+                    missing: None,
                 },
             }
         })
@@ -1568,6 +1789,15 @@ pub fn by_executable(entries: &[Entry]) -> BTreeMap<PathBuf, Vec<&Entry>> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    // Write entry points, used only to plant what these tests then read. The
+    // module itself only ever reads.
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteTreeW, RegSetValueExW, HKEY,
+        HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE,
+        REG_SZ, REG_VALUE_TYPE,
+    };
 
     #[test]
     fn a_quoted_path_with_arguments_resolves() {
@@ -2054,6 +2284,340 @@ mod tests {
             "no services and no explanation, which reads as every service having vanished"
         );
         println!("{listed} service(s) listed, failure reported: {said}");
+    }
+
+    /// Made-up services under this account's own hive, removed when dropped.
+    ///
+    /// The reader is pointed at these in place of the machine's real ones, so
+    /// what a service of some shape reads as can be tested without one being
+    /// installed, which would need an administrator and would be a real
+    /// service.
+    struct ScratchServices {
+        path: String,
+    }
+
+    impl ScratchServices {
+        fn new(tag: &str) -> Self {
+            let services = Self {
+                path: format!(
+                    r"Software\KAM Security\test services {tag} {}",
+                    std::process::id()
+                ),
+            };
+            services.put("", "made by", REG_SZ, &wide_bytes("a test"));
+            services
+        }
+
+        /// Write one value, making the key it lives in if it is not there.
+        fn put(&self, key: &str, name: &str, kind: REG_VALUE_TYPE, data: &[u8]) {
+            let path = if key.is_empty() {
+                self.path.clone()
+            } else {
+                format!(r"{}\{key}", self.path)
+            };
+            let wide_path: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+            let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut handle = HKEY::default();
+            unsafe {
+                let made = RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    PCWSTR(wide_path.as_ptr()),
+                    None,
+                    PWSTR::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_READ | KEY_WRITE,
+                    None,
+                    &mut handle,
+                    None,
+                );
+                assert_eq!(made, ERROR_SUCCESS, "could not create {path}");
+                let set =
+                    RegSetValueExW(handle, PCWSTR(wide_name.as_ptr()), None, kind, Some(data));
+                let _ = RegCloseKey(handle);
+                assert_eq!(set, ERROR_SUCCESS, "could not write {name} in {path}");
+            }
+        }
+
+        fn number(&self, key: &str, name: &str, value: u32) {
+            self.put(key, name, REG_DWORD, &value.to_le_bytes());
+        }
+
+        /// Text with its variables left in, as Windows stores these.
+        fn text(&self, key: &str, name: &str, value: &str) {
+            self.put(key, name, REG_EXPAND_SZ, &wide_bytes(value));
+        }
+
+        /// A service that starts itself, with what it is said to run.
+        fn service(&self, name: &str, kind: u32, image: &str) {
+            self.number(name, "Type", kind);
+            self.number(name, "Start", 2);
+            self.text(name, "ImagePath", image);
+        }
+
+        /// One that runs inside the real svchost.exe.
+        fn hosted(&self, name: &str) {
+            self.service(name, 0x20, HOSTED);
+        }
+
+        fn read(&self) -> Survey {
+            let root = registry::Key::look(HKEY_CURRENT_USER, &self.path, View::Native)
+                .expect("the scratch services should open");
+            let mut survey = Survey::default();
+            read_services_in(&mut survey, &root);
+            survey
+        }
+    }
+
+    impl Drop for ScratchServices {
+        fn drop(&mut self) {
+            let path: Vec<u16> = self.path.encode_utf16().chain(std::iter::once(0)).collect();
+            unsafe {
+                let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr()));
+                let _ = RegDeleteKeyW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr()));
+            }
+        }
+    }
+
+    /// How a service inside svchost.exe names its program, as Windows writes
+    /// it.
+    const HOSTED: &str = r"%SystemRoot%\System32\svchost.exe -k netsvcs -p";
+
+    fn wide_bytes(text: &str) -> Vec<u8> {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+
+    fn the_service<'a>(survey: &'a Survey, name: &str) -> &'a Entry {
+        survey
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("{name} was not listed: {:#?}", survey.entries))
+    }
+
+    fn is_the_real_host(path: &Path) -> bool {
+        is_service_host(path, &service_hosts())
+    }
+
+    /// A service inside svchost.exe is judged on the file it loads there.
+    ///
+    /// Only `ImagePath` was read, so every such service was svchost.exe,
+    /// signed by Microsoft: a service planted in that shape looked like
+    /// Windows, and swapping the library under a real one changed nothing.
+    #[test]
+    fn a_service_inside_svchost_is_judged_on_the_file_it_loads() {
+        let library = scratch_script("hosted.dll");
+        let services = ScratchServices::new("hosted");
+        services.hosted("Hosted");
+        services.text(
+            r"Hosted\Parameters",
+            "ServiceDll",
+            &library.display().to_string(),
+        );
+        // A few older services keep the value in the service's own key, and
+        // Windows stores it with the variable left in.
+        services.hosted("Older");
+        services.text("Older", "ServiceDll", r"%SystemRoot%\System32\kernel32.dll");
+        // And a service that is its own program is read as it always was.
+        services.service("Plain", 0x10, r"%SystemRoot%\System32\notepad.exe");
+
+        let survey = services.read();
+        std::fs::remove_file(&library).unwrap();
+        assert!(survey.unreadable.is_empty(), "{:?}", survey.unreadable);
+
+        let hosted = the_service(&survey, "Hosted");
+        assert_eq!(hosted.host.as_deref(), Some("svchost.exe"));
+        assert_eq!(hosted.payload.as_deref(), Some(library.as_path()));
+        assert_eq!(hosted.target(), Some(library.as_path()));
+        assert!(hosted.unresolved().is_none());
+        assert!(is_the_real_host(hosted.executable.as_deref().unwrap()));
+
+        let older = the_service(&survey, "Older");
+        assert_eq!(older.host.as_deref(), Some("svchost.exe"));
+        assert_eq!(
+            older
+                .target()
+                .map(|path| path.to_string_lossy().to_lowercase()),
+            Some(system32("kernel32.dll").to_string_lossy().to_lowercase())
+        );
+
+        let plain = the_service(&survey, "Plain");
+        assert_eq!(plain.host, None);
+        assert_eq!(
+            plain
+                .target()
+                .map(|path| path.to_string_lossy().to_lowercase()),
+            Some(system32("notepad.exe").to_string_lossy().to_lowercase())
+        );
+    }
+
+    /// A service inside svchost.exe whose library is not named, or is not
+    /// there, says so. It does not fall back to being svchost.exe.
+    #[test]
+    fn a_service_inside_svchost_with_nothing_to_load_says_so() {
+        let services = ScratchServices::new("nothing");
+        services.hosted("Nameless");
+        services.hosted("Gone");
+        services.text(
+            r"Gone\Parameters",
+            "ServiceDll",
+            r"C:\kam-not-a-real-folder\helper.dll",
+        );
+
+        let survey = services.read();
+        for name in ["Nameless", "Gone"] {
+            let entry = the_service(&survey, name);
+            assert_eq!(entry.target(), None, "{name} was judged on something");
+            assert!(
+                is_the_real_host(entry.executable.as_deref().unwrap()),
+                "the premise: {name} does run inside svchost.exe"
+            );
+        }
+
+        let nameless = the_service(&survey, "Nameless").unresolved().unwrap();
+        assert!(
+            nameless.starts_with("Could not tell what a Windows service \"Nameless\" runs"),
+            "{nameless}"
+        );
+        assert!(nameless.contains("does not name the file"), "{nameless}");
+
+        let gone = the_service(&survey, "Gone").unresolved().unwrap();
+        assert!(
+            gone.contains(r"C:\kam-not-a-real-folder\helper.dll"),
+            "{gone}"
+        );
+        assert!(gone.contains("no file was found there"), "{gone}");
+    }
+
+    /// A program that is only called svchost.exe is what runs, and is judged
+    /// as itself. Its name does not make it the service host, and a
+    /// `ServiceDll` beside it does not get it judged as Windows.
+    #[test]
+    fn a_program_only_called_svchost_is_judged_as_itself() {
+        let folder = std::env::temp_dir().join(format!("kam-fake-host-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let impostor = folder.join("svchost.exe");
+        std::fs::write(&impostor, "MZ").unwrap();
+
+        let services = ScratchServices::new("impostor");
+        services.service(
+            "Impostor",
+            0x20,
+            &format!("{} -k netsvcs", impostor.display()),
+        );
+        services.text(
+            r"Impostor\Parameters",
+            "ServiceDll",
+            r"%SystemRoot%\System32\kernel32.dll",
+        );
+        let survey = services.read();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        let entry = the_service(&survey, "Impostor");
+        assert_eq!(entry.host, None);
+        assert_eq!(entry.target(), Some(impostor.as_path()));
+    }
+
+    /// A copy Windows makes of a per-account service has no `Parameters` of
+    /// its own, and is run from its template's.
+    #[test]
+    fn a_copy_of_a_per_account_service_loads_what_its_template_names() {
+        let library = scratch_script("per-account.dll");
+        let services = ScratchServices::new("copies");
+        // The template does not start itself here; its copy does.
+        services.service("Clip", 0x60, HOSTED);
+        services.number("Clip", "Start", 3);
+        services.text(
+            r"Clip\Parameters",
+            "ServiceDll",
+            &library.display().to_string(),
+        );
+        services.service("Clip_1a2b3c", 0xE0, HOSTED);
+        // Marked as a copy, of something that is not a template.
+        services.hosted("Odd");
+        services.text(
+            r"Odd\Parameters",
+            "ServiceDll",
+            r"%SystemRoot%\System32\kernel32.dll",
+        );
+        services.service("Odd_1a2b3c", 0xE0, HOSTED);
+
+        let survey = services.read();
+        std::fs::remove_file(&library).unwrap();
+
+        let copy = the_service(&survey, "Clip_1a2b3c");
+        assert_eq!(copy.target(), Some(library.as_path()));
+        assert_eq!(copy.host.as_deref(), Some("svchost.exe"));
+
+        let odd = the_service(&survey, "Odd_1a2b3c");
+        assert_eq!(
+            odd.target(),
+            None,
+            "a library was borrowed from a service that is not this one's template"
+        );
+    }
+
+    /// The whole way through: a service planted in the shape Windows uses for
+    /// its own is written down by the watcher's judgement, where it used to
+    /// be svchost.exe in System32 and not worth a line.
+    #[test]
+    fn a_planted_service_inside_svchost_is_worth_a_line() {
+        let library = scratch_script("planted.dll");
+        let services = ScratchServices::new("planted");
+        services.hosted("Planted");
+        services.text(
+            r"Planted\Parameters",
+            "ServiceDll",
+            &library.display().to_string(),
+        );
+        let survey = services.read();
+        let observation = crate::behaviour::judge_entry(the_service(&survey, "Planted"));
+        std::fs::remove_file(&library).unwrap();
+
+        let observation = observation.expect("an unsigned library in Temp, run as a service");
+        assert_eq!(observation.concern, crate::behaviour::Concern::Strong);
+        assert!(
+            observation.summary.contains("planted.dll"),
+            "{}",
+            observation.summary
+        );
+        assert!(
+            observation
+                .evidence
+                .iter()
+                .any(|line| line.contains("svchost.exe")),
+            "{:#?}",
+            observation.evidence
+        );
+    }
+
+    /// On the real machine: no service is left looking like svchost.exe.
+    #[test]
+    fn this_machines_services_inside_svchost_are_judged_on_what_they_load() {
+        let mut survey = Survey::default();
+        read_services(&mut survey);
+
+        let mut hosted = 0;
+        for entry in &survey.entries {
+            if let Some(target) = entry.target() {
+                assert!(
+                    !is_the_real_host(target),
+                    "{} is still judged as svchost.exe itself",
+                    entry.name
+                );
+            }
+            if entry.host.as_deref() == Some("svchost.exe") && entry.payload.is_some() {
+                hosted += 1;
+            }
+        }
+        assert!(
+            hosted > 0,
+            "every Windows runs services inside svchost.exe, and none was read: {:?}",
+            survey.unreadable
+        );
+        println!("{hosted} service(s) judged on the file svchost.exe loads for them");
     }
 
     /// A task tree nested past the walk's own limit is reported, not dropped.

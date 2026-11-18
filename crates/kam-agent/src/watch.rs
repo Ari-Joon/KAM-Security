@@ -128,10 +128,21 @@ impl Log {
 /// A stable key for one startup entry, so the same entry seen twice is not
 /// reported twice. Location pins down where it lives; the command catches an
 /// entry that keeps its name but changes what it runs.
+///
+/// So does the file the command comes to, which the command does not always
+/// say. Every service inside svchost.exe has the same command, and what it
+/// runs is a library named somewhere else: one swapped for another has to be
+/// a different entry here, or it is never looked at.
 fn key(entry: &persistence::Entry) -> String {
     format!(
-        "{}\u{0}{}\u{0}{}",
-        entry.location, entry.name, entry.command
+        "{}\u{0}{}\u{0}{}\u{0}{}",
+        entry.location,
+        entry.name,
+        entry.command,
+        entry
+            .target()
+            .map(|target| target.to_string_lossy().into_owned())
+            .unwrap_or_default()
     )
 }
 

@@ -915,6 +915,7 @@ mod tests {
             host: None,
             hidden: false,
             machine_wide: false,
+            missing: None,
         }
     }
 
@@ -931,6 +932,7 @@ mod tests {
             host: Some("cmd.exe".to_owned()),
             hidden: true,
             machine_wide: true,
+            missing: None,
         }
     }
 
@@ -980,6 +982,7 @@ mod tests {
                 host: Some("rundll32.exe".to_owned()),
                 hidden: false,
                 machine_wide: true,
+                missing: None,
             }],
         );
         assert_eq!(
