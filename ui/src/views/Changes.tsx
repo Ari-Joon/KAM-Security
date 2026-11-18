@@ -186,7 +186,7 @@ export default function Changes({
           <p className="lede">
             The things that start themselves or hold a privilege, compared
             against the last time this machine was looked at. A change is not a
-            problem — software installs itself, updates move things. This says
+            problem: software installs itself, updates move things. This says
             what is different and leaves the conclusion to you.
           </p>
         </div>
@@ -248,7 +248,7 @@ export default function Changes({
                 it. Anything already present was recorded as ordinary and will
                 never be reported as having appeared, because it did not appear.
                 This is the one moment that gap can be named, so it is named.
-                Nothing here has immunity afterwards — if one of these changes
+                Nothing here has immunity afterwards: if one of these changes
                 later, it is reported like anything else.
               </p>
               <ul className="entries">
@@ -376,7 +376,7 @@ export default function Changes({
             <p className="panel-lede">
               How much changed each week. This compares the machine against its
               own history rather than against a standard, so there is no score
-              and no target — only whether this week looks like the others.
+              and no target, only whether this week looks like the others.
               Colour shows what kind of thing changed, not how serious it was.
             </p>
             <ChangeBars history={sweep.history} swept={sweep.swept ?? []} />

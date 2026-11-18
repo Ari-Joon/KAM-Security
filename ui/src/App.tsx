@@ -267,15 +267,15 @@ export default function App() {
         {mismatched && (
           <div className="notice notice-warn">
             This shell speaks protocol {shellProtocol}, the agent speaks{" "}
-            {status.protocol_version}. They were built from different versions —
-            update both rather than trusting what is shown.
+            {status.protocol_version}. They were built from different versions.
+            Update both rather than trusting what is shown.
           </div>
         )}
 
         {!connected && error && (
           <div className="notice notice-down">
             <strong>Cannot reach the agent.</strong> Nothing is listening on its
-            pipe, or it refused this program — it only serves clients installed
+            pipe, or it refused this program: it only serves clients installed
             in its own directory.
             <pre className="error">{error}</pre>
             <code>cargo run -p kam-agent -- --console</code>

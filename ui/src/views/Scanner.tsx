@@ -274,7 +274,7 @@ export default function Scanner() {
               <Setting
                 label="Tamper protection"
                 value={status.tamper_protection}
-                explain="Stops other software — including this one — changing these settings."
+                explain="Stops other software (including this one) changing these settings."
               />
             </ul>
           </section>
@@ -517,7 +517,7 @@ function VirusTotalKey({ hasKey, onChange }: { hasKey: boolean; onChange: () => 
       ) : (
         <p className="footnote">
           With a free VirusTotal API key you can ask about individual files.
-          Only the file's <strong>hash</strong> is sent — never the file itself.
+          Only the file's <strong>hash</strong> is sent, never the file itself.
           The key is stored encrypted under your Windows account.{" "}
           <button className="link-button" onClick={() => setEditing(true)}>
             Add a key
@@ -561,7 +561,7 @@ function signatureLabel(signature: Signature): string {
         ? `${signature.signer} (part of Windows)`
         : `${signature.signer} (through a Windows catalogue)`;
     case "invalid":
-      return signature.signer ? `${signature.signer} — not accepted` : "signature not accepted";
+      return signature.signer ? `${signature.signer} (not accepted)` : "signature not accepted";
     case "unsigned":
       return "not signed";
     case "unknown":
@@ -668,7 +668,7 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
       </div>
 
       <p className="muted">
-        This runs Windows Defender, not a scanner of ours — it already has the
+        This runs Windows Defender, not a scanner of ours: it already has the
         signatures and is already watching this machine. What it does not have
         is a way to start it from here and see the answer without going looking.
         A quick scan takes minutes; a full scan can take hours and can be
@@ -709,7 +709,7 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
       {running && (
         <div className="scan-running">
           <p>
-            {running === "quick" ? "Quick scan" : "Full scan"} running —{" "}
+            {running === "quick" ? "Quick scan" : "Full scan"} running,{" "}
             {fmt.duration(elapsed * 1000)} so far.
           </p>
           {/* It said "You can leave this page", which was not true: leaving
@@ -890,7 +890,7 @@ function Canaries() {
         fake wallet, a fake recovery phrase, and fake saved connections in the
         registry where PuTTY, WinSCP and Remote Desktop keep theirs. Nothing on
         this machine uses any of them and no ordinary program has a reason to
-        open one — so if something reads one, that is not evidence to be weighed
+        open one, so if something reads one, that is not evidence to be weighed
         against other evidence. It is close to proof that something is going
         through your machine looking for credentials, and Windows records which
         program did it.
@@ -969,7 +969,7 @@ function Canaries() {
               <span className="muted small">
                 {report.auditing
                   ? "Windows is recording access to files that ask for it. Turning this off makes the decoys inert."
-                  : "Switches on Windows' File System auditing. It only produces events for files that ask to be watched — these five — so it does not fill your Security log."}
+                  : "Switches on Windows' File System auditing. It only produces events for files that ask to be watched (these five), so it does not fill your Security log."}
               </span>
             </div>
           )}
@@ -1178,7 +1178,7 @@ function Hardening() {
       </div>
 
       <p className="lede panel-lede">
-        Defender ships a set of Attack Surface Reduction rules — narrow blocks on
+        Defender ships a set of Attack Surface Reduction rules: narrow blocks on
         things malware does and ordinary software almost never does. They are
         free, already installed, and off by default. This reports which are on
         and what each one would prevent. Choose a rule to read what it does;
@@ -1365,7 +1365,7 @@ function Hardening() {
             to try a rule: you see what it would have stopped before it starts
             stopping it. Every change here goes through Defender's own interface
             rather than its settings in the registry, because Tamper Protection
-            ignores the second — and what you see afterwards is Defender read
+            ignores the second. And what you see afterwards is Defender read
             back, not the fact that the request did not error.
           </p>
         </>
@@ -1422,7 +1422,7 @@ function Extensions() {
         An extension that can read every page is, in practical terms, a program
         holding your passwords, your email and your session cookies. It carries
         no signature to check and starts nothing at boot, so the rest of this
-        tool is structurally blind to it. Nothing here is called malicious —
+        tool is structurally blind to it. Nothing here is called malicious:
         plenty of good extensions need exactly these permissions. What is listed
         is what each one is allowed to do.
       </p>
@@ -1822,7 +1822,7 @@ function Provenance() {
 
       {stopped && (
         <p className="empty">
-          Stopped. Nothing was changed — this only ever reads.
+          Stopped. Nothing was changed: this only ever reads.
         </p>
       )}
 
@@ -1830,7 +1830,7 @@ function Provenance() {
         Every program that starts itself, and everything that arrived from
         outside this machine, judged on who signed it, when it appeared, where
         it came from and how it holds on. This is not a virus scan and finds
-        nothing Defender would — it answers a different question, and none of it
+        nothing Defender would. It answers a different question, and none of it
         is proof of anything on its own.
       </p>
 

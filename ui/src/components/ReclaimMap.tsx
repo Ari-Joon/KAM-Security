@@ -144,7 +144,7 @@ export default function ReclaimMap({
               background: REVERSAL_COLOUR[node.reversal],
             }}
             onClick={() => onOpen(node)}
-            title={`${node.label}\n${fmt.bytes(node.bytes)} — ${node.detail}${
+            title={`${node.label}\n${fmt.bytes(node.bytes)}: ${node.detail}${
               deeper ? "\n\nClick to see what is inside" : ""
             }`}
           >

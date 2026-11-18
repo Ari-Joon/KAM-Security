@@ -829,7 +829,7 @@ export default function Firewall() {
           <p className="lede">
             Windows Defender Firewall's own state and rules, and every program
             currently holding a network connection. This does not replace the
-            firewall — it is the interface it never shipped with.
+            firewall: it is the interface it never shipped with.
           </p>
         </div>
         <button onClick={() => void load()} disabled={loading || busy}>
@@ -861,7 +861,7 @@ export default function Firewall() {
             <code>{confirming.path}</code> from making outgoing connections, on
             every network. Incoming traffic and every other program are left
             alone. The rule is tagged as ours, so you can remove it from this
-            screen — or from Windows Firewall, where it appears under "KAM
+            screen, or from Windows Firewall, where it appears under "KAM
             Security".
           </p>
           <div className="confirm-actions">
@@ -946,14 +946,14 @@ export default function Firewall() {
             </div>
             <div className="stat">
               <span className="stat-label">Connected now</span>
-              <span className="stat-value">{live?.established.toLocaleString() ?? "—"}</span>
+              <span className="stat-value">{live?.established.toLocaleString() ?? "not known"}</span>
               <span className="stat-sub">
                 {live ? `${live.external} reaching the internet` : "not read"}
               </span>
             </div>
             <div className="stat">
               <span className="stat-label">Programs</span>
-              <span className="stat-value">{live?.programs.toLocaleString() ?? "—"}</span>
+              <span className="stat-value">{live?.programs.toLocaleString() ?? "not known"}</span>
               <span className="stat-sub">holding a connection</span>
             </div>
           </div>
@@ -1178,7 +1178,7 @@ export default function Firewall() {
         <p className="footnote">
           Prompting before a connection opens is not on this list. It needs a
           kernel driver, an EV certificate and Microsoft attestation signing,
-          and it is permanently out of scope — observing and then blocking gets
+          and it is permanently out of scope: observing and then blocking gets
           most of the value with none of that.
         </p>
       </section>

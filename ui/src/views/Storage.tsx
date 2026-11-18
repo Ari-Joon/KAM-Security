@@ -98,7 +98,7 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
           >
             {volumes.map((volume) => (
               <option key={volume.root} value={volume.root}>
-                {volume.root} {volume.label ? `— ${volume.label}` : ""}
+                {volume.root} {volume.label ? `(${volume.label})` : ""}
               </option>
             ))}
             {!volumes.some((volume) => volume.root === target) && (

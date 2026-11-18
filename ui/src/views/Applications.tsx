@@ -17,7 +17,7 @@ type Props = { volumes: Volume[]; onMeasured: () => void };
  * Shown as a waiting mark rather than as `0 B`, because a zero in that column
  * is a claim, and the claim would be wrong for every row on screen.
  */
-const NOT_MEASURED = "—";
+const NOT_MEASURED = "being measured";
 
 type SortKey = "size" | "name" | "publisher" | "installed" | "used";
 type Filter = "all" | "unused" | "unknown" | "understated";
@@ -179,7 +179,7 @@ function Row({
           {notFound && (
             <li className="app-location-empty">
               No directories for this application were found on this drive. It
-              is most likely installed on another one — measure that drive to
+              is most likely installed on another one. Measure that drive to
               see it.
             </li>
           )}
@@ -200,7 +200,7 @@ function Row({
               {location.shared_with > 0 && (
                 <span className="loc-shared">
                   shared with {location.shared_with} other
-                  {location.shared_with === 1 ? "" : "s"} — not counted
+                  {location.shared_with === 1 ? "" : "s"}, not counted
                 </span>
               )}
             </li>
@@ -233,7 +233,7 @@ function ConfirmUninstall({
       <div className="modal" onClick={(event) => event.stopPropagation()}>
         <h2>Uninstall {app.name}?</h2>
         <p className="muted">
-          This hands over to the application's own uninstaller — KAM Security
+          This hands over to the application's own uninstaller: KAM Security
           does not delete anything itself, and cannot undo what that uninstaller
           does. It may ask for administrator rights, and it may leave data
           behind, which Cleanup can find afterwards.
@@ -671,7 +671,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
               .filter((volume) => volume.supports_mft)
               .map((volume) => (
                 <option key={volume.root} value={volume.root}>
-                  {volume.root} {volume.label ? `— ${volume.label}` : ""}
+                  {volume.root} {volume.label ? `(${volume.label})` : ""}
                 </option>
               ))}
           </select>
@@ -892,7 +892,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
               ? "This is what the installers say about themselves, read from the registry. The measured sizes are being read off the disk now and will replace the claims when they arrive; searching, sorting and grouping all work in the meantime."
               : notMeasured !== null
                 ? `This is what the installers say about themselves, read from the registry. Their real sizes were not measured: ${notMeasured}. The Actual column says so rather than showing a number nobody read.`
-                : "A folder matched by more than one application — several NVIDIA packages sharing one data directory, for instance — is listed but not added to any of their totals. Totals understate rather than double-count."}
+                : "A folder matched by more than one application (several NVIDIA packages sharing one data directory, for instance) is listed but not added to any of their totals. Totals understate rather than double-count."}
           </p>
 
           <div className="app-controls">

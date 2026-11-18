@@ -73,7 +73,7 @@ export default function StateGrid({
             style={{ borderTopColor: tile.colour }}
             aria-pressed={isOn}
             onClick={() => onSelect(tile.key)}
-            title={`${tile.label} — ${tile.state}`}
+            title={`${tile.label}: ${tile.state}`}
           >
             <span className="stategrid-name">{tile.label}</span>
             <span className="stategrid-state" style={{ color: tile.colour }}>

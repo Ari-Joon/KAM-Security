@@ -39,7 +39,7 @@ export default function Activity({
         <div>
           <h1>Activity</h1>
           <p className="lede">
-            What the agent did, and what it refused. Append-only — the database
+            What the agent did, and what it refused. Append-only: the database
             rejects updates and deletes, so this cannot be quietly rewritten.
           </p>
         </div>

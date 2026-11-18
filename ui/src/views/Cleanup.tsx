@@ -625,7 +625,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       );
     } catch (cause) {
       setError(
-        `${reason(cause)} — if this copy is not yours to delete, hold it instead ` +
+        `${reason(cause)}. If this copy is not yours to delete, hold it instead ` +
           `and it can be put back for 30 days.`,
       );
     } finally {
@@ -750,7 +750,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       );
     } catch (cause) {
       setError(
-        `${reason(cause)} — if this folder is not yours to delete, quarantine it ` +
+        `${reason(cause)}. If this folder is not yours to delete, quarantine it ` +
           `instead and it can be put back for 30 days.`,
       );
     } finally {
@@ -914,7 +914,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
               .filter((volume) => volume.supports_mft)
               .map((volume) => (
                 <option key={volume.root} value={volume.root}>
-                  {volume.root} {volume.label ? `— ${volume.label}` : ""}
+                  {volume.root} {volume.label ? `(${volume.label})` : ""}
                 </option>
               ))}
           </select>
@@ -961,7 +961,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             Everything measured so far, drawn to scale: a block's area is its
             size on disk. A list gives a forty-gigabyte item and a
             four-megabyte item the same row and only ever tells you the order,
-            never the ratio — and the question on a full drive is not what is on
+            never the ratio. And the question on a full drive is not what is on
             it, it is what is worth your time.
           </p>
           <ReclaimMap nodes={drawn} onOpen={openBlock} />
@@ -1129,7 +1129,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           </button>
         </div>
         <p className="muted">
-          Compared by size, then by their first 64 KB, then in full — so
+          Compared by size, then by their first 64 KB, then in full, so
           "duplicate" means every byte, not a guess. Each set is then judged by
           where its copies live, because identical is not the same as spare:
           Windows keeps several copies of the same library on purpose, every
@@ -1197,7 +1197,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         {duplicateSummary?.truncated && (
           <p className="held-warn">
             This stopped before it had finished. There is a ceiling on how much
-            it will read in full, and it was reached — so some sets of possible
+            it will read in full, and it was reached, so some sets of possible
             copies were never compared, and anything in them is not below.
             Narrowing the search to one drive reads less and gets further.
           </p>
@@ -1579,7 +1579,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         </div>
         <p className="muted">
           A destination has to be a folder you already keep that kind of file
-          in — this never invents one. Executables are excluded on purpose: a
+          in: this never invents one. Executables are excluded on purpose: a
           downloaded installer may be pointed at by a shortcut or a scheduled
           task, and none of that is visible from here.
         </p>
@@ -1743,7 +1743,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           <li>
             <strong>Leftovers</strong> are folders under <code>ProgramData</code>{" "}
             and the two <code>AppData</code> roots that no installed application
-            accounts for — usually left behind when something was uninstalled
+            accounts for, usually left behind when something was uninstalled
             years ago. Each says why it is listed.
           </li>
           <li>
@@ -1765,14 +1765,14 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           <li>
             <strong>Caches</strong> are places Windows and a few programs write
             data they can regenerate. Clearing one empties its contents and
-            leaves the folder, and each says what it costs you — usually
+            leaves the folder, and each says what it costs you: usually
             nothing, sometimes a slower first launch.
           </li>
           <li>
             <strong>Loose files</strong> are downloads sitting in{" "}
             <code>Downloads</code> or on the Desktop that match a folder you
             already keep that kind of file in. Only documents, images, audio,
-            video and archives — never anything that runs.
+            video and archives, never anything that runs.
           </li>
           <li>
             <strong>Quarantine</strong> is where anything you act on goes by
@@ -1784,7 +1784,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             thing instead: the item goes where anything you delete in Explorer
             goes, and comes back the same way. Use it when you would rather not
             learn a second place things are kept. It is your bin, not the
-            service's, so it appears where you expect — and this program records
+            service's, so it appears where you expect, and this program records
             that it happened without pretending it did it for you.
           </li>
           <li>
@@ -1806,7 +1806,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         <p className="muted">
           Only those three folders are examined, one level deep, and never a
           directory Windows owns. These are suggestions from names and dates,
-          not certainties — an application still using a folder will misbehave
+          not certainties: an application still using a folder will misbehave
           until you restore it.
         </p>
         )}
