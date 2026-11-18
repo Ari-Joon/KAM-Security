@@ -1,9 +1,11 @@
 //! The one place anything is ever removed from, or moved within, the system.
 //!
-//! Product rule: nothing is deleted. Every module routes destructive intent
-//! through here, which stages the item, records everything needed to put it
-//! back, and keeps it for thirty days. Purging afterwards is a separate,
-//! explicit call.
+//! Product rule: nothing is deleted outright. Every module routes destructive
+//! intent through here, which stages the item, records everything needed to
+//! put it back, and keeps it for thirty days. After that it is deleted for
+//! good: the agent's expiry pass asks for everything whose thirty days are up
+//! ([`Store::expired`]) and purges each one ([`Store::purge`]), which checks
+//! the age itself rather than taking the caller's word for it.
 //!
 //! # Why this is a rename, not a copy
 //!
@@ -334,7 +336,8 @@ impl Store {
     ///
     /// This is the automatic path: nothing here decides on its own that an
     /// item is old enough, but when something does, the age rule is checked
-    /// here rather than trusted from the caller.
+    /// here rather than trusted from the caller. That something is the agent's
+    /// expiry pass, working through [`Store::expired`].
     pub fn purge(&self, id: &str) -> Result<u64> {
         let manifest = self.manifest(id)?;
         let remaining = manifest.retention_remaining(now_seconds());
@@ -351,10 +354,11 @@ impl Store {
     /// Delete an item permanently, at somebody's explicit request.
     ///
     /// The retention period exists so that a mistake has thirty days to be
-    /// noticed, and nothing in this product deletes anything on its own. But it
-    /// is the machine's owner asking, about something they put here themselves,
-    /// and a quarantine that can only be emptied by waiting a month is a
-    /// quarantine that fills up with things somebody has already decided about.
+    /// noticed, and the only thing that goes on its own is an item whose thirty
+    /// days are up. But it is the machine's owner asking, about something they
+    /// put here themselves, and a quarantine that can only be emptied by
+    /// waiting a month is a quarantine that fills up with things somebody has
+    /// already decided about.
     ///
     /// Separate from [`Store::purge`] rather than a flag on it, so that the
     /// automatic path cannot ever take this one by passing the wrong argument,
@@ -402,6 +406,27 @@ impl Store {
         }
         items.sort_by_key(|item| std::cmp::Reverse(item.quarantined_at));
         Ok(items)
+    }
+
+    /// Everything whose thirty days are up, oldest first.
+    ///
+    /// The list the expiry pass works through. Being on it is not permission
+    /// to delete: [`Store::purge`] checks each item's age again when asked, so
+    /// a list worked out a moment early, or by a caller that got the sum
+    /// wrong, cannot take anything before its time.
+    ///
+    /// A clock that cannot be read counts as the beginning of time, when
+    /// nothing has expired, and an item stamped later than now simply has
+    /// longer to wait. Both err towards keeping.
+    pub fn expired(&self) -> Result<Vec<Manifest>> {
+        let now = now_seconds();
+        let mut due: Vec<Manifest> = self
+            .list()?
+            .into_iter()
+            .filter(|item| item.retention_remaining(now) == 0)
+            .collect();
+        due.sort_by_key(|item| item.quarantined_at);
+        Ok(due)
     }
 
     fn moves_directory(&self) -> PathBuf {
@@ -832,6 +857,54 @@ mod tests {
             source.exists(),
             "restoring then deleting took the file back"
         );
+    }
+
+    /// Put an item's clock back, as though it had been taken that long ago.
+    fn age(store: &Store, id: &str, days: u64) {
+        let path = store.item_directory(id).unwrap().join(MANIFEST);
+        let mut manifest: Manifest =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        manifest.quarantined_at = now_seconds() - days * 86_400;
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    /// Thirty days means thirty days, in both directions.
+    ///
+    /// The store promised a month and then kept everything for ever, because
+    /// nothing asked which items were due. This is the question the agent's
+    /// expiry pass asks, and the answer must hold nothing that is a day short.
+    #[test]
+    fn only_an_item_that_has_had_its_thirty_days_is_due_and_only_that_one_goes() {
+        let scratch = Scratch::new("expired");
+        let store = scratch.store();
+        let take = |name: &str, size: usize| {
+            let source = scratch.join(name);
+            fs::write(&source, vec![7_u8; size]).unwrap();
+            store.take(&source, size as u64, "a test").unwrap()
+        };
+
+        let old = take("old.bin", 100);
+        age(&store, &old.id, RETENTION_DAYS + 1);
+        let nearly = take("nearly.bin", 200);
+        age(&store, &nearly.id, RETENTION_DAYS - 1);
+        let fresh = take("fresh.bin", 300);
+
+        let due = store.expired().unwrap();
+        assert_eq!(
+            due.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            vec![old.id.as_str()],
+            "something other than the one old item was listed as due"
+        );
+
+        assert_eq!(store.purge(&old.id).unwrap(), 100);
+        assert!(store.manifest(&old.id).is_err(), "it is still there");
+
+        // A day short is refused by the store itself, whoever asks.
+        assert!(store.purge(&nearly.id).is_err());
+        assert!(store.purge(&fresh.id).is_err());
+        assert!(store.manifest(&nearly.id).is_ok());
+        assert!(store.manifest(&fresh.id).is_ok());
+        assert!(store.expired().unwrap().is_empty());
     }
 
     #[test]

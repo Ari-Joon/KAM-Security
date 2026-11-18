@@ -164,6 +164,9 @@ fn serve_until_stopped(shutdown: &Shutdown) -> Result<()> {
     // accept loop returns, so a stop waits for the watcher's current second to
     // finish rather than leaving a thread running in a stopping process.
     let watcher = crate::watch::spawn(context.behaviour.clone(), true, shutdown.clone());
+    // And what is past its thirty days in quarantine, on a thread of its own
+    // so that it carries on when the watching is switched off.
+    let expiry = crate::expiry::spawn(true, shutdown.clone());
 
     let listener = PipeListener::new();
     tracing::info!(pipe = kam_ipc::PIPE_NAME, "listening");
@@ -171,6 +174,9 @@ fn serve_until_stopped(shutdown: &Shutdown) -> Result<()> {
 
     if let Some(watcher) = watcher {
         let _ = watcher.join();
+    }
+    if let Some(expiry) = expiry {
+        let _ = expiry.join();
     }
     outcome
 }

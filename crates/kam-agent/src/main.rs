@@ -14,6 +14,7 @@ mod baseline;
 mod check;
 mod dispatch;
 mod downloads;
+mod expiry;
 mod server;
 mod service;
 mod store_acl;
@@ -137,6 +138,7 @@ fn run(mode: Mode) -> kam_core::Result<()> {
     // The behaviour watcher runs in console mode too, so development exercises
     // the same path the service uses rather than a quieter one.
     let watcher = watch::spawn(context.behaviour.clone(), false, shutdown.clone());
+    let expiry = expiry::spawn(false, shutdown.clone());
 
     let listener = PipeListener::new();
     tracing::info!(pipe = kam_ipc::PIPE_NAME, "listening");
@@ -144,6 +146,9 @@ fn run(mode: Mode) -> kam_core::Result<()> {
 
     if let Some(watcher) = watcher {
         let _ = watcher.join();
+    }
+    if let Some(expiry) = expiry {
+        let _ = expiry.join();
     }
     outcome
 }
