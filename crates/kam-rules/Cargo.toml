@@ -10,6 +10,9 @@ kam-core = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 yara-x = { workspace = true }
+# Named for a feature yara-x needs and does not ask for; see the workspace
+# manifest. Nothing here calls it.
+rsa = { workspace = true }
 
 [lints]
 workspace = true

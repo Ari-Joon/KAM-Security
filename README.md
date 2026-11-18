@@ -15,7 +15,7 @@
   </a>
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0">
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0a7bbb" alt="Windows 10/11">
-  <img src="https://img.shields.io/badge/rust-1.91%2B-b7410e" alt="Rust 1.91+">
+  <img src="https://img.shields.io/badge/rust-1.95%2B-b7410e" alt="Rust 1.95+">
 </p>
 
 ---

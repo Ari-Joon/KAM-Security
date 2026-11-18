@@ -9,8 +9,9 @@ members = ["crates/*", "ui/src-tauri"]
 [workspace.package]
 version = "0.6.0"
 edition = "2021"
-# Raised from 1.82 by yara-x, which the scanner uses for rule matching.
-rust-version = "1.91"
+# Raised from 1.82 by yara-x, which the scanner uses for rule matching, and
+# again to 1.95 by yara-x 1.22, the first release on a patched wasmtime.
+rust-version = "1.95"
 authors = ["KAM Security contributors"]
 license = "Apache-2.0"
 repository = "https://github.com/Ari-Joon/KAM-Security"
@@ -37,7 +38,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -89,7 +90,7 @@ sha2 = "0.11"
 # Reached only by `kam-rules`, which only the unprivileged shell links. It
 # carries wasmtime's JIT, and that does not belong in a LocalSystem service --
 # see the note in deny.toml.
-yara-x = { version = "1.20", default-features = false, features = [
+yara-x = { version = "1.23", default-features = false, features = [
     "pe-module",
     "hash-module",
     "math-module",
@@ -98,6 +99,15 @@ yara-x = { version = "1.20", default-features = false, features = [
     "exact-atoms",
     "fast-regexp",
 ] }
+
+# Here only to switch one feature on. yara-x 1.23 was published against a
+# release candidate of rsa 0.10 in which PKCS#1 v1.5 signatures were always
+# compiled in. The final 0.10.0 moved them behind a feature that yara-x does
+# not ask for, so yara-x alone no longer compiles against it. Features are
+# additive across a build, so asking for it once is enough; `kam-rules` names
+# this and calls nothing in it. Delete it when a yara-x release asks for the
+# feature itself.
+rsa = { version = "0.10", default-features = false, features = ["pkcs1v15"] }
 
 # Added at the phase that first needs them.
 # windows-service = "0.7"
