@@ -340,6 +340,8 @@ impl RemovedFile {
 ///
 /// - A member Defender flagged is never extracted, and a member inside an
 ///   archive inside this one flags that inner archive whole.
+/// - When the name Defender printed fits more than one member, none of them
+///   is extracted: which it meant cannot be told.
 /// - A member is left out for its name (see
 ///   [`kam_storage::downloads::safe_relative`]), for being a link, for being
 ///   password-protected (Defender could not look inside, which is not the same
@@ -391,13 +393,24 @@ pub fn dissect(archive: &str, sha256: &str, scan: FileScan, entries: &[Entry]) -
     let mut totals = Totals::default();
     let members: Vec<Member> = entries
         .iter()
-        .zip(&attribution.by_member)
-        .map(|(entry, threats)| {
-            let status = if entry.is_dir && threats.is_empty() {
+        .zip(attribution.by_member.iter().zip(&attribution.either))
+        .map(|(entry, (threats, either))| {
+            let status = if entry.is_dir && threats.is_empty() && either.is_empty() {
                 MemberStatus::Folder
             } else if !threats.is_empty() {
                 MemberStatus::Flagged {
                     threats: threats.clone(),
+                }
+            } else if !either.is_empty() {
+                // Said as what it is. Calling it flagged would put Defender's
+                // name on a file Defender may not have meant.
+                MemberStatus::LeftOut {
+                    reason: format!(
+                        "Defender flagged a file as {} under a name that fits this file and at \
+                         least one other in the archive, so which it meant cannot be told and \
+                         none of them is extracted.",
+                        either.join(", ")
+                    ),
                 }
             } else if let Err(refusal) = kam_storage::downloads::safe_relative(&entry.name) {
                 MemberStatus::LeftOut {
@@ -666,6 +679,30 @@ mod tests {
                 "{member:?}"
             );
         }
+    }
+
+    /// Red review: a harmless member with the plain spelling took the flag,
+    /// and the member Defender named, whose name ends in a no-break space,
+    /// was shown as nothing found and offered for extraction.
+    #[test]
+    fn a_member_whose_name_only_looks_like_the_flagged_one_is_not_extracted_either() {
+        let scan = flagged(&["file : C:\\w.zip->tool.exe\u{a0}"]);
+        let entries = [
+            entry("tool.exe", 10),
+            entry("tool.exe\u{a0}", 20),
+            entry("readme.txt", 5),
+        ];
+        let dissection = dissect(r"C:\D\x.zip", "ab", scan, &entries);
+        for member in &dissection.members[..2] {
+            let MemberStatus::LeftOut { reason } = &member.status else {
+                panic!("{:?} could be extracted: {:?}", member.name, member.status);
+            };
+            assert!(reason.contains("which it meant cannot be told"), "{reason}");
+        }
+        assert_eq!(dissection.members[2].status, MemberStatus::NothingFound);
+        assert!(dissection.offered, "the unrelated file is still offered");
+        assert_eq!(dissection.totals.clean, 1);
+        assert_eq!(dissection.totals.left_out, 2);
     }
 
     #[test]

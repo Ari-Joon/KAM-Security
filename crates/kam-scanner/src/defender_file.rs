@@ -28,6 +28,8 @@
 //! - **Anything the listing names that cannot be matched fails closed.** See
 //!   [`attribute`]: a member Defender named and the archive does not list, or a
 //!   threat on the archive as a whole, means nothing is offered for extraction.
+//!   A name that fits more than one member is held against all of them, and
+//!   none of those is extracted.
 //! - **Names carrying control characters are never trusted**, as targets here
 //!   and as archive members in the window.
 
@@ -571,7 +573,12 @@ fn threat_blocks(lines: &[&str], expected_threats: usize) -> (Vec<Flagged>, bool
         }
         if indented && trimmed.contains(':') {
             if let Some(threat) = threats.last_mut() {
-                threat.resources.push(trimmed.to_owned());
+                // Only the indent comes off. The rest ends in a name chosen
+                // by whoever made the archive, and a name is compared as
+                // Defender printed it: see `parse_resource`.
+                threat
+                    .resources
+                    .push(line.trim_start_matches([' ', '\t']).to_owned());
             }
         }
     }
@@ -623,23 +630,24 @@ pub struct Resource {
 /// The archive and its member are split at the *first* `->`. A Windows path
 /// cannot contain `>`, so that arrow is never part of the archive's own path,
 /// while a member's name can contain anything at all.
+///
+/// Nothing is taken off the end. This used to `trim` the text, and Rust's
+/// `trim` removes every kind of white space, a no-break space included: a
+/// flagged member whose name ended in one was read as the member with the
+/// plain spelling, which then took the flag in its place. Only the spaces
+/// Defender itself puts in front of the value are removed.
 pub fn parse_resource(text: &str) -> Option<Resource> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
+    let text = text.trim_start_matches([' ', '\t']);
 
     // A kind is a word of two letters or more, then a colon. A bare path
     // starts with one letter and a colon, which is a drive, not a kind.
     let word: String = text.chars().take_while(char::is_ascii_alphabetic).collect();
-    let after_word = &text[word.len()..];
-    let labelled = word.len() >= 2 && after_word.trim_start().starts_with(':');
+    let after_word = text[word.len()..].trim_start_matches(' ');
+    let labelled = word.len() >= 2 && after_word.starts_with(':');
     let (kind, value) = if labelled {
-        let rest = after_word
-            .trim_start()
-            .strip_prefix(':')
-            .unwrap_or_default();
-        let rest = rest.strip_prefix('_').unwrap_or(rest).trim();
+        let rest = after_word.strip_prefix(':').unwrap_or_default();
+        let rest = rest.trim_start_matches(' ');
+        let rest = rest.strip_prefix('_').unwrap_or(rest);
         let kind = match word.to_ascii_lowercase().as_str() {
             "file" => ResourceKind::File,
             "containerfile" => ResourceKind::Container,
@@ -649,12 +657,12 @@ pub fn parse_resource(text: &str) -> Option<Resource> {
     } else {
         (ResourceKind::File, text)
     };
-    if value.is_empty() {
+    if value.trim().is_empty() {
         return None;
     }
 
     let (path, member) = match value.split_once("->") {
-        Some((path, member)) => (path.trim_end(), Some(member.to_owned())),
+        Some((path, member)) => (path, Some(member.to_owned())),
         None => (value, None),
     };
     Some(Resource {
@@ -667,8 +675,13 @@ pub fn parse_resource(text: &str) -> Option<Resource> {
 /// Which members of an archive Defender's answer names.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Attribution {
-    /// For each member, in the order given, the threats Defender attached.
+    /// For each member, in the order given, the threats Defender put on a
+    /// name that fits that member and no other.
     pub by_member: Vec<Vec<String>>,
+    /// For each member, the threats Defender put on a name that fits that
+    /// member and at least one other, so which of them it meant cannot be
+    /// told. None of the members such a name fits is extracted.
+    pub either: Vec<Vec<String>>,
     /// Threats Defender attached to the archive as a whole, naming no member.
     pub whole: Vec<String>,
     /// Members Defender named that match nothing in the listing.
@@ -676,47 +689,101 @@ pub struct Attribution {
 }
 
 impl Attribution {
-    /// Whether every flag Defender raised landed on a member that can be left
-    /// out by itself. When not, nothing is offered for extraction.
+    /// Whether every flag Defender raised landed on members that can be left
+    /// out by themselves. When not, nothing is offered for extraction.
     pub fn complete(&self) -> bool {
         self.whole.is_empty() && self.unmatched.is_empty()
     }
 }
 
-/// A member's name, reduced to what Defender's printed form can be compared
-/// on: one kind of separator, no leading one, ASCII case folded, and every
-/// character outside ASCII replaced by `?`, because the console's code page
-/// cannot be trusted to have kept it.
-fn comparable_member(name: &str) -> String {
-    name.replace('\\', "/")
-        .trim_start_matches('/')
-        .chars()
-        .map(|c| {
+/// One position of a name, as it can be held against what Defender printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unit {
+    /// An ASCII character, lower case. Defender prints these as they are.
+    Plain(u8),
+    /// Anything else. The console's code page may have printed it as itself,
+    /// as `?`, or as a plain letter that looks like it, so in a member's own
+    /// name it is taken to fit whatever was printed in its place.
+    Unknown,
+}
+
+/// A name reduced to what can be compared: the parts a path is made of, with
+/// one kind of separator, ASCII case folded, and one [`Unit::Unknown`] for
+/// each UTF-16 unit outside ASCII (the console prints one `?` for each).
+///
+/// Both sides go through this, and that is the point. Empty and `.` parts
+/// are dropped, and white space of every kind and dots are taken off the end
+/// of each part, for the member's own name exactly as for the printed one.
+/// What Defender does to such a name before printing it has not been
+/// established, so two names that differ only in those ways are treated as
+/// one name: whichever was printed, it fits both, and neither is extracted.
+fn comparable(name: &str) -> Vec<Unit> {
+    let mut units = Vec::with_capacity(name.len());
+    for part in name.split(['/', '\\']) {
+        let part = part.trim_end_matches(|c: char| c.is_whitespace() || c == '.');
+        if part.is_empty() {
+            continue;
+        }
+        if !units.is_empty() {
+            units.push(Unit::Plain(b'/'));
+        }
+        for c in part.chars() {
             if c.is_ascii() {
-                c.to_ascii_lowercase()
+                units.push(Unit::Plain(c.to_ascii_lowercase() as u8));
             } else {
-                '?'
+                units.extend(std::iter::repeat_n(Unit::Unknown, c.len_utf16()));
             }
+        }
+    }
+    units
+}
+
+/// Whether a member's name could have been printed as `printed`.
+fn fits(member: &[Unit], printed: &[Unit]) -> bool {
+    member.len() == printed.len()
+        && member.iter().zip(printed).all(|pair| match pair {
+            (Unit::Unknown, _) => true,
+            (Unit::Plain(listed), Unit::Plain(shown)) => listed == shown,
+            (Unit::Plain(_), Unit::Unknown) => false,
         })
-        .collect()
 }
 
 /// Match what Defender flagged against an archive's own list of members.
 ///
-/// A member is flagged when Defender named it exactly, or named something
-/// inside it (`inner.zip->tools/x.com` flags `inner.zip`, which is then left
-/// out whole). Matching is deliberately loose in one direction: characters the
-/// console may have mangled match each other, so an ambiguous name can flag
-/// two members, and never flags none.
+/// A printed name is held against every member it could be the printed form
+/// of: the member of that name, or an archive it is inside
+/// (`inner.zip->tools/x.com` names `inner.zip`, which is then left out
+/// whole). See [`comparable`] for what counts as the same name.
 ///
-/// The other direction fails closed. A flagged name that matches no member,
-/// or a threat on the archive with no member named, goes into `unmatched` or
-/// `whole`, and [`Attribution::complete`] is then false.
+/// - Fits one member: that member is flagged.
+/// - Fits several: which one Defender meant cannot be told, so each of them
+///   is listed under `either` and none of them is extracted. This is how a
+///   look-alike name is stopped from taking the flag for the file Defender
+///   really named.
+/// - Fits none, or the threat is on the archive with no member named: it
+///   goes into `unmatched` or `whole`, [`Attribution::complete`] is false and
+///   nothing at all is offered.
 pub fn attribute(threats: &[Flagged], members: &[&str]) -> Attribution {
-    let comparable: Vec<String> = members.iter().map(|name| comparable_member(name)).collect();
+    let listed: Vec<Vec<Unit>> = members.iter().map(|name| comparable(name)).collect();
+    // By length, so each printed name is only held against the members it
+    // could be. Comparing every name with every member made an archive of
+    // tens of thousands of files with a long list of detections take minutes.
+    let mut by_length: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, units) in listed.iter().enumerate() {
+        if !units.is_empty() {
+            by_length.entry(units.len()).or_default().push(index);
+        }
+    }
     let mut attribution = Attribution {
         by_member: vec![Vec::new(); members.len()],
+        either: vec![Vec::new(); members.len()],
         ..Attribution::default()
+    };
+    let note = |list: &mut Vec<String>, name: &String| {
+        if !list.contains(name) {
+            list.push(name.clone());
+        }
     };
 
     for threat in threats {
@@ -732,34 +799,39 @@ pub fn attribute(threats: &[Flagged], members: &[&str]) -> Attribution {
             named_a_file = true;
             let Some(member) = resource.member else {
                 // The archive itself, not anything in it.
-                if !attribution.whole.contains(&threat.name) {
-                    attribution.whole.push(threat.name.clone());
-                }
+                note(&mut attribution.whole, &threat.name);
                 continue;
             };
-            let flagged = comparable_member(&member);
-            let mut matched = false;
-            for (index, candidate) in comparable.iter().enumerate() {
-                if candidate.is_empty() {
-                    continue;
-                }
-                let exact = flagged == *candidate;
-                let inside = flagged.starts_with(&format!("{candidate}->"));
-                if exact || inside {
-                    matched = true;
-                    if !attribution.by_member[index].contains(&threat.name) {
-                        attribution.by_member[index].push(threat.name.clone());
+            let printed = comparable(&member);
+            // The whole name, and every place an arrow could end the name of
+            // an archive this is inside.
+            let arrows = printed
+                .windows(2)
+                .enumerate()
+                .filter(|(_, pair)| *pair == [Unit::Plain(b'-'), Unit::Plain(b'>')])
+                .map(|(at, _)| at);
+            let mut fitting: Vec<usize> = Vec::new();
+            for end in std::iter::once(printed.len()).chain(arrows) {
+                for &index in by_length.get(&end).map(Vec::as_slice).unwrap_or_default() {
+                    if fits(&listed[index], &printed[..end]) {
+                        fitting.push(index);
                     }
                 }
             }
-            if !matched {
-                attribution.unmatched.push(member);
+            match fitting.as_slice() {
+                [] => attribution.unmatched.push(member),
+                [only] => note(&mut attribution.by_member[*only], &threat.name),
+                several => {
+                    for index in several {
+                        note(&mut attribution.either[*index], &threat.name);
+                    }
+                }
             }
         }
         // A threat that named only the container, or nothing at all, is a
         // threat on the archive.
-        if !named_a_file && !attribution.whole.contains(&threat.name) {
-            attribution.whole.push(threat.name.clone());
+        if !named_a_file {
+            note(&mut attribution.whole, &threat.name);
         }
     }
     attribution
@@ -978,16 +1050,96 @@ mod tests {
         }];
         let attribution = attribute(&threats, &["a->b.exe", "a"]);
         assert!(attribution.complete());
-        assert_eq!(
-            attribution.by_member[0].len(),
-            1,
-            "the member really called a->b.exe"
+        // The member really called a->b.exe, or something inside an archive
+        // called a: the printed name fits both, so it is held against both
+        // and pinned on neither.
+        assert_eq!(attribution.either[0].len(), 1);
+        assert_eq!(attribution.either[1].len(), 1);
+        assert!(attribution.by_member.iter().all(Vec::is_empty));
+    }
+
+    /// Red review: a flagged member whose name ends in a no-break space was
+    /// read, after `trim`, as the harmless member with the plain spelling.
+    /// That one took the flag, nothing was left unmatched, and the flagged
+    /// file was offered for extraction. Read through the whole report, as
+    /// Defender prints it.
+    #[test]
+    fn a_look_alike_member_cannot_take_the_flag_for_the_one_defender_named() {
+        let output = format!(
+            "Scanning {ZIP} found 1 threats.\r\n\
+             Threat                  : Trojan:Win32/Example\r\n\
+             Resources               : 2 total\r\n\
+             \x20   file                : {ZIP}->tool.exe\u{a0}\r\n\
+             \x20   containerfile       : {ZIP}\r\n"
         );
+        let scan = parse_report(Some(2), &output);
+        assert!(scan.listing_consistent, "{scan:?}");
         assert_eq!(
-            attribution.by_member[1].len(),
-            1,
-            "and, to be safe, anything it could be inside"
+            parse_resource(&scan.threats[0].resources[0])
+                .unwrap()
+                .member
+                .as_deref(),
+            Some("tool.exe\u{a0}"),
+            "the name was not kept as Defender printed it"
         );
+
+        let members = ["tool.exe", "tool.exe\u{a0}", "readme.txt"];
+        let attribution = attribute(&scan.threats, &members);
+        assert!(attribution.complete(), "{attribution:?}");
+        let held = |index: usize| {
+            !attribution.by_member[index].is_empty() || !attribution.either[index].is_empty()
+        };
+        assert!(held(1), "the member Defender named was not held back");
+        assert!(held(0), "its look-alike could still be the one meant");
+        assert!(!held(2), "an unrelated member was held back");
+
+        // The same whichever of the two spellings Defender had printed.
+        let plain = [Flagged {
+            name: "Trojan:Win32/Example".to_owned(),
+            resources: vec![format!("file : {ZIP}->tool.exe")],
+        }];
+        let attribution = attribute(&plain, &members);
+        assert_eq!(attribution.either[0].len(), 1);
+        assert_eq!(attribution.either[1].len(), 1);
+    }
+
+    /// What Defender prints for a letter outside its code page is not
+    /// established: `?`, or a plain letter that looks like it. Either way the
+    /// printed name fits both members, and neither is taken to be clear.
+    #[test]
+    fn a_name_that_fits_two_members_is_pinned_on_neither_and_clears_neither() {
+        for (printed, members) in [
+            // A full-width letter printed as the plain one.
+            ("tool.exe", ["tool.exe", "tool.\u{ff45}xe"]),
+            // One character outside the basic plane is two question marks,
+            // which is also what two ordinary ones come out as.
+            ("a??.exe", ["a\u{1f600}.exe", "a\u{4e2d}\u{6587}.exe"]),
+            // Untidy paths that would be written to the same place.
+            ("docs/a.exe", ["docs/a.exe", "./docs//a.exe"]),
+            ("A.EXE", ["a.exe", "A.exe"]),
+        ] {
+            let threats = [Flagged {
+                name: "Trojan:Win32/Example".to_owned(),
+                resources: vec![format!("file : {ZIP}->{printed}")],
+            }];
+            let attribution = attribute(&threats, &members);
+            assert!(attribution.complete(), "{printed}: {attribution:?}");
+            assert!(
+                attribution.either.iter().all(|threats| threats.len() == 1),
+                "{printed}: {attribution:?}"
+            );
+            assert!(attribution.by_member.iter().all(Vec::is_empty));
+        }
+
+        // A plain letter in the member's own name is always printed as it
+        // is, so a name with another letter there is another file.
+        let threats = [Flagged {
+            name: "Trojan:Win32/Example".to_owned(),
+            resources: vec![format!("file : {ZIP}->pr\u{f8}be.com")],
+        }];
+        let attribution = attribute(&threats, &["probe.com", "pr\u{f8}be.com"]);
+        assert!(attribution.by_member[0].is_empty() && attribution.either[0].is_empty());
+        assert_eq!(attribution.by_member[1].len(), 1);
     }
 
     /// The console's code page replaces what it cannot show with `?`. Both
