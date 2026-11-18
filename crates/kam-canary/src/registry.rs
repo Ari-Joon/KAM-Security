@@ -62,7 +62,8 @@ pub struct RegistryDecoy {
 
 /// Whether registry decoys are planted at all.
 ///
-/// **Off, because the feature does not work and shipping it would be a lie.**
+/// On again, after ten weeks off. The story is worth keeping, because the
+/// wrong conclusion was drawn from true observations.
 ///
 /// What was observed on 7 September 2026, on a machine where the file canaries
 /// work perfectly:
@@ -72,25 +73,25 @@ pub struct RegistryDecoy {
 ///   marker value reads back.
 /// - The kernel agrees too: it writes audit events for successful opens of
 ///   those exact paths, which it would not do for an object that did not exist.
-/// - Nothing else on the machine can see them. `Test-Path`, `reg.exe` and
-///   .NET's `OpenSubKey` all report the leaf missing — `OpenSubKey` returns
-///   null rather than throwing, so this is genuinely "not found" and not a
-///   permissions problem. The parent key enumerates zero subkeys.
+/// - Afterwards nothing else on the machine can see them. `Test-Path`,
+///   `reg.exe` and .NET's `OpenSubKey` all report the leaf missing, and the
+///   parent key enumerates zero subkeys.
 ///
-/// The root cause is not understood. What is understood is the consequence: if
-/// the account's own tools cannot see the key, then an infostealer running as
-/// that account cannot see it either. A decoy nothing can find is never read,
-/// and a canary that is never read is not protection — it is a line in the
-/// interface claiming protection that does not exist, which is worse than the
-/// feature being absent, because it stops somebody looking further.
+/// That was read as Windows hiding the keys from everything but the process
+/// that wrote them, and the feature was switched off rather than shipped
+/// claiming a protection nobody could confirm: a decoy nothing can find is
+/// never read, and a canary that is never read is a line in the interface
+/// claiming protection that does not exist.
 ///
-/// The code, the tests and the audit plumbing all stay: the registry half of
-/// the audit policy is still switched on, the event matching still handles the
-/// kernel's `\REGISTRY\USER\<sid>\…` naming, and
-/// `planting_through_the_users_hive_round_trips` still covers the agent's path.
-/// Only the planting is held back, behind this one flag, until the disappearing
-/// keys are explained.
-pub const REGISTRY_DECOYS_ENABLED: bool = false;
+/// Switching it off was right. The explanation was wrong. The keys were there,
+/// and then they were deleted, by this crate's own tests: see [`decoys`]. Each
+/// observation above was true at the moment it was made.
+///
+/// The flag stays as the one switch that turns the planting off again, should
+/// a decoy ever be reported planted while `reg.exe` run as the same person
+/// cannot see it. That check, by a program that shares no code with this one,
+/// is the only evidence that counts.
+pub const REGISTRY_DECOYS_ENABLED: bool = true;
 
 /// The decoys, and why each path is the one a thief reads.
 ///
@@ -131,6 +132,77 @@ pub const REGISTRY_DECOYS: &[RegistryDecoy] = &[
         values: &[("UsernameHint", "DOMAIN\\svc-remote")],
     },
 ];
+
+/// The decoys this build plants.
+///
+/// In the shipped program that is [`REGISTRY_DECOYS`]. In this crate's own
+/// tests it is a set of scratch keys under `Software\KAM Security\Tests`, and
+/// that difference is the whole explanation of the keys that vanished in
+/// September 2026.
+///
+/// A hive is not a directory. The tests can give themselves a scratch profile
+/// for the file decoys, but every registry path is in the real hive of whoever
+/// runs them. They used the product's own paths: they planted "their" decoys,
+/// removed them, and asserted that none survived. On a machine where the
+/// product is installed for the same account, those are the product's decoys.
+/// Every run of the test suite deleted what the agent had planted. The agent's
+/// checks agreed the keys were there because, when it made them, they were,
+/// and a test run later `reg.exe` could not find them. The parent keys on the
+/// machine where it happened were last written in the second a test run
+/// finished.
+///
+/// So a test build gets keys of its own, named for the process so that two
+/// runs at once cannot remove each other's, and a test fails if one is ever
+/// handed a path the product plants.
+#[cfg(not(test))]
+pub(crate) fn decoys() -> &'static [RegistryDecoy] {
+    REGISTRY_DECOYS
+}
+
+/// See the non-test half above. The same decoys in every respect but where
+/// they live.
+#[cfg(test)]
+pub(crate) fn decoys() -> &'static [RegistryDecoy] {
+    static SCRATCH: std::sync::OnceLock<Vec<RegistryDecoy>> = std::sync::OnceLock::new();
+    SCRATCH.get_or_init(|| {
+        REGISTRY_DECOYS
+            .iter()
+            .map(|decoy| {
+                // The last component is kept, because that is the part that
+                // names itself and the part the event matching keys on.
+                let leaf = decoy.relative.rsplit('\\').next().unwrap_or(decoy.id);
+                let relative: &'static str =
+                    Box::leak(format!(r"{}\{}\{leaf}", scratch_run(), decoy.id).into_boxed_str());
+                RegistryDecoy { relative, ..*decoy }
+            })
+            .collect()
+    })
+}
+
+/// Where test builds keep their decoys, in the hive of whoever runs the tests.
+#[cfg(test)]
+pub(crate) const SCRATCH_ROOT: &str = r"Software\KAM Security\Tests\decoys";
+
+/// This process's own corner of [`SCRATCH_ROOT`].
+#[cfg(test)]
+fn scratch_run() -> String {
+    format!(r"{SCRATCH_ROOT}\run-{}", std::process::id())
+}
+
+/// Take this process's scratch keys away again, parents and all.
+///
+/// Called at the end of each test that plants, while it still holds the hive
+/// lock, so that a test run leaves nothing behind in the registry of the
+/// person who ran it. A test that fails before reaching this leaves an empty
+/// key under [`SCRATCH_ROOT`], which is the lesser evil.
+#[cfg(test)]
+pub(crate) fn tidy_scratch(user: &UserContext) {
+    let (root, prefix) = hive(user);
+    let path = wide(&format!("{prefix}{}", scratch_run()));
+    unsafe {
+        let _ = RegDeleteTreeW(root, PCWSTR(path.as_ptr()));
+    }
+}
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -373,13 +445,41 @@ mod tests {
             .ends_with("kam-security-decoy-do-not-use"));
     }
 
+    /// No test may plant or remove at a path the product plants.
+    ///
+    /// The hive these tests write to is the real one of whoever runs them, and
+    /// on the machine this is developed on the product is installed for the
+    /// same account. When the tests used the product's paths, every test run
+    /// removed the decoys the agent had planted, which is what switched this
+    /// feature off for ten weeks. See [`decoys`].
+    #[test]
+    fn a_test_build_is_never_handed_a_path_the_product_plants() {
+        let scratch = decoys();
+        assert_eq!(scratch.len(), REGISTRY_DECOYS.len());
+        for decoy in scratch {
+            assert!(
+                decoy.relative.starts_with(SCRATCH_ROOT),
+                "{} is outside the scratch key",
+                decoy.relative
+            );
+            assert!(
+                REGISTRY_DECOYS
+                    .iter()
+                    .all(|real| !real.relative.eq_ignore_ascii_case(decoy.relative)),
+                "{} is a path the product plants",
+                decoy.relative
+            );
+        }
+    }
+
     #[test]
     fn planting_and_removing_a_real_key_round_trips() {
         let _guard = hive_guard();
-        // Writes to this account's own hive under a decoy path, then removes
-        // it. No privilege needed for HKCU, so this runs everywhere.
+        // Writes a real key to this account's own hive, under the scratch key
+        // and never a decoy's own path, then removes it. No privilege needed
+        // for HKCU, so this runs everywhere.
         let user = UserContext::current();
-        let decoy = &REGISTRY_DECOYS[0];
+        let decoy = &decoys()[0];
 
         // Never run against a path somebody already has something at.
         if exists(&user, decoy) && !is_ours(&user, decoy) {
@@ -396,6 +496,7 @@ mod tests {
 
         remove(&user, decoy).expect("our own key should be removable");
         assert!(!exists(&user, decoy), "the key survived removal");
+        tidy_scratch(&user);
     }
 
     /// The account's own SID, when the caller supplies it.
@@ -425,7 +526,7 @@ mod tests {
         let _guard = hive_guard();
 
         let user = UserContext::new(Some(sid.clone()), r"C:\Users\ignored");
-        let decoy = &REGISTRY_DECOYS[0];
+        let decoy = &decoys()[0];
 
         if exists(&user, decoy) && !is_ours(&user, decoy) {
             println!("something is already there; skipping");
@@ -450,6 +551,7 @@ mod tests {
             "a removed key must not still report as ours -- this is the check \
              that catches a planting failure being reported as success"
         );
+        tidy_scratch(&user);
     }
 
     /// Something other than this crate has to be able to see the key.
@@ -467,16 +569,20 @@ mod tests {
     ///
     /// So this one asks a program that shares no code with us. `reg.exe` is the
     /// same tool a person would check with, which is the point.
+    ///
+    /// It used to run only when handed a SID. It now runs every time: through
+    /// `HKEY_USERS\<sid>` when the caller says who they are, which is the
+    /// agent's route, and through this account's own hive otherwise, so the
+    /// question is asked on every run and not only on a machine set up for it.
     #[test]
     fn a_planted_key_is_visible_to_a_tool_that_shares_no_code_with_us() {
-        let Some(sid) = test_sid() else {
-            println!("KAM_TEST_SID not set; skipping the independent check");
-            return;
-        };
         let _guard = hive_guard();
 
-        let user = UserContext::new(Some(sid.clone()), r"C:\Users\ignored");
-        let decoy = &REGISTRY_DECOYS[0];
+        let user = match test_sid() {
+            Some(sid) => UserContext::new(Some(sid), r"C:\Users\ignored"),
+            None => UserContext::current(),
+        };
+        let decoy = &decoys()[0];
 
         if exists(&user, decoy) && !is_ours(&user, decoy) {
             println!("something is already there; skipping");
@@ -486,7 +592,7 @@ mod tests {
         plant(&user, decoy).expect("the agent's own path should create the key");
 
         // Ask reg.exe, which knows nothing about any of this.
-        let full = format!(r"HKEY_USERS\{sid}\{}", decoy.relative);
+        let full = display_name(&user, decoy);
         let seen = std::process::Command::new("reg.exe")
             .args(["query", &full, "/v", MARKER_VALUE])
             .output();
@@ -501,6 +607,7 @@ mod tests {
 
         // Clean up before asserting, so a failure does not leave a decoy behind.
         let _ = remove(&user, decoy);
+        tidy_scratch(&user);
 
         assert!(
             verdict,
@@ -517,7 +624,7 @@ mod tests {
         // The rule that matters: these paths belong to other people's software,
         // and a real saved session must survive this program entirely.
         let user = UserContext::current();
-        let decoy = &REGISTRY_DECOYS[2];
+        let decoy = &decoys()[2];
         if exists(&user, decoy) {
             println!("something is already there; skipping");
             return;
@@ -554,5 +661,6 @@ mod tests {
         unsafe {
             let _ = RegDeleteTreeW(root, PCWSTR(path.as_ptr()));
         }
+        tidy_scratch(&user);
     }
 }

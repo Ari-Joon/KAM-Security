@@ -348,14 +348,13 @@ fn read_trips(user: &UserContext, report: &mut Report) {
 
 /// Create the registry decoys, with the same rules the files follow.
 ///
-/// Held back behind `REGISTRY_DECOYS_ENABLED` while the keys disappear from
-/// everything except the agent that wrote them. See the flag for what was
-/// observed and why claiming them would be worse than not having them.
+/// Behind `REGISTRY_DECOYS_ENABLED`, which is the one switch that turns the
+/// planting off again. See the flag for the ten weeks it spent off and why.
 fn plant_registry(user: &UserContext, report: &mut Report) {
     if !REGISTRY_DECOYS_ENABLED {
         return;
     }
-    for decoy in REGISTRY_DECOYS {
+    for decoy in registry::decoys() {
         if registry::exists(user, decoy) && !registry::is_ours(user, decoy) {
             report.problems.push(format!(
                 "{} was left alone: something else is already there.",
@@ -454,7 +453,7 @@ pub fn remove(user: &UserContext) -> (usize, Vec<String>) {
 
     // Removal is not gated: a machine that was given decoys by an earlier build
     // must still be able to get rid of them.
-    for decoy in REGISTRY_DECOYS {
+    for decoy in registry::decoys() {
         if !registry::exists(user, decoy) {
             continue;
         }
@@ -483,7 +482,7 @@ fn watched_names(user: &UserContext) -> Vec<String> {
     // matching there works whoever is asking.
     if REGISTRY_DECOYS_ENABLED {
         names.extend(
-            REGISTRY_DECOYS
+            registry::decoys()
                 .iter()
                 .map(|decoy| decoy.relative.to_lowercase()),
         );
@@ -521,7 +520,10 @@ pub fn status(user: &UserContext) -> Report {
     // Read-only, deliberately. Reporting what is planted must never plant
     // anything: the window polls this every few seconds, and a status call that
     // created keys would put decoys on a machine whose owner never asked.
-    for decoy in REGISTRY_DECOYS.iter().filter(|_| REGISTRY_DECOYS_ENABLED) {
+    for decoy in registry::decoys()
+        .iter()
+        .filter(|_| REGISTRY_DECOYS_ENABLED)
+    {
         if !registry::is_ours(user, decoy) {
             continue;
         }
@@ -605,10 +607,11 @@ mod tests {
         // Arming needs privilege the tests do not have; the decoys must still be
         // created, and that is what is checked here.
         //
-        // The profile is a scratch directory, so the file decoys land there. The
-        // registry decoys have nowhere scratch to go — a hive is not a directory
-        // — so they land in this account's real HKEY_CURRENT_USER, under paths
-        // that name themselves, and are removed again below.
+        // The profile is a scratch directory, so the file decoys land there. A
+        // hive is not a directory, so the registry decoys land in this
+        // account's real one, under a scratch key of this crate's own and never
+        // at the paths the product plants (see `registry::decoys` for what
+        // using those cost), and are removed again below.
         let files: Vec<_> = report
             .canaries
             .iter()
@@ -633,13 +636,14 @@ mod tests {
                 canary.path
             );
         }
-        for decoy in REGISTRY_DECOYS {
+        for decoy in registry::decoys() {
             assert!(
                 !registry::is_ours(&user, decoy),
                 "{} survived removal",
                 registry::display_name(&user, decoy)
             );
         }
+        registry::tidy_scratch(&user);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -673,6 +677,7 @@ mod tests {
         let (_, refused) = remove(&user);
         assert!(victim.is_file(), "an existing file was deleted");
         assert!(refused.iter().any(|r| r.contains("not one of ours")));
+        registry::tidy_scratch(&user);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -685,6 +690,7 @@ mod tests {
         assert_eq!(first.canaries.len(), second.canaries.len());
         assert!(second.problems.is_empty(), "{:?}", second.problems);
         remove(&user);
+        registry::tidy_scratch(&user);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -791,7 +797,7 @@ mod tests {
         set_auditing(true).expect("auditing should be switchable on when privileged");
 
         // Read one, exactly as something enumerating saved sessions would.
-        let decoy = &REGISTRY_DECOYS[0];
+        let decoy = &registry::decoys()[0];
         assert!(registry::is_ours(&user, decoy), "the decoy key is not ours");
 
         let expected = decoy.relative.to_lowercase();
