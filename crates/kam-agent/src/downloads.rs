@@ -15,6 +15,7 @@
 //! as the person. What the window did comes back here as a report, and the
 //! audit log says it was reported rather than witnessed.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use kam_core::audit::Effect;
@@ -28,12 +29,15 @@ use kam_scanner::downloads::{
 
 use crate::dispatch::{human_bytes, Context};
 
-/// How many history rows one answer carries.
+/// How many of the most recent history rows one answer carries.
 const MAX_ROWS: usize = 1000;
 
-/// How many members of an archive are kept in its record. The totals count
-/// every member regardless.
-const MAX_RECORDED_MEMBERS: usize = 5000;
+/// How many files one request may ask after by name.
+const MAX_PATHS: usize = 5000;
+
+/// How large the history in one answer may be, as the JSON it is sent as:
+/// half of what a frame may hold, so the rest of the frame is never in doubt.
+const LIST_BUDGET: usize = kam_ipc::MAX_FRAME_BYTES / 2;
 
 /// The caller's key in the history. Every real caller is identified by SID;
 /// an unidentified one (a test, a console run) gets the empty key, which no
@@ -292,7 +296,11 @@ pub fn check(
             .signature
             .as_ref()
             .and_then(|signature| serde_json::to_string(signature).ok()),
-        outcome: serde_json::to_string(&checked.scan).unwrap_or_default(),
+        // The row keeps Defender's names and one resource for each. The whole
+        // list goes back in the reply below, which is where taking an archive
+        // apart reads it; kept in every row it made the history too large to
+        // send.
+        outcome: serde_json::to_string(&checked.scan.for_record()).unwrap_or_default(),
         actions: String::new(),
         dissection: None,
     };
@@ -329,34 +337,28 @@ pub fn check(
         ),
     );
 
-    let mut record =
-        current_record(context, user, &checked.path, &checked.sha256).unwrap_or_else(|| {
-            DownloadRecord {
-                check: checked,
-                checked_at: kam_core::clock::now_utc_iso(),
-                actions: Vec::new(),
-                dissection: None,
-                first_check: false,
-            }
-        });
-    record.first_check = first;
-    Response::DownloadChecked(Box::new(record))
-}
-
-/// The stored row for one path and content, as a record.
-fn current_record(
-    context: &Context,
-    user: &UserContext,
-    path: &str,
-    sha256: &str,
-) -> Option<DownloadRecord> {
-    context
+    // What the row already has (what was done to it, what taking it apart
+    // came to) with this check's own answer, whole.
+    let stored = context
         .store
-        .downloads_for(caller(user), MAX_ROWS)
-        .ok()?
-        .into_iter()
-        .find(|row| row.sha256 == sha256 && row.path.eq_ignore_ascii_case(path))
-        .map(record_from_row)
+        .download_at(caller(user), &checked.path, Some(&checked.sha256))
+        .ok()
+        .flatten()
+        .map(record_from_row);
+    let record = DownloadRecord {
+        checked_at: stored
+            .as_ref()
+            .map(|stored| stored.checked_at.clone())
+            .unwrap_or_else(kam_core::clock::now_utc_iso),
+        actions: stored
+            .as_ref()
+            .map(|stored| stored.actions.clone())
+            .unwrap_or_default(),
+        dissection: stored.and_then(|stored| stored.dissection),
+        check: checked,
+        first_check: first,
+    };
+    Response::DownloadChecked(Box::new(record))
 }
 
 /// A stored row, read back into the shape the window draws.
@@ -365,17 +367,21 @@ fn current_record(
 /// dropped: Defender's answer in particular never reads as nothing found
 /// because its record was damaged.
 fn record_from_row(row: DownloadRow) -> DownloadRecord {
-    let scan: FileScan = serde_json::from_str(&row.outcome).unwrap_or_else(|_| FileScan {
-        answer: Answer::NotFinished,
-        completed: false,
-        exit_code: None,
-        seconds: 0,
-        threats: Vec::new(),
-        listing_consistent: false,
-        caveat: Some("The stored answer for this check could not be read back.".to_owned()),
-        definitions: None,
-        notes: Vec::new(),
-    });
+    let scan = serde_json::from_str::<FileScan>(&row.outcome)
+        // A row written before rows were kept small still holds Defender's
+        // whole list. It is read back in the same short form as the rest.
+        .map(|scan| scan.for_record())
+        .unwrap_or_else(|_| FileScan {
+            answer: Answer::NotFinished,
+            completed: false,
+            exit_code: None,
+            seconds: 0,
+            threats: Vec::new(),
+            listing_consistent: false,
+            caveat: Some("The stored answer for this check could not be read back.".to_owned()),
+            definitions: None,
+            notes: Vec::new(),
+        });
     DownloadRecord {
         check: DownloadCheck {
             path: row.path,
@@ -403,19 +409,71 @@ fn record_from_row(row: DownloadRow) -> DownloadRecord {
     }
 }
 
-/// The caller's own history, newest first. A read, so not audited.
-pub fn list(context: &Context, user: &UserContext) -> Response {
-    match context.store.downloads_for(caller(user), MAX_ROWS) {
-        Ok(rows) => Response::Downloads {
-            records: rows.into_iter().map(record_from_row).collect(),
-        },
-        Err(error) => {
-            tracing::error!(%error, "could not read the download history");
-            Response::Error {
-                message: "the download history could not be read".to_owned(),
-            }
+/// The caller's own history: the newest row for each file they name, then
+/// the most recently checked, newest first. A read, so not audited.
+///
+/// # Bounded three ways
+///
+/// By how many recent rows (`MAX_ROWS`), by how many named files
+/// (`MAX_PATHS`), and by the size of the answer (`LIST_BUDGET`), measured as
+/// it is built. The last is the one that cannot be argued with: a frame over
+/// 8 MiB is not sent at all, and before this the page's whole history went
+/// in one frame with every archive's member list in it. A dozen large
+/// archives were enough, and from then on the page could never be sent its
+/// list again. Rows are small now, and should they ever not be, the answer
+/// stops short of the limit and says how many rows there are in all.
+pub fn list(paths: &[String], recent: u32, context: &Context, user: &UserContext) -> Response {
+    let sid = caller(user);
+    let unreadable = |error: kam_core::Error| {
+        tracing::error!(%error, "could not read the download history");
+        Response::Error {
+            message: "the download history could not be read".to_owned(),
+        }
+    };
+    let recent = match context
+        .store
+        .downloads_for(sid, (recent as usize).min(MAX_ROWS))
+    {
+        Ok(rows) => rows,
+        Err(error) => return unreadable(error),
+    };
+    let on_record = match context.store.download_count(sid) {
+        Ok(count) => count,
+        Err(error) => return unreadable(error),
+    };
+
+    // Compared the way the store compares paths: ASCII case folded.
+    let mut seen: HashSet<String> = recent
+        .iter()
+        .map(|row| row.path.to_ascii_lowercase())
+        .collect();
+    let mut rows = Vec::new();
+    for path in paths.iter().take(MAX_PATHS) {
+        if !seen.insert(path.to_ascii_lowercase()) {
+            continue;
+        }
+        match context.store.download_at(sid, path, None) {
+            Ok(Some(row)) => rows.push(row),
+            Ok(None) => {}
+            Err(error) => return unreadable(error),
         }
     }
+    // The named files first: they are the ones in the folder now, and a row
+    // left out for one of them shows it as never checked.
+    rows.extend(recent);
+
+    let mut records = Vec::new();
+    let mut size = 0_usize;
+    for row in rows {
+        let record = record_from_row(row);
+        size =
+            size.saturating_add(serde_json::to_vec(&record).map_or(usize::MAX, |json| json.len()));
+        if size > LIST_BUDGET {
+            break;
+        }
+        records.push(record);
+    }
+    Response::Downloads { records, on_record }
 }
 
 /// Note something done to a download on its row. A missing row is not an
@@ -472,12 +530,9 @@ pub fn quarantine(path: &str, context: &Context, user: &UserContext) -> Response
 
     let latest = context
         .store
-        .downloads_for(caller(user), MAX_ROWS)
+        .download_at(caller(user), &text, None)
         .ok()
-        .and_then(|rows| {
-            rows.into_iter()
-                .find(|row| row.path.eq_ignore_ascii_case(&text))
-        })
+        .flatten()
         .map(record_from_row);
     let reason = match &latest {
         Some(record) if record.check.scan.answer == Answer::Flagged => format!(
@@ -569,7 +624,7 @@ pub fn record_dissection(
             message: "a record of an archive needs its SHA-256".to_owned(),
         };
     };
-    let mut kept = dissection.for_record(MAX_RECORDED_MEMBERS);
+    let mut kept = dissection.for_record(kam_scanner::downloads::RECORDED_MEMBERS);
     kept.archive = path.to_owned();
     kept.sha256 = sha256.clone();
     for member in &mut kept.members {
@@ -946,6 +1001,166 @@ mod tests {
             refused_as_original.is_err(),
             "an original the caller cannot open was accepted"
         );
+    }
+
+    fn stored(path: &str, sha256: &str, outcome: &FileScan) -> DownloadRow {
+        DownloadRow {
+            sid: "S-1-5-21-0-0-0-4100".to_owned(),
+            path: path.to_owned(),
+            sha256: sha256.to_owned(),
+            name: "a.zip".to_owned(),
+            bytes: 1,
+            arrived_at: None,
+            checked_at: String::new(),
+            origin: None,
+            signature: None,
+            outcome: serde_json::to_string(outcome).unwrap(),
+            actions: String::new(),
+            dissection: None,
+        }
+    }
+
+    fn fits_in_a_frame(response: Response) -> bool {
+        kam_ipc::frame::write_frame(&mut Vec::new(), &kam_ipc::Reply::Done(response)).is_ok()
+    }
+
+    /// Red review: the history went to the page in one frame, every row
+    /// carrying its archive's member list and Defender's whole answer. Past
+    /// 8 MiB the frame was refused, and the page could never be sent its
+    /// history again. Rows written that way are still in real stores, so
+    /// this builds them as they were.
+    #[test]
+    fn a_history_of_large_archives_is_still_sent_and_says_how_much_there_is() {
+        let context = context();
+        let (root, user) = scratch_profile("history");
+        let flagged = kam_scanner::defender_file::parse_report(
+            Some(2),
+            &format!(
+                "Scanning C:\\a.zip found 1 threats.\r\nThreat : Trojan:Win32/Example\r\n\
+                 Resources : 3000 total\r\n{}",
+                (0..3000)
+                    .map(|number| format!("    file : C:\\a.zip->tools/{number}.exe\r\n"))
+                    .collect::<String>()
+            ),
+        );
+        let entries: Vec<kam_scanner::downloads::Entry> = (0..5000)
+            .map(|number| kam_scanner::downloads::Entry {
+                name: format!("a/rather/long/folder/name/for/file-number-{number}.dat"),
+                bytes: 10,
+                packed: 5,
+                is_dir: false,
+                encrypted: false,
+                link: false,
+                unsupported: None,
+            })
+            .collect();
+        for number in 0..40 {
+            let path = format!(r"C:\D\{number}.zip");
+            let sha256 = format!("{number:064x}");
+            context
+                .store
+                .record_download_check(&stored(&path, &sha256, &flagged))
+                .unwrap();
+            let dissection =
+                kam_scanner::downloads::dissect(&path, &sha256, flagged.clone(), &entries);
+            context
+                .store
+                .set_download_dissection(
+                    caller(&user),
+                    &path,
+                    &sha256,
+                    &serde_json::to_string(&dissection).unwrap(),
+                )
+                .unwrap();
+        }
+
+        let response = list(&[], 1000, &context, &user);
+        let Response::Downloads { records, on_record } = &response else {
+            panic!("the history was not listed: {response:?}");
+        };
+        assert_eq!((records.len(), *on_record), (40, 40));
+        let row = &records[0];
+        assert_eq!(row.check.scan.answer, Answer::Flagged);
+        assert_eq!(row.check.scan.threats[0].resources.len(), 1);
+        assert_eq!(row.dissection.as_ref().unwrap().totals.files, 5000);
+        assert!(fits_in_a_frame(response), "the history no longer fits");
+
+        // And should rows ever be large all the same, the answer stops short
+        // of what a frame can carry and says how many rows there are.
+        let action = serde_json::to_string(&DownloadAction {
+            at: "2026-11-18T00:00:00.000Z".to_owned(),
+            what: "x".repeat(300_000),
+            undo: None,
+        })
+        .unwrap();
+        for number in 0..40 {
+            context
+                .store
+                .add_download_action(caller(&user), &format!(r"C:\D\{number}.zip"), None, &action)
+                .unwrap();
+        }
+        let response = list(&[], 1000, &context, &user);
+        let Response::Downloads { records, on_record } = &response else {
+            panic!("the history was not listed: {response:?}");
+        };
+        assert_eq!(*on_record, 40);
+        assert!(
+            !records.is_empty() && records.len() < 40,
+            "{} rows of 300 KB each were all sent",
+            records.len()
+        );
+        assert!(fits_in_a_frame(response), "the answer was not cut to fit");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The window names the files in Downloads now, and gets the newest row
+    /// for each however old it is, so a file checked long ago does not read
+    /// as never checked once the history is longer than one answer.
+    #[test]
+    fn a_file_the_window_names_is_found_however_old_its_row() {
+        let context = context();
+        let (root, user) = scratch_profile("named");
+        let nothing = kam_scanner::defender_file::parse_report(Some(0), "");
+        for (number, path) in [r"C:\D\old.zip", r"C:\D\middle.zip", r"C:\D\new.zip"]
+            .iter()
+            .enumerate()
+        {
+            context
+                .store
+                .record_download_check(&stored(path, &format!("{number:064x}"), &nothing))
+                .unwrap();
+        }
+        let asked = [r"c:\d\OLD.zip".to_owned(), r"C:\D\never.zip".to_owned()];
+        let Response::Downloads { records, on_record } = list(&asked, 1, &context, &user) else {
+            panic!("the history was not listed");
+        };
+        let paths: Vec<&str> = records
+            .iter()
+            .map(|record| record.check.path.as_str())
+            .collect();
+        assert_eq!(paths, [r"C:\D\old.zip", r"C:\D\new.zip"]);
+        assert_eq!(on_record, 3);
+
+        // The reply to a check carries Defender's whole list, cut to a size
+        // that can be sent.
+        let long = kam_scanner::defender_file::parse_report(
+            Some(2),
+            &format!(
+                "Scanning C:\\a.zip found 1 threats.\r\nThreat : Trojan:Win32/Example\r\n\
+                 Resources : 60000 total\r\n{}",
+                (0..60_000)
+                    .map(|number| format!(
+                        "    file : C:\\a.zip->{}\u{1}{number}.exe\r\n",
+                        r"a\b\".repeat(30)
+                    ))
+                    .collect::<String>()
+            ),
+        )
+        .bounded(kam_scanner::defender_file::MAX_ANSWER_BYTES);
+        let mut record = record_from_row(stored(r"C:\D\a.zip", &"0".repeat(64), &nothing));
+        record.check.scan = long;
+        assert!(fits_in_a_frame(Response::DownloadChecked(Box::new(record))));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

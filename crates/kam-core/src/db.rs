@@ -306,7 +306,41 @@ pub struct DownloadRow {
     pub outcome: String,
     /// A JSON array, oldest first.
     pub actions: String,
+    /// What the archive was found to hold. Written whole; read back without
+    /// its list of members (see `DOWNLOAD_COLUMNS`).
     pub dissection: Option<String>,
+}
+
+/// The columns a download row is read back by, in [`download_row`]'s order.
+///
+/// The record of taking an archive apart is read without its list of members
+/// and without the copy of Defender's answer it carries. Those are most of a
+/// row: up to five thousand names for one archive. Nothing that reads a row
+/// back needs them, and reading a thousand rows with them could come to
+/// hundreds of megabytes, so they are left in the store by the query itself
+/// and never loaded. A record that is not readable JSON comes back as none,
+/// so one damaged row cannot fail the whole list.
+const DOWNLOAD_COLUMNS: &str = "sid, path, sha256, name, bytes, arrived_at, checked_at,
+    origin, signature, outcome, actions,
+    CASE WHEN json_valid(dissection)
+         THEN json_remove(dissection, '$.members', '$.scan', '$.whole_archive', '$.unmatched')
+    END";
+
+fn download_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadRow> {
+    Ok(DownloadRow {
+        sid: row.get(0)?,
+        path: row.get(1)?,
+        sha256: row.get(2)?,
+        name: row.get(3)?,
+        bytes: row.get::<_, i64>(4)?.max(0) as u64,
+        arrived_at: row.get(5)?,
+        checked_at: row.get(6)?,
+        origin: row.get(7)?,
+        signature: row.get(8)?,
+        outcome: row.get(9)?,
+        actions: row.get(10)?,
+        dissection: row.get(11)?,
+    })
 }
 
 /// Whether the protective work is running, as stored in `settings`.
@@ -506,35 +540,61 @@ impl Store {
     ///
     /// Only theirs. The agent serves everybody signed in to the machine, and a
     /// list of what somebody downloaded is theirs to read and nobody else's.
+    ///
+    /// The record of taking an archive apart comes back without its list of
+    /// members: see [`DOWNLOAD_COLUMNS`].
     pub fn downloads_for(&self, sid: &str, limit: usize) -> Result<Vec<DownloadRow>> {
         let connection = self.lock()?;
         let mut statement = connection
-            .prepare(
-                "SELECT sid, path, sha256, name, bytes, arrived_at, checked_at,
-                        origin, signature, outcome, actions, dissection
-                 FROM downloads WHERE sid = ?1
-                 ORDER BY checked_at DESC, id DESC LIMIT ?2",
-            )
+            .prepare(&format!(
+                "SELECT {DOWNLOAD_COLUMNS} FROM downloads WHERE sid = ?1
+                 ORDER BY checked_at DESC, id DESC LIMIT ?2"
+            ))
             .map_err(to_db_error)?;
         let rows = statement
-            .query_map(params![sid, limit as i64], |row| {
-                Ok(DownloadRow {
-                    sid: row.get(0)?,
-                    path: row.get(1)?,
-                    sha256: row.get(2)?,
-                    name: row.get(3)?,
-                    bytes: row.get::<_, i64>(4)?.max(0) as u64,
-                    arrived_at: row.get(5)?,
-                    checked_at: row.get(6)?,
-                    origin: row.get(7)?,
-                    signature: row.get(8)?,
-                    outcome: row.get(9)?,
-                    actions: row.get(10)?,
-                    dissection: row.get(11)?,
-                })
-            })
+            .query_map(params![sid, limit as i64], download_row)
             .map_err(to_db_error)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(to_db_error)
+    }
+
+    /// One person's row for one path: the newest, or the one with this
+    /// content when `sha256` is given. `None` when there is none.
+    ///
+    /// Asked for by name, so that finding one download does not mean reading
+    /// every row, and so that a row older than the newest thousand can still
+    /// be found.
+    pub fn download_at(
+        &self,
+        sid: &str,
+        path: &str,
+        sha256: Option<&str>,
+    ) -> Result<Option<DownloadRow>> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                &format!(
+                    "SELECT {DOWNLOAD_COLUMNS} FROM downloads
+                     WHERE sid = ?1 AND path = ?2 AND (?3 IS NULL OR sha256 = ?3)
+                     ORDER BY checked_at DESC, id DESC LIMIT 1"
+                ),
+                params![sid, path, sha256],
+                download_row,
+            )
+            .optional()
+            .map_err(to_db_error)
+    }
+
+    /// How many checked downloads one person has on record.
+    pub fn download_count(&self, sid: &str) -> Result<u64> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM downloads WHERE sid = ?1",
+                params![sid],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count.max(0) as u64)
             .map_err(to_db_error)
     }
 
@@ -2368,6 +2428,90 @@ mod tests {
                 .unwrap(),
             "an action landed on somebody else's row"
         );
+    }
+
+    /// A row comes back with the counts of what its archive held and without
+    /// the list of members, which is most of the row and which nothing that
+    /// reads a row back needs. A record that is not JSON reads as none and
+    /// does not fail the list.
+    #[test]
+    fn a_row_is_read_back_without_the_members_of_its_archive() {
+        let store = Store::open_in_memory().unwrap();
+        let me = "S-1-5-21-1-1001";
+        let member = format!(r#"{{"name":"{}","bytes":1}}"#, "x".repeat(200));
+        let listed = vec![member; 5000].join(",");
+        let dissection = format!(
+            r#"{{"archive":"a","scan":{{"threats":["{}"]}},"members":[{listed}],"totals":{{"files":5000}},"offered":true,"whole_archive":["w"],"unmatched":["u"]}}"#,
+            "y".repeat(5000)
+        );
+        assert!(dissection.len() > 1_000_000, "the premise: a large record");
+        for (path, sha256, record) in [
+            (r"C:\D\big.zip", "aa", dissection.as_str()),
+            (r"C:\D\damaged.zip", "bb", "not json at all"),
+        ] {
+            store
+                .record_download_check(&download(me, path, sha256, "{}"))
+                .unwrap();
+            assert!(store
+                .set_download_dissection(me, path, sha256, record)
+                .unwrap());
+        }
+
+        let rows = store.downloads_for(me, 50).unwrap();
+        assert_eq!(rows.len(), 2, "a damaged record failed the whole list");
+        let big = rows.iter().find(|row| row.sha256 == "aa").unwrap();
+        let kept = big.dissection.as_deref().unwrap();
+        assert!(
+            kept.len() < 200,
+            "the members came back: {} bytes",
+            kept.len()
+        );
+        assert!(kept.contains(r#""totals":{"files":5000}"#), "{kept}");
+        assert!(kept.contains(r#""offered":true"#), "{kept}");
+        assert!(
+            !kept.contains("members") && !kept.contains("scan"),
+            "{kept}"
+        );
+        let damaged = rows.iter().find(|row| row.sha256 == "bb").unwrap();
+        assert_eq!(damaged.dissection, None);
+
+        // The one-row read is the same shape.
+        let one = store
+            .download_at(me, r"C:\D\big.zip", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(one.dissection, big.dissection);
+    }
+
+    /// One download is found by its path, newest content first or by its
+    /// content, without reading every row to look for it, and only among the
+    /// caller's own.
+    #[test]
+    fn one_download_is_found_by_its_path() {
+        let store = Store::open_in_memory().unwrap();
+        let me = "S-1-5-21-1-1001";
+        let path = r"C:\Users\me\Downloads\setup.exe";
+        store
+            .record_download_check(&download(me, path, "aa", "first"))
+            .unwrap();
+        store
+            .record_download_check(&download(me, path, "bb", "second"))
+            .unwrap();
+        store
+            .record_download_check(&download("S-1-5-21-1-1002", path, "cc", "theirs"))
+            .unwrap();
+
+        let newest = store.download_at(me, &path.to_uppercase(), None).unwrap();
+        assert_eq!(newest.map(|row| row.outcome).as_deref(), Some("second"));
+        let by_content = store.download_at(me, path, Some("aa")).unwrap();
+        assert_eq!(by_content.map(|row| row.outcome).as_deref(), Some("first"));
+        assert!(store.download_at(me, path, Some("cc")).unwrap().is_none());
+        assert!(store
+            .download_at(me, r"C:\Users\me\Downloads\other.exe", None)
+            .unwrap()
+            .is_none());
+        assert_eq!(store.download_count(me).unwrap(), 2);
+        assert_eq!(store.download_count("S-1-5-21-1-1003").unwrap(), 0);
     }
 
     /// A store from before readings were kept, as an update finds it: swept,

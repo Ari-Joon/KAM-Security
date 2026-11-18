@@ -215,7 +215,123 @@ pub fn note_for(name: &str) -> ThreatNote {
 pub const MACHINE_LEARNING: &str = "The !ml at the end of the name means Defender's \
      machine-learning model flagged it, rather than a match with a known signature.";
 
+/// How large an answer may be, as the JSON it travels and is stored as.
+///
+/// An answer goes back to the window in one frame, and a frame may not exceed
+/// 8 MiB. Defender's list for an archive with a great many detections, or
+/// with names built to print lines of their own, can be longer than that, and
+/// a reply that cannot be sent is a check that never answers. Measured as
+/// JSON and not as what Defender printed, because one printed byte can become
+/// six once a control character is escaped.
+pub const MAX_ANSWER_BYTES: usize = 3 * 1024 * 1024;
+
+/// How many of Defender's names a history row keeps, and how much of each
+/// resource. A row is for reading back, not for taking an archive apart.
+const RECORDED_NAMES: usize = 50;
+const RECORDED_RESOURCE_CHARS: usize = 1024;
+
+/// Text for a history row, cut to a length that keeps the row small.
+fn clip(text: &str) -> String {
+    text.chars().take(RECORDED_RESOURCE_CHARS).collect()
+}
+
 impl FileScan {
+    /// This answer, cut to fit in `budget` bytes of JSON if it does not.
+    ///
+    /// Resources are kept in the order Defender listed them until the budget
+    /// is spent. When anything is left off, the listing is marked as not
+    /// adding up, so nothing is offered for extraction on the strength of a
+    /// list that is known to be incomplete. That Defender flagged something
+    /// stands either way.
+    pub fn bounded(mut self, budget: usize) -> Self {
+        // The text as JSON, and the comma or braces that go with it.
+        let size = |text: &str| {
+            serde_json::to_string(text).map_or(usize::MAX, |json| json.len().saturating_add(32))
+        };
+        let mut spent = 0_usize;
+        let mut cut = false;
+        let mut kept: Vec<Flagged> = Vec::new();
+        for mut threat in std::mem::take(&mut self.threats) {
+            // A name brings its note with it, which is longer than the name.
+            let note = serde_json::to_string(&note_for(&threat.name))
+                .map_or(usize::MAX, |json| json.len());
+            spent = spent.saturating_add(size(&threat.name).saturating_add(note));
+            if spent > budget {
+                cut = true;
+                break;
+            }
+            let mut resources = Vec::new();
+            for resource in std::mem::take(&mut threat.resources) {
+                spent = spent.saturating_add(size(&resource));
+                if spent > budget {
+                    cut = true;
+                    break;
+                }
+                resources.push(resource);
+            }
+            threat.resources = resources;
+            kept.push(threat);
+            if cut {
+                break;
+            }
+        }
+        self.threats = kept;
+        if cut {
+            self.notes = notes_for(&self.threats);
+            self.listing_consistent = false;
+            self.caveat.get_or_insert_with(|| {
+                "Defender's list of what it flagged was too long to keep whole.".to_owned()
+            });
+        }
+        self
+    }
+
+    /// The answer as a history row keeps it: what Defender said, by what
+    /// names, and one resource for each name.
+    ///
+    /// The one resource is a member of the archive where the name has one, so
+    /// a reader can still tell a flag on a file inside from a flag on the
+    /// archive as a whole. The full list is in the reply to the check, which
+    /// is where taking an archive apart reads it from; a row that kept it
+    /// could be megabytes, and a thousand such rows could not be listed.
+    pub fn for_record(&self) -> Self {
+        let mut threats: Vec<Flagged> = Vec::new();
+        for threat in &self.threats {
+            let names_member = |resource: &&String| resource.contains("->");
+            let name = clip(&threat.name);
+            match threats.iter().position(|kept| kept.name == name) {
+                Some(at) => {
+                    // A later block of the same name may be the one that
+                    // names a file inside.
+                    let kept = &mut threats[at];
+                    if !kept.resources.iter().any(|kept| names_member(&kept)) {
+                        if let Some(member) = threat.resources.iter().find(names_member) {
+                            kept.resources = vec![clip(member)];
+                        }
+                    }
+                }
+                None if threats.len() < RECORDED_NAMES => threats.push(Flagged {
+                    name,
+                    resources: threat
+                        .resources
+                        .iter()
+                        .find(names_member)
+                        .or(threat.resources.first())
+                        .map(|resource| vec![clip(resource)])
+                        .unwrap_or_default(),
+                }),
+                None => {}
+            }
+        }
+        Self {
+            notes: notes_for(&threats),
+            threats,
+            caveat: self.caveat.clone(),
+            definitions: self.definitions.clone(),
+            ..*self
+        }
+    }
+
     /// The names Defender gave, without repeats, in the order it gave them.
     pub fn threat_names(&self) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
@@ -366,7 +482,7 @@ pub fn check_file(path: &str, cancel: &AtomicBool) -> Result<FileScan> {
             definitions: None,
             notes: Vec::new(),
         },
-        None => parse_report(exit_code, &output),
+        None => parse_report(exit_code, &output).bounded(MAX_ANSWER_BYTES),
     };
     scan.seconds = started.elapsed().as_secs();
     scan.definitions = definitions;
@@ -1297,6 +1413,88 @@ mod tests {
                 "no dashes in what the person reads"
             );
         }
+    }
+
+    /// A list of detections long enough to overflow one frame of the pipe is
+    /// cut to a size that can be sent, and says it was cut: the flag stands,
+    /// and nothing is offered on the strength of an incomplete list.
+    #[test]
+    fn an_answer_too_long_to_send_is_cut_and_says_so() {
+        let mut output = format!(
+            "Scanning {ZIP} found 1 threats.\r\n\
+             Threat                  : Virus:DOS/EICAR_Test_File\r\n\
+             Resources               : 40000 total\r\n"
+        );
+        for number in 0..40_000 {
+            // Backslashes and a control character: the worst a printed name
+            // can be for the JSON it becomes.
+            output.push_str(&format!(
+                "    file                : {ZIP}->{}\u{1}{number}.exe\r\n",
+                r"a\b\".repeat(40)
+            ));
+        }
+        let whole = parse_report(Some(2), &output);
+        assert!(whole.listing_consistent, "the premise: the list adds up");
+        assert!(
+            serde_json::to_vec(&whole).unwrap().len() > 8 * 1024 * 1024,
+            "the premise: this answer does not fit in a frame"
+        );
+
+        let sent = whole.clone().bounded(MAX_ANSWER_BYTES);
+        let size = serde_json::to_vec(&sent).unwrap().len();
+        assert!(size <= MAX_ANSWER_BYTES + 4096, "{size} bytes");
+        assert_eq!(sent.answer, Answer::Flagged, "the flag itself stands");
+        assert!(!sent.listing_consistent);
+        assert!(sent
+            .caveat
+            .as_deref()
+            .unwrap_or_default()
+            .contains("too long"));
+        assert!(!sent.threats[0].resources.is_empty());
+
+        // An ordinary answer is not touched.
+        let ordinary = parse_report(Some(2), &eicar_output(ZIP));
+        assert_eq!(ordinary.clone().bounded(MAX_ANSWER_BYTES), ordinary);
+    }
+
+    /// A history row keeps Defender's names and one resource for each, a
+    /// member of the archive where there is one, and not the whole list.
+    #[test]
+    fn a_history_row_keeps_the_names_and_one_resource_for_each() {
+        let scan = FileScan {
+            threats: vec![
+                Flagged {
+                    name: "Trojan:Win32/Example".to_owned(),
+                    resources: vec![format!("containerfile : {ZIP}")],
+                },
+                Flagged {
+                    name: "Trojan:Win32/Example".to_owned(),
+                    resources: (0..5000)
+                        .map(|number| format!("file : {ZIP}->tools/{number}.exe"))
+                        .collect(),
+                },
+                Flagged {
+                    name: "Exploit:Win32/Whole".to_owned(),
+                    resources: vec![format!("file:_{ZIP}")],
+                },
+            ],
+            ..parse_report(Some(2), &eicar_output(ZIP))
+        };
+        let row = scan.for_record();
+        assert_eq!(row.answer, Answer::Flagged);
+        assert_eq!(
+            row.threat_names(),
+            ["Trojan:Win32/Example", "Exploit:Win32/Whole"]
+        );
+        assert_eq!(row.threats.len(), 2);
+        assert_eq!(
+            row.threats[0].resources,
+            [format!("file : {ZIP}->tools/0.exe")],
+            "the one kept names a file inside, where the name has one"
+        );
+        assert_eq!(row.threats[1].resources.len(), 1);
+        assert_eq!(row.notes.len(), 2);
+        assert!(serde_json::to_vec(&row).unwrap().len() < 4096);
     }
 
     #[test]

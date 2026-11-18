@@ -1041,6 +1041,17 @@ export type Dissection = {
   original: { quarantined: string | null; refused: string | null };
 };
 
+/**
+ * What a history row says about an archive that was taken apart: the counts,
+ * without the list of members, which stays in the store.
+ */
+export type DissectionSummary = {
+  totals: DissectionTotals;
+  offered: boolean;
+  not_offered: string | null;
+  original: { quarantined: string | null; refused: string | null };
+};
+
 export type RemovedFile = {
   name: string;
   /** The detection that names it, when Defender's history has one. */
@@ -1072,7 +1083,7 @@ export type DownloadRecord = {
   scan: FileScan;
   checked_at: string;
   actions: DownloadAction[];
-  dissection: Dissection | null;
+  dissection: DissectionSummary | null;
   first_check: boolean;
 };
 
@@ -1106,6 +1117,8 @@ export type DownloadsPage = {
   folder_error: string | null;
   watch: WatchStatus;
   records: PageRecord[];
+  /** How many checks are on record in all; can be more than `records` holds. */
+  on_record: number;
   history_error: string | null;
   unchecked: LooseFile[];
   failures: { path: string; message: string }[];

@@ -205,7 +205,7 @@ pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
         | Request::GetCanaries
         | Request::GetProtection
         | Request::CheckDownload { .. }
-        | Request::ListDownloads => false,
+        | Request::ListDownloads { .. } => false,
     }
 }
 
@@ -1084,7 +1084,9 @@ pub fn handle(
         }
 
         // Not audited. The page reads it whenever it is opened.
-        Request::ListDownloads => crate::downloads::list(context, user),
+        Request::ListDownloads { paths, recent } => {
+            crate::downloads::list(&paths, recent, context, user)
+        }
 
         Request::QuarantineDownload { path } => crate::downloads::quarantine(&path, context, user),
 
@@ -2223,6 +2225,14 @@ mod tests {
         file
     }
 
+    /// The history, as the page asks for it.
+    fn everything() -> Request {
+        Request::ListDownloads {
+            paths: Vec::new(),
+            recent: 1000,
+        }
+    }
+
     fn check(path: &str, user: &UserContext, context: &Context) -> Response {
         handle(
             Request::CheckDownload {
@@ -2263,14 +2273,14 @@ mod tests {
         };
         assert!(!second.first_check, "a second look was announced as new");
 
-        let Response::Downloads { records } =
-            handle(Request::ListDownloads, &context, &Reporter::silent(), &me)
+        let Response::Downloads { records, .. } =
+            handle(everything(), &context, &Reporter::silent(), &me)
         else {
             panic!("no history came back");
         };
         assert_eq!(records.len(), 1);
-        let Response::Downloads { records } =
-            handle(Request::ListDownloads, &context, &Reporter::silent(), &them)
+        let Response::Downloads { records, .. } =
+            handle(everything(), &context, &Reporter::silent(), &them)
         else {
             panic!("no history came back");
         };
@@ -2509,8 +2519,8 @@ mod tests {
         );
         assert!(matches!(extracted, Response::Acknowledged));
 
-        let Response::Downloads { records } =
-            handle(Request::ListDownloads, &context, &Reporter::silent(), &me)
+        let Response::Downloads { records, .. } =
+            handle(everything(), &context, &Reporter::silent(), &me)
         else {
             panic!("no history");
         };

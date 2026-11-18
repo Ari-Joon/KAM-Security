@@ -365,7 +365,20 @@ pub enum Request {
         copy_of: Option<String>,
     },
     /// The caller's own download history, and nobody else's.
-    ListDownloads,
+    ///
+    /// `recent` is how many of the most recently checked rows to send, which
+    /// the agent caps. `paths` are files whose newest row is wanted however
+    /// old it is: the window names what is in the Downloads folder now, so a
+    /// file checked long ago does not read as never checked once the history
+    /// has grown past what one answer carries. The answer is also held to a
+    /// size that fits in one frame, and says how many rows are on record, so
+    /// that a history too long to send whole is said and not silently cut.
+    ListDownloads {
+        #[serde(default)]
+        paths: Vec<String>,
+        #[serde(default)]
+        recent: u32,
+    },
     /// Move one download into quarantine.
     ///
     /// Fenced to a file that resolves inside the caller's own Downloads
@@ -504,9 +517,13 @@ pub enum Response {
     Hardening(Box<HardeningReport>),
     /// One download, as just checked and recorded.
     DownloadChecked(Box<kam_scanner::downloads::DownloadRecord>),
-    /// The caller's download history, newest first.
+    /// The caller's download history, newest first: as many rows as were
+    /// asked for and fit in one frame.
     Downloads {
         records: Vec<kam_scanner::downloads::DownloadRecord>,
+        /// How many rows the caller has on record in all.
+        #[serde(default)]
+        on_record: u64,
     },
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {
@@ -615,6 +632,7 @@ mod tests {
         round_trip(Response::Hardening(Default::default()));
         round_trip(Response::Downloads {
             records: Vec::new(),
+            on_record: 0,
         });
         round_trip(Response::BehaviourEvents {
             observations: Vec::new(),

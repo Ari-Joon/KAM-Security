@@ -66,8 +66,10 @@ pub struct DownloadRecord {
     pub checked_at: String,
     #[serde(default)]
     pub actions: Vec<DownloadAction>,
+    /// What taking it apart came to, when it has been: the counts, not the
+    /// list of members, which stays in the store.
     #[serde(default)]
-    pub dissection: Option<Dissection>,
+    pub dissection: Option<DissectionSummary>,
     /// Set only in the reply to a check: true the first time this file, with
     /// this content, was recorded for this person. A notice is sent then and
     /// not on a second look.
@@ -403,6 +405,29 @@ pub struct Dissection {
     pub original: OriginalFate,
 }
 
+/// How many members of an archive are kept in its record. The totals count
+/// every member regardless. The window cuts what it reports to this, so that
+/// the report of a vast archive still fits in one frame of the pipe, and the
+/// agent cuts what it is sent to the same number whatever arrives.
+pub const RECORDED_MEMBERS: usize = 5000;
+
+/// What a history row says about an archive that was taken apart.
+///
+/// The counts and what became of the original, without the members. A row
+/// used to travel with its whole list, up to five thousand names, and a
+/// history of a dozen large archives then no longer fitted in one frame of
+/// the pipe: the page could not be sent its list at all, and stayed that way.
+/// Reads from a stored [`Dissection`], whose other fields it ignores.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DissectionSummary {
+    pub totals: Totals,
+    pub offered: bool,
+    #[serde(default)]
+    pub not_offered: Option<String>,
+    #[serde(default)]
+    pub original: OriginalFate,
+}
+
 /// What a person agreed to extract, and what came of it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Extraction {
@@ -606,10 +631,22 @@ pub fn dissect(archive: &str, sha256: &str, scan: FileScan, entries: &[Entry]) -
 }
 
 impl Dissection {
+    /// The counts, for a history row. See [`DissectionSummary`].
+    pub fn summary(&self) -> DissectionSummary {
+        DissectionSummary {
+            totals: self.totals.clone(),
+            offered: self.offered,
+            not_offered: self.not_offered.clone(),
+            original: self.original.clone(),
+        }
+    }
+
     /// A copy small enough to record: every flagged and left-out member, and
-    /// the first of the rest up to `keep` in all. The totals are untouched.
+    /// the first of the rest up to `keep` in all, with Defender's answer cut
+    /// to what a row keeps. The totals are untouched.
     pub fn for_record(&self, keep: usize) -> Self {
         let mut copy = self.clone();
+        copy.scan = self.scan.for_record();
         if copy.members.len() <= keep {
             return copy;
         }

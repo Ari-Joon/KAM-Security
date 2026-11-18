@@ -184,6 +184,9 @@ pub struct Page {
     folder_error: Option<String>,
     watch: WatchStatus,
     records: Vec<PageRecord>,
+    /// How many checks are on record in all, which can be more than
+    /// `records` holds: the page says so when it is.
+    on_record: u64,
     history_error: Option<String>,
     unchecked: Vec<LooseFile>,
     failures: Vec<Failure>,
@@ -194,26 +197,27 @@ pub struct Page {
     notifications: Option<String>,
 }
 
-/// Gather the page: the history from the agent, and the folder as it is now.
-pub fn page(state: &Downloads) -> Page {
-    let (records, history_error) = match kam_ipc::client::call(&Request::ListDownloads) {
-        Ok(Response::Downloads { records }) => (records, None),
-        Ok(Response::Error { message }) => (Vec::new(), Some(message)),
-        Ok(other) => (
-            Vec::new(),
-            Some(format!(
-                "the agent answered something unexpected: {other:?}"
-            )),
-        ),
-        Err(error) => (Vec::new(), Some(error.to_string())),
-    };
-    let protection = match kam_ipc::client::call(&Request::GetProtection) {
-        Ok(Response::Protection { enabled }) => Some(enabled),
-        _ => None,
-    };
+/// How many of the most recent checks the page asks for. The agent has its
+/// own cap, and the page says when there are more on record than it shows.
+const RECENT_ROWS: u32 = 1000;
 
+/// The newest row on record for each of `paths`, and the `recent` most
+/// recently checked, with how many rows there are in all.
+fn history(paths: Vec<String>, recent: u32) -> Result<(Vec<DownloadRecord>, u64), String> {
+    match kam_ipc::client::call(&Request::ListDownloads { paths, recent }) {
+        Ok(Response::Downloads { records, on_record }) => Ok((records, on_record)),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(other) => Err(format!(
+            "the agent answered something unexpected: {other:?}"
+        )),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Gather the page: the folder as it is now, and the history from the agent.
+pub fn page(state: &Downloads) -> Page {
     let folder = known_folder();
-    let mut unchecked = Vec::new();
+    let mut present: Vec<(String, String, std::fs::Metadata)> = Vec::new();
     let mut folder_error = None;
     if let Ok(folder) = &folder {
         match std::fs::read_dir(folder) {
@@ -222,34 +226,47 @@ pub fn page(state: &Downloads) -> Page {
                     let Ok(metadata) = item.metadata() else {
                         continue;
                     };
-                    if !metadata.is_file() {
-                        continue;
-                    }
                     let name = item.file_name().to_string_lossy().into_owned();
-                    if is_partial(&name) {
-                        continue;
+                    if metadata.is_file() && !is_partial(&name) {
+                        present.push((item.path().to_string_lossy().into_owned(), name, metadata));
                     }
-                    let path = item.path().to_string_lossy().into_owned();
-                    let latest = records
-                        .iter()
-                        .find(|record| record.check.path.eq_ignore_ascii_case(&path));
-                    if latest.is_some_and(|record| record.check.bytes == metadata.len()) {
-                        continue;
-                    }
-                    unchecked.push(LooseFile {
-                        archive: archive_label(&name),
-                        arrived_at: created_iso(&metadata),
-                        bytes: metadata.len(),
-                        changed_since_checked: latest.is_some(),
-                        name,
-                        path,
-                    });
                 }
             }
             Err(error) => {
                 folder_error = Some(format!("your Downloads folder could not be read: {error}"))
             }
         }
+    }
+
+    // The files in the folder are named in the request, so each one's row
+    // comes back however long ago it was checked. Asked for only by recency,
+    // a file checked before the newest thousand read as never checked.
+    let named = present.iter().map(|(path, _, _)| path.clone()).collect();
+    let (records, on_record, history_error) = match history(named, RECENT_ROWS) {
+        Ok((records, on_record)) => (records, on_record, None),
+        Err(reason) => (Vec::new(), 0, Some(reason)),
+    };
+    let protection = match kam_ipc::client::call(&Request::GetProtection) {
+        Ok(Response::Protection { enabled }) => Some(enabled),
+        _ => None,
+    };
+
+    let mut unchecked = Vec::new();
+    for (path, name, metadata) in present {
+        let latest = records
+            .iter()
+            .find(|record| record.check.path.eq_ignore_ascii_case(&path));
+        if latest.is_some_and(|record| record.check.bytes == metadata.len()) {
+            continue;
+        }
+        unchecked.push(LooseFile {
+            archive: archive_label(&name),
+            arrived_at: created_iso(&metadata),
+            bytes: metadata.len(),
+            changed_since_checked: latest.is_some(),
+            name,
+            path,
+        });
     }
     unchecked.sort_by(|a, b| b.arrived_at.cmp(&a.arrived_at));
 
@@ -287,6 +304,7 @@ pub fn page(state: &Downloads) -> Page {
             .map(|watch| watch.clone())
             .unwrap_or(WatchStatus::Starting),
         records,
+        on_record,
         history_error,
         unchecked,
         failures,
@@ -754,12 +772,9 @@ pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<Dissecti
         .to_owned();
 
     // What Defender said about the original when it arrived, if anything.
-    let earlier = match kam_ipc::client::call(&Request::ListDownloads) {
-        Ok(Response::Downloads { records }) => records
-            .into_iter()
-            .find(|record| record.check.path.eq_ignore_ascii_case(&original)),
-        _ => None,
-    };
+    let earlier = history(vec![original.clone()], 0)
+        .ok()
+        .and_then(|(records, _)| records.into_iter().next());
     let known_flagged = earlier
         .as_ref()
         .is_some_and(|record| record.check.scan.answer == Answer::Flagged);
@@ -838,7 +853,10 @@ pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<Dissecti
     if let Err(error) = kam_ipc::client::call(&Request::RecordDissection {
         path: original.clone(),
         sha256: record.check.sha256.clone(),
-        dissection: Box::new(dissection.clone()),
+        // Cut to what a record keeps before it is sent. Whole, the list of a
+        // vast archive is larger than one frame of the pipe, and the record
+        // of it was then silently never made.
+        dissection: Box::new(dissection.for_record(kam_scanner::downloads::RECORDED_MEMBERS)),
     }) {
         eprintln!("what the archive holds could not be recorded: {error}");
     }

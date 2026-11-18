@@ -416,6 +416,13 @@ export default function Downloads({ launches }: { launches: number }) {
         {page && rows.length === 0 && (
           <p className="empty">Nothing has arrived in Downloads since this was set up.</p>
         )}
+        {page && page.on_record > page.records.length && (
+          <p className="small muted">
+            Showing {fmt.count(page.records.length)} of the {fmt.count(page.on_record)} checks
+            on record: the most recent, and the newest for each file in the folder now. The
+            older ones are still on record.
+          </p>
+        )}
         <ul className="dl-list">
           {rows.map((row) =>
             row.kind === "record" ? (
