@@ -123,11 +123,17 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
         {error && <pre className="error">{error}</pre>}
 
         {scan && scan.method === "directory_walk" && scan.fallback_reason && (
+          // The reason is the service's own and is the only part that says
+          // why. This used to say above it that the file table "needs
+          // administrative rights", whatever the reason was: over "this
+          // volume is not NTFS", and it would have said it over "the file
+          // table is in too many pieces" as well.
           <div className="notice notice-warn">
-            <strong>Read the slow way.</strong> The master file table gives the
-            same answer in about two seconds and counts hard links correctly,
-            but it needs administrative rights. Run the agent as a service, or
-            elevated, to use it.
+            <strong>Read the slow way.</strong> The file table could not be
+            used for this drive, for the reason below, so the folders were
+            walked one by one instead. The file table gives its answer in
+            about two seconds and counts a file with several names once; a
+            walk takes longer and counts it once for each name.
             <pre className="error">{scan.fallback_reason}</pre>
           </div>
         )}

@@ -71,6 +71,24 @@ const NAMESPACE_DOS: u8 = 2;
 /// sequential rather than a series of seeks.
 const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
+/// Bytes read to see the boot sector.
+///
+/// A raw read from a volume has to be a whole number of the disk's sectors.
+/// The boot sector's contents fit in 512 bytes and this used to ask for
+/// exactly that, which is not a whole sector on a disk whose sectors are 4096
+/// bytes: the read failed, and the reader never worked on such a disk at all.
+/// 4096 is a whole number of sectors for both sizes.
+const BOOT_READ_BYTES: usize = 4096;
+
+/// How far apart NTFS puts the bytes it protects in a record.
+///
+/// Always 512, whatever the disk's own sector size. The boot sector's
+/// "bytes per sector" is the disk's, and on a disk with 4096-byte sectors it
+/// is a different number: stepping through a record by it lands past the end
+/// of the record at the second step, so every record on such a disk failed
+/// its check.
+const FIXUP_STRIDE: usize = 512;
+
 /// One file or directory, as the table describes it.
 #[derive(Debug, Clone)]
 pub struct MftEntry {
@@ -162,9 +180,13 @@ fn read_u64(buffer: &[u8], at: usize) -> Option<u64> {
 }
 
 /// Geometry read out of the NTFS boot sector.
+///
+/// The disk's own sector size is read on the way to the cluster size and not
+/// kept. Nothing after the boot sector is measured in it: records are
+/// protected every 512 bytes whatever the disk ([`FIXUP_STRIDE`]), and every
+/// read here is of whole clusters or whole records.
 #[derive(Debug, Clone, Copy)]
 struct Geometry {
-    bytes_per_sector: u64,
     bytes_per_cluster: u64,
     record_bytes: u64,
     mft_start_cluster: u64,
@@ -215,7 +237,6 @@ fn parse_boot_sector(boot: &[u8]) -> Result<Geometry> {
     }
 
     Ok(Geometry {
-        bytes_per_sector,
         bytes_per_cluster,
         record_bytes,
         mft_start_cluster,
@@ -253,7 +274,19 @@ impl Volume {
 
         Ok(Self(handle))
     }
+}
 
+/// Somewhere a volume's bytes can be read from, at any offset.
+///
+/// The real one is a handle on the volume, which needs administrative rights
+/// and a disk of the right kind to exercise. Reading through this instead
+/// means the whole reader can be run against a volume made up in memory, with
+/// whatever sector size and whatever layout a test needs.
+trait RawVolume {
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize>;
+}
+
+impl RawVolume for Volume {
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
         unsafe {
             SetFilePointerEx(self.0, offset as i64, None, FILE_BEGIN)
@@ -335,12 +368,12 @@ fn parse_runs(mapping: &[u8]) -> Vec<Run> {
 
 /// Undo the update sequence protection applied to a multi-sector structure.
 ///
-/// NTFS overwrites the last two bytes of every sector in a record with a shared
-/// sequence number, keeping the originals in an array in the header. It is how
-/// a torn write is detected. Skipping this step corrupts any attribute that
-/// happens to straddle a sector boundary, which on a 1 KB record over 512-byte
-/// sectors is most of them.
-fn apply_fixups(record: &mut [u8], bytes_per_sector: u64) -> Option<()> {
+/// NTFS overwrites the last two bytes of every 512 bytes in a record with a
+/// shared sequence number, keeping the originals in an array in the header. It
+/// is how a torn write is detected. Skipping this step corrupts any attribute
+/// that happens to straddle one of those boundaries, which in a 1 KB record is
+/// most of them.
+fn apply_fixups(record: &mut [u8]) -> Option<()> {
     let offset = read_u16(record, 0x04)? as usize;
     let count = read_u16(record, 0x06)? as usize;
     if count == 0 {
@@ -348,10 +381,9 @@ fn apply_fixups(record: &mut [u8], bytes_per_sector: u64) -> Option<()> {
     }
 
     let signature = read_u16(record, offset)?;
-    let sector_size = bytes_per_sector as usize;
 
     for sector in 0..count - 1 {
-        let tail = (sector + 1) * sector_size;
+        let tail = (sector + 1) * FIXUP_STRIDE;
         if tail < 2 || tail > record.len() {
             return None;
         }
@@ -530,7 +562,7 @@ struct Parsed {
 /// happen several times at once. On this machine the table holds 1.9 million
 /// records: reading them off an NVMe disk takes about half a second and parsing
 /// them took nearly two, so the disk was idle for three quarters of the wait.
-fn parse_block(block: &mut Block, record_bytes: usize, bytes_per_sector: u64) -> Parsed {
+fn parse_block(block: &mut Block, record_bytes: usize) -> Parsed {
     let mut parsed = Parsed::default();
     let mut record_index = block.first_record;
 
@@ -541,7 +573,7 @@ fn parse_block(block: &mut Block, record_bytes: usize, bytes_per_sector: u64) ->
             parsed.stats.records_seen += 1;
         }
 
-        if apply_fixups(record, bytes_per_sector).is_some() {
+        if apply_fixups(record).is_some() {
             if let Some(raw) = parse_record(record) {
                 if raw.in_use {
                     parsed.stats.in_use += 1;
@@ -633,9 +665,21 @@ impl BufferPool {
 /// Read the whole master file table for one drive letter.
 pub fn read(drive_letter: char) -> Result<MftSnapshot> {
     let volume = Volume::open(drive_letter)?;
+    read_from(&volume, drive_letter)
+}
 
-    let mut boot = vec![0_u8; 512];
-    volume.read_at(0, &mut boot)?;
+/// Read the whole master file table of a volume that is already open.
+fn read_from(volume: &impl RawVolume, drive_letter: char) -> Result<MftSnapshot> {
+    let mut boot = vec![0_u8; BOOT_READ_BYTES];
+    let read = volume.read_at(0, &mut boot)?;
+    // A read that came back short is not an NTFS volume failing to be one,
+    // and is not reported as that.
+    if read < 512 {
+        return Err(Error::Refused(
+            "the start of the volume could not be read".to_owned(),
+        ));
+    }
+    boot.truncate(read);
     let geometry = parse_boot_sector(&boot)?;
 
     // Record 0 describes the $MFT itself, including where the rest of it lives.
@@ -644,10 +688,10 @@ pub fn read(drive_letter: char) -> Result<MftSnapshot> {
         geometry.mft_start_cluster * geometry.bytes_per_cluster,
         &mut first,
     )?;
-    apply_fixups(&mut first, geometry.bytes_per_sector)
+    apply_fixups(&mut first)
         .ok_or_else(|| Error::Refused("the $MFT record failed its fixup check".to_owned()))?;
 
-    let runs = mft_runs(&first)?;
+    let runs = mft_runs(&first, geometry.bytes_per_cluster)?;
     if runs.is_empty() {
         return Err(Error::Refused("the $MFT reported no data runs".to_owned()));
     }
@@ -656,7 +700,6 @@ pub fn read(drive_letter: char) -> Result<MftSnapshot> {
     let mut bytes_read = 0_u64;
 
     let record_bytes = geometry.record_bytes as usize;
-    let bytes_per_sector = geometry.bytes_per_sector;
 
     // One thread reads, the rest parse.
     //
@@ -675,6 +718,7 @@ pub fn read(drive_letter: char) -> Result<MftSnapshot> {
     let pool = BufferPool::new(threads + 2);
 
     let mut read_error: Option<Error> = None;
+    let mut blocks_sent = 0_usize;
     let mut blocks: Vec<(usize, Parsed)> = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|_| {
@@ -690,7 +734,7 @@ pub fn read(drive_letter: char) -> Result<MftSnapshot> {
                             Err(_) => break,
                         };
                         let Ok(mut block) = taken else { break };
-                        let parsed = parse_block(&mut block, record_bytes, bytes_per_sector);
+                        let parsed = parse_block(&mut block, record_bytes);
                         mine.push((block.sequence, parsed));
                         pool.give_back(block.bytes);
                     }
@@ -774,6 +818,7 @@ pub fn read(drive_letter: char) -> Result<MftSnapshot> {
 
         // Closing the queue is what tells the parsers there is no more.
         drop(sender);
+        blocks_sent = sequence;
 
         let mut all = Vec::new();
         for worker in workers {
@@ -786,6 +831,33 @@ pub fn read(drive_letter: char) -> Result<MftSnapshot> {
 
     if let Some(error) = read_error {
         return Err(error);
+    }
+
+    // A table read in part is not a table, and is never returned as one.
+    //
+    // Two ways it could be, both of which used to pass without a word. A read
+    // that came back short ended that piece of the table and went on to the
+    // next, which lost the records in between and numbered every later one
+    // wrongly, so parents pointed at the wrong folders. And a parser thread
+    // that died took the blocks it had finished with it. Either way the result
+    // was a smaller drive than the real one, presented as the whole of it.
+    let listed_bytes = runs.iter().fold(0_u64, |total, run| {
+        total.saturating_add(run.clusters.saturating_mul(geometry.bytes_per_cluster))
+    });
+    if bytes_read < listed_bytes {
+        return Err(Error::Refused(format!(
+            "the file table on this drive could only be read in part ({} of {}), so \
+             it was not used",
+            megabytes(bytes_read),
+            megabytes(listed_bytes)
+        )));
+    }
+    if blocks.len() != blocks_sent {
+        return Err(Error::Refused(format!(
+            "part of the file table on this drive was read and then lost before it \
+             could be interpreted ({} of {blocks_sent} blocks were), so it was not used",
+            blocks.len()
+        )));
     }
 
     // Merged in the order the blocks were read, so the result does not depend
@@ -836,8 +908,27 @@ pub fn read(drive_letter: char) -> Result<MftSnapshot> {
     })
 }
 
+/// A size the way a person would say it, for a refusal somebody will read.
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
 /// Find the `$DATA` runs inside the `$MFT`'s own record.
-fn mft_runs(record: &[u8]) -> Result<Vec<Run>> {
+///
+/// # The list can run on past this record
+///
+/// A table that has grown in a great many pieces, as on an old and nearly full
+/// hard disk, has more pieces than one record holds. NTFS then continues the
+/// list in other records, and this reads only the first. It used to return
+/// that part as though it were all of it: the reader read the first stretch of
+/// the table, found the files recorded there, and reported a drive that
+/// looked half empty, with nothing to say so.
+///
+/// The record states how long the table is, so the two are compared. A list
+/// that covers less than the table holds is refused, with both figures. Scan
+/// then walks the folders and gives this as its reason, and the pages with no
+/// other route show it. Following the continuation is not done here.
+fn mft_runs(record: &[u8], bytes_per_cluster: u64) -> Result<Vec<Run>> {
     let malformed = || Error::Refused("the $MFT record could not be parsed".to_owned());
 
     let mut cursor = read_u16(record, 0x14).ok_or_else(malformed)? as usize;
@@ -859,7 +950,26 @@ fn mft_runs(record: &[u8]) -> Result<Vec<Run>> {
             let mapping = record
                 .get(cursor + mapping_offset..cursor + length)
                 .ok_or_else(malformed)?;
-            return Ok(parse_runs(mapping));
+            let runs = parse_runs(mapping);
+
+            // The table's length in bytes, which only this first piece of the
+            // attribute carries. Measured against what holds records rather
+            // than against what is set aside for the table to grow into: a
+            // list that reaches every record is whole for this purpose.
+            let table_bytes = read_u64(record, cursor + 0x30).ok_or_else(malformed)?;
+            let listed_bytes = runs.iter().fold(0_u64, |total, run| {
+                total.saturating_add(run.clusters.saturating_mul(bytes_per_cluster))
+            });
+            if listed_bytes < table_bytes {
+                return Err(Error::Refused(format!(
+                    "the file table on this drive is in too many pieces to read directly: \
+                     its first record lists {} of {}, and reading only that much would \
+                     leave files out",
+                    megabytes(listed_bytes),
+                    megabytes(table_bytes)
+                )));
+            }
+            return Ok(runs);
         }
 
         cursor += length;
@@ -887,7 +997,6 @@ mod tests {
     fn typical_geometry_is_read_correctly() {
         // 8 sectors per cluster, records described as 2^10 bytes.
         let geometry = parse_boot_sector(&boot_sector(8, -10)).unwrap();
-        assert_eq!(geometry.bytes_per_sector, 512);
         assert_eq!(geometry.bytes_per_cluster, 4096);
         assert_eq!(geometry.record_bytes, 1024);
         assert_eq!(geometry.mft_start_cluster, 786_432);
@@ -944,7 +1053,7 @@ mod tests {
         record[510..512].copy_from_slice(&0xBEEF_u16.to_le_bytes());
         record[1022..1024].copy_from_slice(&0xBEEF_u16.to_le_bytes());
 
-        assert!(apply_fixups(&mut record, 512).is_some());
+        assert!(apply_fixups(&mut record).is_some());
         assert_eq!(read_u16(&record, 510).unwrap(), 0x1111);
         assert_eq!(read_u16(&record, 1022).unwrap(), 0x2222);
     }
@@ -960,6 +1069,316 @@ mod tests {
         record[510..512].copy_from_slice(&0xBEEF_u16.to_le_bytes());
         record[1022..1024].copy_from_slice(&0xDEAD_u16.to_le_bytes());
 
-        assert!(apply_fixups(&mut record, 512).is_none());
+        assert!(apply_fixups(&mut record).is_none());
+    }
+
+    // What follows reads whole volumes made up in memory. The real reader
+    // needs administrative rights and a disk of the kind being tested, and the
+    // two kinds it got wrong are ones the development machine does not have.
+    // These are built from the layout NTFS documents, by somebody reading that
+    // layout, so they show that the reader does what the layout asks. They are
+    // not a real disk of either kind.
+
+    fn put(buffer: &mut [u8], at: usize, bytes: &[u8]) {
+        buffer[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn rounded_to_eight(length: usize) -> usize {
+        (length + 7) & !7
+    }
+
+    /// An attribute whose value sits inside the record.
+    fn resident(kind: u32, value: &[u8]) -> Vec<u8> {
+        const HEADER: usize = 0x18;
+        let mut attribute = vec![0_u8; rounded_to_eight(HEADER + value.len())];
+        let length = attribute.len() as u32;
+        put(&mut attribute, 0x00, &kind.to_le_bytes());
+        put(&mut attribute, 0x04, &length.to_le_bytes());
+        put(&mut attribute, 0x10, &(value.len() as u32).to_le_bytes());
+        put(&mut attribute, 0x14, &(HEADER as u16).to_le_bytes());
+        put(&mut attribute, HEADER, value);
+        attribute
+    }
+
+    fn standard_information(modified: u64) -> Vec<u8> {
+        let mut value = vec![0_u8; 0x30];
+        put(&mut value, 0x08, &modified.to_le_bytes());
+        resident(ATTR_STANDARD_INFORMATION, &value)
+    }
+
+    fn file_name(parent: u32, name: &str) -> Vec<u8> {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let mut value = vec![0_u8; 0x42 + units.len() * 2];
+        put(&mut value, 0x00, &(parent as u64).to_le_bytes());
+        value[0x40] = units.len() as u8;
+        // The Win32 namespace: an ordinary long name.
+        value[0x41] = 1;
+        for (position, unit) in units.iter().enumerate() {
+            put(&mut value, 0x42 + position * 2, &unit.to_le_bytes());
+        }
+        resident(ATTR_FILE_NAME, &value)
+    }
+
+    /// An unnamed `$DATA` whose contents live in clusters, as a list of
+    /// (clusters, first cluster) pieces. `bytes` is the length it states.
+    fn data_in_clusters(pieces: &[(u8, u16)], bytes: u64) -> Vec<u8> {
+        const HEADER: usize = 0x40;
+        let mut mapping = Vec::new();
+        let mut previous = 0_i32;
+        for (clusters, first) in pieces {
+            // One byte of length, two of offset from the piece before.
+            let step = (*first as i32 - previous) as i16;
+            mapping.push(0x21);
+            mapping.push(*clusters);
+            mapping.extend_from_slice(&step.to_le_bytes());
+            previous = *first as i32;
+        }
+        mapping.push(0);
+
+        let mut attribute = vec![0_u8; rounded_to_eight(HEADER + mapping.len())];
+        let length = attribute.len() as u32;
+        put(&mut attribute, 0x00, &ATTR_DATA.to_le_bytes());
+        put(&mut attribute, 0x04, &length.to_le_bytes());
+        attribute[0x08] = 1;
+        put(&mut attribute, 0x20, &(HEADER as u16).to_le_bytes());
+        put(&mut attribute, 0x28, &bytes.to_le_bytes());
+        put(&mut attribute, 0x30, &bytes.to_le_bytes());
+        put(&mut attribute, 0x38, &bytes.to_le_bytes());
+        put(&mut attribute, HEADER, &mapping);
+        attribute
+    }
+
+    const IN_USE: u16 = FLAG_IN_USE;
+    const IN_USE_DIRECTORY: u16 = FLAG_IN_USE | FLAG_DIRECTORY;
+
+    /// One record of `size` bytes, protected the way NTFS protects it: the
+    /// last two bytes of every 512 moved into the header, and a sequence
+    /// number left in their place.
+    fn file_record(size: usize, flags: u16, attributes: &[Vec<u8>]) -> Vec<u8> {
+        const ARRAY: usize = 0x30;
+        const SEQUENCE: u16 = 0x0C0A;
+        let strides = size / 512;
+        let first_attribute = rounded_to_eight(ARRAY + 2 * (strides + 1));
+
+        let mut record = vec![0_u8; size];
+        put(&mut record, 0x00, b"FILE");
+        put(&mut record, 0x04, &(ARRAY as u16).to_le_bytes());
+        put(&mut record, 0x06, &((strides + 1) as u16).to_le_bytes());
+        put(&mut record, 0x14, &(first_attribute as u16).to_le_bytes());
+        put(&mut record, 0x16, &flags.to_le_bytes());
+
+        let mut cursor = first_attribute;
+        for attribute in attributes {
+            put(&mut record, cursor, attribute);
+            cursor += attribute.len();
+        }
+        put(&mut record, cursor, &ATTR_END.to_le_bytes());
+        cursor += 8;
+        put(&mut record, 0x18, &(cursor as u32).to_le_bytes());
+        put(&mut record, 0x1C, &(size as u32).to_le_bytes());
+
+        put(&mut record, ARRAY, &SEQUENCE.to_le_bytes());
+        for stride in 0..strides {
+            let tail = (stride + 1) * 512;
+            let original = [record[tail - 2], record[tail - 1]];
+            put(&mut record, ARRAY + 2 + stride * 2, &original);
+            put(&mut record, tail - 2, &SEQUENCE.to_le_bytes());
+        }
+        record
+    }
+
+    /// A volume in memory, which refuses what a real volume refuses: a read
+    /// that is not a whole number of its sectors, or does not start on one.
+    struct Image {
+        bytes: Vec<u8>,
+        sector: usize,
+    }
+
+    impl RawVolume for Image {
+        fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
+            let offset = offset as usize;
+            let whole_sectors =
+                buffer.len().is_multiple_of(self.sector) && offset.is_multiple_of(self.sector);
+            if !whole_sectors {
+                return Err(Error::Privileged(
+                    "could not read from the volume: the parameter is incorrect".to_owned(),
+                ));
+            }
+            let start = offset.min(self.bytes.len());
+            let end = (start + buffer.len()).min(self.bytes.len());
+            buffer[..end - start].copy_from_slice(&self.bytes[start..end]);
+            Ok(end - start)
+        }
+    }
+
+    /// Where the made-up table starts, in clusters.
+    const TABLE_AT: u16 = 4;
+    /// How many records it holds: the table's own, four unused, the root, one
+    /// folder and one file.
+    const RECORDS: usize = 8;
+
+    /// A small volume: a root, `Users` inside it, and `big.bin` of 5000 bytes
+    /// inside that.
+    ///
+    /// `listed` is how many clusters of the table its own record lists, and
+    /// `stated` how many bytes it says the table is. On a healthy volume the
+    /// first covers the second.
+    fn volume(sector: usize, cluster: usize, record: usize, listed: u8, stated: u64) -> Image {
+        let mut boot = vec![0_u8; sector.max(512)];
+        put(&mut boot, 3, b"NTFS    ");
+        put(&mut boot, 0x0B, &(sector as u16).to_le_bytes());
+        boot[0x0D] = (cluster / sector) as u8;
+        put(&mut boot, 0x30, &(TABLE_AT as u64).to_le_bytes());
+        // Negative means two to that power, in bytes.
+        boot[0x40] = (-(record.trailing_zeros() as i8)) as u8;
+
+        let mut records = vec![vec![0_u8; record]; RECORDS];
+        records[0] = file_record(
+            record,
+            IN_USE,
+            &[
+                file_name(5, "$MFT"),
+                data_in_clusters(&[(listed, TABLE_AT)], stated),
+            ],
+        );
+        records[5] = file_record(record, IN_USE_DIRECTORY, &[file_name(5, ".")]);
+        records[6] = file_record(
+            record,
+            IN_USE_DIRECTORY,
+            &[standard_information(777), file_name(5, "Users")],
+        );
+        records[7] = file_record(
+            record,
+            IN_USE,
+            &[
+                standard_information(999),
+                file_name(6, "big.bin"),
+                data_in_clusters(&[(2, 40)], 5000),
+            ],
+        );
+
+        let mut bytes = vec![0_u8; TABLE_AT as usize * cluster];
+        put(&mut bytes, 0, &boot);
+        for record in records {
+            bytes.extend_from_slice(&record);
+        }
+        // Whole clusters to the end, as a volume is.
+        bytes.resize(bytes.len().next_multiple_of(cluster), 0);
+        Image { bytes, sector }
+    }
+
+    /// The table in whole clusters, and in bytes.
+    fn table_size(cluster: usize, record: usize) -> (u8, u64) {
+        let bytes = RECORDS * record;
+        (bytes.div_ceil(cluster) as u8, bytes as u64)
+    }
+
+    fn assert_the_small_volume_was_read(snapshot: &MftSnapshot) {
+        assert_eq!(snapshot.drive, 'K');
+        assert_eq!(snapshot.skipped, 0);
+        assert_eq!(snapshot.stats.records_seen, 4);
+
+        let users = snapshot.entries.get(&6).expect("the folder was not found");
+        assert!(users.is_directory);
+        assert_eq!((users.name.as_str(), users.parent), ("Users", 5));
+        assert_eq!(users.modified, 777);
+
+        let file = snapshot.entries.get(&7).expect("the file was not found");
+        assert!(!file.is_directory);
+        assert_eq!((file.name.as_str(), file.parent), ("big.bin", 6));
+        assert_eq!(file.bytes, 5000);
+        assert_eq!(file.modified, 999);
+    }
+
+    #[test]
+    fn a_table_on_an_ordinary_disk_is_read_through_the_same_path() {
+        // The control for the tests below: 512-byte sectors and 1 KB records,
+        // which is what the development machine's drive has.
+        let (clusters, bytes) = table_size(4096, 1024);
+        let image = volume(512, 4096, 1024, clusters, bytes);
+        let snapshot = read_from(&image, 'k').unwrap();
+        assert_the_small_volume_was_read(&snapshot);
+    }
+
+    /// A disk whose sectors are 4096 bytes is read like any other.
+    ///
+    /// It never was. The boot sector was asked for as 512 bytes, which such a
+    /// disk refuses because it is not a whole sector; and had that read worked,
+    /// every record would then have failed its check, because the check
+    /// stepped through the record by the disk's sector size where NTFS always
+    /// steps by 512. Storage fell back to walking the folders and said the
+    /// fast route "needs administrative rights"; the other pages had no
+    /// fallback and could not work on such a disk at all.
+    #[test]
+    fn a_table_on_a_disk_with_4096_byte_sectors_is_read() {
+        let (clusters, bytes) = table_size(4096, 4096);
+        let image = volume(4096, 4096, 4096, clusters, bytes);
+        let snapshot = read_from(&image, 'k').unwrap();
+        assert_the_small_volume_was_read(&snapshot);
+    }
+
+    #[test]
+    fn a_4096_byte_record_is_checked_every_512_bytes() {
+        // Eight protected stretches, so nine entries in the array: the
+        // sequence number and the eight pairs of bytes it stands in for.
+        let mut record = file_record(4096, IN_USE, &[file_name(5, "thing.bin")]);
+        assert_eq!(read_u16(&record, 0x06).unwrap(), 9);
+        assert_eq!(read_u16(&record, 4094).unwrap(), 0x0C0A);
+
+        assert!(apply_fixups(&mut record).is_some());
+        assert_eq!(
+            read_u16(&record, 4094).unwrap(),
+            0,
+            "the bytes were not put back"
+        );
+        let parsed = parse_record(&record).expect("the record should parse");
+        assert_eq!(
+            parsed.name.map(|(_, name, _)| name).as_deref(),
+            Some("thing.bin")
+        );
+    }
+
+    /// A table in more pieces than its first record lists is not read in part.
+    ///
+    /// The record here says the table is four times as long as the pieces it
+    /// lists, which is what a table that has outgrown one record's list looks
+    /// like from that record. This used to read what was listed and return it
+    /// as the whole drive.
+    #[test]
+    fn a_table_whose_first_record_lists_only_part_of_it_is_refused_and_says_so() {
+        let (clusters, bytes) = table_size(4096, 1024);
+        let image = volume(512, 4096, 1024, clusters, bytes * 4);
+
+        let refusal = read_from(&image, 'k').map(|_| ()).unwrap_err();
+        assert!(matches!(refusal, Error::Refused(_)), "{refusal}");
+        let text = refusal.to_string();
+        assert!(
+            text.contains("too many pieces") && text.contains("leave files out"),
+            "the refusal should say why: {text}"
+        );
+    }
+
+    /// A read that comes back short is not the end of the table.
+    ///
+    /// The table's record lists more clusters than the volume gives back, as
+    /// when a read fails part-way. This used to stop reading that piece
+    /// without a word and return what it had.
+    #[test]
+    fn a_table_that_could_only_be_read_in_part_is_refused_and_says_so() {
+        let (clusters, bytes) = table_size(4096, 1024);
+        let image = volume(512, 4096, 1024, clusters + 2, bytes);
+        // The premise: the volume ends where the records do, two clusters
+        // short of what the list says belongs to the table.
+        assert_eq!(
+            image.bytes.len(),
+            (TABLE_AT as usize + clusters as usize) * 4096
+        );
+
+        let refusal = read_from(&image, 'k').map(|_| ()).unwrap_err();
+        let text = refusal.to_string();
+        assert!(
+            text.contains("only be read in part"),
+            "the refusal should say the read was partial: {text}"
+        );
     }
 }
