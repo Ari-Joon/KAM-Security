@@ -45,6 +45,38 @@ pub fn resolve(name: &str, fallback: &str) -> String {
     fallback.to_owned()
 }
 
+/// The application package an indirect string names, when it names one.
+///
+/// A Store application's rule, task or service is registered as
+/// `@{<Name>_<version>_<architecture>__<publisher id>?ms-resource://...}`. The
+/// part before the first underscore is the application's own identity: stable,
+/// and readable where the whole pointer is not.
+pub fn package_of(reference: &str) -> Option<&str> {
+    let inner = reference.strip_prefix("@{")?;
+    let name = inner.split(['_', '?', '}']).next()?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// A name fit to put in front of a person, whoever is asking.
+///
+/// [`resolve`], with a fallback that can still be read. A pointer into a
+/// package can only be looked up by an account that package is installed for,
+/// and one left behind by a version since replaced cannot be looked up by
+/// anybody. Both happen: of the 65 rules named this way on the machine this
+/// was written on, 22 point at versions that are gone. Those are shown as the
+/// package's name and the fact that it could not be looked up, which is true
+/// and is not a line of punctuation.
+pub fn display(name: &str) -> String {
+    if !name.starts_with('@') {
+        return name.to_owned();
+    }
+    let fallback = match package_of(name) {
+        Some(package) => format!("{package} (its name could not be looked up)"),
+        None => "a name that could not be looked up".to_owned(),
+    };
+    resolve(name, &fallback)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -69,6 +101,39 @@ mod tests {
         // The property that matters: a raw pointer must never reach a screen.
         let resolved = resolve("@{NotARealPackage?ms-resource://nope/Nope}", "fallback");
         assert_eq!(resolved, "fallback");
+    }
+
+    #[test]
+    fn a_package_pointer_names_its_package() {
+        assert_eq!(
+            package_of(
+                "@{Microsoft.WindowsAlarms_11.2607.6.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.WindowsAlarms/Resources/AppStoreName}"
+            ),
+            Some("Microsoft.WindowsAlarms")
+        );
+        // Not a package pointer, or not enough of one to name anything.
+        assert_eq!(package_of(r"@%SystemRoot%\system32\wscsvc.dll,-200"), None);
+        assert_eq!(package_of("@{"), None);
+        assert_eq!(package_of("Windows Clock"), None);
+    }
+
+    /// What a person sees when the lookup fails is words, not the pointer.
+    ///
+    /// The Firewall page listed a seventh of its rules as raw pointers, because
+    /// the lookup ran in the service, for whom no Store application is
+    /// installed, and the fallback was the pointer itself.
+    #[test]
+    fn a_pointer_that_cannot_be_looked_up_is_shown_as_its_package() {
+        let shown = display(
+            "@{KamSecurity.NoSuchApp_1.0.0.0_x64__0000000000000?ms-resource://KamSecurity.NoSuchApp/Resources/AppName}",
+        );
+        assert_eq!(
+            shown,
+            "KamSecurity.NoSuchApp (its name could not be looked up)"
+        );
+        assert_eq!(display("@{"), "a name that could not be looked up");
+        assert_eq!(display("Windows Clock"), "Windows Clock");
+        assert_eq!(display(""), "");
     }
 
     #[test]

@@ -568,6 +568,35 @@ async fn reveal_in_explorer(path: String) -> Result<(), String> {
     .await
 }
 
+/// Turn the pointers some names are stored as into the names they point at.
+///
+/// A Store application registers its firewall rules under a pointer into its
+/// own resources, `@{Microsoft.WindowsAlarms_...?ms-resource://...}`, where an
+/// ordinary program writes a name. Looking one up means asking the package,
+/// and a package is installed per person.
+///
+/// So this is done here and not in the agent, for the reason that keeps coming
+/// round in this program: the wrong principal. The agent is LocalSystem, for
+/// whom no Store application is installed, so every lookup failed there and
+/// the Firewall page showed a seventh of its rules as raw pointers. The window
+/// runs as the person. Checked on the machine this was written on: 43 of 65
+/// such names resolve here, and the rest belong to versions that have since
+/// been replaced, which nobody can look up and which are shown as the
+/// package's own name.
+///
+/// The answers come back in the order asked. Nothing here is acted on: the
+/// raw name stays the rule's identity, and this is only what is drawn.
+#[tauri::command]
+async fn display_names(names: Vec<String>) -> Result<Vec<String>, String> {
+    off_the_window(move || {
+        Ok(names
+            .iter()
+            .map(|name| kam_core::mui::display(name))
+            .collect())
+    })
+    .await
+}
+
 #[tauri::command]
 async fn find_organise_proposals(drive: String) -> Result<OrganiseReport, String> {
     off_the_window(move || {
@@ -1319,6 +1348,7 @@ pub fn run() {
             recycle_item,
             can_recycle_all,
             reveal_in_explorer,
+            display_names,
             run_uninstaller,
             protocol_version,
             check_for_update,

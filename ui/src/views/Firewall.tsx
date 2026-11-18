@@ -121,7 +121,23 @@ type Program = {
    * untrue.
    */
   reachable: number;
+  /** Windows' own System process, which is not a program file. See below. */
+  system: boolean;
 };
+
+/**
+ * Whether a socket belongs to Windows' own System process.
+ *
+ * Process 4 is the kernel on every version of Windows this runs on. It holds
+ * the sockets for file sharing, printing and the other services built into
+ * Windows, and it has no program file, so the agent has nothing to read a
+ * name or a signature from. It was shown as "unidentified program (process
+ * 4)", which is true of the lookup and reads as though something unknown were
+ * listening. Named for what it is; nothing else about it is claimed.
+ */
+function isSystemProcess(connection: Connection): boolean {
+  return connection.image_path == null && connection.process_id === 4;
+}
 
 /** Whether a listening socket can be reached from off this machine. */
 function isReachable(connection: Connection): boolean {
@@ -160,7 +176,10 @@ function byProgram(connections: Connection[]): Program[] {
         label:
           connection.description ??
           connection.name ??
-          `unidentified program (process ${connection.process_id})`,
+          (isSystemProcess(connection)
+            ? "Windows itself (the System process)"
+            : `unidentified program (process ${connection.process_id})`),
+        system: isSystemProcess(connection),
         file: connection.name,
         company: connection.company,
         signer: connection.signer,
@@ -400,7 +419,11 @@ function attention(program: Program): string[] {
     notes.push(place.text[0].toUpperCase() + place.text.slice(1));
   }
 
-  if (program.unsigned === null) {
+  if (program.system) {
+    notes.push(
+      "This is the Windows kernel's own process. It is not a program file, so there is no name or signature to read",
+    );
+  } else if (program.unsigned === null) {
     notes.push("The owning program could not be read, so nothing here is known about it");
   }
 
@@ -614,12 +637,29 @@ function ProgramGroup({
   );
 }
 
+/**
+ * The package a rule's name points into, for the moment before it is looked up.
+ *
+ * A Store application registers its rules under a pointer,
+ * `@{Microsoft.WindowsAlarms_...?ms-resource://...}`, and the window looks
+ * those up once the list has arrived. Until the answer comes back, and if it
+ * never does, the package's own name is shown: the raw pointer reads as
+ * corruption, and a seventh of this list used to be exactly that.
+ */
+function packageOf(pointer: string): string | null {
+  const match = /^@\{([^_?}]+)/.exec(pointer);
+  return match ? match[1] : null;
+}
+
 function RuleRow({
   rule,
+  nameOf,
   onRemove,
   busy,
 }: {
   rule: FirewallRule;
+  /** What to draw for a name. The raw name stays the rule's identity. */
+  nameOf: (name: string) => string;
   onRemove: (name: string) => void;
   /** True while a change is on its way, so a second click sends nothing. */
   busy: boolean;
@@ -636,7 +676,7 @@ function RuleRow({
               : "action unknown"}
         </span>
         <span className="fw-rule-name">
-          {rule.name || <span className="muted">(a rule with no name)</span>}
+          {rule.name ? nameOf(rule.name) : <span className="muted">(a rule with no name)</span>}
         </span>
         {rule.ours ? (
           <button
@@ -659,7 +699,11 @@ function RuleRow({
               : "direction unknown"}
         </span>
         {rule.application && <span className="fw-rule-app">{rule.application}</span>}
-        {rule.grouping && !rule.ours && <span>{rule.grouping}</span>}
+        {/* A Store application's group is the same pointer as its name, so it
+            is only worth a second line when it says something different. */}
+        {rule.grouping && !rule.ours && nameOf(rule.grouping) !== nameOf(rule.name) && (
+          <span>{nameOf(rule.grouping)}</span>
+        )}
       </div>
     </li>
   );
@@ -667,6 +711,8 @@ function RuleRow({
 
 export default function Firewall() {
   const [report, setReport] = useState<FirewallReport | null>(null);
+  /** Names looked up for rules registered under a pointer, by that pointer. */
+  const [names, setNames] = useState<Record<string, string>>({});
   const [live, setLive] = useState<ConnectionReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
@@ -741,11 +787,47 @@ export default function Firewall() {
     ? (publishers.find((group) => group.key === inside) ?? null)
     : null;
 
+  /**
+   * Look up the rule names that are stored as pointers.
+   *
+   * Asked of the window and not the agent: a pointer into a Store application
+   * can only be looked up by an account it is installed for, and the agent is
+   * LocalSystem. One request for all of them, after the list is on screen, so
+   * a slow lookup never holds the list back.
+   */
+  const lookUpNames = useCallback(async (loaded: FirewallReport) => {
+    const pointers = [
+      ...new Set(
+        loaded.rules
+          .flatMap((rule) => [rule.name, rule.grouping ?? ""])
+          .filter((text) => text.startsWith("@")),
+      ),
+    ];
+    if (pointers.length === 0) return;
+    try {
+      const answers = await api.displayNames(pointers);
+      setNames(
+        Object.fromEntries(pointers.map((pointer, index) => [pointer, answers[index] ?? pointer])),
+      );
+    } catch {
+      // Left as the package names `nameOf` falls back to. A list that is a
+      // little less readable is better than no list.
+    }
+  }, []);
+
+  /** What to draw for a rule's name or group. */
+  const nameOf = useCallback(
+    (name: string) => names[name] ?? (name.startsWith("@") ? (packageOf(name) ?? name) : name),
+    [names],
+  );
+
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setReport(await api.firewall());
+      const loaded = await api.firewall();
+      setReport(loaded);
       setError(null);
+      void lookUpNames(loaded);
     } catch (cause) {
       setError(reason(cause));
       setReport(null);
@@ -759,7 +841,7 @@ export default function Firewall() {
       // take the rules with it.
       setLive(null);
     }
-  }, []);
+  }, [lookUpNames]);
 
   useEffect(() => {
     void load();
@@ -1126,6 +1208,7 @@ export default function Firewall() {
               <RuleRow
                 key={`${rule.name}-${index}`}
                 rule={rule}
+                nameOf={nameOf}
                 busy={busy}
                 onRemove={(name) => void unblock(name)}
               />
@@ -1149,6 +1232,7 @@ export default function Firewall() {
               <RuleRow
                 key={`${rule.name}-${index}`}
                 rule={rule}
+                nameOf={nameOf}
                 busy={busy}
                 onRemove={(name) => void unblock(name)}
               />

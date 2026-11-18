@@ -76,6 +76,11 @@ export const api = {
   findRemnants: (name: string, paths: string[], kinds: string[]) =>
     invoke<Remnants>("find_remnants", { name, paths, kinds }),
   firewall: () => invoke<FirewallReport>("firewall"),
+  /**
+   * The names a list of pointers stand for, in the same order. Looked up by the
+   * window, as the person: see `display_names` in the shell.
+   */
+  displayNames: (names: string[]) => invoke<string[]>("display_names", { names }),
   connections: () => invoke<ConnectionReport>("connections"),
   blockProgram: (path: string) => invoke<string>("block_program", { path }),
   unblockProgram: (rule: string) => invoke<void>("unblock_program", { rule }),
