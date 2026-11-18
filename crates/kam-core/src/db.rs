@@ -15,7 +15,7 @@ use crate::audit::{AuditLog, Effect, Entry, Record};
 use crate::{Error, Result};
 
 /// Bumped whenever the schema below changes. Stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE audit (
@@ -225,6 +225,66 @@ SELECT kind, 1
         UNION ALL SELECT 'administrator')
  WHERE EXISTS (SELECT 1 FROM sweeps);
 ";
+
+/// What the watcher has already seen, so that a restart is not a fresh look.
+///
+/// # Why the watcher needs a memory that lasts
+///
+/// It kept what it had seen in memory, and took the first look after the
+/// service started as the one to learn from. The service starts with the
+/// machine, before anybody has signed in, so that look held nobody's own
+/// startup entries. They turned up on the second look and were written down
+/// as having just appeared, after every restart: the same two entries four
+/// times in a month on the machine this was found on. The other half was
+/// worse. Anything added while the service was not running was learned at
+/// the next start, and never reported at all.
+///
+/// # What a scope is
+///
+/// Something looked at as a whole, which either has been looked at before or
+/// has not: the machine's own startup entries, one account's, the reads of
+/// one account's decoys. `watched_scopes` holds the ones that have been,
+/// because "looked at and found empty" and "never looked at" must not be the
+/// same answer. The first look at a scope learns it and reports nothing.
+/// Every later look, in any run of the service, reports what is not on
+/// record.
+///
+/// # What a row is
+///
+/// `kind` and `place` are spelled as a sighting's kind and scope are, so that
+/// the rule about sources that could not be read can be asked of a row before
+/// it is taken off the record. `what` is everything else that makes the thing
+/// itself and not another.
+///
+/// This is not the `sightings` table, though both remember what starts
+/// itself. That one is compared when a person asks what changed, and what it
+/// reports is theirs to read. The watcher looks every two minutes and must
+/// not use their answer up.
+const SCHEMA_V8: &str = "
+CREATE TABLE watched (
+    scope TEXT NOT NULL,
+    kind  TEXT NOT NULL,
+    place TEXT NOT NULL,
+    what  TEXT NOT NULL,
+    PRIMARY KEY (scope, kind, place, what)
+);
+
+CREATE TABLE watched_scopes (
+    scope      TEXT PRIMARY KEY,
+    learned_at TEXT NOT NULL
+);
+";
+
+/// One thing the watcher has on record. See [`SCHEMA_V8`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Watched {
+    /// What sort of thing, as the token a sighting of it would be filed under.
+    pub kind: String,
+    /// Where it lives, as a sighting's scope is spelled.
+    pub place: String,
+    /// Everything else that makes it this one and not another.
+    pub what: String,
+}
 
 /// One checked download as the store keeps it. See [`SCHEMA_V6`].
 ///
@@ -1067,6 +1127,99 @@ impl Store {
         })
     }
 
+    /// What the watcher has on record for one scope.
+    ///
+    /// `None` when the scope has never been looked at, which is a different
+    /// answer from having been looked at and found empty: the first is a
+    /// scope to learn, the second a scope in which anything is new.
+    pub fn watched(&self, scope: &str) -> Result<Option<Vec<Watched>>> {
+        let connection = self.lock()?;
+        let learned: Option<String> = connection
+            .query_row(
+                "SELECT learned_at FROM watched_scopes WHERE scope = ?1",
+                params![scope],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_db_error)?;
+        if learned.is_none() {
+            return Ok(None);
+        }
+        let mut statement = connection
+            .prepare("SELECT kind, place, what FROM watched WHERE scope = ?1")
+            .map_err(to_db_error)?;
+        let rows = statement
+            .query_map(params![scope], |row| {
+                Ok(Watched {
+                    kind: row.get(0)?,
+                    place: row.get(1)?,
+                    what: row.get(2)?,
+                })
+            })
+            .map_err(to_db_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(to_db_error)?;
+        Ok(Some(rows))
+    }
+
+    /// Bring one scope's record up to date: `appeared` is added to it, `gone`
+    /// is taken off it, and the scope is marked as looked at if it was not.
+    ///
+    /// All of it or none of it, for the reason a sweep is. A record that took
+    /// the additions and lost the mark would be learned again from nothing at
+    /// the next look, and whatever arrived in between would never be
+    /// reported.
+    pub fn record_watched(
+        &self,
+        scope: &str,
+        appeared: &[Watched],
+        gone: &[Watched],
+    ) -> Result<()> {
+        let mut guard = self.lock()?;
+        let transaction = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(to_db_error)?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO watched_scopes (scope, learned_at)
+                 VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                params![scope],
+            )
+            .map_err(to_db_error)?;
+        for one in gone {
+            transaction
+                .execute(
+                    "DELETE FROM watched
+                      WHERE scope = ?1 AND kind = ?2 AND place = ?3 AND what = ?4",
+                    params![scope, one.kind, one.place, one.what],
+                )
+                .map_err(to_db_error)?;
+        }
+        for one in appeared {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO watched (scope, kind, place, what)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![scope, one.kind, one.place, one.what],
+                )
+                .map_err(to_db_error)?;
+        }
+        transaction.commit().map_err(to_db_error)
+    }
+
+    /// Forget everything the watcher has learned, in every scope, so that the
+    /// next look at each is a first look.
+    pub fn forget_watched(&self) -> Result<()> {
+        let mut guard = self.lock()?;
+        let transaction = guard
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(to_db_error)?;
+        transaction
+            .execute_batch("DELETE FROM watched; DELETE FROM watched_scopes;")
+            .map_err(to_db_error)?;
+        transaction.commit().map_err(to_db_error)
+    }
+
     /// The connection, taking it back from a panic rather than giving up on it.
     ///
     /// This used to return an error when the mutex was poisoned, which meant a
@@ -1155,7 +1308,7 @@ fn one_line(detail: &str) -> String {
 }
 
 /// Every schema step, with the version it brings the store to.
-const MIGRATIONS: [(i64, &str); 7] = [
+const MIGRATIONS: [(i64, &str); 8] = [
     (1, SCHEMA_V1),
     (2, SCHEMA_V2),
     (3, SCHEMA_V3),
@@ -1163,6 +1316,7 @@ const MIGRATIONS: [(i64, &str); 7] = [
     (5, SCHEMA_V5),
     (6, SCHEMA_V6),
     (7, SCHEMA_V7),
+    (8, SCHEMA_V8),
 ];
 
 fn migrate(connection: &Connection) -> Result<()> {
@@ -2527,5 +2681,125 @@ mod tests {
             readings_in(&store.lock().unwrap()),
             vec![("service".to_owned(), 2)]
         );
+    }
+
+    fn watched(kind: &str, place: &str, what: &str) -> Watched {
+        Watched {
+            kind: kind.to_owned(),
+            place: place.to_owned(),
+            what: what.to_owned(),
+        }
+    }
+
+    /// A store from before the watcher kept anything gains its memory, keeps
+    /// what it already held, and starts with no scope looked at.
+    #[test]
+    fn a_version_seven_store_is_brought_up_to_eight_and_keeps_what_it_held() {
+        let connection = a_swept_version_six_store();
+        migrate_through(&connection, &MIGRATIONS[..7]).unwrap();
+        assert!(
+            connection
+                .execute_batch("SELECT scope FROM watched_scopes")
+                .is_err(),
+            "the premise: a version seven store has no memory for the watcher"
+        );
+
+        migrate_through(&connection, &MIGRATIONS[..8]).expect("the upgrade to eight should apply");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+        let kept: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sightings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, 3, "the baseline did not survive the upgrade");
+        assert_eq!(readings_in(&connection).len(), 6);
+
+        // And the upgraded store is a working one, in which nothing has been
+        // looked at yet: the first look after the update is a first look.
+        let store = Store {
+            connection: Mutex::new(connection),
+        };
+        assert_eq!(store.watched("machine").unwrap(), None);
+        store
+            .record_watched("machine", &[watched("service", "a", "x")], &[])
+            .unwrap();
+        assert_eq!(
+            store.watched("machine").unwrap(),
+            Some(vec![watched("service", "a", "x")])
+        );
+    }
+
+    /// The step that adds the watcher's memory, stopped partway, is finished
+    /// by the next start.
+    #[test]
+    fn an_interrupted_upgrade_to_eight_is_finished_by_the_next_start() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_through(&connection, &MIGRATIONS[..7]).unwrap();
+        let interrupted = [(
+            8,
+            "CREATE TABLE watched (scope TEXT NOT NULL);
+             this is where the process was stopped;",
+        )];
+        assert!(migrate_through(&connection, &interrupted).is_err());
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
+
+        migrate_through(&connection, &MIGRATIONS[..8])
+            .expect("the next start should finish the upgrade");
+        connection
+            .execute_batch(
+                "SELECT scope, kind, place, what FROM watched;
+                 SELECT scope, learned_at FROM watched_scopes;",
+            )
+            .expect("the tables the upgrade adds are there, whole");
+    }
+
+    /// Never looked at and looked at and found empty are different answers.
+    /// The first is a scope to learn; in the second, anything is new.
+    #[test]
+    fn a_scope_never_looked_at_is_not_a_scope_found_empty() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.watched("S-1-5-21-1-1001").unwrap(), None);
+
+        store.record_watched("S-1-5-21-1-1001", &[], &[]).unwrap();
+        assert_eq!(store.watched("S-1-5-21-1-1001").unwrap(), Some(Vec::new()));
+        assert_eq!(
+            store.watched("S-1-5-21-1-1002").unwrap(),
+            None,
+            "looking at one account is not looking at another"
+        );
+    }
+
+    /// The record takes additions and removals, one scope at a time, and
+    /// forgetting it puts every scope back to never looked at.
+    #[test]
+    fn the_watchers_record_is_kept_per_scope_and_can_be_forgotten() {
+        let store = Store::open_in_memory().unwrap();
+        let one = watched("run_key", "hklm\\run", "Updater\u{0}up.exe");
+        let two = watched("service", "hklm\\services\\thing", "Thing\u{0}thing.exe");
+
+        store
+            .record_watched("machine", &[one.clone(), two.clone(), one.clone()], &[])
+            .unwrap();
+        store
+            .record_watched("S-1-5-21-1-1001", std::slice::from_ref(&one), &[])
+            .unwrap();
+        let mut machine = store.watched("machine").unwrap().unwrap();
+        machine.sort_by(|a, b| a.kind.cmp(&b.kind));
+        assert_eq!(machine, vec![one.clone(), two.clone()], "written once each");
+
+        // Taken off one scope, and still on the other.
+        store
+            .record_watched("machine", &[], std::slice::from_ref(&one))
+            .unwrap();
+        assert_eq!(store.watched("machine").unwrap(), Some(vec![two]));
+        assert_eq!(store.watched("S-1-5-21-1-1001").unwrap(), Some(vec![one]));
+
+        store.forget_watched().unwrap();
+        assert_eq!(store.watched("machine").unwrap(), None);
+        assert_eq!(store.watched("S-1-5-21-1-1001").unwrap(), None);
     }
 }

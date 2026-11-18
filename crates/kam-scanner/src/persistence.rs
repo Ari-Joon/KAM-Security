@@ -562,7 +562,21 @@ const RUN_KEYS: &[(&str, Anchor)] = &[
     ),
 ];
 
-fn read_run_keys(survey: &mut Survey, users: &[UserContext]) {
+/// Whose share of a source that exists both for the machine and for each
+/// account is being read.
+///
+/// The two are read apart so that they can be told apart afterwards. The
+/// watcher keeps a record for the machine and one for each account, and an
+/// account's is only there to be compared while that account is signed in.
+#[derive(Debug, Clone, Copy)]
+enum Whose<'a> {
+    /// `HKLM`, and the Startup folder everybody shares.
+    Machine,
+    /// One account's own hive and its own Startup folder.
+    Account(&'a UserContext),
+}
+
+fn read_run_keys(survey: &mut Survey, whose: Whose<'_>) {
     // Both hives and both views. A 32-bit installer writing to the Run key on a
     // 64-bit machine lands in `WOW6432Node`, and reading only the native view
     // would miss it entirely — which is exactly the kind of blind spot that
@@ -572,26 +586,30 @@ fn read_run_keys(survey: &mut Survey, users: &[UserContext]) {
     // LocalSystem service `HKEY_CURRENT_USER` is SYSTEM's own hive, where
     // nobody has ever put a startup entry, so a survey of what starts itself
     // silently omitted half of what does.
-    let mut hives: Vec<(_, String, String, Option<&UserContext>)> =
-        vec![(HKEY_LOCAL_MACHINE, String::new(), "HKLM".to_owned(), None)];
-    for user in users {
-        let (hive, prefix) = user.hive();
-        // Named for the key that was actually opened, and for nothing else.
-        //
-        // This used to read `HKEY_USERS\{sid}` when more than one hive was
-        // loaded and `HKCU` when only one was -- so the label for a given
-        // registry value depended on how many people happened to be signed in.
-        // Since a sighting's identity is `(kind, scope, name)` and scope is
-        // this string, one person signing in renamed every one of the other
-        // person's startup entries: the whole lot reported as vanished, an
-        // equal number reported as appeared, and the pair flipping back when
-        // they signed out. Three flips and they degrade to "comes and goes",
-        // which teaches the panel to be quiet about exactly those entries.
-        let label = match user.sid() {
-            Some(sid) => format!("HKEY_USERS\\{sid}"),
-            None => "HKCU".to_owned(),
-        };
-        hives.push((hive, prefix, label, Some(user)));
+    let mut hives: Vec<(_, String, String, Option<&UserContext>)> = Vec::new();
+    match whose {
+        Whose::Machine => hives.push((HKEY_LOCAL_MACHINE, String::new(), "HKLM".to_owned(), None)),
+        Whose::Account(user) => {
+            let (hive, prefix) = user.hive();
+            // Named for the key that was actually opened, and for nothing
+            // else.
+            //
+            // This used to read `HKEY_USERS\{sid}` when more than one hive was
+            // loaded and `HKCU` when only one was -- so the label for a given
+            // registry value depended on how many people happened to be
+            // signed in. Since a sighting's identity is `(kind, scope, name)`
+            // and scope is this string, one person signing in renamed every
+            // one of the other person's startup entries: the whole lot
+            // reported as vanished, an equal number reported as appeared, and
+            // the pair flipping back when they signed out. Three flips and
+            // they degrade to "comes and goes", which teaches the panel to be
+            // quiet about exactly those entries.
+            let label = match user.sid() {
+                Some(sid) => format!("HKEY_USERS\\{sid}"),
+                None => "HKCU".to_owned(),
+            };
+            hives.push((hive, prefix, label, Some(user)));
+        }
     }
 
     for (hive, prefix, hive_label, owner) in hives {
@@ -714,32 +732,29 @@ fn entry(
 }
 
 /// Files sitting in a Startup folder.
-fn read_startup_folders(survey: &mut Survey, users: &[UserContext]) {
+fn read_startup_folders(survey: &mut Survey, whose: Whose<'_>) {
     let mut folders: Vec<(PathBuf, Option<&UserContext>)> = Vec::new();
 
-    // Per-user, so it comes from the caller rather than from `%APPDATA%`.
-    for user in users {
-        folders.push((
-            PathBuf::from(user.roaming_app_data())
-                .join(r"Microsoft\Windows\Start Menu\Programs\Startup"),
-            Some(user),
-        ));
-    }
-    match std::env::var("ProgramData") {
-        Ok(program_data) => folders.push((
-            PathBuf::from(program_data).join(r"Microsoft\Windows\Start Menu\Programs\StartUp"),
-            None,
-        )),
-        // Reported rather than skipped. Without the variable the machine-wide
-        // Startup folder is not read, and every item in it would then be
-        // reported as removed -- the same shape as `task_store` two functions
-        // down, which does say so, and the two should not disagree.
-        Err(_) => survey.unreadable.push(Unreadable::of(
-            Anchor::StartupFolder.kind(),
-            "Windows did not say where the machine-wide Startup folder is, so it \
-             was not read"
-                .to_owned(),
-        )),
+    match whose {
+        // Per-user, so it comes from the caller rather than from `%APPDATA%`.
+        Whose::Account(user) => folders.push((startup_folder_of(user), Some(user))),
+        Whose::Machine => match std::env::var("ProgramData") {
+            Ok(program_data) => folders.push((
+                PathBuf::from(program_data).join(r"Microsoft\Windows\Start Menu\Programs\StartUp"),
+                None,
+            )),
+            // Reported rather than skipped. Without the variable the
+            // machine-wide Startup folder is not read, and every item in it
+            // would then be reported as removed -- the same shape as
+            // `task_store` two functions down, which does say so, and the two
+            // should not disagree.
+            Err(_) => survey.unreadable.push(Unreadable::of(
+                Anchor::StartupFolder.kind(),
+                "Windows did not say where the machine-wide Startup folder is, so it \
+                 was not read"
+                    .to_owned(),
+            )),
+        },
     }
 
     for (folder, owner) in folders {
@@ -1787,18 +1802,85 @@ pub fn survey(user: &UserContext) -> Survey {
 /// Everything that starts itself, for several people at once.
 ///
 /// The machine-wide sources — services, tasks, `HKLM` — are read once; the
-/// per-user sources are read for each account given. This is what the watcher
-/// uses, since a startup entry planted under any signed-in account is worth
-/// noticing whoever is asking.
+/// per-user sources are read for each account given.
 pub fn survey_for(users: &[UserContext]) -> Survey {
+    let mut survey = survey_of_machine();
+    for user in users {
+        match survey_of_account(user) {
+            Some(theirs) => {
+                survey.entries.extend(theirs.entries);
+                survey.unreadable.extend(theirs.unreadable);
+            }
+            // Said, and confined to that account's own places, so that
+            // nothing of theirs is concluded to have gone.
+            None => {
+                let hive = match user.sid() {
+                    Some(sid) => format!("HKEY_USERS\\{sid}"),
+                    None => "HKCU".to_owned(),
+                };
+                survey.unreadable.push(Unreadable::covering(
+                    &[
+                        Anchor::RunKey.kind(),
+                        Anchor::RunOnceKey.kind(),
+                        Anchor::StartupFolder.kind(),
+                    ],
+                    &[hive, startup_folder_of(user).display().to_string()],
+                    "an account signed out while what starts itself under it was being read, \
+                     so its entries are not shown",
+                ));
+            }
+        }
+    }
+    in_order(survey)
+}
+
+/// What starts itself for the machine as a whole: services, tasks, `HKLM`
+/// and the Startup folder everybody shares. Nobody's own entries.
+///
+/// The watcher reads this and [`survey_of_account`] apart, because it keeps a
+/// record for each: the machine is there to be compared at every look, and
+/// an account only while it is signed in.
+pub fn survey_of_machine() -> Survey {
     let mut survey = Survey::default();
-    read_run_keys(&mut survey, users);
-    read_startup_folders(&mut survey, users);
+    read_run_keys(&mut survey, Whose::Machine);
+    read_startup_folders(&mut survey, Whose::Machine);
     read_services(&mut survey);
     read_scheduled_tasks(&mut survey);
+    in_order(survey)
+}
 
-    // Hardest-to-shift first, then alphabetically, so the order is stable
-    // between runs and the interesting end is the top.
+/// What starts itself for one account alone: the Run keys in its own hive and
+/// its own Startup folder.
+///
+/// `None` when the account's hive is not there once it has been read, which
+/// is what an account that is not signed in, or has just signed out, looks
+/// like. A key in a hive that has gone answers "not there", and for a Run key
+/// that is an ordinary answer: read in the middle of a sign-out, an account
+/// would look as though every one of its entries had been removed, and each
+/// would be reported as new at the next sign-in. So such a read is not an
+/// answer at all.
+pub fn survey_of_account(user: &UserContext) -> Option<Survey> {
+    let mut survey = Survey::default();
+    read_run_keys(&mut survey, Whose::Account(user));
+    read_startup_folders(&mut survey, Whose::Account(user));
+
+    let (hive, prefix) = user.hive();
+    let gone = !prefix.is_empty()
+        && matches!(
+            registry::Key::look(hive, prefix.trim_end_matches('\\'), View::Native),
+            Err(Unopened::Absent)
+        );
+    (!gone).then(|| in_order(survey))
+}
+
+/// Where one account's own Startup folder is.
+fn startup_folder_of(user: &UserContext) -> PathBuf {
+    PathBuf::from(user.roaming_app_data()).join(r"Microsoft\Windows\Start Menu\Programs\Startup")
+}
+
+/// Hardest-to-shift first, then alphabetically, so the order is stable
+/// between runs and the interesting end is the top.
+fn in_order(mut survey: Survey) -> Survey {
     survey.entries.sort_by(|a, b| {
         b.anchor
             .tenacity()
@@ -2090,7 +2172,7 @@ mod tests {
         );
 
         let mut survey = Survey::default();
-        read_startup_folders(&mut survey, std::slice::from_ref(&user));
+        read_startup_folders(&mut survey, Whose::Account(&user));
         let entry = survey
             .entries
             .iter()
@@ -2102,6 +2184,82 @@ mod tests {
         assert!(entry.unresolved().is_none());
         // Still the shortcut, which is what is in the folder.
         assert!(entry.command.to_lowercase().ends_with("helper.lnk"));
+    }
+
+    /// The machine's entries and an account's are read apart, and together
+    /// they are what reading them at once gives.
+    #[test]
+    fn the_machine_and_an_account_are_read_apart() {
+        let mine = UserContext::current();
+        let machine = survey_of_machine();
+        let account = survey_of_account(&mine).expect("the account running the tests is signed in");
+        assert!(
+            machine.entries.iter().all(|entry| entry.machine_wide),
+            "somebody's own entry was read as the machine's"
+        );
+        assert!(
+            account.entries.iter().all(|entry| !entry.machine_wide),
+            "one of the machine's entries was read as this account's"
+        );
+        assert!(
+            account.entries.iter().all(|entry| matches!(
+                entry.anchor,
+                Anchor::RunKey | Anchor::RunOnceKey | Anchor::StartupFolder
+            )),
+            "a service or a task was read as belonging to an account"
+        );
+        assert_eq!(
+            survey_for(std::slice::from_ref(&mine)).entries.len(),
+            machine.entries.len() + account.entries.len()
+        );
+    }
+
+    /// An account whose hive is not there is not taken to have no sign-in
+    /// entries.
+    ///
+    /// A key in a hive that is not loaded answers "not there", which for a
+    /// Run key is an ordinary answer. An account signing out while it was
+    /// being read would have had every one of its entries taken for removed.
+    #[test]
+    fn an_account_whose_hive_is_not_loaded_is_not_read_as_an_empty_account() {
+        // Nobody with this SID is signed in, here or anywhere.
+        let (_profile, absent) = scratch_profile("no-hive");
+        assert!(
+            survey_of_account(&absent).is_none(),
+            "an account that is not signed in was read as though it were"
+        );
+
+        // Read along with the machine, it is a gap confined to its own
+        // places, so nothing of its is concluded to have gone.
+        let survey = survey_for(std::slice::from_ref(&absent));
+        let run_key =
+            r"hkey_users\s-1-5-21-1-2-3-1001\software\microsoft\windows\currentversion\run";
+        let folder = startup_folder_of(&absent).display().to_string();
+        for (kind, place) in [
+            (Anchor::RunKey.kind(), run_key),
+            (Anchor::RunOnceKey.kind(), run_key),
+            (Anchor::StartupFolder.kind(), folder.as_str()),
+        ] {
+            assert!(
+                survey
+                    .unreadable
+                    .iter()
+                    .any(|source| source.covers(kind, place)),
+                "an account that is not signed in read as having no {kind}: {:?}",
+                survey.unreadable
+            );
+        }
+        assert!(
+            !survey
+                .unreadable
+                .iter()
+                .any(|source| source.what.contains("signed out")
+                    && source.covers(Anchor::RunKey.kind(), r"hklm\software\microsoft")),
+            "an account signing out silenced the machine's own Run key"
+        );
+
+        // The account running the tests is signed in, and is read.
+        assert!(survey_of_account(&UserContext::current()).is_some());
     }
 
     /// An entry that names nothing to be found says so in a sentence.
