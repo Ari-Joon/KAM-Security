@@ -84,9 +84,10 @@ pub struct MftEntry {
     pub modified: u64,
     /// When the file was created here. For a download this is when it arrived.
     pub created: u64,
-    /// Last read. Windows disables access-time updates by default, so this is
-    /// often equal to `created` and cannot be trusted without checking whether
-    /// the machine tracks it -- see [`crate::provenance::last_access_tracked`].
+    /// Last read. Whether Windows keeps this up to date is a setting that
+    /// differs by machine, so it cannot be trusted without checking; see
+    /// [`crate::provenance::access_times`]. Where it is kept, any program that
+    /// reads the file moves it, and Windows writes it down to within an hour.
     pub accessed: u64,
 }
 

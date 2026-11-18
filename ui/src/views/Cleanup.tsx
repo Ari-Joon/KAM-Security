@@ -12,6 +12,7 @@ import { GridLegend } from "../components/StateGrid";
 import FileRow from "../components/FileRow";
 import PathLink from "../components/PathLink";
 import type {
+  AccessTimes,
   Cache,
   Cleared,
   Confidence,
@@ -113,6 +114,36 @@ const DUPE_LIMIT = 40;
 
 /** The same, for downloads, which are informational rather than actionable. */
 const DOWNLOAD_LIMIT = 25;
+
+/**
+ * What a download's last-opened date is worth on this PC, said before any is
+ * shown.
+ *
+ * This was one sentence, printed whenever the service said Windows was not
+ * recording opens, and the service read the setting backwards: it said so on
+ * PCs where Windows was recording them. Three answers now, because "could not
+ * be read" is neither of the other two.
+ */
+const ACCESS_TIMES: Record<AccessTimes, string> = {
+  recorded:
+    "Windows is recording when files are opened on this PC. Any program that " +
+    "reads a file counts, including antivirus and backup, so an old date " +
+    "means nothing has read it since, and a recent date means only that " +
+    "something did.",
+  not_recorded:
+    "Windows is not recording when files are opened on this PC, so there is " +
+    "no way to tell which of these were ever opened.",
+  unknown:
+    "Whether Windows records when files are opened on this PC could not be " +
+    "read, so no last-opened dates are shown.",
+};
+
+/** How long ago, in whole days, the way a person would say it. */
+function daysAgo(days: number): string {
+  if (days <= 0) return "today";
+  if (days === 1) return "yesterday";
+  return `${fmt.count(days)} days ago`;
+}
 
 /**
  * How long quarantine keeps an item before the service deletes it for good.
@@ -1714,13 +1745,19 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           <p className="muted">
             Files over 32 MB carrying Windows' own record of having come from
             the internet. Click one to show it in Explorer.
-            {downloadSummary && !downloadSummary.last_access_tracked && (
-              <>
-                {" "}
-                This machine does not update last-access times, so there is no
-                way to tell which of these were ever opened.
-              </>
-            )}
+            {downloadSummary && <> {ACCESS_TIMES[downloadSummary.access_times]}</>}
+            {downloadSummary &&
+              downloadSummary.access_times === "recorded" &&
+              downloadSummary.read_as_opened > 0 && (
+                <>
+                  {" "}
+                  {fmt.count(downloadSummary.read_as_opened)} of these could
+                  only be read in a way Windows counts as opening{" "}
+                  {downloadSummary.read_as_opened === 1 ? "it" : "them"}, so{" "}
+                  {downloadSummary.read_as_opened === 1 ? "its" : "their"}{" "}
+                  last-opened date now shows this search.
+                </>
+              )}
           </p>
           {downloads.length > DOWNLOAD_LIMIT && (
             <p className="footnote">
@@ -1750,6 +1787,18 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                           {" "}
                           · arrived {download.days_since_arrival}{" "}
                           {download.days_since_arrival === 1 ? "day" : "days"} ago
+                        </>
+                      )}
+                      {/* Only where Windows keeps the date. Elsewhere it is a
+                          number nothing maintains, and the paragraph above
+                          says so instead. */}
+                      {downloadSummary?.access_times === "recorded" && (
+                        <>
+                          {" "}
+                          ·{" "}
+                          {download.days_since_access === null
+                            ? "no record of when it was last opened"
+                            : `last opened ${daysAgo(download.days_since_access)}`}
                         </>
                       )}
                       {download.zone === "restricted" && (

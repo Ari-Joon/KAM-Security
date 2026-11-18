@@ -6,12 +6,12 @@
 //!
 //! # Why not last-access times
 //!
-//! The obvious source is the filesystem's own last-access timestamp, and it is
-//! useless: Windows stopped maintaining those by default years ago, because
-//! updating a timestamp on every read is expensive. The scanner already checks
-//! this before reporting anything based on it. On a machine where tracking is
-//! off — which is nearly all of them — every file claims to have been touched
-//! whenever it was written.
+//! The obvious source is the filesystem's own last-access timestamp, and it
+//! answers a different question. Where Windows keeps it at all, which is a
+//! setting that differs by machine (see [`crate::provenance::access_times`]),
+//! it moves whenever any program reads the file: an antivirus scan, a backup,
+//! an indexer. So it can say that nothing has read a program's files since a
+//! date, and it cannot say that a person started it.
 //!
 //! # UserAssist
 //!

@@ -454,10 +454,13 @@ pub enum Response {
         orphans: Vec<Orphan>,
         orphan_summary: OrphanSummary,
         downloads: Vec<Download>,
-        download_summary: DownloadSummary,
+        /// Boxed, with the timings, for the reason `Scan` is: this is the
+        /// widest answer there is, and every reply is as wide as the widest.
+        /// The wire carries the same thing either way.
+        download_summary: Box<DownloadSummary>,
         /// How long each stage took. Shown, so "it feels slow" can become a
         /// number somebody can argue with.
-        timings: kam_storage::apps::Timings,
+        timings: Box<kam_storage::apps::Timings>,
     },
     Duplicates {
         groups: Vec<DuplicateGroup>,

@@ -1306,11 +1306,11 @@ DUPLICATES: {} sets holding {:.1} GB of copies, {:.1} GB of it reclaimable acros
 
         let (downloads, download_summary) = crate::provenance::find(&index, "C:", now);
         println!(
-            "\nDOWNLOADS: {} of {} large files carry a download record, {:.1} GB (last-access tracked: {})",
+            "\nDOWNLOADS: {} of {} large files carry a download record, {:.1} GB (last-access times: {:?})",
             download_summary.found,
             download_summary.examined,
             gb(download_summary.total_bytes),
-            download_summary.last_access_tracked
+            download_summary.access_times
         );
         for download in downloads.iter().take(10) {
             println!(

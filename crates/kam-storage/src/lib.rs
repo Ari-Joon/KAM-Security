@@ -29,6 +29,7 @@ pub mod organise;
 pub mod orphans;
 mod paths;
 pub mod provenance;
+pub mod quiet;
 pub mod remnants;
 /// Re-exported from the shared crate, where it moved once the scanner
 /// needed it too.

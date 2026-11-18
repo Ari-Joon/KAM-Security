@@ -304,8 +304,8 @@ pub fn handle(
                         orphans: report.orphans,
                         orphan_summary: report.orphan_summary,
                         downloads: report.downloads,
-                        download_summary: report.download_summary,
-                        timings: report.timings,
+                        download_summary: Box::new(report.download_summary),
+                        timings: Box::new(report.timings),
                     }
                 }
                 Err(error) => {

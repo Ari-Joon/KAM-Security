@@ -92,11 +92,19 @@ export type Download = {
   days_since_access: number | null;
 };
 
+/** Whether Windows keeps last-access times up to date on this PC. */
+export type AccessTimes = "recorded" | "not_recorded" | "unknown";
+
 export type DownloadSummary = {
   found: number;
   total_bytes: number;
-  last_access_tracked: boolean;
+  access_times: AccessTimes;
   examined: number;
+  /**
+   * Listed files whose record could only be read in a way Windows counts as
+   * opening them, so their last-opened date now shows the search itself.
+   */
+  read_as_opened: number;
 };
 
 /** Who put a copy where it is, which decides whether it can go. */

@@ -796,9 +796,23 @@ fn check_within(
     Ok(())
 }
 
+/// Open a file to compare it, without Windows counting that as opening it.
+///
+/// A search reads every large file that has a twin of the same length, all
+/// over the drive, and read the ordinary way that stamps each one as opened
+/// just now. The Cleanup page shows when a download was last opened, so a
+/// duplicate search would have rewritten the answer for every file it touched.
+///
+/// Windows' own files do not grant the right a quiet read needs, even to
+/// LocalSystem, and are read the ordinary way as they always were; see
+/// [`crate::quiet::open`]. Nothing shows a last-opened date for those.
+fn open_to_compare(path: &str) -> Option<std::fs::File> {
+    crate::quiet::open(path).ok().map(|reader| reader.file)
+}
+
 /// Hash the first [`HEAD_BYTES`] of a file, or the whole thing if it is smaller.
 fn head_hash(path: &str) -> Option<[u8; 32]> {
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = open_to_compare(path)?;
     let mut buffer = vec![0_u8; HEAD_BYTES];
     let mut filled = 0;
     // A single read may return less than asked for without being at the end.
@@ -813,7 +827,7 @@ fn head_hash(path: &str) -> Option<[u8; 32]> {
 }
 
 fn full_hash(path: &str) -> Option<[u8; 32]> {
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = open_to_compare(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
@@ -1726,5 +1740,53 @@ mod tests {
     fn a_missing_file_hashes_to_nothing_rather_than_panicking() {
         assert!(head_hash(r"C:\this\is\not\here.bin").is_none());
         assert!(full_hash(r"C:\this\is\not\here.bin").is_none());
+    }
+
+    /// Comparing a file must not make it look freshly opened.
+    ///
+    /// Both passes read file contents, and read the ordinary way each stamped
+    /// the file with the moment of the search. The time checked here is the
+    /// one the Cleanup page reports as "last opened".
+    #[test]
+    fn comparing_a_file_does_not_stamp_it_as_opened() {
+        use std::time::{Duration, SystemTime};
+
+        let directory = std::env::temp_dir().join(format!("kam-dup-quiet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let aged = |name: &str| -> (String, SystemTime) {
+            let path = directory.join(name).to_string_lossy().into_owned();
+            std::fs::write(&path, vec![5_u8; 100_000]).unwrap();
+            let handle = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let then = SystemTime::now() - Duration::from_secs(3 * 86_400);
+            handle
+                .set_times(std::fs::FileTimes::new().set_accessed(then))
+                .unwrap();
+            drop(handle);
+            let recorded = std::fs::metadata(&path).unwrap().accessed().unwrap();
+            (path, recorded)
+        };
+        let last_access = |path: &str| std::fs::metadata(path).unwrap().accessed().unwrap();
+
+        // The premise: on this machine an ordinary read does move the time.
+        // Where Windows is not recording opens there is nothing to show.
+        let (control, before) = aged("control.bin");
+        let _ = std::fs::read(&control).unwrap();
+        if last_access(&control) == before {
+            let _ = std::fs::remove_dir_all(&directory);
+            return;
+        }
+
+        let (path, before) = aged("copy.bin");
+        assert!(head_hash(&path).is_some());
+        assert!(full_hash(&path).is_some());
+        assert_eq!(
+            last_access(&path),
+            before,
+            "comparing the file stamped it as opened just now"
+        );
+
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

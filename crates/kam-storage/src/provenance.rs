@@ -21,11 +21,23 @@
 //!
 //! # On "never opened"
 //!
-//! Windows stops updating last-access times by default, because doing so turns
-//! every read into a write. When that is the case the access time simply equals
-//! the creation time and means nothing, so [`last_access_tracked`] is checked
-//! and reported rather than letting the UI draw a confident conclusion from a
-//! number the filesystem stopped maintaining.
+//! Whether Windows keeps a file's last-access time up to date is a setting,
+//! and it differs by machine. Where it is off the time means nothing, so
+//! [`access_times`] is checked and reported rather than letting the UI draw a
+//! confident conclusion from a number the filesystem stopped maintaining.
+//!
+//! This module used to read that setting backwards. It took every value but 0
+//! to mean "off", including the 2 that current Windows sets by itself, and 2
+//! means the times are kept. So on an ordinary machine the page said there was
+//! no way to tell which downloads had ever been opened, while Windows was
+//! recording exactly that.
+//!
+//! Where the time is kept, any read moves it, this module's own included. The
+//! record beside each file is therefore read through [`crate::quiet`], which
+//! asks Windows not to count the read. The two corrections belong together:
+//! reporting a time this survey had just overwritten would be reporting itself.
+
+use std::io::Read;
 
 use serde::{Deserialize, Serialize};
 use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
@@ -115,7 +127,7 @@ impl Origin {
 /// Most files have no such stream, and that is not an error: it means nothing
 /// was recorded, not that the file is local.
 pub fn origin_of(path: &str) -> Option<Origin> {
-    let (zone, host_url, referrer_url) = parse_stream(&read_stream(path)?)?;
+    let (zone, host_url, referrer_url) = parse_stream(&read_stream(path)?.text)?;
     Some(Origin {
         zone,
         host_url,
@@ -140,19 +152,40 @@ pub struct Download {
     /// The page that linked to it, when the downloader recorded one.
     pub referrer_url: Option<String>,
     pub days_since_arrival: Option<u64>,
-    /// Meaningless unless [`DownloadSummary::last_access_tracked`] is true.
+    /// Meaningless unless [`DownloadSummary::access_times`] says Windows is
+    /// recording them. Any program that reads the file moves it, so an old
+    /// figure is evidence that nothing has and a recent one only that
+    /// something did.
     pub days_since_access: Option<u64>,
+}
+
+/// Whether Windows keeps last-access times up to date on this machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessTimes {
+    /// A read moves a file's last-access time.
+    Recorded,
+    /// It does not, and the time on a file is whatever it last happened to be.
+    NotRecorded,
+    /// The setting could not be read. Not the same as either answer, and the
+    /// interface shows no last-opened dates on the strength of it.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadSummary {
     pub found: usize,
     pub total_bytes: u64,
-    /// Whether this machine still maintains last-access times. When false, the
+    /// Whether this machine maintains last-access times. Unless it does, the
     /// access figures are not evidence of anything.
-    pub last_access_tracked: bool,
+    pub access_times: AccessTimes,
     /// How many files were interrogated to produce the list.
     pub examined: usize,
+    /// Listed files whose record could only be read in a way Windows counts as
+    /// opening them, so their last-access time now shows this survey. Zero in
+    /// the ordinary case; see [`crate::quiet`] for when it is not.
+    #[serde(default)]
+    pub read_as_opened: usize,
 }
 
 /// Parse the `Zone.Identifier` stream.
@@ -185,41 +218,67 @@ fn parse_stream(text: &str) -> Option<(Zone, Option<String>, Option<String>)> {
     zone.map(|zone| (zone, host, referrer))
 }
 
+/// The record beside a file, and whether reading it left the file looking
+/// unopened.
+struct Stream {
+    text: String,
+    /// False when Windows counted the read as opening the file.
+    quiet: bool,
+}
+
 /// Read the stream beside a file, if it has one.
 ///
 /// The `path:stream` form is how Windows addresses an alternate data stream, and
 /// ordinary file reads understand it. Most files have none, so a failure here is
 /// the normal case rather than an error worth reporting.
-fn read_stream(path: &str) -> Option<String> {
-    let bytes = std::fs::read(format!("{path}:Zone.Identifier")).ok()?;
+fn read_stream(path: &str) -> Option<Stream> {
+    let mut reader = crate::quiet::open(&format!("{path}:Zone.Identifier")).ok()?;
+    let mut bytes = Vec::new();
+    reader.file.read_to_end(&mut bytes).ok()?;
+    let quiet = reader.quiet;
     // Usually ASCII, occasionally UTF-16 with a byte order mark from an older
     // writer. Lossy either way: only three keys are being looked for.
-    if bytes.starts_with(&[0xFF, 0xFE]) {
+    let text = if bytes.starts_with(&[0xFF, 0xFE]) {
         let units: Vec<u16> = bytes[2..]
             .as_chunks::<2>()
             .0
             .iter()
             .map(|pair| u16::from_le_bytes(*pair))
             .collect();
-        Some(String::from_utf16_lossy(&units))
+        String::from_utf16_lossy(&units)
     } else {
-        Some(String::from_utf8_lossy(&bytes).into_owned())
-    }
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    Some(Stream { text, quiet })
 }
 
-/// Whether this machine still updates last-access times.
-///
-/// `NtfsDisableLastAccessUpdate` is 0 when tracking is on. Every other value —
-/// including the 2 that modern Windows defaults to — means the timestamps stop
-/// moving, so "never opened" would be a claim about a number nothing maintains.
-pub fn last_access_tracked() -> bool {
-    Key::open(
+/// Whether this machine keeps last-access times up to date.
+pub fn access_times() -> AccessTimes {
+    let Some(key) = Key::open(
         HKEY_LOCAL_MACHINE,
         r"SYSTEM\CurrentControlSet\Control\FileSystem",
         View::Native,
-    )
-    .and_then(|key| key.dword("NtfsDisableLastAccessUpdate"))
-    .is_some_and(|value| value == 0)
+    ) else {
+        return AccessTimes::Unknown;
+    };
+    access_times_from(key.dword("NtfsDisableLastAccessUpdate"))
+}
+
+/// What `NtfsDisableLastAccessUpdate` says.
+///
+/// The lowest bit is the answer: 0 and 2 mean the times are kept, 1 and 3 that
+/// they are not. The next bit only says who chose, the person (0 and 1) or
+/// Windows (2 and 3), and current Windows also sets the highest bit, so the
+/// value on an untouched machine is `0x80000002` and Windows' own tool reports
+/// it as "System Managed, Last Access Time Updates ENABLED".
+///
+/// A value that is not there, or could not be read, is its own answer.
+fn access_times_from(setting: Option<u32>) -> AccessTimes {
+    match setting {
+        None => AccessTimes::Unknown,
+        Some(value) if value & 1 == 0 => AccessTimes::Recorded,
+        Some(_) => AccessTimes::NotRecorded,
+    }
 }
 
 const FILETIME_EPOCH_OFFSET: u64 = 11_644_473_600;
@@ -251,19 +310,23 @@ pub fn find(
 
     let examined = candidates.len();
     let mut downloads = Vec::new();
+    let mut read_as_opened = 0_usize;
 
     for (record, bytes) in candidates {
         let Some(path) = index.path_of(record, drive_root) else {
             continue;
         };
-        let Some(text) = read_stream(&path) else {
+        let Some(stream) = read_stream(&path) else {
             continue;
         };
-        let Some((zone, host_url, referrer_url)) = parse_stream(&text) else {
+        let Some((zone, host_url, referrer_url)) = parse_stream(&stream.text) else {
             continue;
         };
         if !zone.is_external() {
             continue;
+        }
+        if !stream.quiet {
+            read_as_opened += 1;
         }
 
         let entry = index.entry(record);
@@ -285,8 +348,9 @@ pub fn find(
     let summary = DownloadSummary {
         found: downloads.len(),
         total_bytes: downloads.iter().map(|download| download.bytes).sum(),
-        last_access_tracked: last_access_tracked(),
+        access_times: access_times(),
         examined,
+        read_as_opened,
     };
     (downloads, summary)
 }
@@ -368,10 +432,100 @@ mod tests {
         assert_eq!(days_since(three_days_ago, now), Some(3));
     }
 
+    /// The setting is read by its lowest bit, whoever chose it.
+    ///
+    /// This is the regression test for reading it backwards. The value on the
+    /// development machine is `0x80000002`, which Windows' own tool reports as
+    /// "System Managed, Last Access Time Updates ENABLED", and the old reading
+    /// (anything but 0 means off) called that not recorded. Current Windows
+    /// always sets the high bit, so the old reading could no longer answer
+    /// "recorded" on any up-to-date machine.
     #[test]
-    fn the_machine_reports_whether_it_tracks_last_access() {
-        // Informational: modern Windows defaults to not tracking, and the UI
-        // must know that before it says anything about "never opened".
-        println!("last access tracked here: {}", last_access_tracked());
+    fn the_last_access_setting_is_read_by_its_lowest_bit() {
+        for kept in [0, 2, 0x8000_0000, 0x8000_0002] {
+            assert_eq!(
+                access_times_from(Some(kept)),
+                AccessTimes::Recorded,
+                "{kept:#x} means Windows is keeping last-access times"
+            );
+        }
+        for stopped in [1, 3, 0x8000_0001, 0x8000_0003] {
+            assert_eq!(
+                access_times_from(Some(stopped)),
+                AccessTimes::NotRecorded,
+                "{stopped:#x} means Windows is not keeping last-access times"
+            );
+        }
+    }
+
+    #[test]
+    fn a_setting_that_could_not_be_read_is_neither_answer() {
+        assert_eq!(access_times_from(None), AccessTimes::Unknown);
+    }
+
+    #[test]
+    fn the_machine_reports_whether_it_keeps_last_access_times() {
+        // Informational: the setting differs by machine, and the UI must know
+        // it before it says anything about when a file was last opened.
+        println!("last-access times here: {:?}", access_times());
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("kam-provenance-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// Asking where a file came from must not make it look freshly opened.
+    ///
+    /// The survey asks this of every large file on the drive, and the answer
+    /// it then shows beside each download is when that file was last opened.
+    /// Read the ordinary way, the question overwrote the answer.
+    #[test]
+    fn asking_where_a_file_came_from_does_not_stamp_it_as_opened() {
+        use std::time::{Duration, SystemTime};
+
+        let folder = scratch("origin");
+        let aged = |name: &str| -> Option<(String, SystemTime)> {
+            let path = folder.join(name).to_string_lossy().into_owned();
+            std::fs::write(&path, b"payload").unwrap();
+            std::fs::write(format!("{path}:Zone.Identifier"), CHROME).ok()?;
+            let handle = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let then = SystemTime::now() - Duration::from_secs(3 * 86_400);
+            handle
+                .set_times(std::fs::FileTimes::new().set_accessed(then))
+                .unwrap();
+            drop(handle);
+            let recorded = std::fs::metadata(&path).unwrap().accessed().unwrap();
+            Some((path, recorded))
+        };
+        let last_access = |path: &str| std::fs::metadata(path).unwrap().accessed().unwrap();
+
+        // The premise, checked on a file of its own: here, an ordinary read of
+        // the record does move the time. Where it does not (the setting is
+        // off, or the folder cannot hold a stream) there is nothing to show.
+        let Some((control, before)) = aged("control.iso") else {
+            let _ = std::fs::remove_dir_all(&folder);
+            return;
+        };
+        let _ = std::fs::read(format!("{control}:Zone.Identifier")).unwrap();
+        if last_access(&control) == before {
+            let _ = std::fs::remove_dir_all(&folder);
+            return;
+        }
+
+        let (path, before) = aged("big.iso").unwrap();
+        let origin = origin_of(&path).expect("the record should be read");
+        assert_eq!(origin.zone, Zone::Internet);
+        assert_eq!(origin.host(), Some("cdn.example.com"));
+        assert_eq!(
+            last_access(&path),
+            before,
+            "reading the download record stamped the file as opened just now"
+        );
+
+        std::fs::remove_dir_all(&folder).unwrap();
     }
 }
