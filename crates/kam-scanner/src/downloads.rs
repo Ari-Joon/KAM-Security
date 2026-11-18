@@ -353,38 +353,42 @@ pub fn dissect(archive: &str, sha256: &str, scan: FileScan, entries: &[Entry]) -
     let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
     let attribution = attribute(&scan.threats, &names);
 
-    // When Defender's answer cannot be pinned to members, no member is known
-    // to be clean just because it was not named, so none is shown as clean.
-    // The first sentence is for the archive, the second for each member.
+    // When Defender's answer cannot be pinned to members, nothing is known
+    // about a member just because it was not named, so none is shown as one
+    // Defender found nothing in. The first sentence is for the archive, the
+    // second for each member. None of them calls a file clean: that would be
+    // this product's verdict, and it does not give one.
     let untrusted: Option<(String, &str)> = if scan.answer == Answer::NotFinished {
         Some((
             "Defender did not finish checking the archive, so nothing in it is offered for \
              extraction."
                 .to_owned(),
-            "Defender did not finish checking the archive, so this file is not known to be clean.",
+            "Defender did not finish checking the archive, so nothing is known about this file \
+             either way.",
         ))
     } else if scan.answer == Answer::Flagged && !scan.listing_consistent {
         Some((
             "Defender flagged something in this archive, and its list of what did not add up, \
              so nothing in it is offered for extraction."
                 .to_owned(),
-            "Defender's list of what it flagged did not add up, so this file is not known to be \
-             clean.",
+            "Defender's list of what it flagged did not add up, so nothing is known about this \
+             file either way.",
         ))
     } else if !attribution.whole.is_empty() {
         Some((
-            "Defender flagged the archive as a whole, not a file inside it, so there are no \
-             clean parts to separate."
+            "Defender flagged the archive as a whole, not a file inside it, so no part of it \
+             can be told apart from the rest."
                 .to_owned(),
-            "Defender flagged the archive as a whole, so this file is not known to be clean.",
+            "Defender flagged the archive as a whole, so nothing is known about this file \
+             either way.",
         ))
     } else if !attribution.unmatched.is_empty() {
         Some((
             "Defender flagged a file this archive's own list does not show by that name, so \
              which file it meant cannot be told and nothing is offered for extraction."
                 .to_owned(),
-            "Defender flagged a file it could not be matched to, so this file is not known to be \
-             clean.",
+            "Defender flagged a file it could not be matched to, so nothing is known about this \
+             file either way.",
         ))
     } else {
         None
@@ -469,7 +473,7 @@ pub fn dissect(archive: &str, sha256: &str, scan: FileScan, entries: &[Entry]) -
         Some(sentence)
     } else if totals.clean == 0 {
         Some(
-            "There is nothing Defender found nothing in, so there is nothing to extract."
+            "Every file in this archive was flagged or left out, so there is nothing to extract."
                 .to_owned(),
         )
     } else {
@@ -640,11 +644,62 @@ mod tests {
         assert!(!dissect("a", "b", whole, &entries).offered);
     }
 
-    /// The real case from this machine's own history: an ML detection whose
-    /// only resource is the zip itself. No member is known to be clean just
-    /// because none was named, so none is shown as clean and none is offered.
+    /// Every sentence this writes about an archive and its members says what
+    /// Defender did or did not do. None calls a file clean, which would be
+    /// this product's own verdict.
     #[test]
-    fn an_archive_flagged_as_a_whole_has_no_clean_parts_to_separate() {
+    fn no_sentence_about_an_archive_calls_a_file_clean() {
+        let entries = [entry("readme.txt", 1), entry("tool.exe", 2)];
+        let mut inconsistent = flagged(&[r"file : C:\w.zip->readme.txt"]);
+        inconsistent.listing_consistent = false;
+        let mut locked = entry("secret.docx", 3);
+        locked.encrypted = true;
+        let cases = [
+            dissect(
+                "a",
+                "b",
+                parse_report(Some(2), "CmdTool: Failed with hr = 0x80070005."),
+                &entries,
+            ),
+            dissect("a", "b", inconsistent, &entries),
+            dissect("a", "b", flagged(&[r"file:_C:\w.zip"]), &entries),
+            dissect(
+                "a",
+                "b",
+                flagged(&[r"file : C:\w.zip->not-listed.exe"]),
+                &entries,
+            ),
+            dissect(
+                "a",
+                "b",
+                flagged(&[r"file : C:\w.zip->readme.txt"]),
+                &entries[..1],
+            ),
+            dissect("a", "b", clean(), &[locked]),
+        ];
+        for dissection in &cases {
+            assert!(!dissection.offered, "{dissection:?}");
+            let mut said = vec![dissection.not_offered.clone().unwrap_or_default()];
+            for member in &dissection.members {
+                if let MemberStatus::LeftOut { reason } = &member.status {
+                    said.push(reason.clone());
+                }
+            }
+            for sentence in said {
+                assert!(
+                    !sentence.to_lowercase().contains("clean"),
+                    "this calls a file clean, or not clean: {sentence}"
+                );
+            }
+        }
+    }
+
+    /// The real case from this machine's own history: an ML detection whose
+    /// only resource is the zip itself. Nothing is known about a member just
+    /// because none was named, so none is shown as one Defender found nothing
+    /// in and none is offered.
+    #[test]
+    fn an_archive_flagged_as_a_whole_has_no_parts_to_tell_apart() {
         let mut scan = flagged(&[r"file:_C:\Users\me\Downloads\WindWakerHD.zip"]);
         scan.threats[0].name = "Trojan:Script/Wacatac.H!ml".to_owned();
         let entries = [entry("readme.txt", 10), entry("game.exe", 20)];
@@ -659,8 +714,8 @@ mod tests {
         assert_eq!(
             dissection.not_offered.as_deref(),
             Some(
-                "Defender flagged the archive as a whole, not a file inside it, so there are no \
-                 clean parts to separate."
+                "Defender flagged the archive as a whole, not a file inside it, so no part of \
+                 it can be told apart from the rest."
             )
         );
         assert_eq!(
@@ -669,7 +724,7 @@ mod tests {
         );
         assert_eq!(
             dissection.totals.clean, 0,
-            "a file was shown as clean: {:?}",
+            "a file was shown as one Defender found nothing in: {:?}",
             dissection.members
         );
         assert_eq!(dissection.totals.left_out, 2);

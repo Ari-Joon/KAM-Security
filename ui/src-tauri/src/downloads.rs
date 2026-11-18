@@ -727,6 +727,12 @@ fn quarantine_original(original: &str) -> OriginalFate {
     }
 }
 
+/// What is said about an archive of a kind this cannot take apart. It says
+/// what was done, and does not call anything clean: that word would be this
+/// product's own verdict on a file.
+const NOT_A_ZIP: &str = "Only zip archives can be taken apart here. Defender was asked about \
+     this one as a single file.";
+
 /// Take a zip apart. `None` when it was stopped. See the module notes.
 pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<DissectionView>, String> {
     let given = Path::new(path);
@@ -736,12 +742,7 @@ pub fn dissect(app: &AppHandle, path: &str, job: &str) -> Result<Option<Dissecti
         .unwrap_or_default();
     match archive_kind(&name) {
         Some(ArchiveKind::Zip) => {}
-        Some(ArchiveKind::Other) => {
-            return Err(
-                "Clean extraction is available for zip archives. This one was checked as a whole."
-                    .to_owned(),
-            )
-        }
+        Some(ArchiveKind::Other) => return Err(NOT_A_ZIP.to_owned()),
         None => return Err("This is not an archive, so there is nothing to take apart.".to_owned()),
     }
     let real = std::fs::canonicalize(given)
@@ -980,6 +981,40 @@ mod tests {
         drop(seen_tx);
         settler.join().unwrap();
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Product rule: no "clean" in this product's own voice. The page said
+    /// "Extract the clean parts", "Clean extraction is available" and "get a
+    /// clean copy". Read from the page's own source, because that is where
+    /// the words a person reads are. What it may still say is what a result
+    /// is not, and that nothing unread is ever shown as clean.
+    #[test]
+    fn nothing_the_page_or_the_window_says_calls_a_file_clean() {
+        let allowed = ["not a clean result", "never shown as clean"];
+        let standalone = |line: &str| {
+            let lower = line.to_lowercase();
+            lower.match_indices("clean").any(|(at, word)| {
+                let before = lower[..at].chars().next_back();
+                let after = lower[at + word.len()..].chars().next();
+                let part_of_a_name = |c: Option<char>| {
+                    c.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '('))
+                };
+                !part_of_a_name(before) && !part_of_a_name(after)
+            }) && !allowed.iter().any(|phrase| lower.contains(phrase))
+        };
+        let page = include_str!("../../src/views/Downloads.tsx");
+        for (number, line) in page.lines().enumerate() {
+            assert!(!standalone(line), "the page, line {}: {line}", number + 1);
+        }
+        assert!(!standalone(NOT_A_ZIP), "{NOT_A_ZIP}");
+        // The check itself: it catches the three sentences it was written for.
+        for wrong in [
+            "Extract the clean parts",
+            "Clean extraction is available for zip archives.",
+            "get a clean copy from its publisher",
+        ] {
+            assert!(standalone(wrong), "{wrong} was let through");
+        }
     }
 
     #[test]

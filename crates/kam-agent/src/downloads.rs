@@ -615,7 +615,7 @@ pub fn record_dissection(
     Response::Acknowledged
 }
 
-/// Record that the window extracted the clean parts of an archive.
+/// Record that the window extracted what Defender did not flag in an archive.
 pub fn record_extraction(
     path: &str,
     sha256: &str,

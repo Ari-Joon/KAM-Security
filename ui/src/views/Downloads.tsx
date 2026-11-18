@@ -23,8 +23,8 @@ import type {
  *
  * Three rules shape every sentence here. Defender decides what is flagged and
  * the page reports its answer by name, never a score. A check that did not
- * finish, or a file that could not be read, is said out loud and never shown
- * as clean. And nothing is moved or deleted unless somebody presses a button:
+ * finish, or a file that could not be read, is said out loud and
+ * never shown as clean. And nothing is moved or deleted unless somebody presses a button:
  * quarantine is the reversible choice, and extraction writes only what
  * Defender found nothing in.
  */
@@ -509,8 +509,8 @@ function RecordRow({
   const flaggedProgram =
     record.scan.answer === "flagged" && record.archive === null && record.signature !== null;
   // Defender names a member of an archive after an arrow. A flag on an
-  // archive that names none is a flag on the archive itself, and then no file
-  // in it is known to be clean.
+  // archive that names none is a flag on the archive itself, and then nothing
+  // is known about any one file in it.
   const flaggedWhole =
     record.archive !== null &&
     record.scan.answer === "flagged" &&
@@ -547,20 +547,20 @@ function RecordRow({
       {flaggedProgram && (
         <p className="small muted wrap">
           A program Defender flagged cannot be repaired or cleaned here. Quarantine
-          it, and if you need it, get a clean copy from its publisher. This copy{" "}
+          it, and if you need it, get a fresh copy from its publisher. This copy{" "}
           {originClause(record)}. {signerSentence(record.signature)}
         </p>
       )}
       {flaggedWhole && (
         <p className="small muted wrap">
-          Defender flagged the archive as a whole, not a file inside it, so there
-          are no clean parts to separate. This copy {originClause(record)}.
+          Defender flagged the archive as a whole, not a file inside it, so no
+          part of it can be told apart from the rest. This copy {originClause(record)}.
         </p>
       )}
       {record.archive === "other" && (
         <p className="small muted">
-          Clean extraction is available for zip archives. This one was checked
-          as a whole.
+          Only zip archives can be taken apart here. Defender was asked about
+          this one as a single file.
         </p>
       )}
 
@@ -593,7 +593,7 @@ function RecordRow({
           </button>
           {record.archive === "zip" && !flaggedWhole && (
             <button className="ghost" onClick={onDissect} disabled={busy}>
-              Extract the clean parts
+              Extract what Defender did not flag
             </button>
           )}
           <button className="ghost" onClick={onQuarantine} disabled={busy}>
@@ -649,7 +649,7 @@ function LooseRow({
         </button>
         {file.archive === "zip" && (
           <button className="ghost" onClick={onDissect} disabled={busy}>
-            Extract the clean parts
+            Extract what Defender did not flag
           </button>
         )}
         <PathLink path={file.path} className="link-button">

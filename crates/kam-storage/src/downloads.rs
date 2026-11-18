@@ -347,7 +347,7 @@ pub fn safe_relative(name: &str) -> Result<Vec<String>, NameRefusal> {
     Ok(parts)
 }
 
-/// The name of the folder clean parts of an archive are extracted into:
+/// The name of the folder the files Defender did not flag are extracted into:
 /// `<archive name> (checked by KAM)`, then ` (2)`, ` (3)` and so on while a
 /// name is taken.
 ///
