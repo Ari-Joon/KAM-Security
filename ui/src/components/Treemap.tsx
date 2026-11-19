@@ -7,6 +7,8 @@ import type { TreeNode } from "../lib/types";
 type Props = {
   node: TreeNode;
   onDrill: (child: TreeNode) => void;
+  /** The folder being read on its own just now, by path, if one is. */
+  reading?: string | null;
 };
 
 /** Enough room to print a name without it turning into an ellipsis smear. */
@@ -35,7 +37,7 @@ const RAMP = [
   "#a8c1ff",
 ];
 
-export default function Treemap({ node, onDrill }: Props) {
+export default function Treemap({ node, onDrill, reading = null }: Props) {
   const container = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
 
@@ -92,13 +94,22 @@ export default function Treemap({ node, onDrill }: Props) {
         {cells.map((cell, index) => {
           const showLabel =
             cell.width >= LABEL_MIN_WIDTH && cell.height >= LABEL_MIN_HEIGHT;
-          const drillable = !cell.item.is_aggregate && cell.item.children.length > 0;
+          // A folder at the floor of what was sent arrives with nothing
+          // beneath it and a mark saying there is more. It opens too: the
+          // page asks the service for it. A folder with neither has no
+          // folders in it, and is not made to look as though it leads
+          // anywhere.
+          const folded = !cell.item.is_aggregate && cell.item.folded === true;
+          const drillable =
+            !cell.item.is_aggregate && (cell.item.children.length > 0 || folded);
+          const beingRead = reading !== null && reading === cell.item.path;
           return (
             <div
               key={`${cell.item.path}-${index}`}
               className={
                 "treemap-cell" +
                 (drillable ? " drillable" : "") +
+                (beingRead ? " reading" : "") +
                 (cell.item.is_aggregate ? " aggregate" : "")
               }
               style={{
@@ -119,7 +130,13 @@ export default function Treemap({ node, onDrill }: Props) {
                 ? {
                     role: "button",
                     tabIndex: 0,
-                    "aria-label": `${cell.item.name}, ${fmt.bytes(cell.item.bytes)}. Open to see what is inside.`,
+                    "aria-label": `${cell.item.name}, ${fmt.bytes(cell.item.bytes)}. ${
+                      beingRead
+                        ? "Being read now."
+                        : cell.item.children.length > 0
+                          ? "Open to see what is inside."
+                          : "Open to read what is inside from the drive."
+                    }`,
                     onKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => {
                       if (event.key === "Enter" || event.key === " ") {
                         event.preventDefault();
@@ -129,12 +146,19 @@ export default function Treemap({ node, onDrill }: Props) {
                   }
                 : {})}
               onClick={() => drillable && onDrill(cell.item)}
-              title={`${cell.item.path}\n${fmt.bytes(cell.item.bytes)}`}
+              title={
+                `${cell.item.path}\n${fmt.bytes(cell.item.bytes)}` +
+                (folded && cell.item.children.length === 0
+                  ? "\n\nClick to read what is inside it from the drive"
+                  : "")
+              }
             >
               {showLabel && (
                 <>
                   <span className="treemap-name">{cell.item.name}</span>
-                  <span className="treemap-size">{fmt.bytes(cell.item.bytes)}</span>
+                  <span className="treemap-size">
+                    {beingRead ? "Reading…" : fmt.bytes(cell.item.bytes)}
+                  </span>
                 </>
               )}
             </div>

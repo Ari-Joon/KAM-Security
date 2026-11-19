@@ -36,6 +36,11 @@ export type TreeNode = {
   files: number;
   children: TreeNode[];
   is_aggregate?: boolean;
+  /**
+   * True when this folder has folders inside it that were not sent, because
+   * the tree stops here. The map asks for such a folder on its own.
+   */
+  folded?: boolean;
 };
 
 export type FileEntry = {
@@ -314,6 +319,24 @@ export type Scan = {
   elapsed_ms: number;
   tree: TreeNode;
   largest_files: FileEntry[];
+};
+
+/**
+ * One folder of a drive, read on its own for the map. Folders only, cut the
+ * way the top of the map is: it names no file.
+ */
+export type FolderScan = {
+  /** The folder, as the drive itself spells it. */
+  path: string;
+  method: ScanMethod;
+  fallback_reason: string | null;
+  /**
+   * Folders beneath it that could not be opened. Null when that cannot be
+   * told, which is whenever the file table was used.
+   */
+  unreadable: number | null;
+  elapsed_ms: number;
+  tree: TreeNode;
 };
 
 export type Confidence = "low" | "medium" | "high";

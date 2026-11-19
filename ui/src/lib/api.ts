@@ -16,6 +16,7 @@ import type {
   Threat,
   AuditRecord,
   Scan,
+  FolderScan,
   SystemStatus,
   Volume,
   ProvenanceReport,
@@ -56,6 +57,8 @@ export const api = {
   recentAudit: (limit: number) => invoke<AuditRecord[]>("recent_audit", { limit }),
   volumes: () => invoke<Volume[]>("list_volumes"),
   scan: (path: string) => invoke<Scan>("scan_path", { path }),
+  /** One folder of the map, read on its own, below where a scan stops. */
+  scanFolder: (path: string) => invoke<FolderScan>("scan_folder", { path }),
   applications: (drive: string) =>
     invoke<ApplicationReport>("list_applications", { drive }),
   applicationsPreview: () => invoke<AppFootprint[]>("list_applications_preview"),

@@ -1,16 +1,136 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Treemap from "../components/Treemap";
 import FileRow from "../components/FileRow";
-import MeasuredAt from "../components/MeasuredAt";
+import MeasuredAt, { whenMeasured } from "../components/MeasuredAt";
 import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
-import type { Scan, TreeNode, Volume } from "../lib/types";
+import type { FolderScan, Scan, ScanMethod, TreeNode, Volume } from "../lib/types";
 
 type Props = {
   volumes: Volume[];
   initialRoot: string | null;
   onScanned: () => void;
 };
+
+/**
+ * One folder read on its own, below where the scan of the drive stops.
+ *
+ * Kept with the moment it arrived. It is a second look at the drive, taken
+ * later than the scan it was opened from, and the page says so wherever it
+ * draws from one.
+ */
+type FolderRead = { folder: FolderScan; at: number };
+
+/**
+ * A step on the way down the map.
+ *
+ * `read` is the folder read this part of the map is drawn from, or null while
+ * it is still the scan of the drive. `rectangle` is set only on the step a
+ * read begins at: what the rectangle that was clicked showed, so that a figure
+ * that differs from it is said to differ.
+ */
+type Step = { node: TreeNode; read: FolderRead | null; rectangle: number | null };
+
+/** How many folder reads are kept at once. Each can be a few megabytes. */
+const READS_KEPT = 24;
+
+const METHOD: Record<ScanMethod, string> = {
+  master_file_table: "from the file table",
+  directory_walk: "by walking its folders",
+};
+
+/** A sentence with a whole path in it has to be able to break inside the path. */
+const LONG_PATHS = { overflowWrap: "anywhere" } as const;
+
+/**
+ * What is said above a part of the map that came from a folder read.
+ *
+ * Three things a second read can leave unsaid, and each would mislead. When
+ * it was taken, because it is not the scan's time. That its figure is not the
+ * one on the rectangle it was opened from, where it is not, with why: the
+ * folder changed, or the two were worked out differently. And how much of the
+ * folder is in files sitting directly in it, which the map does not draw.
+ */
+function ReadNote({
+  step,
+  scan,
+  scannedAt,
+}: {
+  step: Step;
+  scan: Scan;
+  scannedAt: number;
+}) {
+  const read = step.read;
+  if (!read) return null;
+  const { folder, at } = read;
+
+  if (step.rectangle === null) {
+    return (
+      <p className="muted" style={LONG_PATHS}>
+        This part of the map is from {folder.path}, read on its own at{" "}
+        {whenMeasured(at)} {METHOD[folder.method]}.
+      </p>
+    );
+  }
+
+  const tree = folder.tree;
+  const difference = tree.bytes - step.rectangle;
+  const sameMethod = folder.method === scan.method;
+  // Every folder inside it is in `children`, the smallest gathered into one,
+  // so what is left of its total is the files directly in it.
+  const direct = tree.bytes - tree.children.reduce((sum, child) => sum + child.bytes, 0);
+  const unreadable = folder.unreadable ?? 0;
+
+  return (
+    <p className="muted" style={LONG_PATHS}>
+      {folder.path} was read on its own at {whenMeasured(at)} {METHOD[folder.method]}:{" "}
+      {fmt.bytes(tree.bytes)}.
+      {difference !== 0 && (
+        <>
+          {" "}
+          That is {fmt.bytes(Math.abs(difference))} {difference > 0 ? "more" : "less"} than
+          the rectangle it was opened from, which is from the scan at{" "}
+          {whenMeasured(scannedAt)}.
+          {sameMethod && " The two were worked out the same way, so what is in the folder changed in between."}
+        </>
+      )}
+      {!sameMethod && folder.method === "directory_walk" && (
+        <>
+          {" "}
+          The file table could not be used for this read
+          {folder.fallback_reason ? ` (${folder.fallback_reason})` : ""}, so the folder
+          was walked. A walk counts a file with several names once for each name and
+          cannot open every folder. The scan used the file table, which counts such a
+          file once, so the two figures can differ for that reason alone.
+        </>
+      )}
+      {!sameMethod && folder.method === "master_file_table" && (
+        <>
+          {" "}
+          The scan walked the drive's folders, which counts a file with several names
+          once for each name. This read used the file table, which counts it once, so
+          the two figures can differ for that reason alone.
+        </>
+      )}
+      {unreadable > 0 && (
+        <>
+          {" "}
+          {fmt.count(unreadable)} {unreadable === 1 ? "folder" : "folders"} inside it
+          could not be opened, and what {unreadable === 1 ? "it holds" : "they hold"}{" "}
+          is not counted.
+        </>
+      )}
+      {direct > 0 && (
+        <>
+          {" "}
+          {fmt.bytes(direct)} of it is in the {fmt.count(tree.files)}{" "}
+          {tree.files === 1 ? "file" : "files"} sitting directly in this folder, which
+          the map does not draw.
+        </>
+      )}
+    </p>
+  );
+}
 
 export default function Storage({ volumes, initialRoot, onScanned }: Props) {
   const [target, setTarget] = useState(initialRoot ?? "C:\\");
@@ -21,8 +141,19 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
   // Path from the scanned root down to whatever the treemap is showing.
-  const [trail, setTrail] = useState<TreeNode[]>([]);
+  const [trail, setTrail] = useState<Step[]>([]);
+  /** Folders read on their own since the scan on screen arrived, by path. */
+  const [reads, setReads] = useState<Record<string, FolderRead>>({});
+  /** The folder being read on its own now, if one is. */
+  const [opening, setOpening] = useState<TreeNode | null>(null);
+  /** The folder that could not be opened, and the service's reason. */
+  const [notOpened, setNotOpened] = useState<{ name: string; why: string } | null>(null);
   const startedAt = useRef(0);
+  /**
+   * Counts scans. A folder read belongs to the map it was clicked on, so one
+   * that answers after a new scan has replaced that map is let go.
+   */
+  const scanNumber = useRef(0);
 
   useEffect(() => {
     if (initialRoot) setTarget(initialRoot);
@@ -53,22 +184,89 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
     setError(null);
     setElapsed(0);
     startedAt.current = Date.now();
+    scanNumber.current += 1;
     try {
       const result = await api.scan(target);
       setScan(result);
       setScannedAt(Date.now());
-      setTrail([result.tree]);
+      setTrail([{ node: result.tree, read: null, rectangle: null }]);
     } catch (cause) {
       setError(reason(cause));
       setScan(null);
       setTrail([]);
     } finally {
+      // Whatever was read below the old map went with it.
+      setReads({});
+      setNotOpened(null);
       setRunning(false);
       onScanned();
     }
   }
 
-  const current = trail.length > 0 ? trail[trail.length - 1] : null;
+  /**
+   * Go into a rectangle.
+   *
+   * Most of the way down this only moves within the tree already in hand. The
+   * tree stops four folders down, though, and what a person is looking for is
+   * usually below that: everything in AppData\Local, every game in a Steam
+   * library. A rectangle at that floor is marked as having more beneath it,
+   * and opening one asks the service to read the drive again for that folder
+   * alone. Its own tree stops four folders further down and opens the same
+   * way, so the map can be followed as far as the drive goes.
+   */
+  async function open(child: TreeNode) {
+    const here = trail;
+    const parent = here[here.length - 1];
+    if (!parent) return;
+
+    if (child.children.length > 0) {
+      setNotOpened(null);
+      setTrail([...here, { node: child, read: parent.read, rectangle: null }]);
+      return;
+    }
+    // One at a time, and not under a scan that is about to replace the map.
+    if (!child.folded || opening !== null || running) return;
+    setNotOpened(null);
+
+    const key = child.path.toLowerCase();
+    const known = reads[key];
+    if (known) {
+      setTrail([...here, { node: known.folder.tree, read: known, rectangle: child.bytes }]);
+      return;
+    }
+
+    const asked = scanNumber.current;
+    setOpening(child);
+    try {
+      const folder = await api.scanFolder(child.path);
+      if (scanNumber.current !== asked) return;
+      const read: FolderRead = { folder, at: Date.now() };
+      setReads((current) => {
+        const kept = Object.entries(current)
+          .sort(([, a], [, b]) => b.at - a.at)
+          .slice(0, READS_KEPT - 1);
+        return { ...Object.fromEntries(kept), [key]: read };
+      });
+      // Only where the person still is. If they have moved about the map
+      // while it was being read, the folder is kept and opens at once when
+      // they come back to it, instead of the map jumping under them.
+      setTrail((current) =>
+        current === here
+          ? [...here, { node: folder.tree, read, rectangle: child.bytes }]
+          : current,
+      );
+    } catch (cause) {
+      if (scanNumber.current === asked) {
+        setNotOpened({ name: child.name, why: reason(cause) });
+      }
+    } finally {
+      setOpening(null);
+      onScanned();
+    }
+  }
+
+  const step = trail.length > 0 ? trail[trail.length - 1] : null;
+  const current = step?.node ?? null;
 
   // The scanned drive, so the header can say "1.0 TB of 1.8 TB" rather than
   // leaving the measured figure without anything to compare against.
@@ -196,29 +394,56 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
         )}
       </section>
 
-      {scan && current && (
+      {scan && step && current && (
         <>
           <section className="panel">
             <div className="panel-head">
               <h2>Map</h2>
               <nav className="crumbs">
-                {trail.map((node, index) => (
+                {trail.map((visited, index) => (
                   <button
-                    key={node.path + index}
+                    key={visited.node.path + index}
                     className="crumb"
                     disabled={index === trail.length - 1}
-                    onClick={() => setTrail(trail.slice(0, index + 1))}
+                    onClick={() => {
+                      setNotOpened(null);
+                      setTrail(trail.slice(0, index + 1));
+                    }}
                   >
-                    {index === 0 ? scan.root : node.name}
+                    {index === 0 ? scan.root : visited.node.name}
                   </button>
                 ))}
               </nav>
             </div>
             <p className="muted">
               Each rectangle is sized by what it holds. Click one, or Tab to it
-              and press Enter, to go deeper.
+              and press Enter, to go deeper. The map arrives four folders
+              deep. Opening a folder below that reads the drive again for that
+              folder alone.
             </p>
-            <Treemap node={current} onDrill={(child) => setTrail([...trail, child])} />
+            <ReadNote step={step} scan={scan} scannedAt={scannedAt} />
+            {opening && (
+              <p className="muted" style={LONG_PATHS} role="status">
+                Reading {opening.path} from the drive…
+              </p>
+            )}
+            {notOpened && (
+              // The map is a picture of the drive as it was, and a folder on
+              // it can have gone since. That is said, with the service's
+              // reason, and the picture is dated: a click that does nothing
+              // would leave the rectangle looking as though it were still
+              // there to open.
+              <div className="notice notice-warn" style={LONG_PATHS} role="alert">
+                <strong>{notOpened.name} could not be opened:</strong> {notOpened.why}.
+                The map shows the drive as it was when it was scanned at{" "}
+                {whenMeasured(scannedAt)}. Scan again to see it as it is now.
+              </div>
+            )}
+            <Treemap
+              node={current}
+              reading={opening?.path ?? null}
+              onDrill={(child) => void open(child)}
+            />
           </section>
 
           <div className="split">

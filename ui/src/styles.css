@@ -747,6 +747,13 @@ select {
   filter: brightness(1.16);
 }
 
+/* A folder the service is being asked about. The wait is a second or two by
+   the file table and can be a minute by a walk, so the rectangle says so. */
+.treemap-cell.reading {
+  cursor: progress;
+  filter: brightness(1.16);
+}
+
 .treemap-cell.aggregate {
   color: var(--text-2);
 }
