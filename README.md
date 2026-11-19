@@ -426,6 +426,26 @@ told apart from the rest, so nothing is offered. A file Defender removes the
 moment it is written is listed as removed, with the detection that took it,
 and is not counted as extracted.
 
+Files that were already in Downloads, or arrived while KAM Security was not
+running, are listed as not checked yet, and one button checks them all, one
+after another, with a Stop. Each goes through exactly the check a single file
+gets. A file kept only online by OneDrive is skipped and named, because reading
+it would download it, and no notification is raised for any of them: what the
+run came to is said once, on the page.
+
+With Windows notifications switched off, a flagged download would otherwise
+make no sign anywhere. So the downloads Defender flagged, and the checks that
+did not finish, since you last opened the page are counted beside its name in
+the menu and in one line on the Overview. Opening the page clears the count,
+and the page then says what was new. When you last looked is kept in your own
+part of the registry, so each account has its own. A count that could not be
+made shows a question mark with the reason, never a zero.
+
+The list can be searched by name, filtered (flagged, not finished, not checked
+yet, still here, gone) and put in order. A row can be removed from it, or the
+whole list cleared, and both are real deletion of the record, never of the
+file. The Activity log keeps its own entry of each check, and of each removal.
+
 Defender's names carry their own category, and the page says what each one
 means. `HackTool:` and `PUA:` are Defender saying a program is a dual-use or
 unwanted tool rather than malware, which is common for open-source utilities.
