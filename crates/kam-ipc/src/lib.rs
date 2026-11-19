@@ -126,6 +126,9 @@ pub enum Request {
     /// cannot edit: anybody able to mark their own persistence as already-seen
     /// would silence the feature permanently.
     SweepForChanges,
+    /// Read one comparison's list again, as it was shown, by the id a sweep
+    /// offered it under. Takes no comparison and changes nothing.
+    ReadComparison { id: i64 },
     /// Record that a file's hash was sent to VirusTotal.
     ///
     /// The lookup happens in the window, because the VirusTotal client is
@@ -541,7 +544,9 @@ pub enum Response {
     /// What a Defender scan came to.
     DefenderScanned(kam_scanner::defender_scan::ScanOutcome),
     /// What changed since last time, and what could not be checked.
-    Changes(kam_core::changes::Sweep),
+    Changes(Box<kam_core::changes::Sweep>),
+    /// One comparison's list, read again.
+    Comparison(Box<kam_core::changes::Kept>),
     /// Nothing to return beyond "recorded".
     Acknowledged,
     QuarantineList {
@@ -709,6 +714,48 @@ mod tests {
             running_as_service: true,
             hostname: "machine".to_owned(),
         }));
+    }
+
+    /// A comparison, with the lists it offers to read again, and one of those
+    /// lists read again, both survive the wire.
+    #[test]
+    fn a_comparison_and_a_list_read_again_survive_the_wire() {
+        use kam_core::changes::{Change, Comparison, Difference, Kept, Sweep};
+
+        let difference = Difference {
+            at: "2026-11-18T14:00:00.000Z".to_owned(),
+            change: Change::Altered,
+            kind: "run_key".to_owned(),
+            scope: r"hkey_users\s-1-5-21-1-2-3-1001\software\microsoft\windows\currentversion\run"
+                .to_owned(),
+            name: "Thing".to_owned(),
+            detail: r"C:\Program Files\Thing\thing.exe".to_owned(),
+            first_seen: "2026-10-12T09:00:00.000Z".to_owned(),
+            last_seen: "2026-11-18T14:00:00.000Z".to_owned(),
+            times_seen: 4,
+            trust: "not signed".to_owned(),
+            was_trusted: Some("signed by Thing Ltd".to_owned()),
+        };
+        round_trip(Response::Changes(Box::new(Sweep {
+            id: 7,
+            afresh: vec!["Services were recorded afresh.".to_owned()],
+            kept: vec![Comparison {
+                id: 7,
+                at: "2026-11-18T14:00:00.000Z".to_owned(),
+                found: 1,
+            }],
+            differences: vec![difference.clone()],
+            ..Sweep::default()
+        })));
+        round_trip(Response::Comparison(Box::new(Kept {
+            id: 7,
+            at: "2026-11-18T14:00:00.000Z".to_owned(),
+            previous_at: Some("2026-11-11T14:00:00.000Z".to_owned()),
+            differences: vec![difference],
+            unreadable: Vec::new(),
+            afresh: Vec::new(),
+            whole: true,
+        })));
     }
 
     #[test]

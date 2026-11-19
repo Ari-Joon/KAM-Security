@@ -31,6 +31,7 @@ import type {
   Removal,
   ScanKind,
   Sweep,
+  Kept,
   ScanOutcome,
   Schedule,
   DownloadsPage,
@@ -142,6 +143,8 @@ export const api = {
    * legitimately reports nothing the second time.
    */
   sweepForChanges: () => invoke<Sweep>("sweep_for_changes"),
+  /** One earlier comparison's list, read again as it was shown. Takes no comparison. */
+  readComparison: (id: number) => invoke<Kept>("read_comparison", { id }),
   /**
    * Ask Windows Defender to scan.
    *

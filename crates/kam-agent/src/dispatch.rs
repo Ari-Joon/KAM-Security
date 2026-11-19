@@ -191,6 +191,7 @@ pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
         | Request::ListApplications { .. }
         | Request::ListQuarantine
         | Request::SweepForChanges
+        | Request::ReadComparison { .. }
         | Request::DefenderScan { .. }
         | Request::GetSchedule
         | Request::RunCheck
@@ -765,7 +766,7 @@ pub fn handle(
                         Effect::Observed,
                         sweep_line(look.seen.len(), &sweep),
                     );
-                    Response::Changes(sweep)
+                    Response::Changes(Box::new(sweep))
                 }
                 Err(error) => {
                     tracing::error!(%error, "could not compare the machine with its history");
@@ -775,6 +776,22 @@ pub fn handle(
                 }
             }
         }
+
+        // Not audited, as reading the log is not: reading what an earlier
+        // comparison found is reading history, and takes nothing and changes
+        // nothing.
+        Request::ReadComparison { id } => match context.store.comparison(id) {
+            Ok(Some(kept)) => Response::Comparison(Box::new(kept)),
+            Ok(None) => Response::Error {
+                message: "no list is kept for that comparison".to_owned(),
+            },
+            Err(error) => {
+                tracing::error!(%error, id, "could not read a kept comparison");
+                Response::Error {
+                    message: format!("that comparison's list could not be read: {error}"),
+                }
+            }
+        },
 
         Request::RecordLookup { sha256, outcome } => {
             // The one thing in this product that sends anything off the
@@ -1650,6 +1667,7 @@ mod tests {
             Request::GetFirewall,
             Request::GetProtection,
             Request::SurveyCaches,
+            Request::ReadComparison { id: 1 },
         ] {
             assert!(
                 !needs_administrator(&request, &user),
@@ -2068,6 +2086,45 @@ mod tests {
         assert!(
             recorded > findings.len(),
             "the run itself should be recorded too"
+        );
+    }
+
+    /// A comparison's list is read again through the pipe, and asking for one
+    /// that is not kept is said, not answered with an empty list.
+    #[test]
+    fn a_kept_comparison_is_read_again_and_one_not_kept_is_said() {
+        let context = context(Mode::Service);
+        let thing = |detail: &str| kam_core::changes::Sighting {
+            kind: "service".to_owned(),
+            scope: "machine".to_owned(),
+            name: "Thing".to_owned(),
+            detail: detail.to_owned(),
+            trust: "signed by Thing Ltd".to_owned(),
+        };
+        context.store.sweep(&[thing("a.exe")], &[]).unwrap();
+        let shown = context.store.sweep(&[thing("b.exe")], &[]).unwrap();
+
+        let response = handle(
+            Request::ReadComparison { id: shown.id },
+            &context,
+            &Reporter::silent(),
+            &someone(),
+        );
+        let Response::Comparison(kept) = response else {
+            panic!("expected the list, got {response:?}");
+        };
+        assert_eq!(kept.differences.len(), 1);
+        assert_eq!(kept.differences[0].detail, "b.exe");
+
+        let response = handle(
+            Request::ReadComparison { id: shown.id + 1 },
+            &context,
+            &Reporter::silent(),
+            &someone(),
+        );
+        assert!(
+            matches!(response, Response::Error { .. }),
+            "a comparison that is not kept came back as {response:?}"
         );
     }
 

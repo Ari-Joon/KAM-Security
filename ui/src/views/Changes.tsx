@@ -1,7 +1,8 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import ChangeBars, { categoryOf } from "../components/ChangeBars";
+import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
-import type { ChangeKind, Difference, Sweep } from "../lib/types";
+import type { ChangeKind, Difference, Kept, Sweep } from "../lib/types";
 
 /**
  * What changed on this machine since the last time it was looked at.
@@ -65,7 +66,7 @@ function longDate(iso: string): string {
   });
 }
 
-function Row({ item }: { item: Difference }) {
+function Row({ item, whole }: { item: Difference; whole: boolean }) {
   const { colour, label: category } = categoryOf(item.kind);
   const kind = KIND_LABEL[item.kind] ?? item.kind.replace(/_/g, " ");
 
@@ -108,16 +109,211 @@ function Row({ item }: { item: Difference }) {
 
         <div className="small muted">
           {kind} in {item.scope}
-          {item.change === "appeared" ? null : (
+          {/* A list kept before these were kept with it has none of them, and
+              an empty one shown would read as nobody having signed. The list
+              says so once, above its rows. */}
+          {item.change === "appeared" || !whole ? null : (
             <>
               {" · "}first seen {fmt.timestamp(item.first_seen)}
               {item.times_seen > 1 ? ` · seen ${fmt.count(item.times_seen)} times` : null}
             </>
           )}
-          {item.was_trusted ? null : <>{" · "}{item.trust}</>}
+          {item.was_trusted || !whole ? null : <>{" · "}{item.trust}</>}
         </div>
       </div>
     </li>
+  );
+}
+
+/** What one comparison's list needs, whether it is the newest or read again. */
+type Shown = {
+  at: string;
+  previous_at: string | null;
+  differences: Difference[];
+  unreadable: string[];
+  afresh: string[];
+  /** False for a list kept before who signed each thing was kept with it. */
+  whole: boolean;
+};
+
+/**
+ * One comparison's list.
+ *
+ * `newest` is when the newest comparison was taken, given only for a list
+ * read again: such a list is about the machine as it was then, and is said to
+ * be, with its date, so it is never read as what is true now.
+ */
+function List({
+  list,
+  newest,
+  onNewest,
+}: {
+  list: Shown;
+  newest: string | null;
+  onNewest: () => void;
+}) {
+  const { shown, windowsTasks } = useMemo(() => {
+    const shown: Difference[] = [];
+    let windowsTasks = 0;
+    // The agent already orders these most-notable-first, with a disappearance
+    // ranked above an appearance. That ordering is deliberate and is not
+    // re-sorted here.
+    for (const item of list.differences) {
+      if (isWindowsOwnTask(item)) windowsTasks += 1;
+      else shown.push(item);
+    }
+    return { shown, windowsTasks };
+  }, [list]);
+
+  const total = shown.length;
+  const unread = list.unreadable.length > 0;
+  const afresh = list.afresh;
+  // "Nothing changed" is a claim about everything this looks at, so it is
+  // only made when everything was read and compared.
+  const complete = !unread && afresh.length === 0;
+  const since = list.previous_at ? longDate(list.previous_at) : "the last sweep";
+  const changed = newest !== null ? "had changed" : "has changed";
+
+  return (
+    <section className="panel">
+      {newest !== null ? (
+        <div className="notice notice-warn">
+          <strong>A past comparison,</strong> taken {fmt.timestamp(list.at)} and
+          kept as it was shown then. It says what had changed by that day, not
+          what the machine is like now: the newest comparison was taken{" "}
+          {fmt.timestamp(newest)}.{" "}
+          <button className="link-button" style={{ padding: 0 }} onClick={onNewest}>
+            Show the newest
+          </button>
+        </div>
+      ) : null}
+      <div className="panel-head">
+        <h2>
+          {total > 0
+            ? `${fmt.count(total)} ${total === 1 ? "thing" : "things"} changed`
+            : unread && afresh.length > 0
+              ? "Nothing changed in what could be read and compared"
+              : unread
+                ? "Nothing changed in what could be read"
+                : !complete
+                  ? "Nothing changed in what was compared"
+                  : windowsTasks > 0
+                    ? "Only Windows' own tasks changed"
+                    : "Nothing changed"}
+        </h2>
+        {total > 0 ? <span className="panel-count">{total}</span> : null}
+      </div>
+      <p className="panel-lede">
+        {list.previous_at ? (
+          newest !== null ? (
+            <>Since {longDate(list.previous_at)}, the comparison before it.</>
+          ) : (
+            <>
+              Since {longDate(list.previous_at)}, the last time this ran.
+              {/* Not "since last week". This machine is not always on, and
+                  the gap between sweeps is frequently not seven days. */}
+            </>
+          )
+        ) : (
+          <>Since the previous sweep.</>
+        )}
+      </p>
+
+      {!list.whole ? (
+        /* Kept before a difference was kept with who signed it and when it
+           was first seen. Those are not shown rather than shown empty, which
+           would read as nobody having signed. */
+        <p className="notice notice-warn">
+          This list was kept before KAM kept who signed each thing, who signed
+          it before and when it was first seen, so those are not shown for it.
+          What was recorded afresh that time is among what could not be read,
+          as it was shown then.
+        </p>
+      ) : null}
+
+      {list.unreadable.length > 0 ? (
+        /* A source that could not be read concludes nothing about what is
+           under it. Saying so out loud is the difference between an
+           honest gap and a silent one. */
+        <>
+          <p className="notice notice-warn">
+            Some of what this looks at could not be read{" "}
+            {newest !== null ? "that time" : "this time"}, so nothing under it
+            is reported as having gone. Nothing is claimed about{" "}
+            {list.unreadable.length === 1 ? "it" : "them"} either way.
+          </p>
+          <ul className="small muted" style={{ margin: "6px 0 0 18px" }}>
+            {list.unreadable.map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+        </>
+      ) : null}
+
+      {afresh.length > 0 ? (
+        /* Read, and recorded as it is, but not compared with last time:
+           usually because this version reads it more closely than the
+           last did. Not a failure to read, so it is not listed with
+           those, and nothing is claimed about it either way. */
+        <>
+          <p className="notice notice-warn" style={{ marginTop: unread ? 12 : undefined }}>
+            Some of it was recorded afresh {newest !== null ? "that time" : "this time"}{" "}
+            rather than compared with the time before, so nothing is reported
+            about {afresh.length === 1 ? "it" : "them"} either way.
+          </p>
+          <ul className="small muted" style={{ margin: "6px 0 0 18px" }}>
+            {afresh.map((note) => (
+              <li key={note}>{note}</li>
+            ))}
+          </ul>
+        </>
+      ) : null}
+
+      {total === 0 ? (
+        <p className="empty">
+          {complete ? (
+            <>
+              Nothing that starts itself or holds a privilege {changed} since{" "}
+              {since}.
+            </>
+          ) : unread && afresh.length > 0 ? (
+            <>
+              Nothing that could be read and compared {changed} since {since}.
+              What could not be read, and what was recorded afresh, are listed
+              above, and nothing is claimed about either.
+            </>
+          ) : unread ? (
+            <>
+              Nothing that could be read {changed} since {since}. What could not
+              be read is listed above, and nothing is claimed about it.
+            </>
+          ) : (
+            <>
+              Nothing that was compared {changed} since {since}. What was
+              recorded afresh is listed above, and nothing is claimed about it.
+            </>
+          )}
+        </p>
+      ) : (
+        <ul className="entries">
+          {shown.map((item) => (
+            <Row
+              key={`${item.kind}|${item.scope}|${item.name}|${item.change}`}
+              item={item}
+              whole={list.whole}
+            />
+          ))}
+        </ul>
+      )}
+
+      {windowsTasks > 0 ? (
+        <p className="footnote">
+          {fmt.count(windowsTasks)} of Windows' own scheduled tasks also
+          changed. Those turn over as Windows updates itself, so they are
+          counted here rather than listed.
+        </p>
+      ) : null}
+    </section>
   );
 }
 
@@ -131,19 +327,11 @@ export default function Changes({
   error: string | null;
   onRetry: () => void;
 }) {
-  const groups = useMemo(() => {
-    if (!sweep) return { shown: [] as Difference[], windowsTasks: 0 };
-    const shown: Difference[] = [];
-    let windowsTasks = 0;
-    // The agent already orders these most-notable-first, with a disappearance
-    // ranked above an appearance. That ordering is deliberate and is not
-    // re-sorted here.
-    for (const item of sweep.differences) {
-      if (isWindowsOwnTask(item)) windowsTasks += 1;
-      else shown.push(item);
-    }
-    return { shown, windowsTasks };
-  }, [sweep]);
+  /** An earlier comparison's list, read again, when one has been chosen. */
+  const [past, setPast] = useState<Kept | null>(null);
+  /** Which list is being fetched, so a second choice is not sent meanwhile. */
+  const [opening, setOpening] = useState<number | null>(null);
+  const [pastError, setPastError] = useState<string | null>(null);
 
   if (!sweep) {
     return (
@@ -172,14 +360,31 @@ export default function Changes({
     );
   }
 
-  const { shown, windowsTasks } = groups;
-  const total = shown.length;
-  const unread = sweep.unreadable.length > 0;
-  const afresh = sweep.afresh ?? [];
-  // "Nothing changed" is a claim about everything this looks at, so it is
-  // only made when everything was read and compared.
-  const complete = !unread && afresh.length === 0;
-  const since = sweep.previous_at ? longDate(sweep.previous_at) : "the last sweep";
+  const newest: Shown = {
+    at: sweep.at,
+    previous_at: sweep.previous_at,
+    differences: sweep.differences,
+    unreadable: sweep.unreadable,
+    afresh: sweep.afresh ?? [],
+    whole: true,
+  };
+  const kept = sweep.kept ?? [];
+  const shownId = past ? past.id : sweep.id;
+
+  /** Read an earlier list again, or go back to the newest. */
+  function open(id: number) {
+    setPastError(null);
+    if (!sweep || id === sweep.id) {
+      setPast(null);
+      return;
+    }
+    setOpening(id);
+    api
+      .readComparison(id)
+      .then(setPast)
+      .catch((cause) => setPastError(reason(cause)))
+      .finally(() => setOpening(null));
+  }
 
   return (
     <>
@@ -294,114 +499,51 @@ export default function Changes({
         </>
       ) : (
         <>
+          {past ? (
+            <List list={past} newest={sweep.at} onNewest={() => open(sweep.id)} />
+          ) : (
+            <List list={newest} newest={null} onNewest={() => open(sweep.id)} />
+          )}
+
           <section className="panel">
             <div className="panel-head">
-              <h2>
-                {total > 0
-                  ? `${fmt.count(total)} ${total === 1 ? "thing" : "things"} changed`
-                  : unread && afresh.length > 0
-                    ? "Nothing changed in what could be read and compared"
-                    : unread
-                      ? "Nothing changed in what could be read"
-                      : !complete
-                        ? "Nothing changed in what was compared"
-                        : windowsTasks > 0
-                          ? "Only Windows' own tasks changed"
-                          : "Nothing changed"}
-              </h2>
-              {total > 0 ? <span className="panel-count">{total}</span> : null}
+              <h2>Earlier comparisons</h2>
             </div>
             <p className="panel-lede">
-              {sweep.previous_at ? (
-                <>
-                  Since {longDate(sweep.previous_at)}, the last time this ran.
-                  {/* Not "since last week". This machine is not always on, and
-                      the gap between sweeps is frequently not seven days. */}
-                </>
-              ) : (
-                <>Since the previous sweep.</>
-              )}
+              Each comparison's list is kept as it was shown, so looking uses
+              nothing up. These are the comparisons from the last twelve weeks,
+              the same weeks as the chart below. Choose one to read its list
+              again.
             </p>
-
-            {sweep.unreadable.length > 0 ? (
-              /* A source that could not be read concludes nothing about what is
-                 under it. Saying so out loud is the difference between an
-                 honest gap and a silent one. */
-              <>
-                <p className="notice notice-warn">
-                  Some of what this looks at could not be read this time, so
-                  nothing under it is reported as having gone. Nothing is
-                  claimed about {sweep.unreadable.length === 1 ? "it" : "them"}{" "}
-                  either way.
-                </p>
-                <ul className="small muted" style={{ margin: "6px 0 0 18px" }}>
-                  {sweep.unreadable.map((reason) => (
-                    <li key={reason}>{reason}</li>
-                  ))}
-                </ul>
-              </>
-            ) : null}
-
-            {afresh.length > 0 ? (
-              /* Read, and recorded as it is, but not compared with last time:
-                 usually because this version reads it more closely than the
-                 last did. Not a failure to read, so it is not listed with
-                 those, and nothing is claimed about it either way. */
-              <>
-                <p className="notice notice-warn" style={{ marginTop: unread ? 12 : undefined }}>
-                  Some of it was recorded afresh this time rather than compared
-                  with last time, so nothing is reported about{" "}
-                  {afresh.length === 1 ? "it" : "them"} either way.
-                </p>
-                <ul className="small muted" style={{ margin: "6px 0 0 18px" }}>
-                  {afresh.map((note) => (
-                    <li key={note}>{note}</li>
-                  ))}
-                </ul>
-              </>
-            ) : null}
-
-            {total === 0 ? (
-              <p className="empty">
-                {complete ? (
-                  <>
-                    Nothing that starts itself or holds a privilege has changed
-                    since {since}.
-                  </>
-                ) : unread && afresh.length > 0 ? (
-                  <>
-                    Nothing that could be read and compared has changed since{" "}
-                    {since}. What could not be read, and what was recorded
-                    afresh, are listed above, and nothing is claimed about
-                    either.
-                  </>
-                ) : unread ? (
-                  <>
-                    Nothing that could be read has changed since {since}. What
-                    could not be read is listed above, and nothing is claimed
-                    about it.
-                  </>
-                ) : (
-                  <>
-                    Nothing that was compared has changed since {since}. What
-                    was recorded afresh is listed above, and nothing is claimed
-                    about it.
-                  </>
-                )}
-              </p>
-            ) : (
-              <ul className="entries">
-                {shown.map((item) => (
-                  <Row key={`${item.kind}|${item.scope}|${item.name}|${item.change}`} item={item} />
+            {kept.length > 1 ? (
+              <div className="tabs">
+                {kept.map((one) => (
+                  <button
+                    key={one.id}
+                    className={"tab" + (one.id === shownId ? " active" : "")}
+                    onClick={() => open(one.id)}
+                    disabled={opening !== null}
+                  >
+                    {fmt.timestamp(one.at)}
+                    {one.id === sweep.id ? ", the newest" : ""}
+                    <span className="tab-count">
+                      {opening === one.id
+                        ? "opening"
+                        : one.found === 0
+                          ? "nothing found"
+                          : `${fmt.count(one.found)} found`}
+                    </span>
+                  </button>
                 ))}
-              </ul>
+              </div>
+            ) : (
+              <p className="empty">
+                This is the only comparison from the last twelve weeks.
+              </p>
             )}
-
-            {windowsTasks > 0 ? (
-              <p className="footnote">
-                {fmt.count(windowsTasks)} of Windows' own scheduled tasks also
-                changed. Those turn over as Windows updates itself, so they are
-                counted here rather than listed.
+            {pastError ? (
+              <p className="notice notice-down" style={{ marginTop: 12 }}>
+                That list could not be read: {pastError}
               </p>
             ) : null}
           </section>

@@ -260,7 +260,23 @@ async fn defender_scan(
 async fn sweep_for_changes() -> Result<kam_core::changes::Sweep, String> {
     off_the_window(move || {
         match kam_ipc::client::call(&Request::SweepForChanges).map_err(|error| error.to_string())? {
-            Response::Changes(sweep) => Ok(sweep),
+            Response::Changes(sweep) => Ok(*sweep),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
+}
+
+/// Read one earlier comparison's list again, as it was shown. Takes no new
+/// comparison.
+#[tauri::command]
+async fn read_comparison(id: i64) -> Result<kam_core::changes::Kept, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::ReadComparison { id })
+            .map_err(|error| error.to_string())?
+        {
+            Response::Comparison(kept) => Ok(*kept),
             Response::Error { message } => Err(message),
             other => Err(unexpected(&other)),
         }
@@ -1501,6 +1517,7 @@ pub fn run() {
             delete_quarantined,
             empty_quarantine,
             sweep_for_changes,
+            read_comparison,
             recycle_item,
             can_recycle_all,
             reveal_in_explorer,

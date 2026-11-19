@@ -446,6 +446,60 @@ pub struct Sweep {
     /// nobody vouches for them" is a true sentence, and a person can act on it
     /// where the software cannot.
     pub unvouched: Vec<Difference>,
+    /// What the store knows this comparison by, to read its list again.
+    #[serde(default)]
+    pub id: i64,
+    /// Every comparison kept from the same twelve weeks as `history`, newest
+    /// first, this one among them. The baseline is not, because it compared
+    /// nothing.
+    ///
+    /// Each one's list can be read again whole. Looking used a list up: it was
+    /// shown once, and the week it was taken in was all that was left of it.
+    #[serde(default)]
+    pub kept: Vec<Comparison>,
+}
+
+/// One comparison as the store keeps it, offered by its date so that its list
+/// can be read again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Comparison {
+    /// What the store knows it by, to ask for its list.
+    pub id: i64,
+    pub at: String,
+    /// How many differences it found, Windows' own tasks among them.
+    pub found: usize,
+}
+
+/// One comparison's list, read again as it was shown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Kept {
+    pub id: i64,
+    pub at: String,
+    /// When the comparison before it was taken, which is what it compared
+    /// the machine against.
+    pub previous_at: Option<String>,
+    /// Its differences, in the order they were shown.
+    pub differences: Vec<Difference>,
+    pub unreadable: Vec<String>,
+    pub afresh: Vec<String>,
+    /// False for a list kept before a difference was kept with who signed it,
+    /// who signed it before, when it was first seen and how often it had been.
+    /// Its rows show what they have, and the rest is not shown as though it
+    /// were empty. Its notes about what was recorded afresh are among
+    /// `unreadable`, where they were said then.
+    pub whole: bool,
+}
+
+/// Put differences in the order they are shown: what has gone first, then
+/// what appeared, what changed in place, and what comes and goes, each by
+/// kind and name.
+pub fn in_order(differences: &mut [Difference]) {
+    differences.sort_by(|a, b| {
+        rank(b.change)
+            .cmp(&rank(a.change))
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.name.cmp(&b.name))
+    });
 }
 
 /// Put a place into the one spelling everything here compares against.

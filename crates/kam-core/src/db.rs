@@ -875,7 +875,7 @@ impl Store {
         readings: &[crate::changes::Reading],
         parts: &[crate::changes::Part],
     ) -> Result<crate::changes::Sweep> {
-        use crate::changes::{rank, Change, Difference, Part, Reading, FLAPS_BEFORE_RECURRING};
+        use crate::changes::{Change, Difference, Part, Reading, FLAPS_BEFORE_RECURRING};
 
         let mut guard = self.lock()?;
         // Dropped without `commit` on any early return, which rolls back.
@@ -1267,43 +1267,42 @@ impl Store {
 
         connection
             .execute(
-                "INSERT INTO sweeps (at, unreadable) VALUES (?1, ?2)",
-                params![
-                    now,
-                    said.iter()
-                        .chain(&afresh_said)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ],
+                "INSERT INTO sweeps (at, unreadable, afresh) VALUES (?1, ?2, ?3)",
+                params![now, said.join("\n"), afresh_said.join("\n")],
             )
             .map_err(to_db_error)?;
+        let id = connection.last_insert_rowid();
 
-        differences.sort_by(|a, b| {
-            rank(b.change)
-                .cmp(&rank(a.change))
-                .then_with(|| a.kind.cmp(&b.kind))
-                .then_with(|| a.name.cmp(&b.name))
-        });
+        crate::changes::in_order(&mut differences);
 
-        // Kept so the machine can be charted against itself later. A sweep that
-        // found nothing writes nothing here; it still counts as a week with
-        // nothing in it, because the sweep itself is recorded above and its
-        // date comes back in `swept`. That is the comparison that makes a busy
+        // Kept so the machine can be charted against itself later, and so
+        // that this comparison's list can be read again as it is shown now:
+        // whole, and under the comparison that found it. A sweep that found
+        // nothing writes nothing here; it still counts as a week with nothing
+        // in it, because the sweep itself is recorded above and its date
+        // comes back in `swept`. That is the comparison that makes a busy
         // week legible, and it is what tells a quiet week from one nobody
         // looked at.
         for difference in &differences {
             connection
                 .execute(
-                    "INSERT INTO changes (at, change, kind, scope, name, detail)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO changes
+                       (at, change, kind, scope, name, detail,
+                        sweep, first_seen, last_seen, times_seen, trust, was_trusted)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         difference.at,
                         difference.change.stored(),
                         difference.kind,
                         difference.scope,
                         difference.name,
-                        difference.detail
+                        difference.detail,
+                        id,
+                        difference.first_seen,
+                        difference.last_seen,
+                        difference.times_seen,
+                        difference.trust,
+                        difference.was_trusted
                     ],
                 )
                 .map_err(to_db_error)?;
@@ -1361,6 +1360,30 @@ impl Store {
             .map_err(to_db_error)?;
         drop(dates);
 
+        // The comparisons whose lists can be read again, over the same
+        // weeks, with how much each found.
+        let mut lists = connection
+            .prepare(
+                "SELECT id, at, (SELECT COUNT(*) FROM changes WHERE changes.sweep = sweeps.id)
+                   FROM sweeps
+                  WHERE id > (SELECT MIN(id) FROM sweeps)
+                    AND at >= datetime('now', '-84 days')
+                  ORDER BY id DESC",
+            )
+            .map_err(to_db_error)?;
+        let kept: Vec<crate::changes::Comparison> = lists
+            .query_map([], |row| {
+                Ok(crate::changes::Comparison {
+                    id: row.get(0)?,
+                    at: row.get(1)?,
+                    found: row.get::<_, i64>(2)?.max(0) as usize,
+                })
+            })
+            .map_err(to_db_error)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(to_db_error)?;
+        drop(lists);
+
         connection.commit().map_err(to_db_error)?;
 
         Ok(crate::changes::Sweep {
@@ -1373,7 +1396,97 @@ impl Store {
             history,
             swept,
             unvouched,
+            id,
+            kept,
         })
+    }
+
+    /// One comparison's list, read again as it was shown.
+    ///
+    /// `None` when no list is kept for it: an id the store does not hold, or
+    /// the first sweep, which took the baseline and compared nothing.
+    ///
+    /// A list kept before the store kept each difference whole comes back
+    /// with what it has and marked as not whole, so that nobody's signature
+    /// is shown as missing when it was only never kept.
+    pub fn comparison(&self, id: i64) -> Result<Option<crate::changes::Kept>> {
+        use crate::changes::{Change, Difference};
+
+        let connection = self.lock()?;
+        let found: Option<(String, String, Option<String>)> = connection
+            .query_row(
+                "SELECT at, unreadable, afresh FROM sweeps
+                  WHERE id = ?1 AND id > (SELECT MIN(id) FROM sweeps)",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(to_db_error)?;
+        let Some((at, unreadable, afresh)) = found else {
+            return Ok(None);
+        };
+        let previous_at: Option<String> = connection
+            .query_row(
+                "SELECT at FROM sweeps WHERE id < ?1 ORDER BY id DESC LIMIT 1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_db_error)?;
+
+        let mut statement = connection
+            .prepare(
+                "SELECT at, change, kind, scope, name, detail,
+                        first_seen, last_seen, times_seen, trust, was_trusted
+                   FROM changes WHERE sweep = ?1",
+            )
+            .map_err(to_db_error)?;
+        // A row that would not read fails the list rather than leaving it,
+        // which would show a list with one thing fewer than was found.
+        let rows: Vec<(Difference, bool)> = statement
+            .query_map(params![id], |row| {
+                let stored: String = row.get(1)?;
+                let trust: Option<String> = row.get(9)?;
+                Ok((
+                    Difference {
+                        at: row.get(0)?,
+                        change: Change::from_stored(&stored),
+                        kind: row.get(2)?,
+                        scope: row.get(3)?,
+                        name: row.get(4)?,
+                        detail: row.get(5)?,
+                        first_seen: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                        last_seen: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                        times_seen: row.get::<_, Option<i64>>(8)?.unwrap_or_default(),
+                        was_trusted: row.get(10)?,
+                        trust: trust.clone().unwrap_or_default(),
+                    },
+                    trust.is_some(),
+                ))
+            })
+            .map_err(to_db_error)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(to_db_error)?;
+
+        let whole = afresh.is_some() && rows.iter().all(|(_, kept)| *kept);
+        let mut differences: Vec<Difference> =
+            rows.into_iter().map(|(difference, _)| difference).collect();
+        crate::changes::in_order(&mut differences);
+        let lines = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        Ok(Some(crate::changes::Kept {
+            id,
+            at,
+            previous_at,
+            differences,
+            unreadable: lines(&unreadable),
+            afresh: afresh.as_deref().map(lines).unwrap_or_default(),
+            whole,
+        }))
     }
 
     /// What the watcher has on record for one scope.
@@ -3169,6 +3282,128 @@ mod tests {
             "a kind that was read was said to be unreadable"
         );
         assert_eq!(sweep.afresh, vec!["service was not compared".to_owned()]);
+    }
+
+    /// A list shown once can be read again, as it was shown, after other
+    /// comparisons have been taken.
+    ///
+    /// Looking used the list up. Each comparison kept only what the weekly
+    /// chart needs, so once the page had shown a list it was gone, and a list
+    /// taken in a week nobody opened the page was never shown at all.
+    #[test]
+    fn a_list_shown_once_can_be_read_again_as_it_was() {
+        let store = Store::open_in_memory().unwrap();
+        let how = [read_as("service", 1), read_as("run_key", 1)];
+        let baseline = store
+            .compare(
+                &[
+                    vouched("run_key", "Thing", "thing.exe", "signed by Thing Ltd"),
+                    seen("service", "Old", "old.exe"),
+                ],
+                &[],
+                &how,
+                &[],
+            )
+            .unwrap();
+
+        let shown = store
+            .compare(
+                &[
+                    vouched("run_key", "Thing", "thing.exe", "not signed"),
+                    seen("service", "New", "new.exe"),
+                ],
+                &[crate::changes::Unreadable::within(
+                    "service",
+                    r"hklm\system\currentcontrolset\services\locked",
+                    "1 service could not be read",
+                )],
+                &[
+                    read_as("service", 1),
+                    read_as("run_key", 1),
+                    read_as("administrator", 1),
+                ],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(shown.differences.len(), 3, "{:?}", shown.differences);
+
+        // More comparisons are taken, and they find nothing.
+        let later = store
+            .compare(
+                &[
+                    vouched("run_key", "Thing", "thing.exe", "not signed"),
+                    seen("service", "New", "new.exe"),
+                ],
+                &[],
+                &how,
+                &[],
+            )
+            .unwrap();
+        assert!(later.differences.is_empty());
+
+        let again = store
+            .comparison(shown.id)
+            .unwrap()
+            .expect("the list that was shown is kept");
+        assert!(again.whole, "a list kept whole said it was not");
+        assert_eq!(again.at, shown.at);
+        assert_eq!(again.previous_at, shown.previous_at);
+        assert_eq!(again.unreadable, shown.unreadable);
+        assert_eq!(again.afresh, shown.afresh);
+        let rows = |differences: &[crate::changes::Difference]| -> Vec<String> {
+            differences.iter().map(|one| format!("{one:?}")).collect()
+        };
+        assert_eq!(
+            rows(&again.differences),
+            rows(&shown.differences),
+            "the list read again is not the list that was shown"
+        );
+
+        // Every comparison is offered with how much it found, newest first.
+        // The baseline compared nothing and has no list.
+        let offered: Vec<(i64, usize)> = later.kept.iter().map(|one| (one.id, one.found)).collect();
+        assert_eq!(offered, vec![(later.id, 0), (shown.id, 3)]);
+        assert!(store.comparison(baseline.id).unwrap().is_none());
+        assert!(store.comparison(later.id + 1).unwrap().is_none());
+    }
+
+    /// A list kept before lists were kept whole is read again with what it
+    /// has, and says it is not whole rather than showing nobody's signature.
+    #[test]
+    fn a_list_from_before_says_what_was_not_kept_with_it() {
+        let connection = a_swept_version_eight_store();
+        migrate(&connection).unwrap();
+        let second: i64 = connection
+            .query_row(
+                "SELECT id FROM sweeps WHERE at = '2026-10-19T09:00:00.000Z'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let store = Store {
+            connection: Mutex::new(connection),
+        };
+
+        let old = store.comparison(second).unwrap().expect("its list is kept");
+        assert!(!old.whole, "a list from before claimed to be whole");
+        let named: Vec<(&str, crate::changes::Change)> = old
+            .differences
+            .iter()
+            .map(|one| (one.name.as_str(), one.change))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("Gone", crate::changes::Change::Vanished),
+                ("Arrived", crate::changes::Change::Appeared),
+            ]
+        );
+        assert!(old.differences.iter().all(|one| one.trust.is_empty()));
+        assert_eq!(
+            old.unreadable,
+            vec!["the task store would not open".to_owned()]
+        );
+        assert_eq!(old.previous_at.as_deref(), Some("2026-10-12T09:00:00.000Z"));
     }
 
     const HER_RUN_KEY: &str =

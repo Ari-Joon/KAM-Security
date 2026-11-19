@@ -493,6 +493,39 @@ export type Sweep = {
    * limitation and a lie.
    */
   unvouched: Difference[];
+  /** What the store knows this comparison by, to read its list again. */
+  id: number;
+  /**
+   * Every comparison kept from the same twelve weeks as `history`, newest
+   * first, this one among them. The baseline is not, because it compared
+   * nothing. Each one's list can be read again with `readComparison`.
+   */
+  kept: Comparison[];
+};
+
+/** One comparison as it is kept, offered by date to be read again. */
+export type Comparison = {
+  id: number;
+  at: string;
+  /** How many differences it found, Windows' own tasks among them. */
+  found: number;
+};
+
+/** One earlier comparison's list, read again as it was shown. */
+export type Kept = {
+  id: number;
+  at: string;
+  /** When the comparison before it was taken: what it compared against. */
+  previous_at: string | null;
+  differences: Difference[];
+  unreadable: string[];
+  afresh: string[];
+  /**
+   * False for a list kept before KAM kept who signed each thing, who signed
+   * it before and when it was first seen. Those are then empty because they
+   * were never kept, not because nobody signed, and must not be shown.
+   */
+  whole: boolean;
 };
 
 export type Threat = {
