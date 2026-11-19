@@ -461,6 +461,12 @@ export type Sweep = {
    * omission in a product whose whole claim is that it says what it did.
    */
   unreadable: string[];
+  /**
+   * What was read this time and recorded without being compared, each in a
+   * sentence of its own. Not a failure to read, so never shown under that
+   * heading; nothing is claimed about it either way.
+   */
+  afresh: string[];
   /** True on the very first sweep, when there was nothing to compare against. */
   baseline: boolean;
   /** The real date of the previous sweep. Say this, never "since last week". */

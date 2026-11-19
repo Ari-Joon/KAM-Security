@@ -189,8 +189,9 @@ impl Unreadable {
 ///
 /// Something of that kind that really did change since the last sweep is
 /// recorded with the rest and never reported. That is one sweep, for one kind,
-/// and it is not kept quiet: `note` is handed to the person with the sources
-/// that could not be read, since in both cases nothing is being claimed.
+/// and it is not kept quiet: `note` is handed to the person in
+/// [`Sweep::afresh`], beside the sources that could not be read, since in both
+/// cases nothing is being claimed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reading {
     /// The kind, as the token its sightings are stored under.
@@ -321,12 +322,16 @@ pub struct Sweep {
     /// Never empty-by-omission: a source that was skipped is said out loud,
     /// because a silently skipped source is a lie by omission in a product
     /// whose whole claim is that it says what it did.
-    ///
-    /// A kind that was recorded this time without being compared is said here
-    /// too, in the words of its [`Reading`]. It was read, but nothing is
-    /// claimed about what changed in it, which is the same thing to somebody
-    /// reading the result.
     pub unreadable: Vec<String>,
+    /// What was recorded this time without being compared, each in a sentence
+    /// of its own: a kind in the words of its [`Reading`].
+    ///
+    /// These were said among the sources that could not be read, and the page
+    /// showed them under that heading, but they were read perfectly well. What
+    /// they share with an unread source is only that nothing is claimed about
+    /// them this time, so they are said apart.
+    #[serde(default)]
+    pub afresh: Vec<String>,
     /// True when this was the first sweep, so there was nothing to compare to.
     ///
     /// A first sweep reports no differences at all. Claiming findings against

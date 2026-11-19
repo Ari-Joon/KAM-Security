@@ -174,9 +174,12 @@ export default function Changes({
 
   const { shown, windowsTasks } = groups;
   const total = shown.length;
+  const unread = sweep.unreadable.length > 0;
+  const afresh = sweep.afresh ?? [];
   // "Nothing changed" is a claim about everything this looks at, so it is
-  // only made when everything was read.
-  const complete = sweep.unreadable.length === 0;
+  // only made when everything was read and compared.
+  const complete = !unread && afresh.length === 0;
+  const since = sweep.previous_at ? longDate(sweep.previous_at) : "the last sweep";
 
   return (
     <>
@@ -296,11 +299,15 @@ export default function Changes({
               <h2>
                 {total > 0
                   ? `${fmt.count(total)} ${total === 1 ? "thing" : "things"} changed`
-                  : !complete
-                    ? "Nothing changed in what could be read"
-                    : windowsTasks > 0
-                      ? "Only Windows' own tasks changed"
-                      : "Nothing changed"}
+                  : unread && afresh.length > 0
+                    ? "Nothing changed in what could be read and compared"
+                    : unread
+                      ? "Nothing changed in what could be read"
+                      : !complete
+                        ? "Nothing changed in what was compared"
+                        : windowsTasks > 0
+                          ? "Only Windows' own tasks changed"
+                          : "Nothing changed"}
               </h2>
               {total > 0 ? <span className="panel-count">{total}</span> : null}
             </div>
@@ -335,20 +342,50 @@ export default function Changes({
               </>
             ) : null}
 
+            {afresh.length > 0 ? (
+              /* Read, and recorded as it is, but not compared with last time:
+                 usually because this version reads it more closely than the
+                 last did. Not a failure to read, so it is not listed with
+                 those, and nothing is claimed about it either way. */
+              <>
+                <p className="notice notice-warn" style={{ marginTop: unread ? 12 : undefined }}>
+                  Some of it was recorded afresh this time rather than compared
+                  with last time, so nothing is reported about{" "}
+                  {afresh.length === 1 ? "it" : "them"} either way.
+                </p>
+                <ul className="small muted" style={{ margin: "6px 0 0 18px" }}>
+                  {afresh.map((note) => (
+                    <li key={note}>{note}</li>
+                  ))}
+                </ul>
+              </>
+            ) : null}
+
             {total === 0 ? (
               <p className="empty">
                 {complete ? (
                   <>
                     Nothing that starts itself or holds a privilege has changed
-                    since{" "}
-                    {sweep.previous_at ? longDate(sweep.previous_at) : "the last sweep"}.
+                    since {since}.
+                  </>
+                ) : unread && afresh.length > 0 ? (
+                  <>
+                    Nothing that could be read and compared has changed since{" "}
+                    {since}. What could not be read, and what was recorded
+                    afresh, are listed above, and nothing is claimed about
+                    either.
+                  </>
+                ) : unread ? (
+                  <>
+                    Nothing that could be read has changed since {since}. What
+                    could not be read is listed above, and nothing is claimed
+                    about it.
                   </>
                 ) : (
                   <>
-                    Nothing that could be read has changed since{" "}
-                    {sweep.previous_at ? longDate(sweep.previous_at) : "the last sweep"}.
-                    What could not be read is listed above, and nothing is
-                    claimed about it.
+                    Nothing that was compared has changed since {since}. What
+                    was recorded afresh is listed above, and nothing is claimed
+                    about it.
                   </>
                 )}
               </p>

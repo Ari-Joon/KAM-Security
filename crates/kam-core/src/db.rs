@@ -790,8 +790,7 @@ impl Store {
     /// recorded under a lower number, is recorded as it is and not compared:
     /// nothing of that kind is reported as appeared, changed or gone this
     /// time. See [`crate::changes::Reading`] for why, and for what it costs.
-    /// The reading's note comes back among the things the sweep could not
-    /// read, because nothing is claimed about either.
+    /// The reading's note comes back in `afresh`.
     ///
     /// A kind that is not named keeps the old rule, under which only the very
     /// first sweep of a store goes uncompared. That is every kind when nothing
@@ -1105,13 +1104,15 @@ impl Store {
         }
 
         // What this sweep has to say about what it could not vouch for: the
-        // sources it could not read, and the kinds it recorded without
-        // comparing. Each kind that was recorded is written down under the
-        // number it was read with, so that the next sweep compares it.
-        let mut said: Vec<String> = unreadable
+        // sources it could not read, and apart from them the kinds it
+        // recorded without comparing. Each kind that was recorded is written
+        // down under the number it was read with, so that the next sweep
+        // compares it.
+        let said: Vec<String> = unreadable
             .iter()
             .map(|source| source.what.clone())
             .collect();
+        let mut afresh_said: Vec<String> = Vec::new();
         for reading in readings {
             // The whole kind could not be read, so it has not been recorded
             // and nothing is written down: its first look is still to come.
@@ -1125,7 +1126,7 @@ impl Store {
             // interface says so in its own words.
             let uncompared = afresh.iter().any(|one| one.kind == reading.kind);
             if uncompared && !baseline && !reading.note.is_empty() {
-                said.push(reading.note.clone());
+                afresh_said.push(reading.note.clone());
             }
             connection
                 .execute(
@@ -1140,7 +1141,14 @@ impl Store {
         connection
             .execute(
                 "INSERT INTO sweeps (at, unreadable) VALUES (?1, ?2)",
-                params![now, said.join("\n")],
+                params![
+                    now,
+                    said.iter()
+                        .chain(&afresh_said)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ],
             )
             .map_err(to_db_error)?;
 
@@ -1231,6 +1239,7 @@ impl Store {
         Ok(crate::changes::Sweep {
             differences,
             unreadable: said,
+            afresh: afresh_said,
             baseline,
             previous_at,
             at: now,
@@ -2838,7 +2847,7 @@ mod tests {
             "only the kind read as before is compared"
         );
         assert_eq!(
-            sweep.unreadable,
+            sweep.afresh,
             vec!["service was not compared".to_owned()],
             "and the person is told which kind was not"
         );
@@ -2858,7 +2867,7 @@ mod tests {
             )
             .unwrap();
         assert!(again.differences.is_empty(), "{:?}", again.differences);
-        assert!(again.unreadable.is_empty(), "{:?}", again.unreadable);
+        assert!(again.afresh.is_empty(), "{:?}", again.afresh);
 
         // And from then on the kind is compared like any other.
         let swapped = store
@@ -2912,7 +2921,7 @@ mod tests {
             .unwrap();
         assert!(first.differences.is_empty(), "{:?}", first.differences);
         assert_eq!(
-            first.unreadable,
+            first.afresh,
             vec!["certificate was not compared".to_owned()]
         );
 
@@ -2957,7 +2966,7 @@ mod tests {
             .unwrap();
         assert_eq!(sweep.differences.len(), 1, "{:?}", sweep.differences);
         assert_eq!(sweep.differences[0].name, "Planted");
-        assert!(sweep.unreadable.is_empty(), "{:?}", sweep.unreadable);
+        assert!(sweep.afresh.is_empty(), "{:?}", sweep.afresh);
     }
 
     /// A kind whose whole source could not be read has not been looked at,
@@ -2993,9 +3002,45 @@ mod tests {
             sweep.differences
         );
         assert_eq!(
-            sweep.unreadable,
+            sweep.afresh,
             vec!["administrator was not compared".to_owned()]
         );
+    }
+
+    /// What was recorded afresh is not said to have been unreadable.
+    ///
+    /// The note about a kind recorded without being compared was said among
+    /// the sources that could not be read, so the page showed "services were
+    /// recorded afresh" under the heading "could not be read this time", and
+    /// the Activity line counted it as a source that could not be read. It
+    /// was read; only the comparison was held back.
+    #[test]
+    fn what_was_recorded_afresh_is_said_apart_from_what_could_not_be_read() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .sweep_read_as(
+                &[seen("service", "One", "a")],
+                &[],
+                &[read_as("service", 1)],
+            )
+            .unwrap();
+
+        let sweep = store
+            .sweep_read_as(
+                &[seen("service", "One", "a")],
+                &[crate::changes::Unreadable::of(
+                    "scheduled_task",
+                    "the task store would not open",
+                )],
+                &[read_as("service", 2)],
+            )
+            .unwrap();
+        assert_eq!(
+            sweep.unreadable,
+            vec!["the task store would not open".to_owned()],
+            "a kind that was read was said to be unreadable"
+        );
+        assert_eq!(sweep.afresh, vec!["service was not compared".to_owned()]);
     }
 
     /// The number a kind was recorded under only goes up. A sweep that names a
