@@ -128,6 +128,13 @@ records**, and only the `$DATA` fragment starting at **virtual cluster 0** knows
 the file's real length. Missing either reports a 138 GB archive as 0 bytes.
 Between them they accounted for 270 GB on the test volume.
 
+It also has to know when not to answer. A table in more pieces than its first
+record lists, or a read that comes back short, used to give part of a drive
+presented as all of it. A disk with 4096-byte sectors could not be read at all.
+A boot sector whose figures no real volume has was taken at its word. Each is
+now either read properly or refused in words, and when it is refused the scan
+walks the folders and says why.
+
 ### The list arrives before the sizes
 
 What an installer *claims* about itself is a registry read: every name,
@@ -280,13 +287,23 @@ red.
 There is no registry cleaner and no health score. Both are how this category of
 software makes money and neither has ever made a machine faster.
 
-What is here is the small real list: temporary files, update downloads, crash
-dumps, error reports, thumbnails, shader caches, browser caches, developer
-package caches, Steam scratch, and a previous Windows that never removed itself.
-On the machine this was written on that came to **72.6 GB**, of which 51.9 GB
-was one graphics shader cache whose own size limit was plainly not working. Each
-entry says what it holds and what clearing it costs, and the ones that cost
-something say so rather than being presented as free.
+What is here is the real list: temporary files, update downloads and what
+Windows keeps while upgrading itself, crash dumps, error reports, logs,
+thumbnails, shader caches, browser caches, developer package caches, driver
+installers a vendor's app has already used, the caches of chat programs, editors
+and game engines, Steam scratch, and a previous Windows that never removed
+itself. On the machine this was written on that came to **105 GB**, of which
+51.7 GB was one graphics shader cache whose own size limit was plainly not
+working. Each entry says what it holds and what clearing it costs, and the ones
+that cost something say so rather than being presented as free.
+
+Beside it is a second list, of large things that are not caches: the
+hibernation file, the page file, restore points, what websites themselves stored
+in a browser, downloaded AI models, the copies Windows Installer keeps. They are
+where a person looks next once the caches have gone, and left unexplained they
+invite deleting by hand. So each is measured and says what it is for and which
+setting decides its size, and none of them has a button. A request to clear one
+is refused by name. On the same machine that list came to 87.8 GB.
 
 Prefetch is deliberately absent: clearing it is folklore, and it makes the next
 launch of everything slower for a few megabytes. The component store is left
@@ -297,7 +314,11 @@ catalogue and never a path. There is no request shape that carries a directory
 to empty, because there is no version of that which is safe in a LocalSystem
 process. Only contents go, never the folder; a junction is removed as a link
 rather than followed, because a junction inside a cache pointing at your
-documents would otherwise mean emptying the cache emptied the documents.
+documents would otherwise mean emptying the cache emptied the documents. The
+same holds for a link above a cache. A location is cleared only when the folder
+being held open really is the place the catalogue names, which is asked of the
+open handle and not of the path, so a folder swapped for a link part-way down
+cannot lead the clear somewhere else.
 
 ### Duplicates that are not waste
 
