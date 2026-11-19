@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Treemap from "../components/Treemap";
 import FileRow from "../components/FileRow";
+import GrowthPanel from "../components/Growth";
 import MeasuredAt, { whenMeasured } from "../components/MeasuredAt";
 import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
@@ -393,6 +394,20 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
           </div>
         )}
       </section>
+
+      {scan?.summary && (
+        <section className="panel">
+          <div className="panel-head">
+            <h2>Since an earlier scan</h2>
+          </div>
+          <GrowthPanel
+            // A new scan is a new comparison, with its own choice of earlier.
+            key={scan.summary.kind === "kept" ? scan.summary.id : scan.summary.why}
+            drive={`${scan.root.slice(0, 1).toUpperCase()}:`}
+            kept={scan.summary}
+          />
+        </section>
+      )}
 
       {scan && step && current && (
         <>

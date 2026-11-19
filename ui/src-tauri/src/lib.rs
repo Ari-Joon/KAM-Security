@@ -130,6 +130,31 @@ async fn scan_folder(path: String) -> Result<kam_storage::FolderScan, String> {
     .await
 }
 
+/// The person's own summaries of their scans of a drive, and what grew and
+/// shrank between two of them: `later`, or the newest, against `earlier`, or
+/// the one kept before it. The agent reads only the caller's.
+#[tauri::command]
+async fn get_growth(
+    drive: String,
+    later: Option<i64>,
+    earlier: Option<i64>,
+) -> Result<kam_storage::growth::Growth, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetGrowth {
+            drive,
+            later,
+            earlier,
+        })
+        .map_err(|error| error.to_string())?
+        {
+            Response::Growth(growth) => Ok(*growth),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
+}
+
 /// What every installed application really occupies.
 ///
 /// Needs a privileged agent, and takes a couple of seconds — it reads the whole
@@ -1525,6 +1550,7 @@ pub fn run() {
             list_volumes,
             scan_path,
             scan_folder,
+            get_growth,
             list_applications,
             list_applications_preview,
             find_duplicates,

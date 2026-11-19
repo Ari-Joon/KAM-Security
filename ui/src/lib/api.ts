@@ -17,6 +17,7 @@ import type {
   AuditRecord,
   Scan,
   FolderScan,
+  Growth,
   SystemStatus,
   Volume,
   ProvenanceReport,
@@ -59,6 +60,13 @@ export const api = {
   scan: (path: string) => invoke<Scan>("scan_path", { path }),
   /** One folder of the map, read on its own, below where a scan stops. */
   scanFolder: (path: string) => invoke<FolderScan>("scan_folder", { path }),
+  /**
+   * The person's own summaries of their scans of a drive, and what grew and
+   * shrank between two: `later` (or the newest) against `earlier` (or the
+   * one kept before it).
+   */
+  growth: (drive: string, later: number | null, earlier: number | null) =>
+    invoke<Growth>("get_growth", { drive, later, earlier }),
   applications: (drive: string) =>
     invoke<ApplicationReport>("list_applications", { drive }),
   applicationsPreview: () => invoke<AppFootprint[]>("list_applications_preview"),

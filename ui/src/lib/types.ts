@@ -358,6 +358,86 @@ export type Scan = {
   elapsed_ms: number;
   tree: TreeNode;
   largest_files: FileEntry[];
+  /**
+   * Every folder of the drive holding the floor or more, when the scan was
+   * of a whole drive: what the service keeps as this scan's summary.
+   */
+  folders?: FolderList | null;
+  /** What became of that summary. */
+  summary?: SummaryKept | null;
+};
+
+/** One folder, as a summary of a scan keeps it. */
+export type FolderTotal = {
+  path: string;
+  /** Everything beneath it included. */
+  bytes: number;
+  /** Files anywhere beneath it. */
+  files: number;
+};
+
+export type FolderList = {
+  /** Every folder holding this many bytes or more is listed. */
+  floor: number;
+  folders: FolderTotal[];
+  unplaced: number;
+};
+
+export type SummaryKept =
+  | { kind: "kept"; id: number; taken_at: string }
+  | { kind: "not_kept"; why: string };
+
+/** One summary as it is listed to choose from, without its folders. */
+export type SummaryHeader = {
+  id: number;
+  /** When it was kept, as UTC in ISO form. */
+  taken_at: string;
+  drive: string;
+  serial: number | null;
+  method: ScanMethod;
+  total_bytes: number;
+  file_count: number;
+};
+
+/** One folder that grew or shrank between two summaries. */
+export type Change = {
+  path: string;
+  /** Null: under the floor then. */
+  before: number | null;
+  /** Null: under the floor now, gone included. */
+  after: number | null;
+  files_before: number | null;
+  files_after: number | null;
+  /** By how much. When `exact` is false, the least it can be. */
+  by: number;
+  exact: boolean;
+};
+
+export type Differences = {
+  floor: number;
+  /** Later total less earlier. Negative when the drive holds less. */
+  total_change: number;
+  grew: Change[];
+  shrank: Change[];
+  grew_left_out: number;
+  shrank_left_out: number;
+  unplaced: number;
+};
+
+export type Comparison =
+  | { kind: "nothing_kept" }
+  | { kind: "nothing_earlier" }
+  | { kind: "not_comparable"; why: string }
+  | ({ kind: "compared" } & Differences);
+
+/** The person's own summaries of a drive's scans, and two of them compared. */
+export type Growth = {
+  drive: string;
+  /** Newest first. */
+  summaries: SummaryHeader[];
+  later: SummaryHeader | null;
+  earlier: SummaryHeader | null;
+  comparison: Comparison;
 };
 
 /**

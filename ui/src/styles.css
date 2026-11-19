@@ -977,6 +977,26 @@ select {
   font-size: 12px;
 }
 
+/* ---------- what grew since an earlier scan ---------- */
+
+.growth-head {
+  margin: 18px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.growth-list li {
+  padding: 4px 0;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.growth-list strong {
+  color: var(--text);
+  font-weight: 500;
+}
+
 /* ---------- audit entries ---------- */
 
 .entry {

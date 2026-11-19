@@ -99,8 +99,9 @@ pub fn keep_summary(scan: &mut Scan, context: &Context, user: &UserContext) {
 fn header(row: &ScanSummaryRow) -> Result<SummaryHeader, String> {
     let method = method_of(&row.method).ok_or_else(|| {
         format!(
-            "the summary kept at {} says it was read by \"{}\", which this version does not know",
-            row.taken_at, row.method
+            "The summary of one of your earlier scans of {} says the drive was read by \
+             \"{}\", which this version does not know, so the summaries cannot be listed.",
+            row.drive, row.method
         )
     })?;
     Ok(SummaryHeader {
@@ -123,8 +124,8 @@ fn folders_of(
 ) -> Result<FolderList, String> {
     let unreadable = |why: String| {
         format!(
-            "The summary of the scan kept at {} could not be read back: {why}",
-            wanted.taken_at
+            "The summary of one of your earlier scans of {} could not be read back: {why}",
+            wanted.drive
         )
     };
     let row = context
