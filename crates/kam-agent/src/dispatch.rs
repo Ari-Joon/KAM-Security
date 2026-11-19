@@ -760,23 +760,7 @@ pub fn handle(
                         "changes",
                         "sweep",
                         Effect::Observed,
-                        format!(
-                            "compared {} things against the last sweep: {} {}{}",
-                            seen.len(),
-                            sweep.differences.len(),
-                            if sweep.baseline {
-                                "differences (this was the first, so nothing was compared)"
-                            } else if sweep.differences.len() == 1 {
-                                "difference"
-                            } else {
-                                "differences"
-                            },
-                            if sweep.unreadable.is_empty() {
-                                String::new()
-                            } else {
-                                format!("; {} source(s) could not be read", sweep.unreadable.len())
-                            }
-                        ),
+                        sweep_line(seen.len(), &sweep),
                     );
                     Response::Changes(sweep)
                 }
@@ -1572,6 +1556,39 @@ fn hostname() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".to_owned())
 }
 
+/// The Activity line for one comparison: how much was compared, what came of
+/// it, and what it could not vouch for.
+///
+/// What could not be read is counted, and apart from it what was recorded
+/// afresh without being compared. The second was counted as the first, so a
+/// comparison that had read everything said a source could not be read.
+fn sweep_line(compared: usize, sweep: &kam_core::changes::Sweep) -> String {
+    let found = sweep.differences.len();
+    let mut line = format!(
+        "compared {compared} things against the last sweep: {found} {}",
+        if sweep.baseline {
+            "differences (this was the first, so nothing was compared)"
+        } else if found == 1 {
+            "difference"
+        } else {
+            "differences"
+        }
+    );
+    match sweep.unreadable.len() {
+        0 => {}
+        1 => line.push_str("; 1 source could not be read"),
+        unread => line.push_str(&format!("; {unread} sources could not be read")),
+    }
+    match sweep.afresh.len() {
+        0 => {}
+        1 => line.push_str("; 1 part was recorded afresh, not compared"),
+        afresh => line.push_str(&format!(
+            "; {afresh} parts were recorded afresh, not compared"
+        )),
+    }
+    line
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -2048,6 +2065,38 @@ mod tests {
         assert!(
             recorded > findings.len(),
             "the run itself should be recorded too"
+        );
+    }
+
+    /// The Activity line counts what could not be read, and apart from it
+    /// what was recorded afresh. The second was counted as the first, so a
+    /// comparison that had read everything said a source could not be read.
+    #[test]
+    fn the_activity_line_does_not_count_what_was_recorded_afresh_as_unreadable() {
+        let afresh_only = kam_core::changes::Sweep {
+            afresh: vec!["Services were recorded as they are, and not compared.".to_owned()],
+            ..Default::default()
+        };
+        let line = sweep_line(312, &afresh_only);
+        assert!(!line.contains("could not be read"), "{line}");
+        assert!(
+            line.ends_with("; 1 part was recorded afresh, not compared"),
+            "{line}"
+        );
+
+        let both = kam_core::changes::Sweep {
+            unreadable: vec!["the task store would not open".to_owned()],
+            afresh: vec!["one".to_owned(), "two".to_owned()],
+            ..Default::default()
+        };
+        assert_eq!(
+            sweep_line(312, &both),
+            "compared 312 things against the last sweep: 0 differences; 1 source could not \
+             be read; 2 parts were recorded afresh, not compared"
+        );
+        assert_eq!(
+            sweep_line(312, &kam_core::changes::Sweep::default()),
+            "compared 312 things against the last sweep: 0 differences"
         );
     }
 
