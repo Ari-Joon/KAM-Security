@@ -1278,6 +1278,14 @@ export type Backlog = {
 /** How far that run has got, sent at every step between two readings of it. */
 export type BacklogStep = Pick<Backlog, "job" | "done" | "total" | "current" | "progress">;
 
+/**
+ * Download results this account has not looked at yet: recorded since Active
+ * downloads was last opened. "unknown" is never to be drawn as none.
+ */
+export type UnseenDownloads =
+  | { state: "counted"; flagged: number; unfinished: number; since: string }
+  | { state: "unknown"; reason: string };
+
 export type DissectionView = {
   token: string;
   dissection: Dissection;

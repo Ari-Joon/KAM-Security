@@ -40,6 +40,7 @@ import type {
   Extraction,
   MenuState,
   Launch,
+  UnseenDownloads,
 } from "./types";
 
 /**
@@ -195,6 +196,16 @@ export const api = {
   stopBacklog: () => invoke<void>("stop_backlog"),
   /** Let go of what that job came to, once it has been read. */
   closeBacklog: () => invoke<void>("close_backlog"),
+  /**
+   * How many download results this account has not looked at yet, or why
+   * that could not be told. Kept per account and across restarts.
+   */
+  downloadsUnseen: () => invoke<UnseenDownloads>("downloads_unseen"),
+  /**
+   * Put it on record that Active downloads is in front of the person now,
+   * which clears that count. Resolves to when it last was.
+   */
+  downloadsLooked: () => invoke<{ previous: string | null }>("downloads_looked"),
   setContextMenu: (enabled: boolean) => invoke<MenuState>("set_context_menu", { enabled }),
   /**
    * The next file asked about from Explorer or a notification, taken once.

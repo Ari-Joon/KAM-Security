@@ -32,6 +32,21 @@ pub fn iso_from_unix_millis(millis: u64) -> String {
     )
 }
 
+/// Whether `text` is a time in exactly the shape this module writes,
+/// `2026-09-06T14:12:02.417Z`.
+///
+/// Times in that shape are compared as text, in the store and outside it.
+/// Text of any other shape would compare as nonsense, so a time that arrives
+/// from somewhere else is held to this before it is compared with anything.
+pub fn is_iso(text: &str) -> bool {
+    const SHAPE: &[u8] = b"0000-00-00T00:00:00.000Z";
+    text.len() == SHAPE.len()
+        && text.bytes().zip(SHAPE).all(|(byte, shape)| match shape {
+            b'0' => byte.is_ascii_digit(),
+            other => byte == *other,
+        })
+}
+
 /// Days since 1970-01-01 to a proleptic Gregorian date. Howard Hinnant's
 /// algorithm, which is exact for every date this program will ever see.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
@@ -78,5 +93,22 @@ mod tests {
         assert_eq!(now.len(), 24, "{now}");
         assert!(now.ends_with('Z'));
         assert!(now.starts_with("20"));
+    }
+
+    #[test]
+    fn only_the_shape_this_writes_is_taken_for_a_time() {
+        assert!(is_iso(&now_utc_iso()));
+        assert!(is_iso("1970-01-01T00:00:00.000Z"));
+        for wrong in [
+            "",
+            "2026-11-19",
+            "2026-11-19T10:02:00Z",
+            "2026-11-19 10:02:00.123Z",
+            "2026-11-19T10:02:00.123+",
+            "2026-11-19T10:02:00.12eZ",
+            " 2026-11-19T10:02:00.123Z",
+        ] {
+            assert!(!is_iso(wrong), "{wrong:?}");
+        }
     }
 }

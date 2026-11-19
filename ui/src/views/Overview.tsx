@@ -7,8 +7,10 @@ import type {
   CheckFinding,
   Schedule,
   SystemStatus,
+  UnseenDownloads,
   Volume,
 } from "../lib/types";
+import { unseenSentence } from "../lib/unseen";
 import EffectBadge from "../components/EffectBadge";
 import UpdateCheck from "../components/UpdateCheck";
 
@@ -31,6 +33,9 @@ type Props = {
   /** How many of the newest entries were asked for. */
   auditLimit: number;
   onOpenStorage: (root: string) => void;
+  /** Download results nobody has looked at yet. Null until first counted. */
+  unseenDownloads: UnseenDownloads | null;
+  onOpenDownloads: () => void;
 };
 
 type UsageTone = "accent" | "warn" | "danger";
@@ -63,6 +68,49 @@ function UsageBar({ used, total }: { used: number; total: number }) {
   );
 }
 
+
+/**
+ * Download results nobody has looked at yet, in one line that leads to them.
+ *
+ * A download Defender flags is announced by a Windows notification, which
+ * somebody with notifications switched off never sees. This is the same news
+ * where it cannot be switched off: downloads Defender flagged, and checks
+ * that did not finish, since Active downloads was last opened.
+ *
+ * It says nothing when there is nothing, because a line that always says all
+ * is well is one people stop reading. A count that could not be made is a
+ * different thing and is said: it is never drawn as nothing.
+ */
+function DownloadsNotLookedAt({
+  unseen,
+  onOpen,
+}: {
+  unseen: UnseenDownloads | null;
+  onOpen: () => void;
+}) {
+  if (unseen === null) return null;
+  const open = (
+    <div className="rule-actions">
+      <button onClick={onOpen}>Open Active downloads</button>
+    </div>
+  );
+  if (unseen.state === "unknown") {
+    return (
+      <div className="notice notice-warn">
+        <strong>Download results could not be counted.</strong> Whether Defender has flagged
+        a download since you last opened Active downloads is not known ({unseen.reason}).
+        {open}
+      </div>
+    );
+  }
+  const sentence = unseenSentence(unseen.flagged, unseen.unfinished);
+  if (sentence === null) return null;
+  return (
+    <div className="notice notice-warn">
+      <strong>Not looked at yet in Active downloads:</strong> {sentence}.{open}
+    </div>
+  );
+}
 
 /**
  * The switch, and the only one there is.
@@ -389,6 +437,8 @@ export default function Overview({
   auditRead,
   auditLimit,
   onOpenStorage,
+  unseenDownloads,
+  onOpenDownloads,
 }: Props) {
   const fixed = volumes.filter((volume) => volume.kind === "fixed");
   const totalCapacity = fixed.reduce((sum, v) => sum + v.total_bytes, 0);
@@ -416,6 +466,8 @@ export default function Overview({
           </p>
         </div>
       </div>
+
+      <DownloadsNotLookedAt unseen={unseenDownloads} onOpen={onOpenDownloads} />
 
       <Protection />
 

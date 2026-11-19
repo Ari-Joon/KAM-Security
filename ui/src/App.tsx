@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api, reason } from "./lib/api";
+import { unseenSentence, unseenShort } from "./lib/unseen";
 import type { Sweep as SweepReport } from "./lib/types";
-import type { AuditRecord, SystemStatus, Volume } from "./lib/types";
+import type { AuditRecord, SystemStatus, UnseenDownloads, Volume } from "./lib/types";
 import Overview from "./views/Overview";
 import Storage from "./views/Storage";
 import Activity from "./views/Activity";
@@ -76,6 +77,36 @@ const NAV: {
  * a count of everything in the log.
  */
 const AUDIT_LIMIT = 200;
+
+/**
+ * What goes beside "Active downloads" in the menu: how many results nobody
+ * has looked at yet, with the words for it on the line beneath.
+ *
+ * It is there for somebody whose Windows notifications are off, who would
+ * otherwise be told nothing when Defender flags a download. Nothing is shown
+ * when there is nothing to look at. A count that could not be made is shown
+ * as a question mark with the reason, and never as nothing.
+ */
+function downloadsMark(
+  unseen: UnseenDownloads | null,
+): { count: string; hint: string; title: string } | null {
+  if (unseen === null) return null;
+  if (unseen.state === "unknown") {
+    return {
+      count: "?",
+      hint: "New results could not be counted",
+      title: `Whether any download result is waiting to be looked at could not be told: ${unseen.reason}`,
+    };
+  }
+  const hint = unseenShort(unseen.flagged, unseen.unfinished);
+  const sentence = unseenSentence(unseen.flagged, unseen.unfinished);
+  if (hint === null || sentence === null) return null;
+  return {
+    count: (unseen.flagged + unseen.unfinished).toLocaleString(),
+    hint,
+    title: `Not looked at yet: ${sentence}.`,
+  };
+}
 
 function Mark() {
   return (
@@ -178,6 +209,29 @@ export default function App() {
     return () => clearInterval(timer);
   }, [refresh]);
 
+  /** Download results nobody has looked at yet. Null until first asked. */
+  const [unseen, setUnseen] = useState<UnseenDownloads | null>(null);
+  const refreshUnseen = useCallback(() => {
+    api
+      .downloadsUnseen()
+      .then(setUnseen)
+      .catch((cause) => setUnseen({ state: "unknown", reason: reason(cause) }));
+  }, []);
+  // Counted when the window opens, when the page in front changes, and when
+  // the list of downloads does. Not on a timer: nothing else can change it.
+  // While Active downloads is the page in front it does the asking, after it
+  // has put on record that it is being looked at. Asked from here as well,
+  // the count would show for a moment beside a page the person is reading.
+  useEffect(() => {
+    if (section === "downloads") return;
+    refreshUnseen();
+    const unlisten = listen("downloads://changed", () => refreshUnseen());
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, [section, refreshUnseen]);
+  const downloadsWaiting = downloadsMark(unseen);
+
   /** Ask for one sweep, unless one is already on its way. */
   const runSweep = useCallback(() => {
     if (sweeping.current) return;
@@ -231,19 +285,26 @@ export default function App() {
         </div>
 
         <nav className="nav">
-          {NAV.map((item) => (
-            <button
-              key={item.key}
-              className={"nav-item" + (section === item.key ? " active" : "")}
-              onClick={() => setSection(item.key)}
-            >
-              <item.Icon />
-              <span className="nav-text">
-                <span className="nav-label">{item.label}</span>
-                <span className="nav-hint">{item.hint}</span>
-              </span>
-            </button>
-          ))}
+          {NAV.map((item) => {
+            const waiting = item.key === "downloads" ? downloadsWaiting : null;
+            return (
+              <button
+                key={item.key}
+                className={"nav-item" + (section === item.key ? " active" : "")}
+                onClick={() => setSection(item.key)}
+                title={waiting?.title}
+              >
+                <item.Icon />
+                <span className="nav-text">
+                  <span className="nav-label">
+                    {item.label}
+                    {waiting && <span className="nav-count">{waiting.count}</span>}
+                  </span>
+                  <span className="nav-hint">{waiting?.hint ?? item.hint}</span>
+                </span>
+              </button>
+            );
+          })}
         </nav>
 
         <div className="sidebar-foot">
@@ -290,6 +351,8 @@ export default function App() {
             auditRead={auditRead}
             auditLimit={AUDIT_LIMIT}
             onOpenStorage={openStorage}
+            unseenDownloads={unseen}
+            onOpenDownloads={() => setSection("downloads")}
           />
         )}
 
@@ -301,7 +364,7 @@ export default function App() {
           />
         )}
 
-        {section === "downloads" && <Downloads launches={launches} />}
+        {section === "downloads" && <Downloads launches={launches} onLooked={refreshUnseen} />}
 
         {section === "applications" && (
           <Applications volumes={volumes} onMeasured={() => void refresh()} />

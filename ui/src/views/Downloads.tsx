@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
 import { runJob, stopJob, type Progress } from "../lib/jobs";
+import { unseenSentence } from "../lib/unseen";
 import ProgressBar from "../components/ProgressBar";
 import PathLink from "../components/PathLink";
 import type {
@@ -248,7 +249,14 @@ function Answer({
 /** An automatic check under way, as the watcher reports it. */
 type AutoCheck = { path: string; job: string; progress: Progress };
 
-export default function Downloads({ launches }: { launches: number }) {
+export default function Downloads({
+  launches,
+  onLooked,
+}: {
+  launches: number;
+  /** Called when what is counted beside this page's name may have changed. */
+  onLooked: () => void;
+}) {
   const [page, setPage] = useState<DownloadsPage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -281,18 +289,56 @@ export default function Downloads({ launches }: { launches: number }) {
   const openToken = useRef<string | null>(null);
   /** Archives closed or extracted here, which a reload must not reopen. */
   const dismissed = useRef<Set<string>>(new Set());
+  /**
+   * When this page was opened the time before. A flagged or unfinished result
+   * recorded since is one the count beside the page's name was about, and its
+   * row is marked as new for as long as the page stays open.
+   */
+  const [newSince, setNewSince] = useState<string | null>(null);
+  /** Why it could not be put on record that the page was opened. */
+  const [lookedError, setLookedError] = useState<string | null>(null);
+  /** Whether that has been put on record once since the page was opened. */
+  const lookedOnce = useRef(false);
+  /** Whether the history was read the last time the page was. */
+  const historyRead = useRef(false);
+
+  /**
+   * Put it on record that this page is in front of the person, which is what
+   * clears the count beside its name in the menu and on the Overview.
+   */
+  const looked = useCallback(async () => {
+    const first = !lookedOnce.current;
+    lookedOnce.current = true;
+    try {
+      const { previous } = await api.downloadsLooked();
+      if (first) setNewSince(previous);
+      setLookedError(null);
+    } catch (cause) {
+      setLookedError(reason(cause));
+    } finally {
+      onLooked();
+    }
+  }, [onLooked]);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setPage(await api.downloadsPage());
+      const next = await api.downloadsPage();
+      setPage(next);
       setError(null);
+      historyRead.current = next.history_error === null;
+      // Results are looked at when the page has shown them: it has read the
+      // history, and it is either being opened or in front of the person. A
+      // download flagged while the window sits behind another, or minimised
+      // on this page, has not been looked at, and stays counted.
+      if (historyRead.current && (!lookedOnce.current || document.hasFocus())) void looked();
+      else onLooked();
     } catch (cause) {
       setError(reason(cause));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [looked, onLooked]);
 
   const say = (path: string, text: string) =>
     setSaid((current) => ({ ...current, [path.toLowerCase()]: { path, text } }));
@@ -474,6 +520,12 @@ export default function Downloads({ launches }: { launches: number }) {
     const unlistenBacklog = listen<BacklogStep>("downloads://backlog", (event) =>
       setStep(event.payload),
     );
+    // Coming back to the window with this page in front is looking at it
+    // again, so what arrived meanwhile stops being counted as not looked at.
+    const onFocus = () => {
+      if (historyRead.current) void looked();
+    };
+    window.addEventListener("focus", onFocus);
     // An archive that is open stays open when this page is left: the window's
     // own half keeps it, and closes it when the window closes. Leaving the
     // page used to delete its private copy, and with the original already in
@@ -482,8 +534,9 @@ export default function Downloads({ launches }: { launches: number }) {
       void unlisten.then((stop) => stop());
       void unlistenProgress.then((stop) => stop());
       void unlistenBacklog.then((stop) => stop());
+      window.removeEventListener("focus", onFocus);
     };
-  }, [load]);
+  }, [load, looked]);
 
   // Coming back to the page: find the archive that was left open. One that
   // was closed here is not brought back by a reload that raced its closing.
@@ -555,6 +608,16 @@ export default function Downloads({ launches }: { launches: number }) {
   // What a press of the button would be about: not checked, and not already
   // on its way to being checked.
   const waitingForACheck = (page?.unchecked ?? []).filter((file) => file.in_flight === null).length;
+
+  // The results the count beside this page's name was about: flagged or
+  // unfinished, and recorded since the page was opened the time before.
+  const isNew = (record: PageRecord) =>
+    newSince !== null && record.counted_as !== null && record.checked_at > newSince;
+  const fresh = (page?.records ?? []).filter(isNew);
+  const freshSentence = unseenSentence(
+    fresh.filter((record) => record.counted_as === "flagged").length,
+    fresh.filter((record) => record.counted_as === "unfinished").length,
+  );
 
   return (
     <>
@@ -730,6 +793,13 @@ export default function Downloads({ launches }: { launches: number }) {
           </div>
         </div>
         {backlogError && <p className="small held-warn wrap">{backlogError}</p>}
+        {lookedError && <p className="small held-warn wrap">{lookedError}</p>}
+        {freshSentence && (
+          <p className="small held-warn wrap">
+            New since this page was last opened: {freshSentence}. Each is marked "new" in the
+            list.
+          </p>
+        )}
         {!page && loading && <p className="empty">Reading…</p>}
         {page && rows.length === 0 && (
           <p className="empty">Nothing has arrived in Downloads since this was set up.</p>
@@ -749,6 +819,7 @@ export default function Downloads({ launches }: { launches: number }) {
                 record={row.record}
                 said={said[row.record.path.toLowerCase()]?.text}
                 focused={focus === row.record.path.toLowerCase()}
+                fresh={isNew(row.record)}
                 busy={busy || moving !== null}
                 checkingAll={checkingAll}
                 onCheck={() => void check(row.record.path)}
@@ -1012,6 +1083,7 @@ function RecordRow({
   record,
   said,
   focused,
+  fresh,
   busy,
   checkingAll,
   onCheck,
@@ -1022,6 +1094,8 @@ function RecordRow({
   record: PageRecord;
   said: string | undefined;
   focused: boolean;
+  /** Flagged or unfinished, and recorded since the page was last opened. */
+  fresh: boolean;
   busy: boolean;
   /** Everything not checked yet is being checked, so no other check is started. */
   checkingAll: boolean;
@@ -1054,6 +1128,7 @@ function RecordRow({
           ) : (
             <span title={record.path}>{record.name}</span>
           )}
+          {fresh && <span className="chip">new</span>}
         </span>
         <span className="dl-size">{fmt.bytes(record.bytes)}</span>
       </div>

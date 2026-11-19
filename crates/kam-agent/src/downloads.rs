@@ -1041,14 +1041,8 @@ pub fn record_extraction(
 /// is exactly that shape. Times in the store are compared as text, and text
 /// of any other shape would compare as nonsense.
 fn store_time(text: &str) -> Option<&str> {
-    const SHAPE: &[u8] = b"0000-00-00T00:00:00.000Z";
     let text = text.trim();
-    let fits = text.len() == SHAPE.len()
-        && text.bytes().zip(SHAPE).all(|(byte, shape)| match shape {
-            b'0' => byte.is_ascii_digit(),
-            other => byte == *other,
-        });
-    fits.then_some(text)
+    kam_core::clock::is_iso(text).then_some(text)
 }
 
 /// Remove one row of the caller's own history, because they asked.

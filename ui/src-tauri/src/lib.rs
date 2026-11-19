@@ -14,6 +14,7 @@ mod context_menu;
 mod downloads;
 mod notice;
 mod recycle;
+mod seen;
 mod startup;
 mod uninstall;
 mod update;
@@ -1243,6 +1244,22 @@ async fn close_backlog(app: tauri::AppHandle) -> Result<(), String> {
     .await
 }
 
+/// How many download results this person has not looked at yet: flagged by
+/// Defender, and checks that did not finish, recorded since they last opened
+/// Active downloads. When that cannot be told the answer says so, and why,
+/// and is never a count of nothing. See `seen.rs`.
+#[tauri::command]
+async fn downloads_unseen() -> Result<seen::Unseen, String> {
+    off_the_window(|| Ok(seen::unseen())).await
+}
+
+/// Put it on record that Active downloads is in front of the person now,
+/// which is what clears that count. Answers with when it last was.
+#[tauri::command]
+async fn downloads_looked() -> Result<seen::Looked, String> {
+    off_the_window(seen::looked).await
+}
+
 /// Add or remove the right-click entries.
 #[tauri::command]
 async fn set_context_menu(enabled: bool) -> Result<context_menu::MenuState, String> {
@@ -1376,12 +1393,14 @@ pub fn run() {
             downloads::start_watching(app.handle().clone());
 
             // Registry and file work kept off the window's thread: the
-            // right-click entries, the Start menu shortcut notifications need,
+            // right-click entries, where download results are counted from
+            // on a first run, the Start menu shortcut notifications need,
             // and any working copy a previous run left behind.
             let _ = std::thread::Builder::new()
                 .name("kam-first-run".to_owned())
                 .spawn(|| {
                     context_menu::apply_at_start();
+                    seen::start_counting();
                     if let Err(error) = notice::ensure_shortcut() {
                         eprintln!("{error}");
                     }
@@ -1469,6 +1488,8 @@ pub fn run() {
             check_backlog,
             stop_backlog,
             close_backlog,
+            downloads_unseen,
+            downloads_looked,
             set_context_menu,
             take_launch,
             launch_waiting
