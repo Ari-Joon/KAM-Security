@@ -1865,6 +1865,9 @@ pub fn check_backlog(app: &AppHandle) -> Result<(), String> {
         if let Ok(mut slot) = state.backlog.lock() {
             *slot = None;
         }
+        // A Stop pressed while the files were being found has nothing left
+        // to stop.
+        state.forget_stop(&job);
         Err(reason)
     };
     let files = match backlog_files(&state) {
