@@ -598,6 +598,24 @@ impl Store {
             .map_err(to_db_error)
     }
 
+    /// What each of one person's checks recorded after `since` came to: the
+    /// stored answers and nothing else of the rows.
+    ///
+    /// For counting the results a person has not looked at yet. The answer
+    /// is all a count needs, and its shape belongs to the crate that writes
+    /// it, so it is handed back as it is stored for the agent to read.
+    pub fn download_outcomes_since(&self, sid: &str, since: &str) -> Result<Vec<String>> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare("SELECT outcome FROM downloads WHERE sid = ?1 AND checked_at > ?2")
+            .map_err(to_db_error)?;
+        let rows = statement
+            .query_map(params![sid, since], |row| row.get::<_, String>(0))
+            .map_err(to_db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(to_db_error)
+    }
+
     /// Note something done to a download, on its most recent row.
     ///
     /// `sha256` narrows it to one content when the caller knows it; without it
@@ -2624,6 +2642,43 @@ mod tests {
             "somebody else's history was cleared"
         );
         assert_eq!(store.clear_downloads(me, &decided).unwrap(), 0);
+    }
+
+    /// The answers recorded since a moment are one person's, and only those
+    /// recorded after it. A check made again counts from when it was made
+    /// again.
+    #[test]
+    fn the_answers_since_a_moment_are_the_callers_and_only_the_later_ones() {
+        let store = Store::open_in_memory().unwrap();
+        let (me, them) = ("S-1-5-21-1-1001", "S-1-5-21-1-1002");
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(50));
+        store
+            .record_download_check(&download(me, r"C:\D\old.exe", "aa", "old"))
+            .unwrap();
+        store
+            .record_download_check(&download(me, r"C:\D\again.exe", "aa", "before"))
+            .unwrap();
+        pause();
+        let looked = crate::clock::now_utc_iso();
+        pause();
+        store
+            .record_download_check(&download(me, r"C:\D\new.exe", "aa", "new"))
+            .unwrap();
+        store
+            .record_download_check(&download(me, r"C:\D\again.exe", "aa", "after"))
+            .unwrap();
+        store
+            .record_download_check(&download(them, r"C:\D\theirs.exe", "aa", "theirs"))
+            .unwrap();
+
+        let mut since = store.download_outcomes_since(me, &looked).unwrap();
+        since.sort();
+        assert_eq!(since, ["after", "new"]);
+        pause();
+        assert!(store
+            .download_outcomes_since(me, &crate::clock::now_utc_iso())
+            .unwrap()
+            .is_empty());
     }
 
     /// A store from before readings were kept, as an update finds it: swept,

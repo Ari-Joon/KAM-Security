@@ -1185,6 +1185,11 @@ export type PageRecord = DownloadRecord & {
   in_downloads: boolean;
   /** For a zip Defender found nothing in: what its own list says. */
   inside: Inside | null;
+  /**
+   * Whether this is a result a person is told about, and as which kind. The
+   * count beside the page's name in the menu is made by the same rule.
+   */
+  counted_as: "flagged" | "unfinished" | null;
 };
 
 /**

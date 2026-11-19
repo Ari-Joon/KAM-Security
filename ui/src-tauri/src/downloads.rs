@@ -42,7 +42,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use kam_core::Progress;
 use kam_ipc::{Request, Response};
-use kam_scanner::defender_file::Answer;
+use kam_scanner::defender_file::{Answer, Counted};
 use kam_scanner::downloads::{Dissection, DownloadRecord, Extraction, OriginalFate};
 use kam_storage::downloads::{archive_kind, is_partial, ArchiveKind};
 use serde::Serialize;
@@ -415,6 +415,10 @@ pub struct PageRecord {
     /// For a zip Defender found nothing in: what its own list says about how
     /// much of it Defender could look inside.
     inside: Option<crate::archive::Inside>,
+    /// Whether this is a result a person is told about, and as which kind:
+    /// flagged, or a check that did not finish. The agent counts by the same
+    /// rule, so the page and the count beside its name cannot disagree.
+    counted_as: Option<Counted>,
 }
 
 /// The archive that is open, for a page that has just been drawn again.
@@ -633,6 +637,7 @@ pub fn page(state: &Downloads) -> Page {
                             .map(|found| state.inside(&record.check.path, found))
                     })
                     .flatten(),
+                counted_as: record.check.scan.counted_as(),
                 present,
                 archive,
                 record,

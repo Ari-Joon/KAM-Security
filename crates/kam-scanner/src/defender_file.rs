@@ -66,6 +66,17 @@ pub enum Answer {
     GoneBeforeCheck,
 }
 
+/// Which of the two kinds of result a person is told about a result is,
+/// when it is one of them. See [`FileScan::counted_as`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Counted {
+    /// Defender flagged it.
+    Flagged,
+    /// The check of it did not finish, or could not be made.
+    Unfinished,
+}
+
 /// One threat Defender flagged, with the resources it named.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Flagged {
@@ -333,6 +344,30 @@ impl FileScan {
             caveat: self.caveat.clone(),
             definitions: self.definitions.clone(),
             ..*self
+        }
+    }
+
+    /// Whether this is a result to bring to somebody's notice, and as which
+    /// of the two kinds that are.
+    ///
+    /// One rule, kept here, for the count beside "Active downloads", the
+    /// filters on that page and the rows it marks as new, so that the three
+    /// can never disagree about a row. It sorts what Defender said and adds
+    /// nothing to it: flagged is Defender's word, and unfinished is the plain
+    /// fact that there is no answer.
+    ///
+    /// A download that was gone before it could be checked has no answer
+    /// either, so it is counted. When Defender's own history holds a
+    /// detection at its path it is counted with the flagged, because that
+    /// is Defender having flagged it; when the history holds nothing, or
+    /// could not be read, it is one whose check could not be made.
+    pub fn counted_as(&self) -> Option<Counted> {
+        match self.answer {
+            Answer::NothingFound => None,
+            Answer::Flagged => Some(Counted::Flagged),
+            Answer::NotFinished => Some(Counted::Unfinished),
+            Answer::GoneBeforeCheck if self.threats.is_empty() => Some(Counted::Unfinished),
+            Answer::GoneBeforeCheck => Some(Counted::Flagged),
         }
     }
 
@@ -1144,6 +1179,42 @@ mod tests {
             assert_eq!(scan.answer, Answer::NotFinished, "{code:?} {output:?}");
             assert!(scan.caveat.is_some());
         }
+    }
+
+    /// Which results are counted beside "Active downloads", and as what.
+    /// Nothing Defender found nothing in is. Everything else is, because
+    /// each is either Defender's flag or the absence of an answer.
+    #[test]
+    fn a_result_is_counted_as_flagged_or_unfinished_or_not_at_all() {
+        assert_eq!(parse_report(Some(0), "").counted_as(), None);
+        assert_eq!(
+            parse_report(Some(2), &eicar_output(ZIP)).counted_as(),
+            Some(Counted::Flagged)
+        );
+        assert_eq!(
+            parse_report(Some(2), "").counted_as(),
+            Some(Counted::Unfinished)
+        );
+
+        // Gone before it could be checked: by what Defender's own history
+        // holds for the path.
+        let named = Flagged {
+            name: "Trojan:Win32/Example".to_owned(),
+            resources: Vec::new(),
+        };
+        assert_eq!(
+            FileScan::gone_before_check(Ok(vec![(named, "quarantined".to_owned())])).counted_as(),
+            Some(Counted::Flagged)
+        );
+        assert_eq!(
+            FileScan::gone_before_check(Ok(Vec::new())).counted_as(),
+            Some(Counted::Unfinished)
+        );
+        assert_eq!(
+            FileScan::gone_before_check(Err("no access".to_owned())).counted_as(),
+            Some(Counted::Unfinished),
+            "a history that could not be read was taken for one with nothing in it"
+        );
     }
 
     /// A member's name can carry a newline and print lines of its own. It

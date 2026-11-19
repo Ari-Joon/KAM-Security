@@ -27,7 +27,7 @@ use kam_core::audit::Effect;
 use kam_core::db::DownloadRow;
 use kam_core::{Reporter, UserContext};
 use kam_ipc::Response;
-use kam_scanner::defender_file::{Answer, FileScan, Flagged};
+use kam_scanner::defender_file::{Answer, Counted, FileScan, Flagged};
 use kam_scanner::downloads::{
     CheckError, Dissection, DownloadAction, DownloadCheck, DownloadRecord, Extraction, Held,
 };
@@ -366,13 +366,12 @@ pub fn check(
     Response::DownloadChecked(Box::new(record))
 }
 
-/// A stored row, read back into the shape the window draws.
+/// Defender's answer as a row stores it, read back.
 ///
-/// A part that cannot be read back is said to be unreadable rather than
-/// dropped: Defender's answer in particular never reads as nothing found
-/// because its record was damaged.
-fn record_from_row(row: DownloadRow) -> DownloadRecord {
-    let scan = serde_json::from_str::<FileScan>(&row.outcome)
+/// One that cannot be read back is said to be unreadable rather than
+/// dropped: it never reads as nothing found because its record was damaged.
+fn scan_from(outcome: &str) -> FileScan {
+    serde_json::from_str::<FileScan>(outcome)
         // A row written before rows were kept small still holds Defender's
         // whole list. It is read back in the same short form as the rest.
         .map(|scan| scan.for_record())
@@ -386,7 +385,15 @@ fn record_from_row(row: DownloadRow) -> DownloadRecord {
             caveat: Some("The stored answer for this check could not be read back.".to_owned()),
             definitions: None,
             notes: Vec::new(),
-        });
+        })
+}
+
+/// A stored row, read back into the shape the window draws.
+///
+/// A part that cannot be read back is said to be unreadable rather than
+/// dropped: see [`scan_from`] for Defender's answer in particular.
+fn record_from_row(row: DownloadRow) -> DownloadRecord {
+    let scan = scan_from(&row.outcome);
     DownloadRecord {
         check: DownloadCheck {
             path: row.path,
@@ -479,6 +486,48 @@ pub fn list(paths: &[String], recent: u32, context: &Context, user: &UserContext
         records.push(record);
     }
     Response::Downloads { records, on_record }
+}
+
+/// Count the caller's own results recorded after `since` that are ones to
+/// look at: flagged by Defender, or a check that did not finish. A read, so
+/// not audited.
+///
+/// Which results those are is [`FileScan::counted_as`], the rule the page
+/// uses too. The answers are read back as the list reads them, so one that
+/// cannot be read back counts as a check that did not finish, here as there.
+///
+/// A history that cannot be read is an error, and so is a `since` that is
+/// not a time. Neither is ever answered with a count of nothing: nothing is
+/// what the person would take it to mean.
+pub fn count_since(since: &str, context: &Context, user: &UserContext) -> Response {
+    let Some(since) = store_time(since) else {
+        return Response::Error {
+            message: "the results since then could not be counted, because when \"then\" was \
+                      did not arrive as a time"
+                .to_owned(),
+        };
+    };
+    let outcomes = match context.store.download_outcomes_since(caller(user), since) {
+        Ok(outcomes) => outcomes,
+        Err(error) => {
+            tracing::error!(%error, "could not read the download history");
+            return Response::Error {
+                message: "the download history could not be read".to_owned(),
+            };
+        }
+    };
+    let (mut flagged, mut unfinished) = (0_u64, 0_u64);
+    for outcome in outcomes {
+        match scan_from(&outcome).counted_as() {
+            Some(Counted::Flagged) => flagged += 1,
+            Some(Counted::Unfinished) => unfinished += 1,
+            None => {}
+        }
+    }
+    Response::DownloadsSince {
+        flagged,
+        unfinished,
+    }
 }
 
 /// Note something done to a download on its row. A missing row is not an

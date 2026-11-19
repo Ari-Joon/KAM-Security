@@ -436,6 +436,16 @@ pub enum Request {
     /// check recorded after that is not on their list and is kept: clearing a
     /// list must not delete a result nobody has been shown.
     ClearDownloadRecords { up_to: String },
+    /// How many of the caller's own download results recorded after `since`
+    /// are ones to look at: flagged by Defender, or a check that did not
+    /// finish.
+    ///
+    /// `since` is when the caller last opened the Active downloads page,
+    /// which the window keeps for the person in their own account. The
+    /// answer is the count shown beside that page in the menu, for somebody
+    /// whose Windows notifications are off and who would otherwise be told
+    /// nothing. A read, asked for whenever the list changes, so not audited.
+    CountDownloadsSince { since: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -567,6 +577,13 @@ pub enum Response {
     DownloadRecordsRemoved {
         removed: u64,
     },
+    /// The caller's download results recorded after the moment asked about
+    /// that are ones to look at, by kind. Both at nothing is an answer, and
+    /// is only ever given when the history was read.
+    DownloadsSince {
+        flagged: u64,
+        unfinished: u64,
+    },
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {
         message: String,
@@ -677,6 +694,10 @@ mod tests {
             on_record: 0,
         });
         round_trip(Response::DownloadRecordsRemoved { removed: 2 });
+        round_trip(Response::DownloadsSince {
+            flagged: 1,
+            unfinished: 0,
+        });
         round_trip(Response::BehaviourEvents {
             observations: Vec::new(),
             watching: true,

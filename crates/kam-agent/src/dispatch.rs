@@ -210,7 +210,8 @@ pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
         | Request::GetCanaries
         | Request::GetProtection
         | Request::CheckDownload { .. }
-        | Request::ListDownloads { .. } => false,
+        | Request::ListDownloads { .. }
+        | Request::CountDownloadsSince { .. } => false,
     }
 }
 
@@ -1116,6 +1117,12 @@ pub fn handle(
         // Not audited. The page reads it whenever it is opened.
         Request::ListDownloads { paths, recent } => {
             crate::downloads::list(&paths, recent, context, user)
+        }
+
+        // Not audited either: the window asks whenever the list changes, to
+        // keep the count beside the page's name true.
+        Request::CountDownloadsSince { since } => {
+            crate::downloads::count_since(&since, context, user)
         }
 
         Request::QuarantineDownload { path } => crate::downloads::quarantine(&path, context, user),
@@ -2943,9 +2950,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
-    /// A row put straight into the history, so that removing rows can be
-    /// tested without Defender having to check anything.
+    /// A row put straight into the history, so that removing and counting
+    /// rows can be tested without Defender having to check anything.
     fn recorded(context: &Context, sid: &str, path: &str, sha256: &str) {
+        let nothing = kam_scanner::defender_file::parse_report(Some(0), "");
+        recorded_as(
+            context,
+            sid,
+            path,
+            sha256,
+            &serde_json::to_string(&nothing).unwrap(),
+        );
+    }
+
+    /// The same, with the answer the row is to hold, as it is stored.
+    fn recorded_as(context: &Context, sid: &str, path: &str, sha256: &str, outcome: &str) {
         context
             .store
             .record_download_check(&kam_core::db::DownloadRow {
@@ -2958,11 +2977,7 @@ mod tests {
                 checked_at: String::new(),
                 origin: None,
                 signature: None,
-                outcome: serde_json::to_string(&kam_scanner::defender_file::parse_report(
-                    Some(0),
-                    "",
-                ))
-                .unwrap(),
+                outcome: outcome.to_owned(),
                 actions: String::new(),
                 dissection: None,
             })
@@ -3135,6 +3150,100 @@ mod tests {
         );
         assert!(!needs_administrator(
             &Request::ClearDownloadRecords { up_to: read_at },
+            &me
+        ));
+    }
+
+    /// The count beside "Active downloads": the caller's own results,
+    /// recorded since they last opened the page, that Defender flagged or
+    /// whose check did not finish. Nobody else's, nothing older, and never a
+    /// count of nothing for a question that could not be answered.
+    #[test]
+    fn results_not_looked_at_yet_are_counted_for_the_caller_alone() {
+        use kam_scanner::defender_file::{parse_report, FileScan, Flagged};
+
+        let context = context(Mode::Service);
+        let (mine, theirs) = ("S-1-5-21-0-0-0-4014", "S-1-5-21-0-0-0-4015");
+        let me = identified(mine);
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(50));
+        let stored = |scan: &FileScan| serde_json::to_string(scan).unwrap();
+        let nothing = stored(&parse_report(Some(0), ""));
+        let flagged = stored(&parse_report(
+            Some(2),
+            "Scanning C:\\a.exe found 1 threats.\r\nThreat : Trojan:Win32/Example\r\n\
+             Resources : 1 total\r\n    file : C:\\a.exe\r\n",
+        ));
+        let unfinished = stored(&parse_report(Some(2), ""));
+        let gone_and_named = stored(&FileScan::gone_before_check(Ok(vec![(
+            Flagged {
+                name: "Trojan:Win32/Example".to_owned(),
+                resources: Vec::new(),
+            },
+            "quarantined".to_owned(),
+        )])));
+        let gone_unexplained = stored(&FileScan::gone_before_check(Ok(Vec::new())));
+        let sha256 = "ab".repeat(32);
+
+        // Recorded before the page was last opened, so looked at already.
+        recorded_as(&context, mine, r"C:\D\old.exe", &sha256, &flagged);
+        pause();
+        let looked = kam_core::clock::now_utc_iso();
+        pause();
+        for (name, sha256, outcome) in [
+            ("a.exe", sha256.as_str(), &nothing),
+            ("b.exe", sha256.as_str(), &flagged),
+            ("c.exe", sha256.as_str(), &unfinished),
+            ("d.exe", "", &gone_and_named),
+            ("e.exe", "", &gone_unexplained),
+            // A damaged row reads back as a check that did not finish.
+            ("f.exe", sha256.as_str(), &"not an answer".to_owned()),
+        ] {
+            recorded_as(&context, mine, &format!(r"C:\D\{name}"), sha256, outcome);
+        }
+        recorded_as(&context, theirs, r"C:\D\g.exe", &sha256, &flagged);
+
+        let count = |since: &str| {
+            handle(
+                Request::CountDownloadsSince {
+                    since: since.to_owned(),
+                },
+                &context,
+                &Reporter::silent(),
+                &me,
+            )
+        };
+        let counted = count(&looked);
+        assert!(
+            matches!(
+                counted,
+                Response::DownloadsSince {
+                    flagged: 2,
+                    unfinished: 3
+                }
+            ),
+            "{counted:?}"
+        );
+        // Opening the page moves the moment, and nothing has come since.
+        pause();
+        let counted = count(&kam_core::clock::now_utc_iso());
+        assert!(
+            matches!(
+                counted,
+                Response::DownloadsSince {
+                    flagged: 0,
+                    unfinished: 0
+                }
+            ),
+            "{counted:?}"
+        );
+        // A moment that is not a time is an error, never a count of nothing.
+        assert!(matches!(count("yesterday"), Response::Error { .. }));
+
+        // Asked whenever the list changes, so not in the audit log, and
+        // anyone's to ask about their own rows.
+        assert!(context.store.recent_audit(10).unwrap().is_empty());
+        assert!(!needs_administrator(
+            &Request::CountDownloadsSince { since: looked },
             &me
         ));
     }
