@@ -262,10 +262,17 @@ pub fn readings() -> Vec<Reading> {
             1,
             never_before("Run-once entries in the registry"),
         ),
+        // 2: a shortcut kept relative to one of a person's own folders is read
+        // for that person. It was read as the service, which placed it under
+        // the service's own folders, so what it runs could not be told and
+        // its item was recorded by the shortcut's own path.
         Reading::of(
             kind_of(Anchor::StartupFolder),
-            1,
-            never_before("Startup folder items"),
+            2,
+            "Startup folder items are read more closely from this version on: a shortcut kept \
+             relative to one of a person's own folders, such as their Desktop, is read for that \
+             person, where before what it runs often could not be told. So this time Startup \
+             folder items were recorded as they are, and not compared with last time.",
         ),
         // 2: a service that runs inside svchost.exe is recorded as the file
         // it loads there. It was recorded as svchost.exe.
@@ -637,6 +644,64 @@ mod tests {
                 "the note is shown to a person as a sentence: {reading:?}"
             );
         }
+    }
+
+    /// The first comparison after this update does not report a Startup item
+    /// as changed because its shortcut can now be read.
+    ///
+    /// A shortcut kept relative to one of a person's folders was read as the
+    /// service, what it ran could not be told, and its item was recorded by
+    /// the shortcut's own path. Read for its person, the same item is
+    /// recorded by what it runs. Nothing on the machine changed, so nothing is
+    /// reported, and the person is told Startup items were recorded afresh.
+    #[test]
+    fn a_startup_item_read_for_its_person_is_not_reported_as_changed_after_the_update() {
+        let store = kam_core::Store::open_in_memory().unwrap();
+        let item = |detail: &str, trust: &str| Sighting {
+            kind: kind_of(Anchor::StartupFolder).to_owned(),
+            scope: r"c:\users\her\appdata\roaming\microsoft\windows\start menu\programs\startup"
+                .to_owned(),
+            name: "Clear Voice".to_owned(),
+            detail: detail.to_owned(),
+            trust: trust.to_owned(),
+        };
+        let lnk = r"C:\Users\her\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\Clear Voice.lnk";
+        // How the version before read: Startup items under their first number.
+        let before: Vec<Reading> = readings()
+            .into_iter()
+            .map(|reading| {
+                if reading.kind == kind_of(Anchor::StartupFolder) {
+                    Reading {
+                        version: 1,
+                        ..reading
+                    }
+                } else {
+                    reading
+                }
+            })
+            .collect();
+        for _ in 0..2 {
+            store
+                .sweep_read_as(&[item(lnk, kam_core::changes::NOT_CHECKED)], &[], &before)
+                .unwrap();
+        }
+
+        let after = store
+            .sweep_read_as(
+                &[item(
+                    r"C:\Users\her\Desktop\Projects\Clear Voice\.venv\Scripts\pythonw.exe",
+                    "signed by Python Software Foundation",
+                )],
+                &[],
+                &readings(),
+            )
+            .unwrap();
+        assert!(
+            after.differences.is_empty(),
+            "a Startup item that can now be read was reported: {:?}",
+            after.differences
+        );
+        assert_eq!(after.afresh.len(), 1, "{:?}", after.afresh);
     }
 
     /// What is compared for a service inside svchost.exe is the file it
