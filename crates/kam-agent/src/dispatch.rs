@@ -189,6 +189,7 @@ pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
         | Request::GetRecentAudit { .. }
         | Request::ListVolumes
         | Request::ScanPath { .. }
+        | Request::ScanFolder { .. }
         | Request::ListApplications { .. }
         | Request::ListQuarantine
         | Request::SweepForChanges
@@ -275,6 +276,8 @@ pub fn handle(
         },
 
         Request::ScanPath { path } => scan_path(&path, context),
+
+        Request::ScanFolder { path } => scan_folder(&path, context),
 
         Request::ListApplications { drive } => {
             let Some(letter) = drive.chars().next().filter(|c| c.is_ascii_alphabetic()) else {
@@ -1497,6 +1500,45 @@ fn scan_path(path: &str, context: &Context) -> Response {
             Response::Error {
                 message: format!("{path} could not be scanned"),
             }
+        }
+    }
+}
+
+/// Read one folder for the map, below where a scan of its drive stops.
+///
+/// What may be asked for, and how the folder is found, are decided in
+/// [`kam_storage::scan::scan_folder`]. Here it is recorded: opening a folder
+/// on the map is something a person asked for, like the scan it came from,
+/// and a refusal is recorded like any other.
+fn scan_folder(path: &str, context: &Context) -> Response {
+    match kam_storage::scan::scan_folder(path) {
+        Ok(folder) => {
+            context.audit(
+                "storage",
+                "scan_folder",
+                Effect::Observed,
+                format!(
+                    "read {}: {} {}, {} ms",
+                    folder.path,
+                    human_bytes(folder.tree.bytes),
+                    match folder.method {
+                        kam_storage::ScanMethod::MasterFileTable => "by the file table",
+                        kam_storage::ScanMethod::DirectoryWalk => "by walking it",
+                    },
+                    folder.elapsed_ms
+                ),
+            );
+            Response::Folder(Box::new(folder))
+        }
+        Err(error) => {
+            // A refusal is already a sentence for the person. Anything else
+            // is given the folder it was about.
+            let message = match error {
+                kam_core::Error::Refused(reason) => reason,
+                other => format!("{path} could not be read: {other}"),
+            };
+            context.audit("storage", "scan_folder", Effect::Refused, message.clone());
+            Response::Error { message }
         }
     }
 }
@@ -2780,6 +2822,115 @@ mod tests {
             "a dash in what the person reads: {}",
             records[0].detail
         );
+    }
+
+    fn open_folder(path: &str, context: &Context) -> Response {
+        handle(
+            Request::ScanFolder {
+                path: path.to_owned(),
+            },
+            context,
+            &Reporter::silent(),
+            &UserContext::current(),
+        )
+    }
+
+    /// Opening a folder on the map reads, so anybody may ask. What may be
+    /// asked about is a folder on a lettered drive, and anything else is
+    /// refused before it is opened and is on the record.
+    #[test]
+    fn a_folder_that_is_not_on_a_lettered_drive_is_refused_and_recorded() {
+        let context = context(Mode::Service);
+        let asked = [
+            r"\\server\share\folder",
+            r"\\?\UNC\server\share\folder",
+            r"\\.\C:\Users",
+            r"C:\Users\..\Windows",
+        ];
+        for path in asked {
+            assert!(!needs_administrator(
+                &Request::ScanFolder {
+                    path: path.to_owned()
+                },
+                &someone()
+            ));
+            let Response::Error { message } = open_folder(path, &context) else {
+                panic!("{path} was read");
+            };
+            assert!(message.contains("was not read"), "{path}: {message}");
+        }
+
+        let records = context.store.recent_audit(10).unwrap();
+        assert_eq!(records.len(), asked.len(), "every refusal is recorded");
+        for record in &records {
+            assert_eq!(
+                (
+                    record.module.as_str(),
+                    record.action.as_str(),
+                    record.effect
+                ),
+                ("storage", "scan_folder", Effect::Refused)
+            );
+        }
+    }
+
+    /// A folder that is not there is said to be gone, however the drive is
+    /// read: by the file table where this runs with the rights for it, by
+    /// walking where it does not.
+    #[test]
+    fn a_folder_that_is_not_there_is_said_to_be_gone_and_recorded() {
+        let context = context(Mode::Console);
+        let missing = std::env::temp_dir().join(format!(
+            "kam-dispatch-no-such-folder-{}",
+            std::process::id()
+        ));
+        let Response::Error { message } = open_folder(&missing.to_string_lossy(), &context) else {
+            panic!("a folder that does not exist was read");
+        };
+        assert!(message.contains("there is no folder at"), "{message}");
+
+        let records = context.store.recent_audit(10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action, "scan_folder");
+        assert_eq!(records[0].effect, Effect::Refused);
+    }
+
+    /// Opening a folder is recorded, as the scan it was opened from is.
+    ///
+    /// Which way the folder is read depends on the rights the tests run with,
+    /// and a folder made a moment ago need not be in the file table on disk
+    /// yet. So this holds whichever happens: one answer, one entry, and where
+    /// the folder was walked, the figure for what was written into it.
+    #[test]
+    fn opening_a_folder_is_recorded_because_the_person_asked_for_it() {
+        let context = context(Mode::Console);
+        let file = scratch_file("open-folder", &[7_u8; 4096]);
+        let folder = file.parent().unwrap().to_string_lossy().into_owned();
+
+        match open_folder(&folder, &context) {
+            Response::Folder(read) => {
+                if read.method == kam_storage::ScanMethod::DirectoryWalk {
+                    assert_eq!(read.tree.bytes, 4096);
+                    assert_eq!(read.unreadable, Some(0));
+                    assert!(read.fallback_reason.is_some(), "a walk says why");
+                }
+            }
+            Response::Error { message } => {
+                assert!(message.contains("there is no folder at"), "{message}")
+            }
+            other => panic!("unexpected answer: {other:?}"),
+        }
+
+        let records = context.store.recent_audit(10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].module, "storage");
+        assert_eq!(records[0].action, "scan_folder");
+        assert!(
+            !records[0].detail.contains(['\u{2014}', '\u{2013}']),
+            "a dash in what the person reads: {}",
+            records[0].detail
+        );
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]

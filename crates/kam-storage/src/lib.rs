@@ -47,7 +47,7 @@ pub use index::VolumeIndex;
 pub use organise::{OrganiseSummary, Proposal};
 pub use orphans::{Confidence, Orphan, OrphanSummary};
 pub use provenance::{Download, DownloadSummary};
-pub use scan::{scan, Scan, ScanMethod};
+pub use scan::{scan, FolderScan, Scan, ScanMethod};
 pub use volumes::{list as list_volumes, Volume};
 
 /// Whether a file may be included in a move proposal.

@@ -112,6 +112,24 @@ async fn scan_path(path: String) -> Result<Scan, String> {
     .await
 }
 
+/// Read one folder for the map, below where a scan of its drive stops.
+///
+/// What a click on a rectangle with nothing sent beneath it asks for. The
+/// agent decides what may be asked about and finds the folder itself.
+#[tauri::command]
+async fn scan_folder(path: String) -> Result<kam_storage::FolderScan, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::ScanFolder { path })
+            .map_err(|error| error.to_string())?
+        {
+            Response::Folder(folder) => Ok(*folder),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
+}
+
 /// What every installed application really occupies.
 ///
 /// Needs a privileged agent, and takes a couple of seconds — it reads the whole
@@ -1474,6 +1492,7 @@ pub fn run() {
             recent_audit,
             list_volumes,
             scan_path,
+            scan_folder,
             list_applications,
             list_applications_preview,
             find_duplicates,

@@ -26,7 +26,7 @@ use kam_storage::apps::LocationKind;
 use kam_storage::remnants::Remnants as RemnantReport;
 use kam_storage::{
     AppFootprint, Cache, Cleared, Download, DownloadSummary, DuplicateGroup, DuplicateSummary,
-    FootprintSummary, OrganiseSummary, Orphan, OrphanSummary, Proposal, Scan, Volume,
+    FolderScan, FootprintSummary, OrganiseSummary, Orphan, OrphanSummary, Proposal, Scan, Volume,
 };
 use serde::{Deserialize, Serialize};
 
@@ -95,6 +95,12 @@ pub enum Request {
     /// Measure everything beneath `path`. Seconds on a full drive, so callers
     /// should expect this one to take a while.
     ScanPath { path: String },
+    /// Read one folder for the map, below where a scan of its drive stops.
+    ///
+    /// Names a folder on a lettered drive and nothing else. The agent refuses
+    /// a network or device path before opening anything, finds the folder
+    /// itself, and answers with folders only, cut as the map of a drive is.
+    ScanFolder { path: String },
     /// What every installed application really occupies on `drive`, and which
     /// directories nothing installed accounts for. Needs the master file table,
     /// so the agent must be privileged.
@@ -477,6 +483,8 @@ pub enum Response {
     /// Boxed because a scan result dwarfs every other variant, and an enum is
     /// as large as its largest member wherever it is passed.
     Scan(Box<Scan>),
+    /// One folder, read on its own for the map.
+    Folder(Box<FolderScan>),
     Applications {
         apps: Vec<AppFootprint>,
         summary: FootprintSummary,
@@ -759,6 +767,48 @@ mod tests {
             afresh: Vec::new(),
             whole: true,
         })));
+    }
+
+    /// One folder read for the map goes over and comes back, and a tree from
+    /// a sender that never marked where it stopped reads as stopping nowhere:
+    /// the map then offers nothing to open that the sender did not offer.
+    #[test]
+    fn a_folder_read_for_the_map_survives_the_wire() {
+        use kam_storage::scan::Node;
+
+        let leaf = Node {
+            name: "DXCache".to_owned(),
+            path: r"C:\Users\someone\AppData\Local\NVIDIA\DXCache".to_owned(),
+            bytes: 8_000,
+            files: 2,
+            children: Vec::new(),
+            is_aggregate: false,
+            folded: true,
+        };
+        round_trip(Response::Folder(Box::new(FolderScan {
+            path: r"C:\Users\someone\AppData\Local\NVIDIA".to_owned(),
+            method: kam_storage::ScanMethod::MasterFileTable,
+            fallback_reason: None,
+            unreadable: None,
+            elapsed_ms: 1_200,
+            tree: Node {
+                name: "NVIDIA".to_owned(),
+                path: r"C:\Users\someone\AppData\Local\NVIDIA".to_owned(),
+                bytes: 8_010,
+                files: 1,
+                children: vec![leaf.clone()],
+                is_aggregate: false,
+                folded: false,
+            },
+        })));
+
+        let wire = serde_json::to_value(&leaf).unwrap();
+        assert_eq!(wire["folded"], true);
+        let unmarked: Node = serde_json::from_value(serde_json::json!({
+            "name": "x", "path": "x", "bytes": 1, "files": 0, "children": []
+        }))
+        .unwrap();
+        assert!(!unmarked.folded);
     }
 
     #[test]
