@@ -21,6 +21,7 @@ pub mod hardening;
 pub mod persistence;
 pub mod places;
 pub mod provenance;
+mod shortcut;
 pub mod signature;
 pub mod wmi;
 

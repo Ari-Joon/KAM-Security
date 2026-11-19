@@ -900,18 +900,25 @@ fn read_startup_folders(survey: &mut Survey, whose: Whose<'_>) {
             // It was never read, so every shortcut here had nothing to judge
             // and was left out of everything that judges what starts itself,
             // which is the usual way a Startup item is made. The target is
-            // read as stored, without asking Windows to go looking for it.
-            // The entry is still the shortcut, which is what is in the folder
-            // and what a person would remove.
+            // read as the shortcut stores it, for the person whose folder it
+            // is in, without asking Windows to go looking for it. Windows
+            // would answer for the service. The entry is still the shortcut,
+            // which is what is in the folder and what a person would remove.
+            let mut missing = None;
             let resolved = if runs_directly {
                 Resolved {
                     executable: Some(path.clone()),
                     ..Default::default()
                 }
             } else if extension == "lnk" {
-                shortcut_command(&path)
-                    .map(|command| resolve_with(&command, expand))
-                    .unwrap_or_default()
+                match crate::shortcut::command(&path, owner) {
+                    Ok(Some(command)) => resolve_with(&command, expand),
+                    Ok(None) => Resolved::default(),
+                    Err(why) => {
+                        missing = Some(why);
+                        Resolved::default()
+                    }
+                }
             } else {
                 Resolved::default()
             };
@@ -925,99 +932,10 @@ fn read_startup_folders(survey: &mut Survey, whose: Whose<'_>) {
                 host: resolved.host,
                 hidden: false,
                 machine_wide,
-                missing: None,
+                missing,
             });
         }
     }
-}
-
-/// COM, entered for the life of one shortcut read and left only if this
-/// entered it. A thread already in another apartment keeps it; the shell link
-/// object works in either.
-struct ComScope(bool);
-
-impl ComScope {
-    fn enter() -> Self {
-        // S_OK and S_FALSE both need a matching CoUninitialize; a thread
-        // already in the other apartment model returns an error and must not
-        // be uninitialised by us.
-        let outcome = unsafe {
-            windows::Win32::System::Com::CoInitializeEx(
-                None,
-                windows::Win32::System::Com::COINIT_MULTITHREADED,
-            )
-        };
-        Self(outcome.is_ok())
-    }
-}
-
-impl Drop for ComScope {
-    fn drop(&mut self) {
-        if self.0 {
-            unsafe { windows::Win32::System::Com::CoUninitialize() };
-        }
-    }
-}
-
-/// What a shortcut runs, as a command line: its target as stored, quoted,
-/// then its arguments.
-///
-/// Read with `SLGP_RAWPATH`, which returns what the shortcut holds and asks
-/// Windows to search for nothing: resolving a shortcut whose target has moved
-/// can wake an installer. The variables are left in for the caller to expand
-/// as the right person. `None` for a shortcut that could not be read or names
-/// no file, such as one pointing at a Store app.
-fn shortcut_command(lnk: &Path) -> Option<String> {
-    use windows::core::{Interface, PCWSTR};
-    use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
-    use windows::Win32::System::Com::{
-        CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ,
-    };
-    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
-
-    /// Return the path as stored, without resolving or searching for it.
-    const SLGP_RAWPATH: u32 = 0x4;
-
-    fn text(buffer: &[u16]) -> String {
-        let end = buffer
-            .iter()
-            .position(|unit| *unit == 0)
-            .unwrap_or(buffer.len());
-        String::from_utf16_lossy(&buffer[..end]).trim().to_owned()
-    }
-
-    // Declared first so it is dropped last, after the interfaces below.
-    let _com = ComScope::enter();
-    let link: IShellLinkW =
-        unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.ok()?;
-    let file: IPersistFile = link.cast().ok()?;
-    let wide: Vec<u16> = lnk
-        .as_os_str()
-        .to_string_lossy()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe { file.Load(PCWSTR(wide.as_ptr()), STGM_READ) }.ok()?;
-
-    let mut target = vec![0_u16; 1024];
-    let mut found = WIN32_FIND_DATAW::default();
-    unsafe { link.GetPath(&mut target, &mut found, SLGP_RAWPATH) }.ok()?;
-    let target = text(&target);
-    if target.is_empty() {
-        return None;
-    }
-
-    let mut arguments = vec![0_u16; 4096];
-    let arguments = match unsafe { link.GetArguments(&mut arguments) } {
-        Ok(()) => text(&arguments),
-        Err(_) => String::new(),
-    };
-
-    Some(if arguments.is_empty() {
-        format!("\"{target}\"")
-    } else {
-        format!("\"{target}\" {arguments}")
-    })
 }
 
 /// Services that start without being asked.
@@ -2306,19 +2224,7 @@ mod tests {
 
     /// Write a real shortcut, the way Explorer does.
     fn make_shortcut(lnk: &Path, target: &Path, arguments: &str) {
-        use windows::core::{Interface, HSTRING};
-        use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER};
-        use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
-
-        let _com = ComScope::enter();
-        let link: IShellLinkW =
-            unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.unwrap();
-        unsafe {
-            link.SetPath(&HSTRING::from(target.as_os_str())).unwrap();
-            link.SetArguments(&HSTRING::from(arguments)).unwrap();
-        }
-        let file: IPersistFile = link.cast().unwrap();
-        unsafe { file.Save(&HSTRING::from(lnk.as_os_str()), true) }.unwrap();
+        crate::shortcut::testing::written_by_windows(lnk, target, arguments);
     }
 
     /// A shortcut in a Startup folder is judged on what it points at.
@@ -2354,6 +2260,89 @@ mod tests {
         assert!(entry.unresolved().is_none());
         // Still the shortcut, which is what is in the folder.
         assert!(entry.command.to_lowercase().ends_with("helper.lnk"));
+    }
+
+    /// A Startup item kept relative to one of its owner's folders is read for
+    /// its owner: judged on the file where that folder is for them, or, when
+    /// that cannot be read, said to be untold. Never placed under the folder
+    /// of whoever is reading, which in the service is LocalSystem.
+    #[test]
+    fn a_startup_shortcut_kept_by_its_owners_folder_is_read_for_its_owner() {
+        use crate::shortcut::testing::{on_the_desktop, Built};
+
+        // Somebody who is not signed in, so their own record of where their
+        // folders are is not there to read.
+        let (profile, them) = scratch_profile("kept-by-folder");
+        let startup = profile
+            .0
+            .join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup");
+        std::fs::create_dir_all(&startup).unwrap();
+        std::fs::write(startup.join("Tool.lnk"), on_the_desktop().bytes()).unwrap();
+
+        let mut survey = Survey::default();
+        read_startup_folders(&mut survey, Whose::Account(&them));
+        let entry = survey
+            .entries
+            .iter()
+            .find(|entry| entry.name == "Tool")
+            .expect("the shortcut is listed");
+        assert_eq!(entry.target(), None, "placed under somebody else's Desktop");
+        let said = entry
+            .unresolved()
+            .expect("what it runs could not be told, and it says so");
+        assert!(said.contains("the Desktop"), "{said}");
+
+        // The account running the tests, whose record can be read. Its own
+        // AppData holds the temporary folder on any ordinary machine.
+        let local = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap());
+        let Ok(inside) = std::env::temp_dir()
+            .strip_prefix(&local)
+            .map(Path::to_path_buf)
+        else {
+            println!("the temporary folder is not inside the local AppData folder here");
+            return;
+        };
+        let (profile, _) = scratch_profile("kept-by-folder-mine");
+        let me = UserContext::new(None, &profile.0.display().to_string());
+        let program = profile.0.join("tool.exe");
+        std::fs::write(&program, "MZ").unwrap();
+        let folder_name = profile
+            .0
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let saved_as = PathBuf::from(r"C:\Users\somebody else\AppData\Local")
+            .join(&inside)
+            .join(&folder_name)
+            .join("tool.exe");
+        let startup = profile
+            .0
+            .join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup");
+        std::fs::create_dir_all(&startup).unwrap();
+        let kept = Built {
+            items: inside.components().count() + 3,
+            path: Some(saved_as.display().to_string()),
+            known: Some((windows::Win32::UI::Shell::FOLDERID_LocalAppData, 1)),
+            ..Built::default()
+        };
+        std::fs::write(startup.join("Mine.lnk"), kept.bytes()).unwrap();
+
+        let mut survey = Survey::default();
+        read_startup_folders(&mut survey, Whose::Account(&me));
+        let entry = survey
+            .entries
+            .iter()
+            .find(|entry| entry.name == "Mine")
+            .expect("the shortcut is listed");
+        assert_eq!(
+            entry
+                .target()
+                .map(|target| target.to_string_lossy().to_lowercase()),
+            Some(program.to_string_lossy().to_lowercase()),
+            "{:?}",
+            entry.unresolved()
+        );
     }
 
     /// The machine's entries and an account's are read apart, and together
