@@ -14,6 +14,11 @@
 //! working copy and the extracted files all belong to the window, which runs
 //! as the person. What the window did comes back here as a report, and the
 //! audit log says it was reported rather than witnessed.
+//!
+//! It also removes rows of the caller's own history when they ask, one at a
+//! time or all that were on record at a given moment. That is real, permanent
+//! removal of the record, and only of the record: no file is touched, and the
+//! audit log keeps its own entry of every check.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -983,6 +988,155 @@ pub fn record_extraction(
     Response::Acknowledged
 }
 
+/// A time as the store writes one, `2026-11-19T10:02:00.123Z`, when the text
+/// is exactly that shape. Times in the store are compared as text, and text
+/// of any other shape would compare as nonsense.
+fn store_time(text: &str) -> Option<&str> {
+    const SHAPE: &[u8] = b"0000-00-00T00:00:00.000Z";
+    let text = text.trim();
+    let fits = text.len() == SHAPE.len()
+        && text.bytes().zip(SHAPE).all(|(byte, shape)| match shape {
+            b'0' => byte.is_ascii_digit(),
+            other => byte == *other,
+        });
+    fits.then_some(text)
+}
+
+/// Remove one row of the caller's own history, because they asked.
+///
+/// The record goes and nothing else does. No file is looked for, opened or
+/// touched, so there is no path here to fence: `path` and `sha256` are only
+/// the row's key among the caller's own rows, and a key that names no row
+/// removes nothing. The audit log keeps its entry of the check itself, and
+/// every request to remove one is entered in it too, whatever came of it,
+/// with whose history it was: the log is one log for everybody.
+pub fn remove_record(path: &str, sha256: &str, context: &Context, user: &UserContext) -> Response {
+    let sha256 = sha256.trim().to_ascii_lowercase();
+    let named = format!(
+        "{} ({})",
+        clipped(path, 1024),
+        if sha256.is_empty() {
+            "it was gone before it could be checked".to_owned()
+        } else {
+            format!("SHA-256 {}", clipped(&sha256, 64))
+        }
+    );
+    let whose = user.profile();
+    match context.store.remove_download(caller(user), path, &sha256) {
+        Ok(0) => {
+            context.audit(
+                "downloads",
+                "remove_record",
+                Effect::Observed,
+                format!(
+                    "was asked to remove the record of the check of {named} from the download \
+                     history of {whose}, and there was no such record"
+                ),
+            );
+            Response::DownloadRecordsRemoved { removed: 0 }
+        }
+        Ok(removed) => {
+            context.audit(
+                "downloads",
+                "remove_record",
+                Effect::Changed,
+                format!(
+                    "removed the record of the check of {named} from the download history of \
+                     {whose}, because they asked. The file itself was not touched"
+                ),
+            );
+            Response::DownloadRecordsRemoved { removed }
+        }
+        Err(error) => {
+            tracing::error!(%error, "could not remove a download record");
+            context.audit(
+                "downloads",
+                "remove_record",
+                Effect::Refused,
+                format!(
+                    "could not remove the record of the check of {named} from the download \
+                     history of {whose}: the history could not be changed"
+                ),
+            );
+            Response::Error {
+                message: "the download history could not be changed, so nothing was removed"
+                    .to_owned(),
+            }
+        }
+    }
+}
+
+/// Remove every row of the caller's own history that was on record by
+/// `up_to`, because they asked. What goes and what does not is as for
+/// [`remove_record`].
+///
+/// `up_to` is when the window read the list the person was looking at when
+/// they decided. A check recorded since is not on that list, so it is kept:
+/// otherwise a download flagged in the moment between reading the question
+/// and answering it would be deleted before anybody had seen it.
+pub fn clear_records(up_to: &str, context: &Context, user: &UserContext) -> Response {
+    let whose = user.profile();
+    let Some(up_to) = store_time(up_to) else {
+        context.audit(
+            "downloads",
+            "clear_records",
+            Effect::Refused,
+            format!(
+                "refused to clear the download history of {whose}: the request did not say, as \
+                 a time, which list was meant"
+            ),
+        );
+        return Response::Error {
+            message: "The list was not cleared, because the request did not say when the list \
+                      was read, so which rows were meant could not be told."
+                .to_owned(),
+        };
+    };
+    match context.store.clear_downloads(caller(user), up_to) {
+        Ok(0) => {
+            context.audit(
+                "downloads",
+                "clear_records",
+                Effect::Observed,
+                format!(
+                    "was asked to clear the download history of {whose} as it stood at {up_to}, \
+                     and there was nothing in it to remove"
+                ),
+            );
+            Response::DownloadRecordsRemoved { removed: 0 }
+        }
+        Ok(removed) => {
+            context.audit(
+                "downloads",
+                "clear_records",
+                Effect::Changed,
+                format!(
+                    "cleared the download history of {whose} as it stood at {up_to}, because \
+                     they asked: {removed} {} removed. No file was touched",
+                    if removed == 1 { "record" } else { "records" }
+                ),
+            );
+            Response::DownloadRecordsRemoved { removed }
+        }
+        Err(error) => {
+            tracing::error!(%error, "could not clear the download history");
+            context.audit(
+                "downloads",
+                "clear_records",
+                Effect::Refused,
+                format!(
+                    "could not clear the download history of {whose}: the history could not be \
+                     changed"
+                ),
+            );
+            Response::Error {
+                message: "the download history could not be changed, so nothing was removed"
+                    .to_owned(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -999,6 +1153,22 @@ mod tests {
     fn text_from_the_window_is_flattened_and_cut() {
         assert_eq!(clipped("a\nb", 10), "a b");
         assert_eq!(clipped(&"x".repeat(20), 5), "xxxxx…");
+    }
+
+    #[test]
+    fn a_time_has_to_be_in_the_stores_own_shape() {
+        let now = kam_core::clock::now_utc_iso();
+        assert_eq!(store_time(&format!(" {now} ")), Some(now.as_str()));
+        for wrong in [
+            "",
+            "2026-11-19",
+            "2026-11-19T10:02:00Z",
+            "2026-11-19 10:02:00.123Z",
+            "2026-11-19T10:02:00.123+",
+            "2026-11-19T10:02:00.12eZ",
+        ] {
+            assert_eq!(store_time(wrong), None, "{wrong:?}");
+        }
     }
 
     #[test]

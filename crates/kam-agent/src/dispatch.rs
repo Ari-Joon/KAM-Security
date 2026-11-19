@@ -166,8 +166,12 @@ pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
         | Request::QuarantineDownload { .. } => false,
 
         // The caller's own things: a schedule that runs as them, unelevated,
-        // and decoy files in their own profile.
-        Request::SetSchedule { .. } | Request::SetCanaries { .. } => false,
+        // decoy files in their own profile, and the rows of their own
+        // download history, which are removed for the caller alone.
+        Request::SetSchedule { .. }
+        | Request::SetCanaries { .. }
+        | Request::RemoveDownloadRecord { .. }
+        | Request::ClearDownloadRecords { .. } => false,
 
         // Recording what the window did, and stopping a job.
         Request::RecordLookup { .. }
@@ -1133,6 +1137,16 @@ pub fn handle(
             sha256,
             extraction,
         } => crate::downloads::record_extraction(&path, &sha256, &extraction, context, user),
+
+        // Real, permanent removal of rows from the caller's own history, and
+        // never of a file. Audited whatever comes of it.
+        Request::RemoveDownloadRecord { path, sha256 } => {
+            crate::downloads::remove_record(&path, &sha256, context, user)
+        }
+
+        Request::ClearDownloadRecords { up_to } => {
+            crate::downloads::clear_records(&up_to, context, user)
+        }
 
         Request::ListQuarantine => match context.quarantine.list() {
             Ok(items) => Response::QuarantineList { items },
@@ -2927,5 +2941,201 @@ mod tests {
             "a file written without its download mark was not said: {said}"
         );
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A row put straight into the history, so that removing rows can be
+    /// tested without Defender having to check anything.
+    fn recorded(context: &Context, sid: &str, path: &str, sha256: &str) {
+        context
+            .store
+            .record_download_check(&kam_core::db::DownloadRow {
+                sid: sid.to_owned(),
+                path: path.to_owned(),
+                sha256: sha256.to_owned(),
+                name: "a.bin".to_owned(),
+                bytes: 5,
+                arrived_at: None,
+                checked_at: String::new(),
+                origin: None,
+                signature: None,
+                outcome: serde_json::to_string(&kam_scanner::defender_file::parse_report(
+                    Some(0),
+                    "",
+                ))
+                .unwrap(),
+                actions: String::new(),
+                dissection: None,
+            })
+            .unwrap();
+    }
+
+    fn removed(response: Response) -> u64 {
+        match response {
+            Response::DownloadRecordsRemoved { removed } => removed,
+            other => panic!("nothing was said to have been removed: {other:?}"),
+        }
+    }
+
+    /// How many entries of one action the audit log holds, by effect:
+    /// changed, observed, refused.
+    fn audited(context: &Context, action: &str) -> (usize, usize, usize) {
+        let entries = context.store.recent_audit(50).unwrap();
+        let count = |effect: Effect| {
+            entries
+                .iter()
+                .filter(|entry| entry.action == action && entry.effect == effect)
+                .count()
+        };
+        (
+            count(Effect::Changed),
+            count(Effect::Observed),
+            count(Effect::Refused),
+        )
+    }
+
+    /// "Remove from this list" removes the record of one check, for the
+    /// person who asked and nobody else, and never the file. Every request
+    /// is in the audit log, which keeps its own entry of the check besides.
+    #[test]
+    fn removing_a_download_record_removes_the_callers_row_and_never_the_file() {
+        let context = context(Mode::Service);
+        let (mine, theirs) = ("S-1-5-21-0-0-0-4010", "S-1-5-21-0-0-0-4011");
+        let me = identified(mine);
+        let file = scratch_file("remove", b"hello");
+        let path = file.to_string_lossy().into_owned();
+        let sha256 = "ab".repeat(32);
+        recorded(&context, mine, &path, &sha256);
+        recorded(&context, theirs, &path, &sha256);
+
+        let remove = |sha256: &str| {
+            removed(handle(
+                Request::RemoveDownloadRecord {
+                    path: path.clone(),
+                    sha256: sha256.to_owned(),
+                },
+                &context,
+                &Reporter::silent(),
+                &me,
+            ))
+        };
+        // Other content under that name would be another row, not this one.
+        assert_eq!(remove(&"cd".repeat(32)), 0);
+        assert_eq!(remove(&sha256.to_uppercase()), 1);
+        assert_eq!(remove(&sha256), 0, "one row was removed twice");
+
+        assert_eq!(context.store.download_count(mine).unwrap(), 0);
+        assert_eq!(
+            context.store.download_count(theirs).unwrap(),
+            1,
+            "somebody else's row was removed"
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"hello",
+            "the file was touched"
+        );
+
+        assert_eq!(audited(&context, "remove_record"), (1, 2, 0));
+        let done = context
+            .store
+            .recent_audit(50)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.action == "remove_record" && entry.effect == Effect::Changed)
+            .unwrap();
+        assert!(
+            done.detail.contains(&path)
+                && done.detail.contains(me.profile())
+                && done.detail.contains("The file itself was not touched"),
+            "{}",
+            done.detail
+        );
+        // A person's own rows, so no administrator is needed.
+        assert!(!needs_administrator(
+            &Request::RemoveDownloadRecord {
+                path: path.clone(),
+                sha256,
+            },
+            &me
+        ));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// "Clear the list" removes every row the caller had on record when the
+    /// list they were looking at was read. A check recorded after that stays,
+    /// and so does everybody else's history. A request that does not say
+    /// when is refused, and the refusal is recorded.
+    #[test]
+    fn clearing_the_download_history_keeps_what_was_recorded_afterwards() {
+        let context = context(Mode::Service);
+        let (mine, theirs) = ("S-1-5-21-0-0-0-4012", "S-1-5-21-0-0-0-4013");
+        let me = identified(mine);
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(50));
+        recorded(&context, mine, r"C:\D\a.bin", &"aa".repeat(32));
+        recorded(&context, mine, r"C:\D\b.bin", &"bb".repeat(32));
+        recorded(&context, theirs, r"C:\D\a.bin", &"aa".repeat(32));
+        pause();
+        let read_at = kam_core::clock::now_utc_iso();
+        pause();
+        recorded(&context, mine, r"C:\D\later.bin", &"cc".repeat(32));
+
+        let clear = |up_to: &str| {
+            handle(
+                Request::ClearDownloadRecords {
+                    up_to: up_to.to_owned(),
+                },
+                &context,
+                &Reporter::silent(),
+                &me,
+            )
+        };
+        let not_times = [
+            "",
+            "everything",
+            "2026-11-19",
+            "2026-11-19 10:02:00.123Z",
+            "2026-11-19T10:02:00.123Z' OR 1=1",
+        ];
+        for wrong in not_times {
+            assert!(
+                matches!(clear(wrong), Response::Error { .. }),
+                "{wrong:?} was taken for a time"
+            );
+        }
+        assert_eq!(
+            context.store.download_count(mine).unwrap(),
+            3,
+            "a refused request removed something"
+        );
+
+        assert_eq!(removed(clear(&read_at)), 2);
+        let left = context.store.downloads_for(mine, 10).unwrap();
+        assert_eq!(left.len(), 1, "a check recorded afterwards was removed");
+        assert_eq!(left[0].path, r"C:\D\later.bin");
+        assert_eq!(
+            context.store.download_count(theirs).unwrap(),
+            1,
+            "somebody else's history was cleared"
+        );
+        assert_eq!(removed(clear(&read_at)), 0);
+
+        assert_eq!(audited(&context, "clear_records"), (1, 1, not_times.len()));
+        let done = context
+            .store
+            .recent_audit(50)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.action == "clear_records" && entry.effect == Effect::Changed)
+            .unwrap();
+        assert!(
+            done.detail.contains("2 records removed")
+                && done.detail.contains("No file was touched"),
+            "{}",
+            done.detail
+        );
+        assert!(!needs_administrator(
+            &Request::ClearDownloadRecords { up_to: read_at },
+            &me
+        ));
     }
 }

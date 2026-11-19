@@ -420,6 +420,22 @@ pub enum Request {
         sha256: String,
         extraction: kam_scanner::downloads::Extraction,
     },
+    /// Remove one row of the caller's own download history, for good.
+    ///
+    /// The row is named by the file's path and the fingerprint it was checked
+    /// at, which with the caller are its key. A row for a download that was
+    /// gone before it could be checked has no fingerprint, and is named with
+    /// an empty one. Nothing is resolved or opened: this removes the record
+    /// of a check and never touches a file. The audit log keeps its own entry
+    /// of the check, and gains one for the removal.
+    RemoveDownloadRecord { path: String, sha256: String },
+    /// Remove every row of the caller's own download history that was last
+    /// checked at or before `up_to`, for good.
+    ///
+    /// `up_to` is when the window read the list the person is looking at. A
+    /// check recorded after that is not on their list and is kept: clearing a
+    /// list must not delete a result nobody has been shown.
+    ClearDownloadRecords { up_to: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -546,6 +562,11 @@ pub enum Response {
         #[serde(default)]
         on_record: u64,
     },
+    /// How many rows were removed from the caller's download history. None
+    /// is an answer too: the row had already gone.
+    DownloadRecordsRemoved {
+        removed: u64,
+    },
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {
         message: String,
@@ -655,6 +676,7 @@ mod tests {
             records: Vec::new(),
             on_record: 0,
         });
+        round_trip(Response::DownloadRecordsRemoved { removed: 2 });
         round_trip(Response::BehaviourEvents {
             observations: Vec::new(),
             watching: true,

@@ -652,6 +652,40 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Remove one person's record of one check, for good: the row for that
+    /// path and that content. Returns how many rows went, one or none.
+    ///
+    /// Only theirs, like every other reading and writing of this table. The
+    /// record is all that goes. The file is not this store's to touch, and
+    /// the audit log keeps its own entry of the check, which nothing removes.
+    pub fn remove_download(&self, sid: &str, path: &str, sha256: &str) -> Result<u64> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "DELETE FROM downloads WHERE sid = ?1 AND path = ?2 AND sha256 = ?3",
+                params![sid, path, sha256],
+            )
+            .map(|removed| removed as u64)
+            .map_err(to_db_error)
+    }
+
+    /// Remove every record one person has that was last checked at or before
+    /// `up_to`, for good. Returns how many rows went.
+    ///
+    /// Up to a time, and not simply all of them, so that clearing a list
+    /// removes what was on it when the person decided. A check recorded a
+    /// moment later is one they have never been shown, and it stays.
+    pub fn clear_downloads(&self, sid: &str, up_to: &str) -> Result<u64> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "DELETE FROM downloads WHERE sid = ?1 AND checked_at <= ?2",
+                params![sid, up_to],
+            )
+            .map(|removed| removed as u64)
+            .map_err(to_db_error)
+    }
+
     /// Most recent entries first. This is what the UI's activity view reads.
     pub fn recent_audit(&self, limit: usize) -> Result<Vec<Record>> {
         let connection = self.lock()?;
@@ -2512,6 +2546,84 @@ mod tests {
             .is_none());
         assert_eq!(store.download_count(me).unwrap(), 2);
         assert_eq!(store.download_count("S-1-5-21-1-1003").unwrap(), 0);
+    }
+
+    /// A person can take a row off their own history, and only their own.
+    /// The row is the one for that path and that content, and no other.
+    #[test]
+    fn a_download_record_is_removed_for_its_owner_alone() {
+        let store = Store::open_in_memory().unwrap();
+        let (me, them) = ("S-1-5-21-1-1001", "S-1-5-21-1-1002");
+        let path = r"C:\Users\Public\Downloads\setup.exe";
+        for (sid, sha256) in [(me, "aa"), (me, "bb"), (them, "aa")] {
+            store
+                .record_download_check(&download(sid, path, sha256, "{}"))
+                .unwrap();
+        }
+        // A row for a download that went before it could be checked has no
+        // fingerprint, and is its own row.
+        store
+            .record_download_check(&download(me, path, "", "{}"))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .remove_download(me, &path.to_uppercase(), "aa")
+                .unwrap(),
+            1
+        );
+        let left: Vec<String> = store
+            .downloads_for(me, 50)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.sha256)
+            .collect();
+        assert_eq!(left.len(), 2);
+        assert!(left.contains(&"bb".to_owned()) && left.contains(&String::new()));
+        assert_eq!(
+            store.download_count(them).unwrap(),
+            1,
+            "somebody else's row went with it"
+        );
+
+        // Already gone is not an error, and removes nothing more.
+        assert_eq!(store.remove_download(me, path, "aa").unwrap(), 0);
+        assert_eq!(store.remove_download(me, path, "").unwrap(), 1);
+        assert_eq!(store.download_count(me).unwrap(), 1);
+    }
+
+    /// Clearing removes what was on record when the person decided, for that
+    /// person alone. A check recorded after that moment stays.
+    #[test]
+    fn clearing_a_history_removes_only_what_was_on_record_by_then() {
+        let store = Store::open_in_memory().unwrap();
+        let (me, them) = ("S-1-5-21-1-1001", "S-1-5-21-1-1002");
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(50));
+        for name in ["a.exe", "b.exe"] {
+            store
+                .record_download_check(&download(me, &format!(r"C:\D\{name}"), "aa", "{}"))
+                .unwrap();
+        }
+        store
+            .record_download_check(&download(them, r"C:\D\a.exe", "aa", "{}"))
+            .unwrap();
+        pause();
+        let decided = crate::clock::now_utc_iso();
+        pause();
+        store
+            .record_download_check(&download(me, r"C:\D\later.exe", "aa", "{}"))
+            .unwrap();
+
+        assert_eq!(store.clear_downloads(me, &decided).unwrap(), 2);
+        let left = store.downloads_for(me, 50).unwrap();
+        assert_eq!(left.len(), 1, "a check recorded afterwards was removed");
+        assert_eq!(left[0].path, r"C:\D\later.exe");
+        assert_eq!(
+            store.download_count(them).unwrap(),
+            1,
+            "somebody else's history was cleared"
+        );
+        assert_eq!(store.clear_downloads(me, &decided).unwrap(), 0);
     }
 
     /// A store from before readings were kept, as an update finds it: swept,
