@@ -15,7 +15,7 @@ use crate::audit::{AuditLog, Effect, Entry, Record};
 use crate::{Error, Result};
 
 /// Bumped whenever the schema below changes. Stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE audit (
@@ -272,6 +272,55 @@ CREATE TABLE watched (
 CREATE TABLE watched_scopes (
     scope      TEXT PRIMARY KEY,
     learned_at TEXT NOT NULL
+);
+";
+
+/// What it takes to read a comparison again, and to give each account a first
+/// look of its own.
+///
+/// # Every list kept as it was shown
+///
+/// A comparison's differences were kept so the weeks could be charted, and
+/// only as much of each as the chart needs: when, what, how and where. Who
+/// signed each thing, who signed it before, when it was first seen and which
+/// comparison found it were not kept, so a list could be shown once and never
+/// again as it was, and opening the page used it up. `changes` now carries
+/// the rest and the comparison each row belongs to. A sweep keeps what it
+/// recorded afresh apart from what it could not read, and what took it: the
+/// page, or the weekly check.
+///
+/// Rows from before this step are given their comparison by its time, which
+/// is the same text in both tables because one sweep writes both. Nothing else
+/// can be given back to them. What was not kept was not kept, and those columns
+/// are left empty, so that a list from before says so rather than showing an
+/// empty signature as though nobody had signed.
+///
+/// # Each account's first look
+///
+/// `compared_parts` is to a comparison what `watched_scopes` is to the
+/// watcher: the parts of what a sweep looks at that are looked at as a whole,
+/// one account's own startup places each, and that have been.
+const SCHEMA_V9: &str = "
+ALTER TABLE changes ADD COLUMN sweep       INTEGER;
+ALTER TABLE changes ADD COLUMN first_seen  TEXT;
+ALTER TABLE changes ADD COLUMN last_seen   TEXT;
+ALTER TABLE changes ADD COLUMN times_seen  INTEGER;
+ALTER TABLE changes ADD COLUMN trust       TEXT;
+ALTER TABLE changes ADD COLUMN was_trusted TEXT;
+
+UPDATE changes
+   SET sweep = (SELECT sweeps.id FROM sweeps
+                 WHERE sweeps.at = changes.at
+                 ORDER BY sweeps.id LIMIT 1);
+
+CREATE INDEX changes_sweep_idx ON changes (sweep);
+
+ALTER TABLE sweeps ADD COLUMN afresh   TEXT;
+ALTER TABLE sweeps ADD COLUMN taken_by TEXT;
+
+CREATE TABLE compared_parts (
+    part      TEXT PRIMARY KEY COLLATE NOCASE,
+    looked_at TEXT NOT NULL
 );
 ";
 
@@ -1430,7 +1479,7 @@ fn one_line(detail: &str) -> String {
 }
 
 /// Every schema step, with the version it brings the store to.
-const MIGRATIONS: [(i64, &str); 8] = [
+const MIGRATIONS: [(i64, &str); 9] = [
     (1, SCHEMA_V1),
     (2, SCHEMA_V2),
     (3, SCHEMA_V3),
@@ -1439,6 +1488,7 @@ const MIGRATIONS: [(i64, &str); 8] = [
     (6, SCHEMA_V6),
     (7, SCHEMA_V7),
     (8, SCHEMA_V8),
+    (9, SCHEMA_V9),
 ];
 
 fn migrate(connection: &Connection) -> Result<()> {
@@ -3142,6 +3192,123 @@ mod tests {
                  SELECT scope, learned_at FROM watched_scopes;",
             )
             .expect("the tables the upgrade adds are there, whole");
+    }
+
+    /// A store from before comparisons were kept whole: swept three times, the
+    /// second of which found two things and could not read one source. One
+    /// change is from a sweep that left no record of itself, which a store
+    /// from before sweeps were one transaction can hold.
+    fn a_swept_version_eight_store() -> Connection {
+        let connection = a_swept_version_six_store();
+        migrate_through(&connection, &MIGRATIONS[..8]).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO sweeps (at, unreadable)
+                 VALUES ('2026-10-19T09:00:00.000Z', 'the task store would not open');
+                 INSERT INTO sweeps (at) VALUES ('2026-10-26T09:00:00.000Z');
+                 INSERT INTO changes (at, change, kind, scope, name, detail) VALUES
+                   ('2026-10-19T09:00:00.000Z', 'appeared', 'run_key', 'machine', 'Arrived', 'new.exe'),
+                   ('2026-10-19T09:00:00.000Z', 'vanished', 'service', 'machine', 'Gone', 'gone.exe'),
+                   ('2026-10-16T12:00:00.000Z', 'appeared', 'service', 'machine', 'Stray', 'x.exe');",
+            )
+            .unwrap();
+        connection
+    }
+
+    /// A store from before gains what each comparison needs to be read again,
+    /// finds each change its comparison by time, and keeps everything it held.
+    /// What was not kept then stays empty, so it can be said to be missing.
+    #[test]
+    fn a_version_eight_store_is_brought_up_to_nine_and_each_change_finds_its_comparison() {
+        let connection = a_swept_version_eight_store();
+        assert!(
+            connection
+                .execute_batch("SELECT sweep FROM changes")
+                .is_err(),
+            "the premise: a version eight store does not say which comparison found what"
+        );
+
+        migrate_through(&connection, &MIGRATIONS[..9]).expect("the upgrade to nine should apply");
+        let count =
+            |query: &str| -> i64 { connection.query_row(query, [], |row| row.get(0)).unwrap() };
+        assert_eq!(count("PRAGMA user_version"), 9);
+
+        let second = count("SELECT id FROM sweeps WHERE at = '2026-10-19T09:00:00.000Z'");
+        let found: Vec<(String, Option<i64>)> = {
+            let mut statement = connection
+                .prepare("SELECT name, sweep FROM changes ORDER BY id")
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(
+            found,
+            vec![
+                ("Arrived".to_owned(), Some(second)),
+                ("Gone".to_owned(), Some(second)),
+                ("Stray".to_owned(), None),
+            ]
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM changes WHERE first_seen IS NULL AND last_seen IS NULL
+                   AND times_seen IS NULL AND trust IS NULL AND was_trusted IS NULL"
+            ),
+            3,
+            "something was made up for a change that was never recorded with it"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sweeps WHERE taken_by IS NULL AND afresh IS NULL"),
+            3
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sweeps WHERE unreadable = 'the task store would not open'"),
+            1,
+            "what a comparison could not read did not survive the upgrade"
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM sightings"), 3);
+        assert_eq!(readings_in(&connection).len(), 6);
+        assert_eq!(count("SELECT COUNT(*) FROM compared_parts"), 0);
+
+        // And the upgraded store is a working one.
+        let store = Store {
+            connection: Mutex::new(connection),
+        };
+        let sweep = store
+            .sweep(&[seen("run_key", "Updater", "up.exe")], &[])
+            .unwrap();
+        assert!(!sweep.baseline);
+    }
+
+    /// The step that keeps comparisons whole, stopped partway, is finished by
+    /// the next start rather than failing on a column it already added.
+    #[test]
+    fn an_interrupted_upgrade_to_nine_is_finished_by_the_next_start() {
+        let connection = a_swept_version_eight_store();
+        let interrupted = [(
+            9,
+            "ALTER TABLE changes ADD COLUMN sweep INTEGER;
+             this is where the process was stopped;",
+        )];
+        assert!(migrate_through(&connection, &interrupted).is_err());
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+
+        migrate_through(&connection, &MIGRATIONS[..9])
+            .expect("the next start should finish the upgrade");
+        connection
+            .execute_batch(
+                "SELECT sweep, first_seen, last_seen, times_seen, trust, was_trusted FROM changes;
+                 SELECT afresh, taken_by FROM sweeps;
+                 SELECT part, looked_at FROM compared_parts;",
+            )
+            .expect("what the upgrade adds is there, whole");
     }
 
     /// Never looked at and looked at and found empty are different answers.
