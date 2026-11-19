@@ -971,6 +971,13 @@ mod tests {
         let mut current = scan.tree;
         let mut opened = 0;
         loop {
+            // A folder with nothing beneath it that still says it has more
+            // would be opened for ever: fail instead of hanging the run.
+            assert!(
+                opened <= 10,
+                "still offered something to open at {}",
+                current.path
+            );
             // Down the only chain there is, as far as this tree was sent.
             let mut floor = &current;
             while let Some(next) = floor.children.first() {
