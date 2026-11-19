@@ -33,6 +33,28 @@
 //!   anything else corrupts servicing.
 //! - **Anything not currently on disk.** A cache with nothing in it is not
 //!   listed at all, rather than shown as a zero somebody has to read past.
+//!
+//! And these, which the November 2026 review suggested and which are left out
+//! on purpose, each for a reason that would survive being asked again:
+//!
+//! - **Visual Studio's package folder**, `Packages` under
+//!   `ProgramData\Microsoft\VisualStudio`. The installer's packages are a
+//!   cache. The same folder also holds `_Instances`, the records Visual Studio
+//!   and the Build Tools are found by, and emptying it would leave them
+//!   installed and impossible to find.
+//! - **A folder at the top of a drive named only for a vendor or by an
+//!   abbreviation**: `C:\AMD`, `C:\ESD`. Installers do unpack there, and
+//!   anybody may have a folder of that name for their own reasons. A name
+//!   that loose is not enough to empty a folder on.
+//! - **Maven's repository** (`.m2\repository`). It also holds whatever
+//!   `mvn install` built on this machine, which nothing downloads again.
+//! - **Playwright's browsers.** Nothing fetches them again by itself: the next
+//!   test run fails until somebody installs them.
+//! - **A game launcher's web cache.** Clearing one can sign the person out,
+//!   and nothing here touches a session. Their logs are listed.
+//! - **Spotify's cache.** Where it keeps songs saved for listening offline was
+//!   not established, and those are not a cache.
+//! - **A single file**, such as a memory dump. This empties folders.
 
 use std::path::{Path, PathBuf};
 
@@ -122,6 +144,18 @@ fn system_drive() -> PathBuf {
     PathBuf::from(format!("{}\\", drive.trim_end_matches('\\')))
 }
 
+fn program_files_x86() -> PathBuf {
+    PathBuf::from(
+        std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".to_owned()),
+    )
+}
+
+/// `AppData\LocalLow`, where programs running with reduced rights keep what
+/// others keep in Local AppData. Some graphics drivers write their caches here.
+fn local_low(user: &UserContext) -> PathBuf {
+    PathBuf::from(user.profile()).join(r"AppData\LocalLow")
+}
+
 /// Every profile directory of a browser family, since people have several.
 fn browser_profiles(base: &Path, subdirectories: &[&str]) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -142,7 +176,13 @@ fn browser_profiles(base: &Path, subdirectories: &[&str]) -> Vec<PathBuf> {
     found
 }
 
-/// Chromium keeps its caches per profile, under names it chooses.
+/// Chromium keeps its caches per profile, under names it chooses, and a few
+/// more beside the profiles that every profile shares.
+///
+/// Every name here is a cache by Chromium's own account: fetched pages,
+/// compiled scripts, compiled graphics shaders, and downloaded copies of its
+/// own components. A profile's history, cookies, passwords and saved site data
+/// sit beside these under other names, and none of those names is here.
 fn chromium_caches(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let Ok(listing) = std::fs::read_dir(root) else {
@@ -159,6 +199,9 @@ fn chromium_caches(root: &Path) -> Vec<PathBuf> {
             "Code Cache",
             "GPUCache",
             "Service Worker\\CacheStorage",
+            "Service Worker\\ScriptCache",
+            "DawnGraphiteCache",
+            "DawnWebGPUCache",
         ] {
             let candidate = item.path().join(sub);
             if candidate.is_dir() {
@@ -166,7 +209,25 @@ fn chromium_caches(root: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    for shared in [
+        "GrShaderCache",
+        "ShaderCache",
+        "GraphiteDawnCache",
+        "component_crx_cache",
+    ] {
+        let candidate = root.join(shared);
+        if candidate.is_dir() {
+            found.push(candidate);
+        }
+    }
     found
+}
+
+/// Several named folders inside one, for an entry that takes some of what a
+/// program keeps and must leave the rest: the names are the whole of what is
+/// taken, and anything beside them stays.
+fn inside(folder: &Path, names: &[&str]) -> Vec<PathBuf> {
+    names.iter().map(|name| folder.join(name)).collect()
 }
 
 /// The catalogue.
@@ -192,13 +253,22 @@ const CATALOGUE: &[Entry] = &[
     Entry {
         id: "windows-update",
         name: "Windows Update downloads",
-        what: "Update packages Windows has already installed. It keeps them, and nothing \
-               removes them on its own.",
-        cost: "An update part-way through downloading starts again.",
+        what: "Update packages Windows has already installed, and the copies it keeps to \
+               pass on to other PCs. It keeps them, and nothing removes them on its own.",
+        cost: "An update part-way through downloading starts again, and other PCs on your \
+               network can no longer fetch these update files from this one.",
         safety: Safety::Routine,
         locate: |_| {
             let root = windir().join("SoftwareDistribution");
-            vec![root.join("Download"), root.join("DeliveryOptimization")]
+            vec![
+                root.join("Download"),
+                // Where older Windows kept the files it shares with other PCs,
+                // and where current Windows keeps them.
+                root.join("DeliveryOptimization"),
+                windir().join(
+                    r"ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache",
+                ),
+            ]
         },
     },
     Entry {
@@ -250,17 +320,34 @@ const CATALOGUE: &[Entry] = &[
         safety: Safety::Considered,
         locate: |user| {
             let local = PathBuf::from(user.local_app_data());
-            [
-                r"D3DSCache",
-                r"NVIDIA\DXCache",
-                r"NVIDIA\GLCache",
-                r"AMD\DxCache",
-                r"AMD\DxcCache",
-                r"Intel\ShaderCache",
-            ]
-            .iter()
-            .map(|sub| local.join(sub))
-            .collect()
+            let mut found = inside(
+                &local,
+                &[
+                    r"D3DSCache",
+                    r"NVIDIA\DXCache",
+                    r"NVIDIA\GLCache",
+                    r"NVIDIA\OptixCache",
+                    r"AMD\DxCache",
+                    r"AMD\DxcCache",
+                    r"AMD\VkCache",
+                    r"AMD\OglCache",
+                    r"AMD\DX9Cache",
+                    r"Intel\ShaderCache",
+                ],
+            );
+            // The drivers also write under LocalLow, for programs that run
+            // with reduced rights, and which folder depends on the driver's
+            // version.
+            found.extend(inside(
+                &local_low(user),
+                &[
+                    r"NVIDIA\DXCache",
+                    r"NVIDIA\PerDriverVersion\DXCache",
+                    r"NVIDIA\PerDriverVersion\GLCache",
+                    r"Intel\ShaderCache",
+                ],
+            ));
+            found
         },
     },
     Entry {
@@ -281,6 +368,7 @@ const CATALOGUE: &[Entry] = &[
                 r"BraveSoftware\Brave-Browser\User Data",
                 r"Vivaldi\User Data",
                 r"Opera Software\Opera Stable",
+                r"Opera Software\Opera GX Stable",
             ] {
                 found.extend(chromium_caches(&local.join(chromium)));
             }
@@ -299,21 +387,43 @@ const CATALOGUE: &[Entry] = &[
     Entry {
         id: "package-caches",
         name: "Developer package caches",
-        what: "Downloaded packages kept by npm, pip, NuGet and Cargo so they do not have \
-               to be fetched again. They grow without limit and nothing prunes them.",
+        what: "Downloaded packages kept by npm, pip, NuGet, Cargo, Yarn, Gradle, Go, uv and \
+               Electron so they do not have to be fetched again. They grow without limit \
+               and nothing prunes them.",
         cost: "The next build of anything that used them downloads again, and an offline \
                build will fail until it has.",
         safety: Safety::Considered,
         locate: |user| {
             let local = PathBuf::from(user.local_app_data());
             let profile = PathBuf::from(user.profile());
-            vec![
-                local.join(r"npm-cache\_cacache"),
-                local.join(r"pip\Cache"),
-                local.join(r"NuGet\v3-cache"),
-                profile.join(r".cargo\registry\cache"),
-                profile.join(r".nuget\packages"),
-            ]
+            let mut found = inside(
+                &local,
+                &[
+                    r"npm-cache\_cacache",
+                    r"pip\Cache",
+                    r"NuGet\v3-cache",
+                    r"Yarn\Cache",
+                    r"Yarn\Berry\cache",
+                    r"go-build",
+                    r"uv\cache",
+                    r"electron\Cache",
+                ],
+            );
+            found.extend(inside(
+                &profile,
+                &[
+                    r".cargo\registry\cache",
+                    // Cargo's unpacked copies of the same packages, and of
+                    // the ones it fetched with git.
+                    r".cargo\registry\src",
+                    r".cargo\git\checkouts",
+                    r".nuget\packages",
+                    r".gradle\caches",
+                    r".gradle\wrapper\dists",
+                    r"go\pkg\mod",
+                ],
+            ));
+            found
         },
     },
     Entry {
@@ -321,7 +431,8 @@ const CATALOGUE: &[Entry] = &[
         name: "Steam download scratch",
         what: "Part-finished downloads and Steam's own shader cache, in every library \
                folder it knows about.",
-        cost: "A paused download restarts from the beginning.",
+        cost: "A paused download restarts from the beginning, and each game rebuilds its \
+               shaders the next time it starts.",
         safety: Safety::Considered,
         locate: |user| {
             crate::steam::library_roots(user)
@@ -343,6 +454,215 @@ const CATALOGUE: &[Entry] = &[
         cost: "You can no longer roll back to the previous version of Windows.",
         safety: Safety::Considered,
         locate: |_| vec![system_drive().join("Windows.old")],
+    },
+    // What follows was added from the November 2026 review, which set this
+    // list beside what is commonly large on a gaming and development PC. Each
+    // was taken only where three things hold: the program that made it makes
+    // it again by itself, nothing in it is a session, a password or history,
+    // and the folder is named so that it can only be that program's. The ones
+    // the review suggested that fail one of those are listed, with which one,
+    // at the top of this file.
+    Entry {
+        id: "nvidia-driver-downloads",
+        name: "NVIDIA driver downloads",
+        what: "Driver installers the NVIDIA App, or GeForce Experience before it, \
+               downloaded and kept after installing them, and the copies they unpacked.",
+        cost: "The NVIDIA App downloads the driver package again if you repair or \
+               reinstall the driver from inside the app.",
+        safety: Safety::Considered,
+        locate: |_| {
+            let nvidia = program_data().join("NVIDIA Corporation");
+            vec![
+                nvidia.join(r"NVIDIA App\UpdateFramework\ota-artifacts"),
+                nvidia.join("Downloader"),
+                system_drive().join(r"NVIDIA\DisplayDriver"),
+            ]
+        },
+    },
+    Entry {
+        id: "nvidia-app-logs",
+        name: "NVIDIA App logs",
+        what: "What the NVIDIA App writes down as it runs. Read only by somebody working \
+               out why it misbehaved.",
+        cost: "",
+        safety: Safety::Routine,
+        locate: |_| vec![program_data().join(r"NVIDIA Corporation\NVIDIA App\Logs")],
+    },
+    Entry {
+        id: "chrome-on-device-model",
+        name: "Chrome's on-device AI model",
+        what: "A language model Chrome downloads for its built-in AI features, such as \
+               help with writing. It is several gigabytes.",
+        cost: "Chrome downloads the model again, several gigabytes, the next time one of \
+               its built-in AI features is used.",
+        safety: Safety::Considered,
+        locate: |user| {
+            vec![PathBuf::from(user.local_app_data())
+                .join(r"Google\Chrome\User Data\OptGuideOnDeviceModel")]
+        },
+    },
+    Entry {
+        id: "steam-web-cache",
+        name: "Steam's web cache",
+        what: "Store and library pages Steam's built-in browser keeps so they open faster.",
+        cost: "Steam loads its store and library pages from the network again.",
+        safety: Safety::Routine,
+        locate: |user| {
+            // The cache folders by name, and not the folder that holds them:
+            // the built-in browser keeps its cookies there too, and nothing
+            // in this list touches a session.
+            inside(
+                &PathBuf::from(user.local_app_data()).join(r"Steam\htmlcache"),
+                &[
+                    "Cache",
+                    "Code Cache",
+                    "GPUCache",
+                    r"Default\Cache",
+                    r"Default\Code Cache",
+                    r"Default\GPUCache",
+                ],
+            )
+        },
+    },
+    Entry {
+        id: "chat-caches",
+        name: "Chat program caches",
+        what: "Pictures, videos and files Discord, Slack and Teams keep after showing \
+               them, so that a chat opens without fetching them again.",
+        cost: "Pictures, videos and files in chats load from the network again. You stay \
+               signed in.",
+        safety: Safety::Routine,
+        locate: |user| {
+            let roaming = PathBuf::from(user.roaming_app_data());
+            let mut found = inside(
+                &roaming.join("discord"),
+                &["Cache", "Code Cache", "GPUCache"],
+            );
+            found.extend(inside(
+                &roaming.join("Slack"),
+                &[
+                    "Cache",
+                    "Code Cache",
+                    "GPUCache",
+                    r"Service Worker\CacheStorage",
+                ],
+            ));
+            found.extend(chromium_caches(&PathBuf::from(user.local_app_data()).join(
+                r"Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView",
+            )));
+            found
+        },
+    },
+    Entry {
+        id: "vscode-cache",
+        name: "Visual Studio Code caches",
+        what: "Compiled copies of VS Code's own scripts, the packages of extensions it has \
+               already installed, and its logs.",
+        cost: "VS Code starts a little slower once.",
+        safety: Safety::Routine,
+        locate: |user| {
+            inside(
+                &PathBuf::from(user.roaming_app_data()).join("Code"),
+                &[
+                    "Cache",
+                    "CachedData",
+                    "CachedExtensionVSIXs",
+                    "Code Cache",
+                    "GPUCache",
+                    "logs",
+                ],
+            )
+        },
+    },
+    Entry {
+        id: "game-engine-caches",
+        name: "Unreal and Unity caches",
+        what: "Shaders and other data the Unreal and Unity editors work out from a \
+               project's files and keep, so that a project opens without doing it again.",
+        cost: "The editor rebuilds shaders and derived data the next time each project is \
+               opened, which can take from minutes to hours.",
+        safety: Safety::Considered,
+        locate: |user| {
+            let local = PathBuf::from(user.local_app_data());
+            let mut found = vec![
+                local.join(r"Unity\cache"),
+                local_low(user).join(r"Unity\Caches\GiCache"),
+            ];
+            // Unreal keeps one shared cache and one for each engine version.
+            if let Ok(listing) = std::fs::read_dir(local.join("UnrealEngine")) {
+                for item in listing.flatten() {
+                    found.push(item.path().join("DerivedDataCache"));
+                }
+            }
+            found
+        },
+    },
+    Entry {
+        id: "adobe-media-cache",
+        name: "Adobe media cache",
+        what: "Previews and audio that Premiere Pro and After Effects work out from your \
+               footage and keep. Your footage and your projects are elsewhere.",
+        cost: "Premiere Pro and After Effects rebuild their previews the next time each \
+               project opens, a few minutes per project.",
+        safety: Safety::Considered,
+        locate: |user| {
+            inside(
+                &PathBuf::from(user.roaming_app_data()).join(r"Adobe\Common"),
+                &["Media Cache Files", "Media Cache"],
+            )
+        },
+    },
+    Entry {
+        id: "windows-upgrade-files",
+        name: "Windows upgrade files",
+        what: "What Windows downloads and unpacks to install a new version of itself, in \
+               hidden folders at the top of the system drive. They are normally removed \
+               when the upgrade is over.",
+        cost: "A Windows upgrade that was downloading or waiting to install starts again. \
+               If one was installed in the last ten days, it may no longer be possible to \
+               go back to the version before it.",
+        safety: Safety::Considered,
+        locate: |_| {
+            ["$WINDOWS.~BT", "$WINDOWS.~WS", "$GetCurrent"]
+                .iter()
+                .map(|name| system_drive().join(name))
+                .collect()
+        },
+    },
+    Entry {
+        id: "windows-servicing-logs",
+        name: "Windows servicing logs",
+        what: "The record Windows keeps of installing updates and checking its own files. \
+               It grows for years and is read only when an update has gone wrong.",
+        cost: "",
+        safety: Safety::Routine,
+        locate: |_| vec![windir().join(r"Logs\CBS")],
+    },
+    Entry {
+        id: "edge-update-downloads",
+        name: "Microsoft Edge update downloads",
+        what: "Installers that Edge's updater downloaded and has already used.",
+        cost: "",
+        safety: Safety::Routine,
+        locate: |_| vec![program_files_x86().join(r"Microsoft\EdgeUpdate\Download")],
+    },
+    Entry {
+        id: "launcher-logs",
+        name: "Game launcher logs",
+        what: "What the Epic Games Launcher, the EA app and VALORANT write down as they \
+               run. Read only by somebody working out why one misbehaved.",
+        cost: "",
+        safety: Safety::Routine,
+        locate: |user| {
+            inside(
+                &PathBuf::from(user.local_app_data()),
+                &[
+                    r"EpicGamesLauncher\Saved\Logs",
+                    r"Electronic Arts\EA Desktop\Logs",
+                    r"VALORANT\Saved\Logs",
+                ],
+            )
+        },
     },
 ];
 
@@ -378,10 +698,97 @@ fn measure(path: &Path) -> (u64, u64, bool) {
     (bytes, files, false)
 }
 
-fn build(entry: &Entry, user: &UserContext) -> Option<Cache> {
+/// The folders every catalogue location starts from, as spelled and as they
+/// really are.
+///
+/// # Why a location is checked against where it starts
+///
+/// A location is one of these followed by names the catalogue spells out:
+/// the caller's profile, then `AppData\Roaming\discord\Cache`. Only the last
+/// of those names used to be checked for being a link. Any folder above it
+/// that the caller can replace could be made a junction, and the clear then
+/// went through it: as LocalSystem, into whatever folder of that last name
+/// the junction led to. `%USERPROFILE%\.nuget` pointed at
+/// `C:\ProgramData\Microsoft\VisualStudio` would have emptied the folder
+/// Visual Studio is found by, for a caller with no rights over it, and every
+/// entry added to this list adds names that could be reached the same way.
+///
+/// So a location is only cleared, or measured, when the folder it really is
+/// turns out to be the starting place followed by exactly those names. The
+/// starting place itself may be reached through a link, because a profile
+/// moved to another drive is: nothing the caller can swap sits above it.
+struct Anchors(Vec<(String, String)>);
+
+impl Anchors {
+    fn of(user: &UserContext) -> Self {
+        let mut folders = vec![
+            PathBuf::from(user.profile()),
+            program_data(),
+            windir(),
+            program_files_x86(),
+            system_drive(),
+        ];
+        // Wherever Steam says its libraries are.
+        folders.extend(crate::steam::library_roots(user));
+        Self::from_folders(&folders)
+    }
+
+    fn from_folders(folders: &[PathBuf]) -> Self {
+        Self(
+            folders
+                .iter()
+                .filter_map(|folder| {
+                    let spelled = folder.to_string_lossy();
+                    // One that is not there has nothing inside it to clear.
+                    let real = crate::paths::existing_plain(&spelled)?;
+                    Some((
+                        crate::paths::plain(&spelled)
+                            .trim_end_matches('\\')
+                            .to_owned(),
+                        real.trim_end_matches('\\').to_owned(),
+                    ))
+                })
+                .collect(),
+        )
+    }
+
+    /// Where `path` is if every name below its starting place is a real
+    /// folder, in plain form. `None` when it starts from none of them.
+    fn where_spelled(&self, path: &Path) -> Option<String> {
+        let spelled = crate::paths::plain(&path.to_string_lossy());
+        self.0
+            .iter()
+            .filter_map(|(anchor, real)| {
+                let below = crate::paths::below(&spelled, anchor)?;
+                let mut expected = real.clone();
+                for name in below {
+                    expected.push('\\');
+                    expected.push_str(name);
+                }
+                Some((anchor.len(), expected))
+            })
+            // The deepest starting place it is under: the profile rather than
+            // the drive the profile is on.
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, expected)| expected)
+    }
+
+    /// Whether `path`, as it resolves now, is where it is spelled.
+    ///
+    /// For listing only, like [`ours_to_empty`]: it answers about this moment.
+    /// The clear asks the same question of the folder it is holding open.
+    fn holds(&self, path: &Path) -> bool {
+        let real = crate::paths::existing_plain(&path.to_string_lossy());
+        real.is_some_and(|real| {
+            self.where_spelled(path).as_deref() == Some(real.trim_end_matches('\\'))
+        })
+    }
+}
+
+fn build(entry: &Entry, user: &UserContext, anchors: &Anchors) -> Option<Cache> {
     let mut locations = Vec::new();
     for path in (entry.locate)(user) {
-        if !ours_to_empty(&path) {
+        if !ours_to_empty(&path) || !anchors.holds(&path) {
             continue;
         }
         let (bytes, files, partial) = measure(&path);
@@ -414,9 +821,10 @@ fn build(entry: &Entry, user: &UserContext) -> Option<Cache> {
 
 /// Measure every cache that is actually present, largest first.
 pub fn survey(user: &UserContext) -> Vec<Cache> {
+    let anchors = Anchors::of(user);
     let mut caches: Vec<Cache> = CATALOGUE
         .iter()
-        .filter_map(|entry| build(entry, user))
+        .filter_map(|entry| build(entry, user, &anchors))
         .collect();
     caches.sort_by_key(|cache| std::cmp::Reverse(cache.bytes));
     caches
@@ -541,10 +949,46 @@ impl HeldRoot {
 
         Ok(Self { _handle: handle })
     }
+
+    /// Where the folder being held really is, in plain form.
+    ///
+    /// Asked of the handle and not of the path. The path can be made to lead
+    /// somewhere else between one look and the next; the handle is already on
+    /// whatever folder it reached, and stays there.
+    fn real_path(&self) -> Option<String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED,
+        };
+
+        let mut buffer = vec![0_u16; 1024];
+        // Twice at most: once to learn the length a long path needs.
+        for _ in 0..2 {
+            // SAFETY: the handle is this value's own and stays open for the
+            // call, and the buffer is as long as it is said to be.
+            let length = unsafe {
+                GetFinalPathNameByHandleW(
+                    HANDLE(self._handle.as_raw_handle()),
+                    &mut buffer,
+                    FILE_NAME_NORMALIZED,
+                )
+            } as usize;
+            if length == 0 {
+                return None;
+            }
+            if length < buffer.len() {
+                let text = String::from_utf16_lossy(&buffer[..length]);
+                return Some(crate::paths::plain(&text).trim_end_matches('\\').to_owned());
+            }
+            buffer.resize(length + 1, 0);
+        }
+        None
+    }
 }
 
 /// Empty one catalogue root, holding it open for the whole walk.
-fn empty_root(path: &Path, result: &mut Cleared) {
+fn empty_root(path: &Path, anchors: &Anchors, result: &mut Cleared) {
     // Said out loud rather than skipped silently: a cache root that has become
     // a link is not a tidy no-op, it is somebody having put it there.
     let held = match HeldRoot::open(path) {
@@ -554,6 +998,30 @@ fn empty_root(path: &Path, result: &mut Cleared) {
             return;
         }
     };
+
+    // The root is no link, and from here nothing above it can be swapped. What
+    // is left to settle is whether a folder above it was a link already, so
+    // that what is held is somebody else's folder of the same name. See
+    // [`Anchors`]. Checked on the handle: if what is held is where the path
+    // spells, then it is that path's own folders the handle is pinning, and
+    // walking by path below is walking this folder.
+    match (held.real_path(), anchors.where_spelled(path)) {
+        (Some(real), Some(spelled)) if real == spelled => {}
+        (Some(real), _) => {
+            result.refused.push(format!(
+                "{} leads to {real}, which is somewhere else, so it was left alone",
+                path.display()
+            ));
+            return;
+        }
+        (None, _) => {
+            result.refused.push(format!(
+                "where {} really is could not be read, so it was left alone",
+                path.display()
+            ));
+            return;
+        }
+    }
 
     empty(path, result);
 
@@ -653,12 +1121,13 @@ pub fn clear(id: &str, user: &UserContext) -> std::result::Result<Cleared, Strin
         refused: Vec::new(),
     };
 
+    let anchors = Anchors::of(user);
     for path in (entry.locate)(user) {
         // Not `is_dir`: that follows a reparse point, which is the whole hole.
         // A root that exists at all is judged; one that does not is simply not
         // there and needs no comment.
         if std::fs::symlink_metadata(&path).is_ok() {
-            empty_root(&path, &mut result);
+            empty_root(&path, &anchors, &mut result);
         }
     }
     Ok(result)
@@ -751,6 +1220,26 @@ mod tests {
         ]
         .iter()
         .map(|root| root.to_lowercase())
+        .chain(
+            // The roots of the entries added in November 2026.
+            [
+                local_low(&user),
+                PathBuf::from(user.profile()).join(".gradle"),
+                PathBuf::from(user.profile()).join(r"go\pkg\mod"),
+                program_data().join("NVIDIA Corporation"),
+                system_drive().join(r"NVIDIA\DisplayDriver"),
+                system_drive().join("$WINDOWS.~BT"),
+                system_drive().join("$WINDOWS.~WS"),
+                system_drive().join("$GetCurrent"),
+                windir().join(r"Logs\CBS"),
+                windir().join(
+                    r"ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization",
+                ),
+                program_files_x86().join(r"Microsoft\EdgeUpdate\Download"),
+            ]
+            .iter()
+            .map(|root| root.to_string_lossy().to_lowercase()),
+        )
         .collect();
 
         // Steam libraries are wherever Steam says, so they are allowed by
@@ -852,7 +1341,7 @@ mod tests {
             files_in_use: 0,
             refused: Vec::new(),
         };
-        empty_root(&link, &mut result);
+        empty_root(&link, &Anchors::of(&UserContext::current()), &mut result);
 
         assert!(
             victim.join("precious.txt").exists(),
@@ -1030,6 +1519,306 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    /// A scratch folder spelled by its real, long path.
+    ///
+    /// The temporary folder is often named through a short name such as
+    /// `RUNNER~1`, and the tests below are about a path being exactly where it
+    /// is spelled.
+    fn long_scratch(tag: &str) -> PathBuf {
+        let real = std::fs::canonicalize(scratch(tag)).unwrap();
+        let text = real.to_string_lossy();
+        PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+    }
+
+    fn nothing_cleared() -> Cleared {
+        Cleared {
+            id: "test".to_owned(),
+            bytes_freed: 0,
+            files_removed: 0,
+            files_in_use: 0,
+            refused: Vec::new(),
+        }
+    }
+
+    fn junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    /// A link above a cache is not followed to somebody else's folder.
+    ///
+    /// Only the last name of a location was checked for being a link. Here the
+    /// caller's own `vendor` folder is a junction to a folder that is not
+    /// theirs, which happens to hold a folder named `Cache`. By name and by
+    /// every check there was, `vendor\Cache` is an ordinary folder, and the
+    /// clear, running as LocalSystem, emptied the other one.
+    #[test]
+    fn a_cache_reached_through_a_link_above_it_is_refused_rather_than_followed() {
+        let base = long_scratch("link-above");
+        let victim = long_scratch("link-above-victim");
+        std::fs::create_dir_all(victim.join("Cache")).unwrap();
+        std::fs::write(victim.join("Cache").join("precious.txt"), b"not a cache").unwrap();
+        if !junction(&base.join("vendor"), &victim) {
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&victim);
+            return;
+        }
+        let location = base.join("vendor").join("Cache");
+
+        // The premise, which is the whole trap.
+        assert!(
+            ours_to_empty(&location),
+            "by its own name this is an ordinary folder"
+        );
+
+        let anchors = Anchors::from_folders(std::slice::from_ref(&base));
+        assert!(
+            !anchors.holds(&location),
+            "a folder reached through a link was taken for the caller's own"
+        );
+
+        let mut result = nothing_cleared();
+        empty_root(&location, &anchors, &mut result);
+        assert!(
+            victim.join("Cache").join("precious.txt").exists(),
+            "the clear went through a link above the cache and emptied somebody else's folder"
+        );
+        assert_eq!(result.files_removed, 0);
+        assert!(
+            result
+                .refused
+                .iter()
+                .any(|why| why.contains("somewhere else")),
+            "it should say why it refused: {:?}",
+            result.refused
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::remove_dir_all(&victim).unwrap();
+    }
+
+    #[test]
+    fn a_cache_that_is_where_its_path_says_is_emptied() {
+        // The control for the test above: the same shape with no link in it.
+        let base = long_scratch("no-link");
+        let location = base.join("vendor").join("Cache");
+        std::fs::create_dir_all(&location).unwrap();
+        std::fs::write(location.join("old.tmp"), vec![1_u8; 700]).unwrap();
+
+        let anchors = Anchors::from_folders(std::slice::from_ref(&base));
+        assert!(anchors.holds(&location));
+
+        let mut result = nothing_cleared();
+        empty_root(&location, &anchors, &mut result);
+        assert_eq!(result.files_removed, 1, "{:?}", result.refused);
+        assert_eq!(result.bytes_freed, 700);
+        assert!(location.is_dir(), "the folder itself must survive");
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The place a location starts from may itself be reached through a link.
+    ///
+    /// A profile moved to another drive is, and nothing the caller can swap
+    /// sits above it. Only what comes below it has to be real.
+    #[test]
+    fn a_starting_place_reached_through_a_link_is_still_a_starting_place() {
+        let base = long_scratch("moved-profile");
+        let moved = long_scratch("moved-profile-target");
+        let location = moved.join("AppData").join("Cache");
+        std::fs::create_dir_all(&location).unwrap();
+        std::fs::write(location.join("old.tmp"), vec![1_u8; 300]).unwrap();
+        let profile = base.join("profile");
+        if !junction(&profile, &moved) {
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&moved);
+            return;
+        }
+
+        let spelled = profile.join("AppData").join("Cache");
+        let anchors = Anchors::from_folders(std::slice::from_ref(&profile));
+        assert!(anchors.holds(&spelled));
+
+        let mut result = nothing_cleared();
+        empty_root(&spelled, &anchors, &mut result);
+        assert_eq!(result.files_removed, 1, "{:?}", result.refused);
+
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::remove_dir_all(&moved).unwrap();
+    }
+
+    #[test]
+    fn a_location_that_starts_from_nowhere_known_is_not_ours() {
+        let base = long_scratch("unanchored");
+        let location = base.join("Cache");
+        std::fs::create_dir_all(&location).unwrap();
+        std::fs::write(location.join("keep.txt"), b"keep").unwrap();
+
+        // Starting places that do not include the folder this is in.
+        let anchors = Anchors::from_folders(&[base.join("somewhere-else")]);
+        assert!(!anchors.holds(&location));
+        let mut result = nothing_cleared();
+        empty_root(&location, &anchors, &mut result);
+        assert!(location.join("keep.txt").exists());
+        assert_eq!(result.refused.len(), 1);
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A made-up person, for asking where an entry reaches without touching
+    /// anybody's real folders.
+    fn someone() -> UserContext {
+        UserContext::new(None, r"C:\Users\someone")
+    }
+
+    fn located(id: &str, user: &UserContext) -> Vec<String> {
+        let entry = CATALOGUE
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap_or_else(|| panic!("{id} is not in the catalogue"));
+        (entry.locate)(user)
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Each added entry is the caller's own to clear, or needs an
+    /// administrator, by where it reaches.
+    #[test]
+    fn the_added_entries_are_classed_by_where_they_reach() {
+        let user = someone();
+        for own in [
+            "chrome-on-device-model",
+            "steam-web-cache",
+            "chat-caches",
+            "vscode-cache",
+            "game-engine-caches",
+            "adobe-media-cache",
+            "launcher-logs",
+        ] {
+            assert!(
+                !is_machine_wide(own, &user),
+                "{own} is inside the caller's profile and was classed as machine-wide"
+            );
+        }
+        for machine in [
+            "nvidia-driver-downloads",
+            "nvidia-app-logs",
+            "windows-upgrade-files",
+            "windows-servicing-logs",
+            "edge-update-downloads",
+        ] {
+            assert!(
+                is_machine_wide(machine, &user),
+                "{machine} reaches outside the caller's profile and was classed as theirs"
+            );
+        }
+    }
+
+    /// The additions to entries that were already there stay where those were.
+    #[test]
+    fn the_additions_to_existing_entries_keep_their_class() {
+        let user = someone();
+        assert!(!is_machine_wide("shader-cache", &user));
+        assert!(!is_machine_wide("browser-cache", &user));
+        assert!(!is_machine_wide("package-caches", &user));
+        assert!(is_machine_wide("windows-update", &user));
+
+        let shaders = located("shader-cache", &user);
+        assert!(shaders.contains(&r"C:\Users\someone\AppData\LocalLow\NVIDIA\DXCache".to_owned()));
+        let packages = located("package-caches", &user);
+        assert!(packages.contains(&r"C:\Users\someone\.cargo\registry\src".to_owned()));
+        assert!(packages.contains(&r"C:\Users\someone\.gradle\caches".to_owned()));
+    }
+
+    /// Steam's web cache is taken by the names of its cache folders, never as
+    /// the folder that holds them, because that folder holds cookies too.
+    #[test]
+    fn the_steam_web_cache_does_not_reach_the_browsers_cookies() {
+        let holder = r"c:\users\someone\appdata\local\steam\htmlcache";
+        let locations = located("steam-web-cache", &someone());
+        assert!(!locations.is_empty());
+        for location in locations {
+            let lowered = location.to_lowercase();
+            assert_ne!(lowered, holder, "the whole folder would be emptied");
+            let last = lowered.rsplit('\\').next().unwrap();
+            assert!(
+                ["cache", "code cache", "gpucache"].contains(&last),
+                "{location} is not one of the cache folders"
+            );
+        }
+    }
+
+    /// A new entry, from the list to an empty folder, in a made-up profile.
+    ///
+    /// Discord keeps its sign-in beside its cache. The cache goes, the folder
+    /// it was in stays, and what sits beside it is not touched.
+    #[test]
+    fn clearing_the_chat_caches_takes_the_cache_and_leaves_the_session() {
+        let profile = long_scratch("chat");
+        let discord = profile.join("AppData").join("Roaming").join("discord");
+        std::fs::create_dir_all(discord.join("Cache").join("Cache_Data")).unwrap();
+        std::fs::create_dir_all(discord.join("Local Storage")).unwrap();
+        std::fs::write(
+            discord.join("Cache").join("Cache_Data").join("f_0001"),
+            vec![9_u8; 4096],
+        )
+        .unwrap();
+        std::fs::write(
+            discord.join("Local Storage").join("session.db"),
+            b"signed in",
+        )
+        .unwrap();
+        let user = UserContext::new(None, &profile.to_string_lossy());
+
+        let listed = survey(&user);
+        let chat = listed
+            .iter()
+            .find(|cache| cache.id == "chat-caches")
+            .expect("the cache has a file in it and should be listed");
+        assert_eq!(chat.bytes, 4096);
+        assert_eq!(chat.locations.len(), 1);
+
+        let cleared = clear("chat-caches", &user).unwrap();
+        assert_eq!(cleared.files_removed, 1, "{:?}", cleared.refused);
+        assert_eq!(cleared.bytes_freed, 4096);
+        assert!(
+            discord.join("Cache").is_dir(),
+            "the folder itself must survive"
+        );
+        assert!(
+            discord.join("Local Storage").join("session.db").exists(),
+            "what keeps the person signed in was removed"
+        );
+
+        std::fs::remove_dir_all(&profile).unwrap();
+    }
+
+    /// Nothing a person reads from this list carries a dash, and every entry
+    /// says what it holds.
+    #[test]
+    fn every_entry_is_described_in_plain_sentences() {
+        for entry in CATALOGUE {
+            for text in [entry.name, entry.what, entry.cost] {
+                assert!(
+                    !text.contains('\u{2014}') && !text.contains('\u{2013}'),
+                    "{} has a dash in: {text}",
+                    entry.id
+                );
+            }
+            assert!(
+                !entry.name.is_empty() && !entry.what.is_empty(),
+                "{}",
+                entry.id
+            );
+        }
     }
 
     #[test]
