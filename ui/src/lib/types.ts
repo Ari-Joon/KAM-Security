@@ -424,7 +424,8 @@ export type Differences = {
   unplaced: number;
 };
 
-export type Comparison =
+/** Two scans of a drive compared, or why they could not be. */
+export type GrowthComparison =
   | { kind: "nothing_kept" }
   | { kind: "nothing_earlier" }
   | { kind: "not_comparable"; why: string }
@@ -437,7 +438,7 @@ export type Growth = {
   summaries: SummaryHeader[];
   later: SummaryHeader | null;
   earlier: SummaryHeader | null;
-  comparison: Comparison;
+  comparison: GrowthComparison;
 };
 
 /**
