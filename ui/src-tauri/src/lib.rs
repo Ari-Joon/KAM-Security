@@ -14,6 +14,7 @@ mod context_menu;
 mod downloads;
 mod notice;
 mod recycle;
+mod remembered;
 mod seen;
 mod startup;
 mod uninstall;
@@ -153,6 +154,28 @@ async fn get_growth(
         }
     })
     .await
+}
+
+/// Keep a page's latest result for the next time the page is opened, in the
+/// person's own Local AppData. See `remembered`.
+#[tauri::command]
+async fn remember_result(kind: String, result: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        remembered::remember_in(&remembered::folder(), &kind, &result)
+    })
+    .await
+    .map_err(|error| format!("it did not finish: {error}"))?
+}
+
+/// A page's latest kept result, `None` when none is kept, or why the one that
+/// is kept could not be read back.
+#[tauri::command]
+async fn remembered_result(kind: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        remembered::recall_in(&remembered::folder(), &kind)
+    })
+    .await
+    .map_err(|error| format!("it did not finish: {error}"))?
 }
 
 /// What every installed application really occupies.
@@ -1551,6 +1574,8 @@ pub fn run() {
             scan_path,
             scan_folder,
             get_growth,
+            remember_result,
+            remembered_result,
             list_applications,
             list_applications_preview,
             find_duplicates,
