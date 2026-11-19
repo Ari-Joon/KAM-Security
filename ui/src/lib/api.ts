@@ -136,6 +136,16 @@ export const api = {
    */
   recycleItem: (path: string) =>
     invoke<{ in_bin: boolean; warning: string | null }>("recycle_item", { path }),
+  /**
+   * Send something to the Recycle Bin, or leave it exactly where it is.
+   *
+   * `recycleItem` reports afterwards when Windows deleted an item outright
+   * because the bin could not take it. This stops that delete before it
+   * happens and rejects with why the file is still there. For the list of
+   * large old files, where too large for the bin is the ordinary case.
+   */
+  recycleOrLeave: (path: string) =>
+    invoke<{ in_bin: boolean; warning: string | null }>("recycle_or_leave", { path }),
   /** For each item, whether this account could remove it itself, without the agent. */
   canRecycleAll: (paths: string[]) => invoke<boolean[]>("can_recycle_all", { paths }),
   /**

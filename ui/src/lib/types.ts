@@ -296,6 +296,43 @@ export type Timings = {
   total: number;
 };
 
+/**
+ * A large file with the dates Windows recorded for it, each in seconds since
+ * 1970. A date that was not recorded is null.
+ */
+export type OldFile = {
+  path: string;
+  name: string;
+  bytes: number;
+  /** When this copy arrived on this drive. */
+  created: number | null;
+  /** When its contents last changed. */
+  modified: number | null;
+  /**
+   * When anything last opened it. Always null unless the summary's
+   * `access_times` is "recorded": the date was then not used and not sent.
+   */
+  accessed: number | null;
+};
+
+export type OldFileSummary = {
+  /** Every file that met the rule in your own folders, listed or not. */
+  found: number;
+  total_bytes: number;
+  /** Anything but "recorded" means the list was built from two dates. */
+  access_times: AccessTimes;
+  /** The rule the list was built by, as the service applied it. */
+  min_bytes: number;
+  older_than_days: number;
+  /** Files that met the rule somewhere that is not yours, by where. */
+  left_out: { owner: Owner; files: number; bytes: number }[];
+  /** Files of the size in your folders with a date that was not recorded. */
+  undated: number;
+  undated_bytes: number;
+  /** Files of the size too many folders deep to be named. */
+  unplaced: number;
+};
+
 export type ApplicationReport = {
   apps: AppFootprint[];
   summary: FootprintSummary;
@@ -303,6 +340,8 @@ export type ApplicationReport = {
   orphan_summary: OrphanSummary;
   downloads: Download[];
   download_summary: DownloadSummary;
+  old_files: OldFile[];
+  old_file_summary: OldFileSummary;
   timings: Timings;
 };
 

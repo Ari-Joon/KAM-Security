@@ -11,7 +11,7 @@ import ReclaimMap, {
 import { GridLegend } from "../components/StateGrid";
 import FileRow from "../components/FileRow";
 import PathLink from "../components/PathLink";
-import MeasuredAt from "../components/MeasuredAt";
+import MeasuredAt, { whenMeasured } from "../components/MeasuredAt";
 import type {
   AccessTimes,
   Cache,
@@ -24,6 +24,8 @@ import type {
   DuplicateGroup,
   DuplicateSummary,
   MoveRecord,
+  OldFile,
+  OldFileSummary,
   OrganiseSummary,
   Proposal,
   Manifest,
@@ -147,6 +149,90 @@ function daysAgo(days: number): string {
   if (days <= 0) return "today";
   if (days === 1) return "yesterday";
   return `${fmt.count(days)} days ago`;
+}
+
+/** The orders the download list can be put in. */
+type DownloadOrder = "largest" | "newest" | "oldest";
+
+const DOWNLOAD_ORDER: Record<DownloadOrder, string> = {
+  largest: "Largest first",
+  newest: "Arrived most recently first",
+  oldest: "Arrived longest ago first",
+};
+
+/** Which rows a shortened list holds, for the line that says so. */
+const DOWNLOADS_SHOWN: Record<DownloadOrder, (shown: string, all: string) => string> = {
+  largest: (shown, all) => `Showing the ${shown} largest of ${all}.`,
+  newest: (shown, all) => `Showing the ${shown} that arrived most recently, of ${all}.`,
+  oldest: (shown, all) => `Showing the ${shown} that arrived longest ago, of ${all}.`,
+};
+
+/**
+ * The downloads in the order asked for.
+ *
+ * A download whose arrival date Windows did not record cannot be placed in
+ * an order by arrival, so it goes last in both, and its row says the date
+ * was not recorded.
+ */
+function ordered(downloads: Download[], order: DownloadOrder): Download[] {
+  if (order === "largest") return downloads;
+  const direction = order === "newest" ? 1 : -1;
+  return [...downloads].sort((a, b) => {
+    if (a.days_since_arrival === null || b.days_since_arrival === null) {
+      return (
+        Number(a.days_since_arrival === null) - Number(b.days_since_arrival === null)
+      );
+    }
+    return direction * (a.days_since_arrival - b.days_since_arrival) || b.bytes - a.bytes;
+  });
+}
+
+/** What the list of large old files can be sorted by: its four columns. */
+type OldColumn = "bytes" | "created" | "modified" | "accessed";
+type OldSort = { by: OldColumn; ascending: boolean };
+
+/**
+ * Where a large old file that is not listed sits, in the words the page uses.
+ *
+ * The service lists only files in the reader's own folders and counts the
+ * rest by which of these it was. "Yours" is never among them.
+ */
+const LEFT_OUT_WHERE: Record<Owner, string> = {
+  windows: "among Windows' own files",
+  servicing: "kept by Windows or an installer for repairs and updates",
+  program: "in program folders",
+  program_data: "in program data folders",
+  yours: "in your own folders",
+  deleted: "already in a Recycle Bin",
+  elsewhere: "in another account's profile, or somewhere else this cannot tell is yours",
+};
+
+/** A date as a column shows it. One that was not recorded says so. */
+function recordedDate(seconds: number | null): string {
+  if (seconds === null) return "not recorded";
+  return new Date(seconds * 1000).toLocaleDateString(undefined, {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  });
+}
+
+/**
+ * The large old files in the order asked for.
+ *
+ * A date that was not recorded sorts last whichever way the column runs: it
+ * is neither the oldest nor the newest.
+ */
+function sortedOldFiles(files: OldFile[], sort: OldSort): OldFile[] {
+  const direction = sort.ascending ? 1 : -1;
+  return [...files].sort((a, b) => {
+    const left = a[sort.by];
+    const right = b[sort.by];
+    if (left === null || right === null) {
+      return Number(left === null) - Number(right === null);
+    }
+    return direction * (left - right) || b.bytes - a.bytes;
+  });
 }
 
 /**
@@ -274,6 +360,28 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const [rootsElsewhere, setRootsElsewhere] = useState<string[]>([]);
   const [downloads, setDownloads] = useState<Download[] | null>(null);
   const [downloadSummary, setDownloadSummary] = useState<DownloadSummary | null>(null);
+  const [downloadOrder, setDownloadOrder] = useState<DownloadOrder>("largest");
+  const [allDownloads, setAllDownloads] = useState(false);
+  /**
+   * Large files in the reader's own folders whose dates are all more than a
+   * year old, as the last search sent them: the largest, at most 200.
+   */
+  const [oldFiles, setOldFiles] = useState<OldFile[] | null>(null);
+  const [oldSummary, setOldSummary] = useState<OldFileSummary | null>(null);
+  /**
+   * What the search found beyond the list it sent. Worked out once, when the
+   * answer arrives, so that the figures stay true as rows leave the list:
+   * what is on screen is added up from the rows, and this is added to it.
+   */
+  const [oldRest, setOldRest] = useState({ files: 0, bytes: 0 });
+  const [oldSort, setOldSort] = useState<OldSort>({ by: "bytes", ascending: false });
+  /**
+   * What became of the last press on that list, said beside it. The line
+   * under the controls is two screens up from this list.
+   */
+  const [oldNotice, setOldNotice] = useState<{ text: string; caution: boolean } | null>(
+    null,
+  );
   const [duplicates, setDuplicates] = useState<DupeSet[] | null>(null);
   const [duplicateSummary, setDuplicateSummary] = useState<DuplicateSummary | null>(null);
   /**
@@ -430,6 +538,17 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       setRootsElsewhere(report.orphan_summary.roots_elsewhere ?? []);
       setDownloads(report.downloads);
       setDownloadSummary(report.download_summary);
+      setOldFiles(report.old_files);
+      setOldSummary(report.old_file_summary);
+      setOldRest({
+        files: Math.max(0, report.old_file_summary.found - report.old_files.length),
+        bytes: Math.max(
+          0,
+          report.old_file_summary.total_bytes -
+            report.old_files.reduce((sum, file) => sum + file.bytes, 0),
+        ),
+      });
+      setOldNotice(null);
       setFoundAt(Date.now());
     } catch (cause) {
       setError(reason(cause));
@@ -440,6 +559,9 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       setRootsElsewhere([]);
       setDownloads(null);
       setDownloadSummary(null);
+      setOldFiles(null);
+      setOldSummary(null);
+      setOldNotice(null);
     } finally {
       setRunning(false);
       onChanged();
@@ -871,6 +993,49 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     }
   }
 
+  /**
+   * Send one large old file to the Recycle Bin, or leave it where it is.
+   *
+   * The window does it, as everywhere on this page, so the file lands in this
+   * person's own bin. Unlike everywhere else on this page it will not let
+   * Windows delete the file outright when the bin cannot take it: every row
+   * of this list is large, which is when that happens. Such a file stays
+   * where it is and the reason is shown beside the list.
+   */
+  async function recycleOldFile(file: OldFile) {
+    const key = `old:${file.path}`;
+    if (!claim(key)) return;
+    setOldNotice(null);
+    try {
+      const outcome = await api.recycleOrLeave(file.path);
+      setOldNotice(
+        outcome.in_bin && !outcome.warning
+          ? {
+              text:
+                `Sent ${file.name} (${fmt.bytes(file.bytes)}) to the Recycle Bin. ` +
+                `It is in there until you empty it.`,
+              caution: false,
+            }
+          : {
+              text:
+                outcome.warning ??
+                `${file.name} was removed but did not reach the Recycle Bin.`,
+              caution: true,
+            },
+      );
+      setOldFiles((current) =>
+        current ? current.filter((item) => item.path !== file.path) : current,
+      );
+    } catch (cause) {
+      // Refused or failed: either way the file has not gone, and the row
+      // stays. The reason is the window's own sentence.
+      setOldNotice({ text: `${reason(cause)}.`, caution: true });
+    } finally {
+      release(key);
+      onChanged();
+    }
+  }
+
   async function restore(id: string) {
     const key = `held:${id}`;
     if (!claim(key)) return;
@@ -1037,7 +1202,48 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     ...(duplicates ?? []).flatMap((group) =>
       group.copies.map((copy) => copy.path),
     ),
+    ...(oldFiles ?? []).map((file) => file.path),
   ]);
+
+  const orderedDownloads = useMemo(
+    () => ordered(downloads ?? [], downloadOrder),
+    [downloads, downloadOrder],
+  );
+  const shownDownloads = allDownloads
+    ? orderedDownloads
+    : orderedDownloads.slice(0, DOWNLOAD_LIMIT);
+  const unlistedDownloads = downloadSummary?.unlisted ?? 0;
+
+  // Whether the last-opened date was used to build the list of large old
+  // files. Only where Windows is known to be recording opens.
+  const opensRecorded = oldSummary?.access_times === "recorded";
+  const shownOldFiles = useMemo(
+    () => sortedOldFiles(oldFiles ?? [], oldSort),
+    [oldFiles, oldSort],
+  );
+  // The rule as the service applied it, in the page's words.
+  const oldAge =
+    oldSummary === null
+      ? ""
+      : oldSummary.older_than_days === 365
+        ? "a year"
+        : `${fmt.count(oldSummary.older_than_days)} days`;
+  // What stands now: the rows still listed, and what was found beyond them.
+  const oldStanding = {
+    files: (oldFiles?.length ?? 0) + oldRest.files,
+    bytes: (oldFiles ?? []).reduce((sum, file) => sum + file.bytes, 0) + oldRest.bytes,
+  };
+
+  /** Sort the large old files by a column, or turn that column's order round. */
+  function sortOldBy(column: OldColumn) {
+    setOldSort((current) =>
+      current.by === column
+        ? { by: column, ascending: !current.ascending }
+        : // Size starts largest first. A date starts oldest first, which is
+          // the end of the list a person came here for.
+          { by: column, ascending: column !== "bytes" },
+    );
+  }
 
   return (
     <>
@@ -2001,13 +2207,56 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                 </>
               )}
           </p>
-          {downloads.length > DOWNLOAD_LIMIT && (
+          {downloads.length > 0 && (
+            // The list could only ever be read largest first, twenty-five
+            // rows of it. When a file arrived is the other thing a person
+            // sorts their downloads by, and the rest of the list was already
+            // here, unseen.
+            <div className="dupe-filter">
+              <label>
+                Order
+                <select
+                  value={downloadOrder}
+                  onChange={(event) =>
+                    setDownloadOrder(event.target.value as DownloadOrder)
+                  }
+                >
+                  {(Object.keys(DOWNLOAD_ORDER) as DownloadOrder[]).map((order) => (
+                    <option key={order} value={order}>
+                      {DOWNLOAD_ORDER[order]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {downloads.length > DOWNLOAD_LIMIT && (
+                <button
+                  className="link-button"
+                  onClick={() => setAllDownloads(!allDownloads)}
+                >
+                  {allDownloads
+                    ? `Show ${fmt.count(DOWNLOAD_LIMIT)}`
+                    : `Show all ${fmt.count(downloads.length)}`}
+                </button>
+              )}
+            </div>
+          )}
+          {downloads.length > 0 && (
             <p className="footnote">
               {/* Said rather than silently cut. A list that stops without
                   saying so is a list claiming to be complete. */}
-              Showing the largest {fmt.count(DOWNLOAD_LIMIT)} of{" "}
-              {/* Of everything found, which can be more than was sent. */}
-              {fmt.count(downloadSummary?.found ?? downloads.length)}.
+              {shownDownloads.length < downloads.length
+                ? DOWNLOADS_SHOWN[downloadOrder](
+                    fmt.count(shownDownloads.length),
+                    fmt.count(downloads.length),
+                  )
+                : `Showing all ${fmt.count(downloads.length)}.`}
+              {/* What was found can be more than was sent. Those are the
+                  smallest, they are not in any order made here, and an order
+                  by arrival is of the ones that were sent. */}
+              {unlistedDownloads > 0 &&
+                (unlistedDownloads === 1
+                  ? " 1 more was found and is not in this list, because one answer could not carry it: the smallest, whenever it arrived."
+                  : ` ${fmt.count(unlistedDownloads)} more were found and are not in this list, because one answer could not carry them: the smallest, whenever they arrived.`)}
             </p>
           )}
           {downloads.length === 0 ? (
@@ -2016,7 +2265,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             </p>
           ) : (
             <ul className="files">
-              {downloads.slice(0, DOWNLOAD_LIMIT).map((download) => (
+              {shownDownloads.map((download) => (
                 <FileRow
                   key={download.path}
                   path={download.path}
@@ -2025,12 +2274,16 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                   note={
                     <>
                       {fmt.host(download.host_url) ?? "source not recorded"}
-                      {download.days_since_arrival !== null && (
+                      {download.days_since_arrival !== null ? (
                         <>
                           {" "}
                           · arrived {download.days_since_arrival}{" "}
                           {download.days_since_arrival === 1 ? "day" : "days"} ago
                         </>
+                      ) : (
+                        // Said now that the list can be put in order of
+                        // arrival: this is why such a row sits at the end.
+                        <> · when it arrived was not recorded</>
                       )}
                       {/* Only where Windows keeps the date. Elsewhere it is a
                           number nothing maintains, and the paragraph above
@@ -2052,6 +2305,209 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                 />
               ))}
             </ul>
+          )}
+        </section>
+      )}
+
+      {/*
+        Sizes and dates, from the same read as the list above, and wider: any
+        large file in the reader's own folders, however it got there. Every
+        word here is about what Windows recorded. None of it says a file is
+        unused or spare, because a date cannot know that, and this list is
+        what somebody will have open while deciding what to remove.
+      */}
+      {oldFiles && oldSummary && (
+        <section className="panel">
+          <div className="panel-head">
+            <h2>
+              {opensRecorded
+                ? `Large files last opened more than ${oldAge} ago`
+                : `Large files last written more than ${oldAge} ago`}
+            </h2>
+            <span className="muted">
+              {fmt.count(oldStanding.files)}{" "}
+              {oldStanding.files === 1 ? "file" : "files"} ·{" "}
+              {fmt.bytes(oldStanding.bytes)}
+            </span>
+          </div>
+          <p className="muted">
+            {opensRecorded ? (
+              <>
+                Files of {fmt.bytes(oldSummary.min_bytes)} or more in your own
+                folders whose three dates are each more than {oldAge} old: when
+                this copy arrived on the drive, when its contents last changed,
+                and when anything last opened it. Any program that reads a file
+                counts as opening it, antivirus and backup included, so an old
+                last-opened date means nothing has read the file since.
+              </>
+            ) : (
+              <>
+                Files of {fmt.bytes(oldSummary.min_bytes)} or more in your own
+                folders that arrived on the drive more than {oldAge} ago and
+                whose contents last changed more than {oldAge} ago.{" "}
+                {oldSummary.access_times === "not_recorded"
+                  ? "Windows is not recording when files are opened on this PC, so the last-opened date was not used to make this list and its column has nothing to show."
+                  : "Whether Windows records when files are opened on this PC could not be read, so the last-opened date was not used to make this list and is not shown."}
+              </>
+            )}{" "}
+            These are sizes and dates and nothing more: a date says when
+            something last happened to a file, not whether it is still needed.
+            Found by the search at {whenMeasured(foundAt)}.
+          </p>
+          <p className="muted">
+            Your own folders are Desktop, Documents, Downloads, Music, Pictures,
+            Videos and Saved Games in your profile, and a OneDrive, Dropbox or
+            Google Drive folder there. Everything else on the drive is left
+            out: Windows' own files, program folders and program data, the
+            Recycle Bin, other accounts' profiles, and anywhere else this
+            cannot tell is yours.{" "}
+            {oldSummary.left_out.length === 0
+              ? "Nothing there met the same size and dates."
+              : "Left out there, though as large and with dates as old: " +
+                oldSummary.left_out
+                  .map(
+                    (group) =>
+                      `${fmt.count(group.files)} ${group.files === 1 ? "file" : "files"} ` +
+                      `(${fmt.bytes(group.bytes)}) ${LEFT_OUT_WHERE[group.owner]}`,
+                  )
+                  .join("; ") +
+                "."}
+          </p>
+          {oldSummary.undated > 0 && (
+            <p className="muted">
+              {oldSummary.undated === 1
+                ? `1 file of this size in your own folders (${fmt.bytes(oldSummary.undated_bytes)}) has a date Windows did not record. It cannot be said to have every date more than ${oldAge} old, so it is not listed.`
+                : `${fmt.count(oldSummary.undated)} files of this size in your own folders (${fmt.bytes(oldSummary.undated_bytes)} together) have a date Windows did not record. They cannot be said to have every date more than ${oldAge} old, so they are not listed.`}
+            </p>
+          )}
+          {oldSummary.unplaced > 0 && (
+            <p className="muted">
+              {oldSummary.unplaced === 1
+                ? "1 file of this size on the drive sits too many folders deep for its path to be worked out, so it could not be placed and is not listed."
+                : `${fmt.count(oldSummary.unplaced)} files of this size on the drive sit too many folders deep for their paths to be worked out, so they could not be placed and are not listed.`}
+            </p>
+          )}
+
+          {oldNotice && (
+            <div
+              className={`notice ${oldNotice.caution ? "notice-warn" : "notice-ok"}`}
+              style={{ overflowWrap: "anywhere", marginTop: 12 }}
+              role="status"
+            >
+              {oldNotice.text}
+            </div>
+          )}
+
+          {oldFiles.length === 0 && oldRest.files === 0 ? (
+            <p className="empty">
+              No file of {fmt.bytes(oldSummary.min_bytes)} or more in your own
+              folders has every date more than {oldAge} old.
+            </p>
+          ) : (
+            <>
+              {oldRest.files > 0 && (
+                <p className="footnote">
+                  {/* The largest were sent, and the rest are counted, so a
+                      list that is not everything says what it is short of. */}
+                  {oldFiles.length > 0
+                    ? `This list holds the ${fmt.count(oldFiles.length)} largest, in the order you choose.`
+                    : "Everything that was listed has gone from the list."}{" "}
+                  {fmt.count(oldRest.files)} more{" "}
+                  {oldRest.files === 1 ? "was" : "were"} found and{" "}
+                  {oldRest.files === 1 ? "holds" : "hold"} {fmt.bytes(oldRest.bytes)}
+                  {oldRest.files === 1 ? "" : " together"}. Find leftovers again to list{" "}
+                  {oldFiles.length > 0 ? "the next largest as these go." : "them."}
+                </p>
+              )}
+              <div className="datefiles-head">
+                <span>File</span>
+                {(
+                  [
+                    ["created", "Arrived here"],
+                    ["modified", "Last written"],
+                    ["accessed", "Last opened"],
+                    ["bytes", "Size"],
+                  ] as [OldColumn, string][]
+                ).map(([column, label]) => {
+                  // Nothing to sort by where the date was not used.
+                  const sortable = column !== "accessed" || opensRecorded;
+                  const active = oldSort.by === column;
+                  return (
+                    <button
+                      key={column}
+                      className={active ? "sorted" : ""}
+                      disabled={!sortable}
+                      aria-pressed={active}
+                      title={
+                        !sortable
+                          ? "No last-opened dates are shown, so there is nothing to sort by"
+                          : active
+                            ? `Sorted by ${label.toLowerCase()}, ${
+                                column === "bytes"
+                                  ? oldSort.ascending
+                                    ? "smallest first"
+                                    : "largest first"
+                                  : oldSort.ascending
+                                    ? "oldest first"
+                                    : "newest first"
+                              }. Press to turn the order round.`
+                            : `Sort by ${label.toLowerCase()}`
+                      }
+                      onClick={() => sortOldBy(column)}
+                    >
+                      {label}
+                      {active ? (oldSort.ascending ? " ▲" : " ▼") : ""}
+                    </button>
+                  );
+                })}
+                <span />
+              </div>
+              <ul className="datefiles">
+                {shownOldFiles.map((file) => {
+                  const { folder } = fmt.splitPath(file.path);
+                  const busy = inFlight.has(`old:${file.path}`);
+                  return (
+                    <li key={file.path} className="datefiles-row">
+                      <button
+                        className="filerow-main"
+                        title={`Show ${file.path} in Explorer`}
+                        onClick={() => void reveal(file.path)}
+                      >
+                        <span className="filerow-name">{file.name}</span>
+                        {folder && <span className="filerow-folder">{folder}</span>}
+                      </button>
+                      <span className="datefiles-date">{recordedDate(file.created)}</span>
+                      <span className="datefiles-date">{recordedDate(file.modified)}</span>
+                      <span className="datefiles-date">
+                        {opensRecorded
+                          ? recordedDate(file.accessed)
+                          : oldSummary.access_times === "not_recorded"
+                            ? "not recorded"
+                            : "not shown"}
+                      </span>
+                      <span className="datefiles-size">{fmt.bytes(file.bytes)}</span>
+                      {canRecycle(file.path) ? (
+                        <button
+                          className="ghost"
+                          disabled={busy}
+                          title="Send it to your Recycle Bin, where Windows can put it back. If the bin cannot take it, it is left where it is."
+                          onClick={() => void recycleOldFile(file)}
+                        >
+                          {busy ? "Sending…" : "Recycle Bin"}
+                        </button>
+                      ) : (
+                        <span
+                          className="orphan-note"
+                          title="Windows will not let this account delete this file, so the Recycle Bin is not offered for it."
+                        >
+                          Not yours to remove
+                        </span>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            </>
           )}
         </section>
       )}
@@ -2082,6 +2538,15 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             come from the internet, with the site they came from and when they
             arrived. Nothing here is a suggestion to delete; it is a list of
             things you may have forgotten you kept.
+          </li>
+          <li>
+            <strong>Large files by date</strong> are files of 100 MB or more
+            in your own folders with no date from the last year: not when the
+            copy arrived, not when it was last written, and, where Windows
+            records it, not when it was last opened. It is a list of sizes and
+            dates. A date says when something last happened to a file, not
+            whether you still need it. The Recycle Bin button there leaves a
+            file where it is if the bin cannot take it.
           </li>
           <li>
             <strong>Duplicates</strong> are files that are byte-for-byte

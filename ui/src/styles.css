@@ -898,6 +898,85 @@ select {
   padding-top: 1px;
 }
 
+/* ---------- files by date ---------- */
+
+/* Three dates and a size to sort by, and one thing to press, so this is a
+   table where the file lists above are single lines. The name and its folder
+   take what room is left, and are the part allowed to shorten. */
+.datefiles-head,
+.datefiles-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 96px 96px 96px 76px 124px;
+  align-items: center;
+  gap: 10px;
+}
+
+.datefiles-head {
+  margin-top: 14px;
+  padding-bottom: 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.datefiles-head button {
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  text-align: right;
+  color: inherit;
+  cursor: pointer;
+}
+
+.datefiles-head button:hover:not(:disabled),
+.datefiles-head button.sorted {
+  color: var(--text);
+}
+
+.datefiles-head button:disabled {
+  cursor: default;
+}
+
+.datefiles {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.datefiles-row {
+  padding: 7px 0;
+  border-top: 1px solid var(--border);
+}
+
+.datefiles-row:first-child {
+  border-top: none;
+}
+
+.datefiles-date,
+.datefiles-size {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.datefiles-size {
+  color: var(--text);
+}
+
+.datefiles-row .ghost,
+.datefiles-row .orphan-note {
+  justify-self: end;
+  font-size: 12px;
+}
+
 /* ---------- audit entries ---------- */
 
 .entry {
