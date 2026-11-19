@@ -967,14 +967,18 @@ export default function Cleanup({ volumes, onChanged }: Props) {
    * ever reaches a copy in a folder you own, because the suggestion came from
    * a classifier. Acting on your choice reaches what you picked, because you
    * looked at the set. Windows' own files are refused either way.
+   *
+   * `keep` is the copy that stays. The agent compares the two before it
+   * moves anything, because this list may be days old.
    */
-  async function holdCopy(path: string, bytes: number, chosen: boolean) {
+  async function holdCopy(path: string, keep: string, bytes: number, chosen: boolean) {
     const key = `copy:${path}`;
     if (!claim(key)) return;
     setError(null);
     try {
       await api.quarantineCopy(
         path,
+        keep,
         chosen
           ? "you chose which copy to keep, and this was not it"
           : "a redundant copy of an identical file",
@@ -1000,11 +1004,21 @@ export default function Cleanup({ volumes, onChanged }: Props) {
    * Same reasoning as `recycleOrphan`: the window does it, so the copy lands in
    * this person's bin rather than SYSTEM's, and no privilege is involved in
    * removing a file they own.
+   *
+   * It is first compared with the copy that stays, as the agent compares one
+   * before quarantining it: this list may be days old.
    */
-  async function recycleCopy(path: string, bytes: number) {
+  async function recycleCopy(path: string, keep: string, bytes: number) {
     const key = `copy:${path}`;
     if (!claim(key)) return;
     setError(null);
+    try {
+      await api.checkStillTwins(path, keep);
+    } catch (cause) {
+      setError(reason(cause));
+      release(key);
+      return;
+    }
     try {
       const outcome = await api.recycleItem(path);
       reportRecycle(
@@ -1989,7 +2003,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                                                   }
                                                   onClick={(event) => {
                                                     event.stopPropagation();
-                                                    void holdCopy(copy.path, group.bytes, !ours);
+                                                    void holdCopy(copy.path, keeper, group.bytes, !ours);
                                                   }}
                                                 >
                                                   Remove this one
@@ -2009,7 +2023,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                                                   title="Send this copy to the Recycle Bin, where Windows can put it back"
                                                   onClick={(event) => {
                                                     event.stopPropagation();
-                                                    void recycleCopy(copy.path, group.bytes);
+                                                    void recycleCopy(copy.path, keeper, group.bytes);
                                                   }}
                                                 >
                                                   Recycle Bin

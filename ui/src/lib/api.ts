@@ -118,8 +118,10 @@ export const api = {
   moves: () => invoke<MoveRecord[]>("list_moves"),
   quarantine: (path: string, reason: string) =>
     invoke<Manifest>("quarantine_path", { path, reason }),
-  quarantineCopy: (path: string, reason: string, chosen = false) =>
-    invoke<Manifest>("quarantine_copy", { path, reason, chosen }),
+  quarantineCopy: (path: string, keep: string, reason: string, chosen = false) =>
+    invoke<Manifest>("quarantine_copy", { path, keep, reason, chosen }),
+  checkStillTwins: (remove: string, keep: string) =>
+    invoke<void>("check_still_twins", { remove, keep }),
   caches: () => invoke<Cache[]>("survey_caches"),
   schedule: () => invoke<Schedule>("schedule"),
   setSchedule: (enabled: boolean, day: string, hour: number) =>

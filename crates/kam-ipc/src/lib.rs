@@ -258,10 +258,16 @@ pub enum Request {
     /// because they looked at the set. Windows' own files and the servicing
     /// store are refused either way, and both go to quarantine rather than
     /// being deleted, which is what makes honouring the second reasonable.
+    ///
+    /// `keep` is the copy that stays. The agent compares the two in full
+    /// before it moves anything, because the list the window shows may be
+    /// days old, and refuses unless they are still the same.
     QuarantineCopy {
         path: String,
         reason: String,
         chosen: bool,
+        #[serde(default)]
+        keep: String,
     },
     /// Find byte-for-byte duplicate files on `drive`.
     ///

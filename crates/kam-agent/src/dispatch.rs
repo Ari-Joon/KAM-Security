@@ -591,7 +591,8 @@ pub fn handle(
             path,
             reason,
             chosen,
-        } => quarantine_copy(&path, &reason, chosen, context, user),
+            keep,
+        } => quarantine_copy(&path, &keep, &reason, chosen, context, user),
 
         Request::FindOrganiseProposals { drive } => {
             let Some(letter) = drive.chars().next().filter(|c| c.is_ascii_alphabetic()) else {
@@ -1392,6 +1393,7 @@ fn quarantine_only_on(context: &Context, searched: char) -> Option<char> {
 /// move is recorded, and it goes back with one press if this was wrong.
 fn quarantine_copy(
     path: &str,
+    keep: &str,
     reason: &str,
     chosen: bool,
     context: &Context,
@@ -1402,7 +1404,11 @@ fn quarantine_copy(
     } else {
         kam_storage::duplicates::Intent::Suggested
     };
-    if let Err(refusal) = kam_storage::duplicates::check_removable(path, user, intent) {
+    // Where it is decides whether it may go; whether it is still a spare
+    // decides whether it should. The list it was chosen from may be days old.
+    let allowed = kam_storage::duplicates::check_removable(path, user, intent)
+        .and_then(|()| kam_storage::duplicates::check_still_twins(path, keep, user));
+    if let Err(refusal) = allowed {
         context.audit(
             "quarantine",
             "take_copy",
@@ -2552,6 +2558,7 @@ mod tests {
                     path: path.to_owned(),
                     reason: "a test".to_owned(),
                     chosen: false,
+                    keep: String::new(),
                 },
                 &context,
                 &Reporter::silent(),
@@ -2570,32 +2577,56 @@ mod tests {
         assert!(std::path::Path::new(r"C:\Windows\System32\kernel32.dll").exists());
     }
 
+    /// A throwaway profile with a Downloads folder, a copy to keep and a
+    /// redundant copy in it, and the caller it belongs to.
+    ///
+    /// The test below used to write its copy into the real Downloads folder of
+    /// whoever ran it, where a running copy of the program saw it land and
+    /// then go, and recorded it in their history every time.
+    fn a_profile_with_two_copies(
+        tag: &str,
+        copy: &[u8],
+        keep: &[u8],
+    ) -> (std::path::PathBuf, UserContext, String, String) {
+        let profile = std::env::temp_dir().join(format!(
+            "kam-dispatch-copy-profile-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&profile);
+        let downloads = profile.join("Downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::write(downloads.join("copy.bin"), copy).unwrap();
+        std::fs::write(downloads.join("keep.bin"), keep).unwrap();
+        let user = UserContext::new(
+            Some("S-1-5-21-0-0-0-4007".to_owned()),
+            &profile.to_string_lossy(),
+        );
+        let path = downloads.join("copy.bin").to_string_lossy().into_owned();
+        let keep = downloads.join("keep.bin").to_string_lossy().into_owned();
+        (profile, user, path, keep)
+    }
+
     /// A real redundant copy is held, and comes back.
     #[test]
     fn a_copy_in_a_folder_of_yours_is_held_and_restored() {
         let context = context(Mode::Service);
-        let user = UserContext::current();
-
-        let downloads = std::path::Path::new(user.profile()).join("Downloads");
-        if !downloads.is_dir() {
-            return;
-        }
-        let copy = downloads.join(format!("kam-copy-test-{}.bin", std::process::id()));
-        std::fs::write(&copy, vec![9_u8; 2048]).unwrap();
-        let path = copy.to_string_lossy().into_owned();
+        let (profile, user, path, keep) =
+            a_profile_with_two_copies("held", &[9_u8; 2048], &[9_u8; 2048]);
+        let copy = std::path::PathBuf::from(&path);
 
         let held = handle(
             Request::QuarantineCopy {
                 path: path.clone(),
                 reason: "a redundant copy".to_owned(),
                 chosen: false,
+                keep,
             },
             &context,
             &Reporter::silent(),
             &user,
         );
         let Response::Quarantined(manifest) = &held else {
-            let _ = std::fs::remove_file(&copy);
+            let _ = std::fs::remove_dir_all(&profile);
             panic!("expected the copy to be held, got {held:?}");
         };
         assert_eq!(manifest.bytes, 2048, "the size was not measured");
@@ -2614,7 +2645,50 @@ mod tests {
         assert!(copy.exists(), "the copy did not come back");
         assert_eq!(std::fs::read(&copy).unwrap().len(), 2048);
 
-        std::fs::remove_file(&copy).unwrap();
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    /// A copy that has changed since the search is not taken, and the refusal
+    /// is on the record.
+    ///
+    /// Cleanup keeps its list of duplicates across restarts, so the copy a
+    /// person removes may have been edited since. Quarantine deletes for good
+    /// after thirty days, so taking it would have been a slow way of losing
+    /// the only copy of what it now holds.
+    #[test]
+    fn a_copy_that_is_no_longer_the_same_as_the_one_kept_is_refused_and_recorded() {
+        let context = context(Mode::Service);
+        let (profile, user, path, keep) =
+            a_profile_with_two_copies("changed", &[1_u8; 2048], &[2_u8; 2048]);
+
+        let response = handle(
+            Request::QuarantineCopy {
+                path: path.clone(),
+                reason: "a redundant copy".to_owned(),
+                chosen: false,
+                keep,
+            },
+            &context,
+            &Reporter::silent(),
+            &user,
+        );
+        let Response::Error { message } = &response else {
+            let _ = std::fs::remove_dir_all(&profile);
+            panic!("a copy that is no longer a twin was taken: {response:?}");
+        };
+        assert!(message.contains("no longer the same as"), "{message}");
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "the copy was moved although it was refused"
+        );
+        let refused = context
+            .store
+            .recent_audit(10)
+            .unwrap()
+            .into_iter()
+            .any(|entry| entry.action == "take_copy" && entry.effect == Effect::Refused);
+        assert!(refused, "the refusal was not recorded");
+        let _ = std::fs::remove_dir_all(&profile);
     }
 
     /// The cache survey answers, and the reply survives the wire.

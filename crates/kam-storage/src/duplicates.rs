@@ -779,6 +779,113 @@ pub fn check_removable(
     check_within(path, user, intent, &Limits::for_caller(user))
 }
 
+/// Whether `remove` is still byte for byte the same as `keep`, a different
+/// file that will stay where it is.
+///
+/// # Why a copy is compared again before it goes
+///
+/// A list of duplicates is true of the moment the search read the drive, and
+/// Cleanup now keeps that list across restarts. A file in it can have been
+/// edited, replaced or deleted since, and then the copy offered for removal is
+/// no longer a spare: it may hold the only copy of what it now contains. It
+/// goes to quarantine, but quarantine deletes for good after thirty days, so a
+/// stale list could end in a real loss nobody chose.
+///
+/// So the copy is compared with the one being kept, in full, at the moment of
+/// removal: both still there, both plain files, not one file reached by two
+/// names, the same length and the same contents. Anything else is refused in a
+/// sentence that says to search again. It is a second read of two large files,
+/// and the price is worth it on the one action this page cannot take back by
+/// itself.
+///
+/// `keep` is held to the limits a chosen copy is held to (no other account's
+/// profile, nothing in this product's own store), because comparing is reading
+/// it, and in the agent that reading is done as LocalSystem.
+pub fn check_still_twins(
+    remove: &str,
+    keep: &str,
+    user: &UserContext,
+) -> std::result::Result<(), String> {
+    still_twins_within(remove, keep, &Limits::for_caller(user))
+}
+
+/// [`check_still_twins`] against limits given rather than read from the
+/// machine, as for [`check_within`].
+fn still_twins_within(
+    remove: &str,
+    keep: &str,
+    limits: &Limits,
+) -> std::result::Result<(), String> {
+    let search_again = "Search again to see the copies as they are now.";
+    if keep.trim().is_empty() {
+        return Err(format!(
+            "{remove} was not removed: no copy to keep was named, so whether another copy of \
+             it would remain could not be checked."
+        ));
+    }
+    let real = |path: &str| {
+        crate::paths::resolved_plain(path).ok_or_else(|| {
+            format!("{remove} was not removed: {path} is not there now. {search_again}")
+        })
+    };
+    let remove_real = real(remove)?;
+    let keep_real = real(keep)?;
+    if let Some(refusal) = limits.refusal(&crate::paths::plain(&keep_real), keep, &keep_real) {
+        return Err(format!(
+            "{remove} was not removed, because the copy to keep could not be compared with it. {}",
+            refusal.replace(
+                "move another account's files",
+                "read another account's files"
+            )
+        ));
+    }
+    if remove_real.eq_ignore_ascii_case(&keep_real) {
+        return Err(format!(
+            "{remove} was not removed: it and the copy to keep are the same file, so removing \
+             it would leave no copy behind."
+        ));
+    }
+
+    let length = |path: &str| -> std::result::Result<u64, String> {
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                format!("{remove} was not removed: {path} is not there now. {search_again}")
+            } else {
+                format!(
+                    "{remove} was not removed: {path} could not be read ({error}). {search_again}"
+                )
+            }
+        })?;
+        if metadata.is_file() {
+            Ok(metadata.len())
+        } else {
+            Err(format!(
+                "{remove} was not removed: {path} is not a file now. {search_again}"
+            ))
+        }
+    };
+    if length(remove)? != length(keep)? {
+        return Err(format!(
+            "{remove} was not removed: it is no longer the same size as {keep}, so it may hold \
+             something that is in no other copy. {search_again}"
+        ));
+    }
+    let contents = |path: &str| {
+        full_hash(path).ok_or_else(|| {
+            format!(
+                "{remove} was not removed: {path} could not be read to compare it. {search_again}"
+            )
+        })
+    };
+    if contents(remove)? != contents(keep)? {
+        return Err(format!(
+            "{remove} was not removed: it is no longer the same as {keep}, so it may hold \
+             something that is in no other copy. {search_again}"
+        ));
+    }
+    Ok(())
+}
+
 /// [`check_removable`] against limits given rather than read from the machine,
 /// so the store limit can be tested on a store that is not the real one.
 fn check_within(
@@ -1445,6 +1552,96 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         // And once it is gone there is nothing to remove.
         assert!(check_removable(&path, &user, Intent::Suggested).is_err());
+    }
+
+    /// A copy is removed only while it is still the same as the one kept.
+    ///
+    /// Cleanup keeps a list of duplicates across restarts, so the list a
+    /// person acts on can be days old. Each way a pair can stop being twins
+    /// in between is refused, and only a true pair goes.
+    #[test]
+    fn a_copy_goes_only_while_it_is_still_the_same_as_the_one_kept() {
+        let scratch = std::env::temp_dir().join(format!("kam-dup-twins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let path = |name: &str| scratch.join(name).to_string_lossy().into_owned();
+        let write =
+            |name: &str, contents: &[u8]| std::fs::write(scratch.join(name), contents).unwrap();
+        // Only the store is fenced here, so that the scratch folder, which is
+        // in whoever runs the tests' profile, is not taken for somebody else's.
+        let limits = only_the_store(r"c:\programdata\kam security");
+        let twins =
+            |remove: &str, keep: &str| still_twins_within(&path(remove), &path(keep), &limits);
+
+        write("keep.bin", b"the same twelve");
+        write("copy.bin", b"the same twelve");
+        assert_eq!(
+            twins("copy.bin", "keep.bin"),
+            Ok(()),
+            "a true pair was refused"
+        );
+
+        // Edited since the search, keeping its length.
+        write("edited.bin", b"the same twelvE");
+        let why = twins("edited.bin", "keep.bin").unwrap_err();
+        assert!(why.contains("no longer the same as"), "{why}");
+
+        // Grown since the search.
+        write("grown.bin", b"the same twelve, and more");
+        let why = twins("grown.bin", "keep.bin").unwrap_err();
+        assert!(why.contains("no longer the same size"), "{why}");
+
+        // The copy to keep has gone since the search.
+        let why = twins("copy.bin", "gone.bin").unwrap_err();
+        assert!(why.contains("is not there now"), "{why}");
+
+        // One file named twice is not two copies.
+        let why = twins("copy.bin", "copy.bin").unwrap_err();
+        assert!(why.contains("same file"), "{why}");
+
+        // No copy to keep named at all.
+        let why = still_twins_within(&path("copy.bin"), " ", &limits).unwrap_err();
+        assert!(why.contains("no copy to keep was named"), "{why}");
+
+        // Nothing here moved anything.
+        for name in ["keep.bin", "copy.bin", "edited.bin", "grown.bin"] {
+            assert!(scratch.join(name).exists(), "{name} went");
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Comparing is reading, and the copy to keep is read as LocalSystem in
+    /// the agent, so it is held to the same limits as a chosen copy.
+    #[test]
+    fn the_copy_to_keep_is_not_read_inside_another_accounts_profile_or_the_store() {
+        let scratch =
+            std::env::temp_dir().join(format!("kam-dup-twin-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("keep.bin"), b"same").unwrap();
+        std::fs::write(scratch.join("copy.bin"), b"same").unwrap();
+        let store = crate::paths::resolved_plain(&scratch.to_string_lossy()).unwrap();
+
+        let why = still_twins_within(
+            &scratch.join("copy.bin").to_string_lossy(),
+            &scratch.join("keep.bin").to_string_lossy(),
+            &only_the_store(&store),
+        )
+        .unwrap_err();
+        assert!(why.contains("own store"), "{why}");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Limits that fence only this product's store, for tests whose scratch
+    /// folders sit in the profile of whoever runs them.
+    fn only_the_store(store: &str) -> Limits {
+        Limits {
+            sid: None,
+            own: Vec::new(),
+            containers: Vec::new(),
+            others: Vec::new(),
+            store: vec![store.to_owned()],
+        }
     }
 
     /// Limits written out by hand, so the rule itself can be read in one place.

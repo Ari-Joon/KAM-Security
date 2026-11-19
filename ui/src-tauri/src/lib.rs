@@ -356,6 +356,25 @@ async fn read_comparison(id: i64) -> Result<kam_core::changes::Kept, String> {
     .await
 }
 
+/// Whether one copy of a duplicated file is still byte for byte the same as
+/// the copy being kept, asked before it is sent to the Recycle Bin.
+///
+/// The list it was chosen from may be days old (Cleanup keeps it), and a copy
+/// edited since is no longer a spare. Asked here, as the person, because it is
+/// the window that recycles, with the same rule the agent applies before it
+/// quarantines one.
+#[tauri::command]
+async fn check_still_twins(remove: String, keep: String) -> Result<(), String> {
+    off_the_window(move || {
+        kam_storage::duplicates::check_still_twins(
+            &remove,
+            &keep,
+            &kam_core::UserContext::current(),
+        )
+    })
+    .await
+}
+
 /// Send one thing to the Recycle Bin.
 ///
 /// Done here rather than through the agent, and that is the point rather than a
@@ -597,12 +616,18 @@ async fn clear_cache(id: String) -> Result<kam_storage::Cleared, String> {
 /// being wrong about a duplicate costs data, so being wrong here costs a press
 /// of "put back" instead.
 #[tauri::command]
-async fn quarantine_copy(path: String, reason: String, chosen: bool) -> Result<Manifest, String> {
+async fn quarantine_copy(
+    path: String,
+    keep: String,
+    reason: String,
+    chosen: bool,
+) -> Result<Manifest, String> {
     off_the_window(move || {
         match kam_ipc::client::call(&Request::QuarantineCopy {
             path,
             reason,
             chosen,
+            keep,
         })
         .map_err(|error| error.to_string())?
         {
@@ -1609,6 +1634,7 @@ pub fn run() {
             list_moves,
             quarantine_path,
             quarantine_copy,
+            check_still_twins,
             survey_caches,
             clear_cache,
             schedule,
