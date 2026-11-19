@@ -690,6 +690,10 @@ pub struct StorageReport {
     pub orphan_summary: crate::orphans::OrphanSummary,
     pub downloads: Vec<crate::provenance::Download>,
     pub download_summary: crate::provenance::DownloadSummary,
+    /// Large files in the caller's own folders with no date from the last
+    /// year, largest first. See [`crate::old_files`].
+    pub old_files: Vec<crate::old_files::OldFile>,
+    pub old_file_summary: crate::old_files::OldFileSummary,
     pub timings: Timings,
 }
 
@@ -820,6 +824,9 @@ pub fn survey(drive_letter: char, now_unix: u64, user: &UserContext) -> Result<S
     let (downloads, download_summary) = crate::provenance::find(&index, &root, now_unix);
     timings.downloads = step.elapsed().as_millis() as u64;
 
+    // From the table alone: no file is opened to make this list.
+    let (old_files, old_file_summary) = crate::old_files::find(&index, &root, now_unix, user);
+
     timings.total = whole.elapsed().as_millis() as u64;
     Ok(StorageReport {
         apps,
@@ -828,6 +835,8 @@ pub fn survey(drive_letter: char, now_unix: u64, user: &UserContext) -> Result<S
         orphan_summary,
         downloads,
         download_summary,
+        old_files,
+        old_file_summary,
         timings,
     })
 }

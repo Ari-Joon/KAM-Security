@@ -147,6 +147,8 @@ async fn list_applications(drive: String) -> Result<ApplicationReport, String> {
                 orphan_summary,
                 downloads,
                 download_summary,
+                old_files,
+                old_file_summary,
                 timings,
             } => Ok(ApplicationReport {
                 apps,
@@ -155,6 +157,8 @@ async fn list_applications(drive: String) -> Result<ApplicationReport, String> {
                 orphan_summary,
                 downloads,
                 download_summary: *download_summary,
+                old_files,
+                old_file_summary: *old_file_summary,
                 timings: *timings,
             }),
             Response::Error { message } => Err(message),
@@ -173,6 +177,8 @@ struct ApplicationReport {
     orphan_summary: OrphanSummary,
     downloads: Vec<Download>,
     download_summary: DownloadSummary,
+    old_files: Vec<kam_storage::OldFile>,
+    old_file_summary: kam_storage::OldFileSummary,
     timings: kam_storage::apps::Timings,
 }
 

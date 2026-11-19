@@ -26,7 +26,8 @@ use kam_storage::apps::LocationKind;
 use kam_storage::remnants::Remnants as RemnantReport;
 use kam_storage::{
     AppFootprint, Cache, Cleared, Download, DownloadSummary, DuplicateGroup, DuplicateSummary,
-    FolderScan, FootprintSummary, OrganiseSummary, Orphan, OrphanSummary, Proposal, Scan, Volume,
+    FolderScan, FootprintSummary, OldFile, OldFileSummary, OrganiseSummary, Orphan, OrphanSummary,
+    Proposal, Scan, Volume,
 };
 use serde::{Deserialize, Serialize};
 
@@ -495,6 +496,10 @@ pub enum Response {
         /// widest answer there is, and every reply is as wide as the widest.
         /// The wire carries the same thing either way.
         download_summary: Box<DownloadSummary>,
+        /// Large files in the caller's own folders whose dates are all more
+        /// than a year old, largest first, and what the list leaves out.
+        old_files: Vec<OldFile>,
+        old_file_summary: Box<OldFileSummary>,
         /// How long each stage took. Shown, so "it feels slow" can become a
         /// number somebody can argue with.
         timings: Box<kam_storage::apps::Timings>,

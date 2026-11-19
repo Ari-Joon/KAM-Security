@@ -413,6 +413,23 @@ pub(crate) mod testing {
             record
         }
 
+        /// A file with all three of its dates given, each as a FILETIME, or
+        /// zero for a date Windows did not record.
+        pub(crate) fn file_dated(
+            &mut self,
+            path: &str,
+            bytes: u64,
+            created: u64,
+            modified: u64,
+            accessed: u64,
+        ) -> u32 {
+            let record = self.file(path, bytes, modified);
+            let entry = self.entries.get_mut(&record).unwrap();
+            entry.created = created;
+            entry.accessed = accessed;
+            record
+        }
+
         pub(crate) fn index(self) -> VolumeIndex {
             VolumeIndex::build(MftSnapshot {
                 drive: self.letter,

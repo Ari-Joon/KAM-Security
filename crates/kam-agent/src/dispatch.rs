@@ -292,18 +292,21 @@ pub fn handle(
                         std::mem::take(&mut report.downloads),
                         &mut report.download_summary,
                     );
+                    report.old_files = sendable_old_files(std::mem::take(&mut report.old_files));
                     context.audit(
                         "storage",
                         "survey",
                         Effect::Observed,
                         format!(
-                            "surveyed {letter}: {} applications using {}, {} leftover directories holding {}, {} downloads holding {}, in {} ms (table {}, index {}, applications {}, leftovers {}, downloads {})",
+                            "surveyed {letter}: {} applications using {}, {} leftover directories holding {}, {} downloads holding {}, {} large files with no date in the last year holding {}, in {} ms (table {}, index {}, applications {}, leftovers {}, downloads {})",
                             report.summary.applications,
                             human_bytes(report.summary.measured_bytes),
                             report.orphan_summary.found,
                             human_bytes(report.orphan_summary.total_bytes),
                             report.download_summary.found,
                             human_bytes(report.download_summary.total_bytes),
+                            report.old_file_summary.found,
+                            human_bytes(report.old_file_summary.total_bytes),
                             report.timings.total,
                             report.timings.read_table,
                             report.timings.build_index,
@@ -319,6 +322,8 @@ pub fn handle(
                         orphan_summary: report.orphan_summary,
                         downloads: report.downloads,
                         download_summary: Box::new(report.download_summary),
+                        old_files: report.old_files,
+                        old_file_summary: Box::new(report.old_file_summary),
                         timings: Box::new(report.timings),
                     }
                 }
@@ -1333,6 +1338,23 @@ fn sendable_downloads(
     downloads
 }
 
+/// How much of that same reply the list of large old files may take.
+///
+/// The list is two hundred rows at most, a few hundred bytes each, so this is
+/// never reached by ordinary paths. It is here because a path can be very
+/// long, and this list rides in the reply that already carries every
+/// application, leftover and download.
+const OLD_FILES_REPLY_BYTES: usize = kam_ipc::MAX_FRAME_BYTES / 8;
+
+/// The large old files a survey found, cut to what fits.
+///
+/// Nothing needs counting here. The summary already holds how many were found
+/// and what they hold in all, and the page works out what is not in the list
+/// from those and the list it was sent, whatever shortened it.
+fn sendable_old_files(files: Vec<kam_storage::OldFile>) -> Vec<kam_storage::OldFile> {
+    fitting(files, OLD_FILES_REPLY_BYTES).0
+}
+
 /// The one drive quarantine holds things from, when `searched` is another.
 ///
 /// The store moves an item in by renaming it, which only works within one
@@ -1951,6 +1973,8 @@ mod tests {
                 orphan_summary: kam_storage::orphans::summarise(&[]),
                 downloads,
                 download_summary: Box::new(download_summary),
+                old_files: Vec::new(),
+                old_file_summary: Box::new(no_old_files()),
                 timings: Box::default(),
             })
         };
@@ -1972,6 +1996,68 @@ mod tests {
 
         write_frame(&mut Vec::new(), &reply(downloads, bounded))
             .expect("the answer that is sent must fit in one frame");
+    }
+
+    fn no_old_files() -> kam_storage::OldFileSummary {
+        kam_storage::OldFileSummary {
+            found: 0,
+            total_bytes: 0,
+            access_times: kam_storage::provenance::AccessTimes::Recorded,
+            min_bytes: kam_storage::old_files::MIN_BYTES,
+            older_than_days: kam_storage::old_files::OLDER_THAN_DAYS,
+            left_out: Vec::new(),
+            undated: 0,
+            undated_bytes: 0,
+            unplaced: 0,
+        }
+    }
+
+    fn old_file(number: u64, folder: &str) -> kam_storage::OldFile {
+        kam_storage::OldFile {
+            path: format!(r"C:\Users\someone\Documents\{folder}\image-{number:04}.iso"),
+            name: format!("image-{number:04}.iso"),
+            bytes: 9_000_000_000 - number,
+            created: Some(1_600_000_000),
+            modified: Some(1_590_000_000),
+            accessed: Some(1_610_000_000),
+        }
+    }
+
+    /// The list of large old files is short and is sent whole, and it still
+    /// cannot take the rest of a survey's answer down with it.
+    ///
+    /// Two hundred ordinary rows are a small part of a reply. Two hundred
+    /// paths at the length Windows allows are not, and they share their reply
+    /// with every application, leftover and download.
+    #[test]
+    fn the_list_of_large_old_files_is_sent_whole_unless_its_paths_are_too_long_to_fit() {
+        let ordinary: Vec<kam_storage::OldFile> = (0..kam_storage::old_files::LISTED as u64)
+            .map(|number| old_file(number, "disk images"))
+            .collect();
+        assert_eq!(sendable_old_files(ordinary.clone()), ordinary);
+
+        let deep = "a-folder-with-a-long-name\\".repeat(1_200);
+        let long: Vec<kam_storage::OldFile> = (0..kam_storage::old_files::LISTED as u64)
+            .map(|number| old_file(number, &deep))
+            .collect();
+        let whole: usize = long
+            .iter()
+            .map(|file| serde_json::to_vec(file).unwrap().len())
+            .sum();
+        assert!(
+            whole > OLD_FILES_REPLY_BYTES,
+            "the test's list is not long enough to show anything"
+        );
+
+        let sent = sendable_old_files(long.clone());
+        assert!(!sent.is_empty() && sent.len() < long.len());
+        // Largest first, so it is the smallest that are not sent.
+        assert_eq!(sent[..], long[..sent.len()]);
+        let size: usize = sent
+            .iter()
+            .map(|file| serde_json::to_vec(file).unwrap().len() + 1)
+            .sum();
+        assert!(size <= OLD_FILES_REPLY_BYTES);
     }
 
     /// A duplicate search of another drive says quarantine cannot reach it.
