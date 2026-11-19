@@ -745,9 +745,12 @@ pub fn handle(
         }
 
         Request::SweepForChanges => {
-            let (seen, unreadable) = crate::baseline::collect();
+            let look = crate::baseline::collect();
             let readings = crate::baseline::readings();
-            match context.store.sweep_read_as(&seen, &unreadable, &readings) {
+            match context
+                .store
+                .compare(&look.seen, &look.unreadable, &readings, &look.parts)
+            {
                 Ok(sweep) => {
                     // Audited as an observation: somebody deliberately asked
                     // what had changed, and the answer is part of the history
@@ -760,7 +763,7 @@ pub fn handle(
                         "changes",
                         "sweep",
                         Effect::Observed,
-                        sweep_line(seen.len(), &sweep),
+                        sweep_line(look.seen.len(), &sweep),
                     );
                     Response::Changes(sweep)
                 }

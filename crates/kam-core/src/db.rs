@@ -299,7 +299,8 @@ CREATE TABLE watched_scopes (
 ///
 /// `compared_parts` is to a comparison what `watched_scopes` is to the
 /// watcher: the parts of what a sweep looks at that are looked at as a whole,
-/// one account's own startup places each, and that have been.
+/// one account's own startup places each, and that have been. See
+/// [`crate::changes::Part`].
 const SCHEMA_V9: &str = "
 ALTER TABLE changes ADD COLUMN sweep       INTEGER;
 ALTER TABLE changes ADD COLUMN first_seen  TEXT;
@@ -853,7 +854,28 @@ impl Store {
         unreadable: &[crate::changes::Unreadable],
         readings: &[crate::changes::Reading],
     ) -> Result<crate::changes::Sweep> {
-        use crate::changes::{rank, Change, Difference, Reading, FLAPS_BEFORE_RECURRING};
+        self.compare(seen, unreadable, readings, &[])
+    }
+
+    /// The same, told also which parts of the machine were looked at as a
+    /// whole: each signed-in account's own startup places.
+    ///
+    /// # The first look is per part, too
+    ///
+    /// A part that has not been looked at before is recorded as it is and not
+    /// compared, the way a kind met for the first time is: nothing under it is
+    /// reported as appeared, changed or gone this time, and its note comes
+    /// back in `afresh`. The machine beside it is compared as ever. See
+    /// [`crate::changes::Part`] for why, and for when a part counts as looked
+    /// at.
+    pub fn compare(
+        &self,
+        seen: &[crate::changes::Sighting],
+        unreadable: &[crate::changes::Unreadable],
+        readings: &[crate::changes::Reading],
+        parts: &[crate::changes::Part],
+    ) -> Result<crate::changes::Sweep> {
+        use crate::changes::{rank, Change, Difference, Part, Reading, FLAPS_BEFORE_RECURRING};
 
         let mut guard = self.lock()?;
         // Dropped without `commit` on any early return, which rolls back.
@@ -896,9 +918,47 @@ impl Store {
                     .is_none_or(|under| *under < reading.version)
             })
             .collect();
-        // Whether what this sweep makes of one kind is reported, or only
+        // The parts being recorded without comparing, this sweep only. A part
+        // not on record that the store already holds something under was
+        // looked at by a sweep from before parts were kept, so it is compared.
+        let on_record: std::collections::HashSet<String> = {
+            let mut stored = connection
+                .prepare("SELECT part FROM compared_parts")
+                .map_err(to_db_error)?;
+            let rows = stored
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(to_db_error)?
+                .map(|row| row.map(|part| part.to_lowercase()))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(to_db_error)?;
+            rows
+        };
+        let held: Vec<(String, String)> = {
+            let mut stored = connection
+                .prepare("SELECT kind, scope FROM sightings WHERE present = 1")
+                .map_err(to_db_error)?;
+            let rows = stored
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(to_db_error)?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(to_db_error)?;
+            rows
+        };
+        let new_parts: Vec<&Part> = parts
+            .iter()
+            .filter(|part| {
+                !on_record.contains(&part.name.to_lowercase())
+                    && !held.iter().any(|(kind, scope)| part.holds(kind, scope))
+            })
+            .collect();
+
+        // Whether what this sweep makes of one thing is reported, or only
         // written down.
-        let compared = |kind: &str| !baseline && !afresh.iter().any(|reading| reading.kind == kind);
+        let compared = |kind: &str, scope: &str| {
+            !baseline
+                && !afresh.iter().any(|reading| reading.kind == kind)
+                && !new_parts.iter().any(|part| part.holds(kind, scope))
+        };
 
         // Whether this sweep genuinely looked where this thing lives.
         //
@@ -949,7 +1009,7 @@ impl Store {
                             ],
                         )
                         .map_err(to_db_error)?;
-                    if compared(&sighting.kind) {
+                    if compared(&sighting.kind, &sighting.scope) {
                         differences.push(Difference {
                             at: now.clone(),
                             change: Change::Appeared,
@@ -1016,7 +1076,7 @@ impl Store {
                         )
                         .map_err(to_db_error)?;
 
-                    if !compared(&sighting.kind) {
+                    if !compared(&sighting.kind, &sighting.scope) {
                         continue;
                     }
                     // A trust that was recorded and has since changed. An
@@ -1131,7 +1191,7 @@ impl Store {
                 )
                 .map_err(to_db_error)?;
 
-            if compared(&kind) {
+            if compared(&kind, &scope) {
                 differences.push(Difference {
                     at: now.clone(),
                     change: if flaps >= FLAPS_BEFORE_RECURRING {
@@ -1183,6 +1243,24 @@ impl Store {
                      ON CONFLICT(kind) DO UPDATE
                         SET version = MAX(version, excluded.version)",
                     params![reading.kind, reading.version],
+                )
+                .map_err(to_db_error)?;
+        }
+        // And each part that was looked at, so that the next sweep compares
+        // it. One whose places could not be read was not looked at, and its
+        // first look is still to come.
+        for part in parts {
+            if part.unread(unreadable) {
+                continue;
+            }
+            let first = new_parts.iter().any(|new| new.name == part.name);
+            if first && !baseline && !part.note.is_empty() {
+                afresh_said.push(part.note.clone());
+            }
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO compared_parts (part, looked_at) VALUES (?1, ?2)",
+                    params![part.name, now],
                 )
                 .map_err(to_db_error)?;
         }
@@ -3091,6 +3169,201 @@ mod tests {
             "a kind that was read was said to be unreadable"
         );
         assert_eq!(sweep.afresh, vec!["service was not compared".to_owned()]);
+    }
+
+    const HER_RUN_KEY: &str =
+        r"hkey_users\s-1-5-21-1-2-3-1001\software\microsoft\windows\currentversion\run";
+
+    /// Her account's own startup places, as a part of what is compared.
+    fn hers() -> crate::changes::Part {
+        crate::changes::Part::new(
+            "startup of S-1-5-21-1-2-3-1001",
+            &["run_key", "run_once_key", "startup_item"],
+            &[
+                r"HKEY_USERS\S-1-5-21-1-2-3-1001\".to_owned(),
+                r"C:\Users\her\".to_owned(),
+            ],
+            "her account was looked at for the first time",
+        )
+    }
+
+    fn reported(sweep: &crate::changes::Sweep) -> Vec<(&str, crate::changes::Change)> {
+        sweep
+            .differences
+            .iter()
+            .map(|one| (one.name.as_str(), one.change))
+            .collect()
+    }
+
+    /// An account looked at for the first time is recorded, not reported as
+    /// having appeared, and the machine beside it is still compared.
+    ///
+    /// The comparison had no first look per account, so the first one to
+    /// include an account, new to the machine or only not signed in when the
+    /// baseline was taken, reported everything that starts itself under it
+    /// as having just appeared.
+    #[test]
+    fn an_account_looked_at_for_the_first_time_is_recorded_without_a_report() {
+        use crate::changes::Change;
+
+        let store = Store::open_in_memory().unwrap();
+        let how = [read_as("service", 1), read_as("run_key", 1)];
+        // The baseline, taken with nobody signed in.
+        store
+            .compare(&[seen("service", "One", "a")], &[], &how, &[])
+            .unwrap();
+
+        // She signs in. Her sign-in entry has been there for months, and the
+        // machine has gained a service since the baseline.
+        let shell = scoped("run_key", HER_RUN_KEY, "Shell", "kam-shell.exe");
+        let first = store
+            .compare(
+                &[
+                    seen("service", "One", "a"),
+                    seen("service", "Two", "b"),
+                    shell.clone(),
+                ],
+                &[],
+                &how,
+                &[hers()],
+            )
+            .unwrap();
+        assert_eq!(
+            reported(&first),
+            vec![("Two", Change::Appeared)],
+            "what was already in her account was reported as new"
+        );
+        assert_eq!(
+            first.afresh,
+            vec!["her account was looked at for the first time".to_owned()]
+        );
+
+        // From then on her account is compared like the machine.
+        let second = store
+            .compare(
+                &[
+                    seen("service", "One", "a"),
+                    seen("service", "Two", "b"),
+                    shell,
+                    scoped("run_key", HER_RUN_KEY, "Updater", "upd.exe"),
+                ],
+                &[],
+                &how,
+                &[hers()],
+            )
+            .unwrap();
+        assert_eq!(reported(&second), vec![("Updater", Change::Appeared)]);
+        assert!(second.afresh.is_empty(), "{:?}", second.afresh);
+    }
+
+    /// An account looked at and found with nothing in it has still been
+    /// looked at, so the first thing to turn up in it is an appearance.
+    #[test]
+    fn an_account_with_nothing_in_it_has_still_been_looked_at() {
+        use crate::changes::Change;
+
+        let store = Store::open_in_memory().unwrap();
+        let how = [read_as("service", 1), read_as("run_key", 1)];
+        let machine = seen("service", "One", "a");
+        store
+            .compare(std::slice::from_ref(&machine), &[], &how, &[])
+            .unwrap();
+        let empty = store
+            .compare(std::slice::from_ref(&machine), &[], &how, &[hers()])
+            .unwrap();
+        assert!(empty.differences.is_empty());
+        assert_eq!(empty.afresh.len(), 1, "{:?}", empty.afresh);
+
+        let planted = store
+            .compare(
+                &[machine, scoped("run_key", HER_RUN_KEY, "Planted", "x.exe")],
+                &[],
+                &how,
+                &[hers()],
+            )
+            .unwrap();
+        assert_eq!(reported(&planted), vec![("Planted", Change::Appeared)]);
+        assert!(planted.afresh.is_empty(), "{:?}", planted.afresh);
+    }
+
+    /// An account whose places could not be read was not looked at, so its
+    /// first look is the first sweep that can read it.
+    #[test]
+    fn an_account_that_could_not_be_read_keeps_its_first_look() {
+        let store = Store::open_in_memory().unwrap();
+        let how = [read_as("service", 1), read_as("run_key", 1)];
+        let machine = seen("service", "One", "a");
+        store
+            .compare(std::slice::from_ref(&machine), &[], &how, &[])
+            .unwrap();
+
+        let signed_out = [crate::changes::Unreadable::covering(
+            &["run_key", "run_once_key", "startup_item"],
+            &[
+                r"HKEY_USERS\S-1-5-21-1-2-3-1001".to_owned(),
+                r"C:\Users\her\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+                    .to_owned(),
+            ],
+            "an account signed out while it was being read",
+        )];
+        let unread = store
+            .compare(std::slice::from_ref(&machine), &signed_out, &how, &[hers()])
+            .unwrap();
+        assert!(unread.afresh.is_empty(), "{:?}", unread.afresh);
+
+        let read = store
+            .compare(
+                &[
+                    machine,
+                    scoped("run_key", HER_RUN_KEY, "Shell", "kam-shell.exe"),
+                ],
+                &[],
+                &how,
+                &[hers()],
+            )
+            .unwrap();
+        assert!(
+            read.differences.is_empty(),
+            "an account that could not be read before was compared against nothing: {:?}",
+            read.differences
+        );
+        assert_eq!(read.afresh.len(), 1, "{:?}", read.afresh);
+    }
+
+    /// A store that held an account's entries before accounts were kept on
+    /// record compares that account after the update, rather than giving it a
+    /// first look that would pass over whatever changed in it meanwhile.
+    #[test]
+    fn an_account_the_store_already_held_is_compared_after_the_update() {
+        use crate::changes::Change;
+
+        let store = Store::open_in_memory().unwrap();
+        let how = [read_as("service", 1), read_as("run_key", 1)];
+        let shell = scoped("run_key", HER_RUN_KEY, "Shell", "kam-shell.exe");
+        // Swept by a version that kept no record of parts.
+        store
+            .compare(
+                &[seen("service", "One", "a"), shell.clone()],
+                &[],
+                &how,
+                &[],
+            )
+            .unwrap();
+
+        let after = store
+            .compare(
+                &[
+                    seen("service", "One", "a"),
+                    shell,
+                    scoped("run_key", HER_RUN_KEY, "Updater", "upd.exe"),
+                ],
+                &[],
+                &how,
+                &[hers()],
+            )
+            .unwrap();
+        assert_eq!(reported(&after), vec![("Updater", Change::Appeared)]);
+        assert!(after.afresh.is_empty(), "{:?}", after.afresh);
     }
 
     /// The number a kind was recorded under only goes up. A sweep that names a

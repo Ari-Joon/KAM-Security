@@ -40,7 +40,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use kam_core::changes::{Reading, Sighting, Unreadable};
+use kam_core::changes::{Part, Reading, Sighting, Unreadable};
 use kam_scanner::persistence::{self, Anchor, Entry};
 
 /// The name a sighting is filed under for each kind of thing.
@@ -120,13 +120,24 @@ fn sighting_of(entry: &Entry, trust: &mut HashMap<PathBuf, String>) -> Sighting 
     }
 }
 
+/// What one look at the machine found, ready to be compared with last time.
+pub struct Look {
+    pub seen: Vec<Sighting>,
+    /// The sources that could not be read. Not an afterthought: `kam-core`'s
+    /// diff refuses to conclude anything about a source it was told failed,
+    /// so getting this wrong in the optimistic direction is how a panel
+    /// starts inventing alarms.
+    pub unreadable: Vec<Unreadable>,
+    /// Each account that was looked at, as a part with a first look of its
+    /// own. See [`Part`].
+    pub parts: Vec<Part>,
+}
+
 /// Everything on this machine worth comparing with last time.
 ///
-/// Returns the sightings and, separately, the sources that could not be read.
-/// The second is not an afterthought: `kam-core`'s diff refuses to conclude
-/// anything about a source it was told failed, so getting this wrong in the
-/// optimistic direction is how a panel starts inventing alarms.
-pub fn collect() -> (Vec<Sighting>, Vec<Unreadable>) {
+/// The machine, and every account signed in at the time, whoever is asking:
+/// nothing here depends on the caller.
+pub fn collect() -> Look {
     // A known blind spot, named here rather than left to be discovered.
     //
     // `signed_in_users` enumerates the subkeys of `HKEY_USERS`, and a profile
@@ -197,7 +208,33 @@ pub fn collect() -> (Vec<Sighting>, Vec<Unreadable>) {
         ));
     }
 
-    (sightings, unreadable)
+    Look {
+        seen: sightings,
+        unreadable,
+        parts: users.iter().map(part_of).collect(),
+    }
+}
+
+/// One account's own startup places, as a part of what is compared.
+///
+/// Named by SID, as the watcher names the same part of its record. Its places
+/// are the prefixes its entries are filed under, its hive and its profile
+/// folder, the same two a gap for an account nobody is signed in as names.
+fn part_of(user: &kam_core::UserContext) -> Part {
+    let (name, hive) = match user.sid() {
+        Some(sid) => (sid.to_owned(), format!("HKEY_USERS\\{sid}\\")),
+        None => (user.profile().to_lowercase(), "HKCU\\".to_owned()),
+    };
+    Part::new(
+        format!("startup of {name}"),
+        &per_account_kinds(),
+        &[hive, format!("{}\\", user.profile())],
+        format!(
+            "The account at {} had not been looked at before, so what starts itself under it \
+             was recorded as it is this time and not compared with anything.",
+            user.profile()
+        ),
+    )
 }
 
 /// How each kind this module files anything under is read, for the store to
@@ -518,7 +555,11 @@ mod tests {
 
     #[test]
     fn this_machine_has_a_baseline_worth_comparing() {
-        let (sightings, unreadable) = collect();
+        let Look {
+            seen: sightings,
+            unreadable,
+            ..
+        } = collect();
 
         assert!(
             !sightings.is_empty(),
@@ -638,7 +679,7 @@ mod tests {
     #[test]
     fn accounts_that_were_not_examined_are_named() {
         let examined = persistence::signed_in_users();
-        let (_, unreadable) = collect();
+        let unreadable = collect().unreadable;
 
         match profiles_not_examined(&examined) {
             Some(note) => {
@@ -676,6 +717,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An account is a part that holds its own entries, as the reader really
+    /// files them, and nothing of the machine's or anybody else's.
+    ///
+    /// The part and the sightings are spelled in two places, and the first
+    /// look per account is only as good as their agreeing: a part that held
+    /// nothing would leave the account's first look to report everything in
+    /// it as new, and one that held the machine's entries would pass over
+    /// whatever changed in those.
+    #[test]
+    fn an_account_is_a_part_holding_its_own_entries_and_nothing_else() {
+        let mine = kam_core::UserContext::current();
+        let part = part_of(&mine);
+        let own = persistence::survey_of_account(&mine).expect("the account running the tests");
+        let mut trust = HashMap::new();
+        for entry in &own.entries {
+            let sighting = sighting_of(entry, &mut trust);
+            assert!(
+                part.holds(&sighting.kind, &sighting.scope),
+                "the account's own entry is not in its part: {sighting:?}"
+            );
+        }
+        for entry in &persistence::survey_of_machine().entries {
+            let sighting = sighting_of(entry, &mut trust);
+            assert!(
+                !part.holds(&sighting.kind, &sighting.scope),
+                "one of the machine's entries is in an account's part: {sighting:?}"
+            );
+        }
+
+        let hers = part_of(&kam_core::UserContext::new(
+            Some("S-1-5-21-1-2-3-1001".to_owned()),
+            r"C:\Users\her",
+        ));
+        let run = r"hkey_users\s-1-5-21-1-2-3-1001\software\microsoft\windows\currentversion\run";
+        assert!(hers.holds("run_key", run));
+        assert!(hers.holds(
+            "startup_item",
+            r"c:\users\her\appdata\roaming\microsoft\windows\start menu\programs\startup"
+        ));
+        assert!(!hers.holds(
+            "startup_item",
+            r"c:\users\herself\appdata\roaming\microsoft\windows\start menu\programs\startup"
+        ));
+        assert!(!hers.holds("service", run), "a service is the machine's");
+        assert!(hers.note.ends_with('.'), "{}", hers.note);
     }
 
     /// Administrators are read, or the failure is reported as a failure.

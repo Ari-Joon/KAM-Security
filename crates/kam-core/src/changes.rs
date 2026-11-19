@@ -215,6 +215,76 @@ impl Reading {
     }
 }
 
+/// One part of what a sweep looks at that is looked at as a whole, and either
+/// has been looked at before or has not: the startup places of one account.
+///
+/// # Why a part has a first look of its own
+///
+/// A kind's first look is decided by its [`Reading`], once for the whole
+/// store. An account is not a kind. Its startup entries are of the same kinds
+/// as the machine's, and they can only be read while somebody is signed in as
+/// it. So the first comparison to include an account, one new to the machine
+/// or one nobody had signed in as since the baseline was taken, met
+/// everything that starts itself under it for the first time and reported the
+/// lot as having appeared. The watcher had already learned not to do that
+/// (`watched_scopes`), and a comparison now follows the same rule: the first
+/// look at a part records what is there and reports nothing about it.
+///
+/// It costs what a kind's first look costs, once, for one account, and it is
+/// said the same way: `note` goes to the person with what was recorded
+/// afresh.
+///
+/// A part whose places could not be read at all has not been looked at, and
+/// keeps its first look. One read only in part is written down as looked at,
+/// as a kind is. A store already holding something under a part's places has
+/// looked at that part, by a sweep from before parts were kept, and compares
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Part {
+    /// What the store keeps it by, such as `startup of S-1-5-21-...`.
+    pub name: String,
+    /// The kinds of thing filed under it.
+    pub kinds: Vec<String>,
+    /// Where those live, as scope prefixes, in the spelling a gap uses.
+    pub scopes: Vec<String>,
+    /// What to tell the person on the one sweep that records it without
+    /// comparing it. A whole sentence.
+    pub note: String,
+}
+
+impl Part {
+    pub fn new(
+        name: impl Into<String>,
+        kinds: &[&str],
+        scopes: &[String],
+        note: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            kinds: kinds.iter().map(|kind| (*kind).to_owned()).collect(),
+            scopes: scopes.iter().map(|scope| as_place(scope)).collect(),
+            note: note.into(),
+        }
+    }
+
+    /// Whether one sighting lies in this part. A part that names no place
+    /// holds nothing.
+    pub fn holds(&self, kind: &str, scope: &str) -> bool {
+        self.kinds.iter().any(|held| held == kind)
+            && self.scopes.iter().any(|prefix| under(scope, prefix))
+    }
+
+    /// Whether a source that could not be read covers one of this part's
+    /// places whole, so that the part was not looked at.
+    pub fn unread(&self, unreadable: &[Unreadable]) -> bool {
+        unreadable.iter().any(|source| {
+            self.kinds
+                .iter()
+                .any(|kind| self.scopes.iter().any(|scope| source.covers(kind, scope)))
+        })
+    }
+}
+
 /// The kinds every sweep looked at before the store kept a number for each.
 ///
 /// A store from before then says nothing about which kinds it has recorded,
@@ -324,7 +394,8 @@ pub struct Sweep {
     /// whose whole claim is that it says what it did.
     pub unreadable: Vec<String>,
     /// What was recorded this time without being compared, each in a sentence
-    /// of its own: a kind in the words of its [`Reading`].
+    /// of its own: a kind in the words of its [`Reading`], an account in the
+    /// words of its [`Part`].
     ///
     /// These were said among the sources that could not be read, and the page
     /// showed them under that heading, but they were read perfectly well. What
