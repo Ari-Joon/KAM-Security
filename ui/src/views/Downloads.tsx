@@ -10,6 +10,7 @@ import type {
   DownloadsPage,
   Extraction,
   FileScan,
+  Inside,
   LooseFile,
   Member,
   PageRecord,
@@ -115,8 +116,88 @@ function Notes({ notes }: { notes: ThreatNote[] }) {
   );
 }
 
+/**
+ * "Defender found nothing" about an archive, said as what it is.
+ *
+ * Defender reports no threat in what it could not open, so that answer about
+ * a password-protected archive says nothing about what is in it, and it used
+ * to be shown in green with no word of that. A zip says for itself which of
+ * its files are locked, and the window reads that. For any other kind of
+ * archive, and for a zip that is no longer there to read, the row says what
+ * was and was not established. Green is kept for where nothing is known to
+ * have gone unread.
+ */
+function NothingFoundInArchive({
+  scan,
+  archive,
+  inside,
+}: {
+  scan: FileScan;
+  archive: "zip" | "other";
+  inside: Inside | null;
+}) {
+  const caveat = scan.caveat && <p className="small held-warn wrap">{scan.caveat}</p>;
+  if (inside?.state === "listed" && inside.locked > 0) {
+    const all = inside.locked === inside.files;
+    return (
+      <div className="dl-answer warn">
+        {all
+          ? inside.files === 1
+            ? "Defender could not look inside this archive: the file in it is password-protected"
+            : `Defender could not look inside this archive: all ${fmt.count(inside.files)} files in it are password-protected`
+          : `Defender could not look inside ${fmt.count(inside.locked)} of the ${fmt.count(inside.files)} files in this archive, because ${inside.locked === 1 ? "it is" : "they are"} password-protected`}
+        <p className="small muted wrap">
+          {all
+            ? "It reported nothing about the archive as a single file, which says nothing about what is in it."
+            : "It found nothing in the rest. That says nothing about what it could not open."}
+        </p>
+        {caveat}
+      </div>
+    );
+  }
+  if (inside?.state === "listed") {
+    return (
+      <div className="dl-answer ok">
+        Defender found nothing
+        <p className="small muted wrap">
+          None of the {fmt.count(inside.files)} {inside.files === 1 ? "file" : "files"} in it is
+          password-protected. Defender looks inside an archive only as far as its own limits on
+          size and depth, and does not say where it stopped.
+        </p>
+        {caveat}
+      </div>
+    );
+  }
+  return (
+    <div className="dl-answer">
+      Defender found nothing in this archive as a single file
+      <p className="small muted wrap">
+        {inside?.state === "unread"
+          ? `How much of it Defender could look inside is not known: its list of files was not read here (${inside.reason}).`
+          : archive === "zip"
+            ? "How much of it Defender could look inside is not known: the archive is not there to be read now."
+            : "Whether Defender could look inside it was not established: only a zip's list of files can be read here."}{" "}
+        Defender cannot look inside a password-protected archive, and stops at its own limits on
+        size and depth without saying so.
+      </p>
+      {caveat}
+    </div>
+  );
+}
+
 /** Defender's answer, as a short line and the caveat when there is one. */
-function Answer({ scan }: { scan: FileScan }) {
+function Answer({
+  scan,
+  archive = null,
+  inside = null,
+}: {
+  scan: FileScan;
+  archive?: "zip" | "other" | null;
+  inside?: Inside | null;
+}) {
+  if (scan.answer === "nothing_found" && archive) {
+    return <NothingFoundInArchive scan={scan} archive={archive} inside={inside} />;
+  }
   if (scan.answer === "nothing_found") {
     return (
       <div className="dl-answer ok">
@@ -169,7 +250,13 @@ export default function Downloads({ launches }: { launches: number }) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState<Running | null>(null);
-  const [said, setSaid] = useState<Record<string, string>>({});
+  const busy = running !== null;
+  /** What was last said about a file, by path, with the path as it was written. */
+  const [said, setSaid] = useState<Record<string, { path: string; text: string }>>({});
+  /** Raised to look for the next file asked about from Explorer. */
+  const [nudge, setNudge] = useState(0);
+  /** True while the next such file is being taken, so two are not taken at once. */
+  const taking = useRef(false);
   const [view, setView] = useState<DissectionView | null>(null);
   const [extraction, setExtraction] = useState<Extraction | null>(null);
   const [extracting, setExtracting] = useState(false);
@@ -199,7 +286,7 @@ export default function Downloads({ launches }: { launches: number }) {
   }, []);
 
   const say = (path: string, text: string) =>
-    setSaid((current) => ({ ...current, [path.toLowerCase()]: text }));
+    setSaid((current) => ({ ...current, [path.toLowerCase()]: { path, text } }));
 
   const check = useCallback(
     async (path: string) => {
@@ -367,20 +454,32 @@ export default function Downloads({ launches }: { launches: number }) {
       .catch(() => {});
   }, [stillOpen]);
 
-  // A file asked about from Explorer or a notification.
+  // Files asked about from Explorer or a notification, one at a time and in
+  // the order they were asked. With several files selected, Windows starts
+  // the program once for each: they used to overwrite one another, and all
+  // but one were dropped. The next is taken only when nothing is running,
+  // and an archive to take apart waits while another is open, so that none
+  // is opened, and its original quarantined, behind the one being read.
+  const archiveFree = view === null;
   useEffect(() => {
+    if (busy || taking.current) return;
+    taking.current = true;
     api
-      .takeLaunch()
+      .takeLaunch(archiveFree)
       .then((launch) => {
         if (!launch) return;
         setFocus(launch.path.toLowerCase());
         if (launch.action === "check") void check(launch.path);
-        if (launch.action === "extract") void dissect(launch.path);
+        else if (launch.action === "extract") void dissect(launch.path);
+        // Nothing to run for a notice that was clicked: look for the next.
+        else setNudge((count) => count + 1);
       })
-      .catch(() => {});
-  }, [launches, check, dissect]);
+      .catch(() => {})
+      .finally(() => {
+        taking.current = false;
+      });
+  }, [launches, busy, archiveFree, nudge, check, dissect]);
 
-  const busy = running !== null;
   const rows: Row[] = page
     ? [
         ...page.records.map(
@@ -392,6 +491,13 @@ export default function Downloads({ launches }: { launches: number }) {
   const failures = new Map(
     (page?.failures ?? []).map((failure) => [failure.path.toLowerCase(), failure.message]),
   );
+  // What was said about a file that has no row to say it on: one checked
+  // from Explorer that is not in Downloads and could not be checked, say.
+  // It used to be said nowhere at all.
+  const placed = new Set(
+    rows.map((row) => (row.kind === "record" ? row.record.path : row.file.path).toLowerCase()),
+  );
+  const unplaced = Object.values(said).filter((entry) => !placed.has(entry.path.toLowerCase()));
 
   return (
     <>
@@ -399,10 +505,11 @@ export default function Downloads({ launches }: { launches: number }) {
         <div>
           <h1>Active downloads</h1>
           <p className="lede">
-            Every file that lands in your Downloads folder is checked by
-            Microsoft Defender as it arrives. Defender decides what is flagged;
-            this page shows its answer, where the file came from, and what was
-            done about it. Nothing is moved or deleted unless you ask.
+            While KAM Security is running, each new file placed in your
+            Downloads folder is checked by Microsoft Defender as it arrives.
+            Defender decides what is flagged; this page shows its answer,
+            where the file came from, and what was done about it. Nothing is
+            moved or deleted unless you ask.
           </p>
         </div>
         <button onClick={() => void load()} disabled={loading}>
@@ -419,7 +526,14 @@ export default function Downloads({ launches }: { launches: number }) {
 
       {page && (
         <p className="small muted">
-          {page.watch.state === "watching" && <>Watching {page.watch.folder} for new files.</>}
+          {page.watch.state === "watching" && (
+            <>
+              Watching {page.watch.folder} for new files: those placed directly in it, not in
+              folders inside it. A name a browser gives a download still in progress (ending
+              .crdownload, .part, .partial, .download, .opdownload or .tmp) is left alone until
+              it is renamed.
+            </>
+          )}
           {page.watch.state === "starting" && <>Starting to watch your Downloads folder.</>}
           {page.watch.state === "not_watching" && (
             <span className="held-warn wrap">
@@ -498,16 +612,43 @@ export default function Downloads({ launches }: { launches: number }) {
         />
       )}
 
+      {page && page.waiting > 0 && (
+        <p className="small muted">
+          {fmt.count(page.waiting)} more {page.waiting === 1 ? "file" : "files"} asked about
+          from Explorer {page.waiting === 1 ? "is" : "are"} waiting{" "}
+          {view
+            ? "behind the archive that is open. Close it to go on to the next."
+            : "to be dealt with in turn."}
+        </p>
+      )}
+
+      {unplaced.length > 0 && (
+        <section className="panel">
+          <div className="panel-head">
+            <h2>Asked about, and not in the list below</h2>
+          </div>
+          <ul className="dl-done">
+            {unplaced.map((entry) => (
+              <li key={entry.path} className="small wrap">
+                <strong>{entry.path}</strong>: {entry.text}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <section className="panel">
         <div className="panel-head">
           <h2>Downloads</h2>
-          {page && (
+          {page && !page.history_error && (
             <span className="panel-count">
-              {fmt.count(page.records.length)} checked, {fmt.count(page.unchecked.length)} not
-              checked yet
+              {fmt.count(page.records.length)} {page.records.length === 1 ? "check" : "checks"}{" "}
+              shown, {fmt.count(page.unchecked.length)}{" "}
+              {page.unchecked.length === 1 ? "file" : "files"} here not checked
             </span>
           )}
         </div>
+        {!page && loading && <p className="empty">Reading…</p>}
         {page && rows.length === 0 && (
           <p className="empty">Nothing has arrived in Downloads since this was set up.</p>
         )}
@@ -524,7 +665,7 @@ export default function Downloads({ launches }: { launches: number }) {
               <RecordRow
                 key={`r-${row.record.path}-${row.record.sha256}`}
                 record={row.record}
-                said={said[row.record.path.toLowerCase()]}
+                said={said[row.record.path.toLowerCase()]?.text}
                 focused={focus === row.record.path.toLowerCase()}
                 busy={busy || moving !== null}
                 onCheck={() => void check(row.record.path)}
@@ -537,7 +678,7 @@ export default function Downloads({ launches }: { launches: number }) {
                 key={`l-${row.file.path}`}
                 file={row.file}
                 failure={failures.get(row.file.path.toLowerCase())}
-                said={said[row.file.path.toLowerCase()]}
+                said={said[row.file.path.toLowerCase()]?.text}
                 focused={focus === row.file.path.toLowerCase()}
                 progress={
                   auto && auto.path.toLowerCase() === row.file.path.toLowerCase()
@@ -656,11 +797,20 @@ function RecordRow({
           {originLabel(record)}
           {signer && <> · {signer}</>}
           {" · "}checked {fmt.timestamp(record.checked_at)}
-          {!record.present && <> · no longer where it was</>}
+          {!record.present &&
+            (record.replaced ? (
+              <> · the file at that name now is not the one that was checked</>
+            ) : (
+              <> · no longer where it was</>
+            ))}
         </div>
       )}
 
-      <Answer scan={record.scan} />
+      <Answer
+        scan={record.scan}
+        archive={record.archive}
+        inside={record.present ? record.inside : null}
+      />
       {(record.scan.answer === "flagged" || record.scan.answer === "gone_before_check") && (
         <Notes notes={record.scan.notes} />
       )}
@@ -707,6 +857,16 @@ function RecordRow({
 
       {said && <p className="small held-warn wrap">{said}</p>}
 
+      {record.present &&
+        record.archive === "zip" &&
+        record.scan.answer === "flagged" &&
+        !flaggedWhole &&
+        record.in_downloads && (
+          <p className="small muted">
+            Taking a flagged archive apart quarantines the original first. It can be put back
+            from this row afterwards, for thirty days.
+          </p>
+        )}
       {record.present && (
         <div className="dl-actions">
           <button className="ghost" onClick={onCheck} disabled={busy}>
@@ -717,9 +877,13 @@ function RecordRow({
               Extract what Defender did not flag
             </button>
           )}
-          <button className="ghost" onClick={onQuarantine} disabled={busy}>
-            Quarantine
-          </button>
+          {/* Only a file in Downloads can be quarantined from here. Anywhere
+              else the button could only ever be refused. */}
+          {record.in_downloads && (
+            <button className="ghost" onClick={onQuarantine} disabled={busy}>
+              Quarantine
+            </button>
+          )}
           <PathLink path={record.path} className="link-button">
             Show in Explorer
           </PathLink>

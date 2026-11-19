@@ -1109,7 +1109,21 @@ export type PageRecord = DownloadRecord & {
   archive: "zip" | "other" | null;
   /** The quarantine item it can be put back from, when it is being held. */
   held: string | null;
+  /** A file is at that path, and it is not the one this row is about. */
+  replaced: boolean;
+  /** In the Downloads folder, the only place a download is quarantined from. */
+  in_downloads: boolean;
+  /** For a zip Defender found nothing in: what its own list says. */
+  inside: Inside | null;
 };
+
+/**
+ * What a zip's own list of files says about how much of it Defender could
+ * look inside. Defender reports nothing about a file it could not open.
+ */
+export type Inside =
+  | { state: "listed"; files: number; locked: number }
+  | { state: "unread"; reason: string };
 
 export type LooseFile = {
   path: string;
@@ -1146,6 +1160,8 @@ export type DownloadsPage = {
   open: { token: string; archive: string } | null;
   /** Why it could not be told which quarantined downloads can be put back. */
   quarantine_error: string | null;
+  /** How many files asked about from Explorer are still waiting their turn. */
+  waiting: number;
   menu: MenuState;
   protection: boolean | null;
   notifications: string | null;

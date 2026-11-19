@@ -23,7 +23,7 @@
 //! list. [`extract`] writes out only what Defender found nothing in, when the
 //! person says so, and deletes the working copy.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -58,6 +58,10 @@ pub enum WatchStatus {
     NotWatching { reason: String },
 }
 
+/// A file's size and when it was last written: enough to tell that it is the
+/// file that was looked at before.
+type FileStamp = (u64, Option<SystemTime>);
+
 /// An archive taken apart and waiting for the person to decide.
 ///
 /// It holds the private copy, and letting it go deletes that copy. So an
@@ -80,9 +84,12 @@ pub struct Downloads {
     watch: Mutex<WatchStatus>,
     /// Why an automatic check of a file did not happen, by path.
     failures: Mutex<HashMap<String, String>>,
-    /// A file somebody asked about from outside the window, waiting for the
-    /// page to pick it up.
-    pending: Mutex<Option<Launch>>,
+    /// Files somebody asked about from outside the window, waiting for the
+    /// page to pick them up, in the order they were asked.
+    pending: Mutex<VecDeque<Launch>>,
+    /// What each zip's own list said, by path, with the size and time the
+    /// file had when it was read.
+    looks: Mutex<HashMap<String, (FileStamp, crate::archive::Inside)>>,
     /// The archive that is open, if one is. One at a time: taking another
     /// apart closes it, and so does closing the window.
     open: Mutex<Option<Arc<Session>>>,
@@ -99,7 +106,8 @@ impl Default for Downloads {
         Self {
             watch: Mutex::new(WatchStatus::Starting),
             failures: Mutex::new(HashMap::new()),
-            pending: Mutex::new(None),
+            pending: Mutex::new(VecDeque::new()),
+            looks: Mutex::new(HashMap::new()),
             open: Mutex::new(None),
             stopped: Mutex::new(HashSet::new()),
             board: Arc::new(Mutex::new(Board::default())),
@@ -200,24 +208,61 @@ impl Downloads {
             .or_else(|| kam_storage::downloads::is_placeholder(path).then_some(InFlight::Arriving))
     }
 
+    /// What a zip's own list says about how much of it Defender could look
+    /// inside, read once for each state of the file and remembered.
+    fn inside(&self, path: &str, metadata: &std::fs::Metadata) -> crate::archive::Inside {
+        let key = path.to_ascii_lowercase();
+        let stamp = (metadata.len(), metadata.modified().ok());
+        if let Ok(looks) = self.looks.lock() {
+            if let Some((seen, inside)) = looks.get(&key) {
+                if *seen == stamp {
+                    return inside.clone();
+                }
+            }
+        }
+        let inside = crate::archive::look_inside(Path::new(path));
+        if let Ok(mut looks) = self.looks.lock() {
+            looks.insert(key, (stamp, inside.clone()));
+        }
+        inside
+    }
+
     /// Remember a file somebody asked about from outside the window.
+    ///
+    /// Each one waits its turn. There was room for one, and each new request
+    /// replaced the last: with several files selected in Explorer, Windows
+    /// starts this program once for each, and all but one were dropped
+    /// without a word.
     pub fn set_launch(&self, launch: Launch) {
         if let Ok(mut pending) = self.pending.lock() {
-            *pending = Some(launch);
+            if !pending.contains(&launch) {
+                pending.push_back(launch);
+            }
         }
     }
 
-    /// The waiting request, once.
-    pub fn take_launch(&self) -> Option<Launch> {
-        self.pending
-            .lock()
-            .ok()
-            .and_then(|mut pending| pending.take())
+    /// The next waiting request, once.
+    ///
+    /// `archive_free` says whether the page can open an archive now. While
+    /// one is open, a request to take another apart stays where it is: only
+    /// one can be open, and replacing it would quarantine the next archive's
+    /// original while nobody was looking at it.
+    pub fn take_launch(&self, archive_free: bool) -> Option<Launch> {
+        let mut pending = self.pending.lock().ok()?;
+        if !archive_free && pending.front().is_some_and(|next| next.action == "extract") {
+            return None;
+        }
+        pending.pop_front()
+    }
+
+    /// How many requests are waiting.
+    pub fn launches_waiting(&self) -> usize {
+        self.pending.lock().map_or(0, |pending| pending.len())
     }
 
     /// Whether a request is waiting, without taking it.
     pub fn has_launch(&self) -> bool {
-        self.pending.lock().is_ok_and(|pending| pending.is_some())
+        self.launches_waiting() > 0
     }
 }
 
@@ -266,6 +311,15 @@ pub struct PageRecord {
     /// being a dead end: a file quarantined from here, or by taking it apart,
     /// can always be put back from its own row.
     held: Option<String>,
+    /// A file is at that path, and it is not the one this row is about.
+    replaced: bool,
+    /// Whether it is in the Downloads folder, which is the only place a
+    /// download can be quarantined from here. Elsewhere the button could
+    /// only ever be refused, so it is not offered.
+    in_downloads: bool,
+    /// For a zip Defender found nothing in: what its own list says about how
+    /// much of it Defender could look inside.
+    inside: Option<crate::archive::Inside>,
 }
 
 /// The archive that is open, for a page that has just been drawn again.
@@ -315,6 +369,8 @@ pub struct Page {
     open: Option<OpenArchive>,
     /// Why it could not be told which quarantined downloads can be put back.
     quarantine_error: Option<String>,
+    /// How many files asked about from Explorer are still waiting their turn.
+    waiting: usize,
     menu: MenuState,
     protection: Option<bool>,
     /// Why notices about new downloads will not be seen, when Windows says
@@ -385,8 +441,7 @@ pub fn page(state: &Downloads) -> Page {
                 && record.check.path.eq_ignore_ascii_case(&path)
         });
         let in_flight = state.in_flight(Path::new(&path));
-        if in_flight.is_none() && latest.is_some_and(|record| record.check.bytes == metadata.len())
-        {
+        if in_flight.is_none() && latest.is_some_and(|record| still_the_file(record, &metadata)) {
             continue;
         }
         unchecked.push(LooseFile {
@@ -422,17 +477,47 @@ pub fn page(state: &Downloads) -> Page {
         (Vec::new(), None)
     };
 
+    let downloads_folder = folder.as_ref().ok().cloned();
+    // Rows come newest first, so the first one seen for a path is the newest.
+    let mut newest: HashSet<String> = HashSet::new();
     let records = records
         .into_iter()
         .map(|record| {
+            let path = Path::new(&record.check.path);
+            let metadata = std::fs::metadata(path).ok().filter(|found| found.is_file());
+            // The row's buttons act on the file at its path, so they are only
+            // offered when that file is the one the row is about: the newest
+            // row for the path, with the size it was checked at, not written
+            // to since. A row counted as "still there" by its path alone, and
+            // an old row then offered to quarantine whatever had replaced it.
             // A file that went before it could be checked is not there,
             // whatever has since been saved under its name.
+            let is_newest = newest.insert(record.check.path.to_ascii_lowercase());
             let present = record.check.scan.answer != Answer::GoneBeforeCheck
-                && Path::new(&record.check.path).is_file();
+                && is_newest
+                && metadata
+                    .as_ref()
+                    .is_some_and(|found| still_the_file(&record, found));
+            let archive = archive_label(&record.check.name);
             PageRecord {
                 held: (!present).then(|| held_as(&record, &held)).flatten(),
+                replaced: !present && metadata.is_some(),
+                in_downloads: downloads_folder
+                    .as_deref()
+                    .is_some_and(|folder| kam_storage::downloads::lies_within(path, folder)),
+                // Only where the answer could be read as "nothing in it":
+                // which of a zip's files Defender could not look inside.
+                inside: (present
+                    && archive == Some("zip")
+                    && record.check.scan.answer == Answer::NothingFound)
+                    .then(|| {
+                        metadata
+                            .as_ref()
+                            .map(|found| state.inside(&record.check.path, found))
+                    })
+                    .flatten(),
                 present,
-                archive: archive_label(&record.check.name),
+                archive,
                 record,
             }
         })
@@ -475,10 +560,29 @@ pub fn page(state: &Downloads) -> Page {
         failures,
         open,
         quarantine_error,
+        waiting: state.launches_waiting(),
         menu: crate::context_menu::state(),
         protection,
         notifications: crate::notice::delivery_problem(),
     }
+}
+
+/// Whether the file at a row's path is still the file that row is about: the
+/// size it was checked at, and not written to since.
+///
+/// Size alone let an edit that kept the size pass for the file that was
+/// checked. A time of writing later than now says nothing, and is not taken
+/// to mean the file changed, or such a file could never read as checked.
+fn still_the_file(record: &DownloadRecord, metadata: &std::fs::Metadata) -> bool {
+    let written = metadata
+        .modified()
+        .ok()
+        .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|since| kam_core::clock::iso_from_unix_millis(since.as_millis() as u64));
+    let written_since = written.is_some_and(|written| {
+        written.as_str() > record.checked_at.as_str() && written <= kam_core::clock::now_utc_iso()
+    });
+    metadata.len() == record.check.bytes && !written_since
 }
 
 /// The quarantine item a download that is no longer where it was can be put
@@ -1225,7 +1329,23 @@ fn check_one(app: &AppHandle, sighting: &Sighting, job: &str) {
 
 /// Send the notification for a newly recorded download.
 fn announce(app: &AppHandle, record: &DownloadRecord) {
-    let (title, body) = crate::notice::sentence(&record.check.name, &record.check.scan);
+    // "Defender found nothing" about a zip it could not look inside is not
+    // what the notice should say, so the zip's own list is read first.
+    let path = Path::new(&record.check.path);
+    let inside = (record.check.scan.answer == Answer::NothingFound
+        && archive_kind(&record.check.name) == Some(ArchiveKind::Zip))
+    .then(|| std::fs::metadata(path).ok())
+    .flatten()
+    .map(|metadata| {
+        app.state::<Downloads>()
+            .inside(&record.check.path, &metadata)
+    });
+    let (title, body) = crate::notice::sentence(
+        &record.check.name,
+        &record.check.scan,
+        archive_kind(&record.check.name).is_some(),
+        inside.as_ref(),
+    );
     let clicked_app = app.clone();
     let path = record.check.path.clone();
     let shown = crate::notice::show(crate::notice::APP_ID, &title, &body, move || {
@@ -2063,6 +2183,78 @@ mod tests {
         assert!(
             said.contains("still where it was") && said.contains("it is in use"),
             "{said}"
+        );
+    }
+
+    /// With several files selected, Windows starts this program once for
+    /// each. There was room for one request, so each replaced the last and
+    /// all but one were dropped without a word.
+    #[test]
+    fn several_files_asked_about_from_explorer_each_wait_their_turn() {
+        let state = Downloads::default();
+        let asked = |action: &str, name: &str| Launch {
+            action: action.to_owned(),
+            path: format!(r"C:\Users\me\Downloads\{name}"),
+        };
+        state.set_launch(asked("check", "a.exe"));
+        state.set_launch(asked("extract", "b.zip"));
+        state.set_launch(asked("check", "c.exe"));
+        // The same request twice is one request.
+        state.set_launch(asked("check", "c.exe"));
+        assert_eq!(state.launches_waiting(), 3);
+        assert!(state.has_launch());
+
+        assert_eq!(state.take_launch(true), Some(asked("check", "a.exe")));
+        // An archive is open: the next one to take apart waits where it is.
+        assert_eq!(state.take_launch(false), None);
+        assert_eq!(state.launches_waiting(), 2);
+        assert_eq!(state.take_launch(true), Some(asked("extract", "b.zip")));
+        // A check does not need the archive to be closed.
+        assert_eq!(state.take_launch(false), Some(asked("check", "c.exe")));
+        assert_eq!(state.take_launch(true), None);
+        assert!(!state.has_launch());
+    }
+
+    /// A row's buttons act on the file at its path, so the file has to be
+    /// the one the row is about. It counted as "still there" by its path
+    /// alone, and as unchanged by its size alone.
+    #[test]
+    fn a_row_is_only_about_the_file_that_was_checked() {
+        let scratch = Scratch::new("same-file");
+        let file = scratch.0.join("Downloads").join("a.bin");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let metadata = std::fs::metadata(&file).unwrap();
+        let row = |bytes: u64, checked_at: &str| DownloadRecord {
+            check: kam_scanner::downloads::DownloadCheck {
+                path: file.to_string_lossy().into_owned(),
+                name: "a.bin".to_owned(),
+                bytes,
+                sha256: "ab".to_owned(),
+                arrived_at: None,
+                origin: None,
+                signature: None,
+                scan: kam_scanner::defender_file::parse_report(Some(0), ""),
+            },
+            checked_at: checked_at.to_owned(),
+            actions: Vec::new(),
+            dissection: None,
+            first_check: false,
+        };
+        let later = kam_core::clock::iso_from_unix_millis(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 60_000,
+        );
+        assert!(still_the_file(&row(10, &later), &metadata));
+        assert!(
+            !still_the_file(&row(11, &later), &metadata),
+            "another size is another file"
+        );
+        assert!(
+            !still_the_file(&row(10, "2000-01-01T00:00:00.000Z"), &metadata),
+            "written to since it was checked, at the same size"
         );
     }
 

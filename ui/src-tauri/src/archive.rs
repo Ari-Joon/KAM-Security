@@ -263,6 +263,100 @@ fn discard_leftovers_in(folder: &Path) {
     }
 }
 
+/// What a zip's own list of files says about how much of it Defender could
+/// look inside.
+///
+/// Defender cannot open a password-protected file, reports no threat in what
+/// it could not open, and so answers "nothing found" about an archive it
+/// never saw inside. That answer was shown in green with no caveat. The zip
+/// says for itself which of its files are locked, and this program can read
+/// that as the person, so the page and the notice say it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Inside {
+    /// The list was read: this many files, this many of them locked.
+    Listed { files: u64, locked: u64 },
+    /// The list was not read, for this reason, so how much of the archive
+    /// Defender could look inside is not known.
+    Unread { reason: String },
+}
+
+/// Most files an archive may list and still be looked through without
+/// anybody asking. This runs when a download lands and when the page is
+/// drawn, and reading a zip's list costs memory for every entry, so an
+/// archive built to list millions is not read here. Taking it apart, which
+/// somebody has to ask for, reads up to [`MAX_MEMBERS`].
+const MAX_LOOKED_THROUGH: usize = 20_000;
+
+/// How many files a zip says it lists, read from the record at its end
+/// without reading the list. `None` when there is no such record, or when it
+/// defers to the larger form, which only an archive of more than 65,534
+/// files (or over 4 GB) needs.
+fn declared_members(file: &mut File) -> Option<usize> {
+    use std::io::{Seek, SeekFrom};
+    // The record is 22 bytes and may be followed by a comment of up to 65,535.
+    const RECORD: usize = 22;
+    let length = file.seek(SeekFrom::End(0)).ok()?;
+    let tail = length.min((RECORD + usize::from(u16::MAX)) as u64);
+    file.seek(SeekFrom::Start(length - tail)).ok()?;
+    let mut bytes = vec![0_u8; tail as usize];
+    file.read_exact(&mut bytes).ok()?;
+    let at = bytes
+        .windows(4)
+        .rposition(|window| window == [0x50, 0x4b, 0x05, 0x06])?;
+    let record = bytes.get(at..at + RECORD)?;
+    let listed = u16::from_le_bytes([record[10], record[11]]);
+    (listed != u16::MAX).then_some(usize::from(listed))
+}
+
+/// Read a zip's own list and count the files Defender cannot look inside.
+pub fn look_inside(archive: &Path) -> Inside {
+    let unread = |reason: String| Inside::Unread { reason };
+    let mut file = match File::open(archive) {
+        Ok(file) => file,
+        Err(error) => return unread(format!("it could not be opened: {error}")),
+    };
+    match declared_members(&mut file) {
+        Some(listed) if listed <= MAX_LOOKED_THROUGH => {}
+        Some(listed) => {
+            return unread(format!(
+                "it lists {listed} files, more than are looked through without being asked"
+            ))
+        }
+        None => {
+            return unread(
+                "it is not a zip this can read the list of, or lists more files than are looked \
+                 through without being asked"
+                    .to_owned(),
+            )
+        }
+    }
+    let mut zip = match zip::ZipArchive::new(&file) {
+        Ok(zip) => zip,
+        Err(error) => return unread(format!("it could not be read as a zip archive ({error})")),
+    };
+    if zip.len() > MAX_LOOKED_THROUGH {
+        return unread(format!(
+            "it lists {} files, more than are looked through without being asked",
+            zip.len()
+        ));
+    }
+    let (mut files, mut locked) = (0_u64, 0_u64);
+    for index in 0..zip.len() {
+        match zip.by_index_raw(index) {
+            Ok(member) if member.is_dir() => {}
+            Ok(member) => {
+                files += 1;
+                locked += u64::from(member.encrypted());
+            }
+            Err(error) => {
+                return unread(format!("its list could not be read to the end ({error})"))
+            }
+        }
+    }
+    Inside::Listed { files, locked }
+}
+
 /// Every member of a zip, as the zip itself lists it.
 pub fn entries(archive: &File) -> Result<Vec<Entry>, String> {
     let mut zip = zip::ZipArchive::new(archive)
@@ -1020,6 +1114,87 @@ mod tests {
         )
         .unwrap();
         assert!(done.unmarked.is_empty());
+    }
+
+    /// Mark the first `count` members of a zip as password-protected, the way
+    /// the zip itself records it: one bit in each member's entry in the list
+    /// at the end. The contents are left as they are, which is harmless and
+    /// all that reading the list needs.
+    fn lock_members(zip_path: &Path, count: usize) {
+        let mut bytes = std::fs::read(zip_path).unwrap();
+        let entries: Vec<usize> = bytes
+            .windows(4)
+            .enumerate()
+            .filter(|(_, window)| *window == [0x50, 0x4b, 0x01, 0x02])
+            .map(|(at, _)| at)
+            .take(count)
+            .collect();
+        assert_eq!(
+            entries.len(),
+            count,
+            "the zip lists fewer members than that"
+        );
+        for at in entries {
+            bytes[at + 8] |= 1;
+        }
+        std::fs::write(zip_path, bytes).unwrap();
+    }
+
+    /// Defender reports nothing about an archive it could not open, and that
+    /// was shown as "Defender found nothing" in green. The zip says for
+    /// itself which of its files are locked, so that is read and said.
+    #[test]
+    fn the_files_defender_cannot_look_inside_are_counted_from_the_zips_own_list() {
+        let scratch = Scratch::new("locked");
+        let zip_path = scratch.downloads().join("a.zip");
+        hostile_zip(&zip_path);
+        assert_eq!(
+            look_inside(&zip_path),
+            Inside::Listed {
+                files: 6,
+                locked: 0
+            },
+            "the folder entry is not a file, and nothing is locked"
+        );
+
+        lock_members(&zip_path, 2);
+        assert_eq!(
+            look_inside(&zip_path),
+            Inside::Listed {
+                files: 6,
+                locked: 2
+            }
+        );
+        // Taking it apart reads the same thing, member by member.
+        let locked = entries(&opened(&zip_path))
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.encrypted)
+            .count();
+        assert_eq!(locked, 2);
+
+        // What could not be read is said, with why, and is never a count.
+        let fake = scratch.downloads().join("fake.zip");
+        std::fs::write(&fake, b"not a zip at all").unwrap();
+        assert!(matches!(look_inside(&fake), Inside::Unread { .. }));
+        assert!(matches!(
+            look_inside(&scratch.downloads().join("gone.zip")),
+            Inside::Unread { .. }
+        ));
+
+        // An archive that says it lists more than is looked through without
+        // being asked is not read at all: the record at its end is enough.
+        let mut vast = b"padding".to_vec();
+        vast.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0]);
+        vast.extend_from_slice(&30_000_u16.to_le_bytes());
+        vast.extend_from_slice(&30_000_u16.to_le_bytes());
+        vast.extend_from_slice(&[0; 10]);
+        let vast_path = scratch.downloads().join("vast.zip");
+        std::fs::write(&vast_path, vast).unwrap();
+        let Inside::Unread { reason } = look_inside(&vast_path) else {
+            panic!("an archive listing 30,000 files was read through");
+        };
+        assert!(reason.contains("30000 files"), "{reason}");
     }
 
     /// What a previous run left is cleared at start. What this run made is

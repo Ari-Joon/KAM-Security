@@ -1193,10 +1193,20 @@ async fn set_context_menu(enabled: bool) -> Result<context_menu::MenuState, Stri
     off_the_window(move || context_menu::set(enabled)).await
 }
 
-/// A file somebody asked about from outside the window, taken once.
+/// The next file somebody asked about from outside the window, taken once.
+/// `archive_free` is whether the page can open an archive now: a request to
+/// take one apart waits while another is open.
 #[tauri::command]
-async fn take_launch(app: tauri::AppHandle) -> Result<Option<context_menu::Launch>, String> {
-    off_the_window(move || Ok(app.state::<downloads::Downloads>().take_launch())).await
+async fn take_launch(
+    app: tauri::AppHandle,
+    archive_free: bool,
+) -> Result<Option<context_menu::Launch>, String> {
+    off_the_window(move || {
+        Ok(app
+            .state::<downloads::Downloads>()
+            .take_launch(archive_free))
+    })
+    .await
 }
 
 /// Whether such a request is waiting, so the window can open on Downloads.

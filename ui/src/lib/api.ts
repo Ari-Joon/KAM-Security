@@ -179,7 +179,12 @@ export const api = {
   extractClean: (token: string) => invoke<Extraction>("extract_clean", { token }),
   discardDissection: (token: string) => invoke<void>("discard_dissection", { token }),
   setContextMenu: (enabled: boolean) => invoke<MenuState>("set_context_menu", { enabled }),
-  takeLaunch: () => invoke<Launch | null>("take_launch"),
+  /**
+   * The next file asked about from Explorer or a notification, taken once.
+   * A request to take an archive apart waits while `archiveFree` is false.
+   */
+  takeLaunch: (archiveFree: boolean) =>
+    invoke<Launch | null>("take_launch", { archiveFree }),
   launchWaiting: () => invoke<boolean>("launch_waiting"),
 };
 

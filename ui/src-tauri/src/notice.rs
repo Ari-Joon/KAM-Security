@@ -295,12 +295,51 @@ pub fn delivery_problem() -> Option<String> {
     }
 }
 
+/// What "Defender found nothing" comes to for an archive, in a sentence.
+///
+/// Defender reports no threat in what it could not open, so that answer
+/// about a password-protected archive says nothing about what is in it, and
+/// was announced as if it did. For a zip, `inside` is what its own list
+/// says. For any other archive, and for a zip whose list could not be read,
+/// the notice says what the answer covers and no more.
+fn nothing_found(is_archive: bool, inside: Option<&crate::archive::Inside>) -> String {
+    use crate::archive::Inside;
+    match inside {
+        Some(Inside::Listed { files, locked }) if *locked > 0 && locked == files => format!(
+            "Defender could not look inside it: {} password-protected.",
+            if *files == 1 {
+                "the file in it is".to_owned()
+            } else {
+                format!("all {files} files in it are")
+            }
+        ),
+        Some(Inside::Listed { files, locked }) if *locked > 0 => format!(
+            "Defender found nothing in what it could open. It could not look inside {locked} of \
+             the {files} files in it, which {} password-protected.",
+            if *locked == 1 { "is" } else { "are" }
+        ),
+        Some(Inside::Listed { .. }) => "Defender found nothing.".to_owned(),
+        _ if is_archive => "Defender found nothing in what it could open. It cannot look inside \
+                            a password-protected archive."
+            .to_owned(),
+        _ => "Defender found nothing.".to_owned(),
+    }
+}
+
 /// The sentence a notification about a checked download says.
-pub fn sentence(name: &str, scan: &kam_scanner::defender_file::FileScan) -> (String, String) {
+///
+/// `is_archive` and `inside` only matter when Defender found nothing: see
+/// [`nothing_found`].
+pub fn sentence(
+    name: &str,
+    scan: &kam_scanner::defender_file::FileScan,
+    is_archive: bool,
+    inside: Option<&crate::archive::Inside>,
+) -> (String, String) {
     use kam_scanner::defender_file::Answer;
     let title = format!("New download: {name}");
     let body = match scan.answer {
-        Answer::NothingFound => "Defender found nothing.".to_owned(),
+        Answer::NothingFound => nothing_found(is_archive, inside),
         Answer::Flagged => format!(
             "{}. It is still in Downloads; open KAM Security to quarantine it.",
             scan.sentence()
@@ -341,23 +380,92 @@ mod tests {
     #[test]
     fn each_answer_reads_as_a_plain_sentence_and_never_as_clean_when_unfinished() {
         let clean = parse_report(Some(0), "");
-        assert_eq!(sentence("a.zip", &clean).1, "Defender found nothing.");
+        assert_eq!(
+            sentence("a.exe", &clean, false, None).1,
+            "Defender found nothing."
+        );
         let unfinished = parse_report(Some(2), "");
         assert_eq!(unfinished.answer, Answer::NotFinished);
-        let body = sentence("a.zip", &unfinished).1;
+        let body = sentence("a.zip", &unfinished, true, None).1;
         assert!(body.contains("not a clean result"), "{body}");
         assert!(!body.contains('—'), "no dashes in what the person reads");
 
         // A download that was gone before it could be checked is never
         // announced as one Defender found nothing in.
         let gone = kam_scanner::defender_file::FileScan::gone_before_check(Ok(Vec::new()));
-        let body = sentence("a.exe", &gone).1;
+        let body = sentence("a.exe", &gone, false, None).1;
         assert!(
             body.starts_with("It was gone before it could be checked.")
                 && body.contains("not known"),
             "{body}"
         );
         assert!(!body.contains("found nothing"), "{body}");
+    }
+
+    /// A password-protected archive was announced as "Defender found
+    /// nothing". Defender could not look inside it, which is not the same
+    /// thing, and the notice says which it was.
+    #[test]
+    fn an_archive_defender_could_not_look_inside_is_not_announced_as_nothing_found() {
+        use crate::archive::Inside;
+        let nothing = parse_report(Some(0), "");
+        let said = |is_archive: bool, inside: Option<Inside>| {
+            sentence("a.zip", &nothing, is_archive, inside.as_ref()).1
+        };
+
+        let all = said(
+            true,
+            Some(Inside::Listed {
+                files: 4,
+                locked: 4,
+            }),
+        );
+        assert_eq!(
+            all,
+            "Defender could not look inside it: all 4 files in it are password-protected."
+        );
+        assert!(!all.contains("found nothing"), "{all}");
+
+        let some = said(
+            true,
+            Some(Inside::Listed {
+                files: 12,
+                locked: 3,
+            }),
+        );
+        assert!(
+            some.starts_with("Defender found nothing in what it could open.")
+                && some.contains("3 of the 12 files in it, which are password-protected"),
+            "{some}"
+        );
+
+        // Nothing locked: Defender's answer as it gave it.
+        assert_eq!(
+            said(
+                true,
+                Some(Inside::Listed {
+                    files: 2,
+                    locked: 0
+                })
+            ),
+            "Defender found nothing."
+        );
+        // Another kind of archive, or a zip whose list could not be read:
+        // what the answer covers, and no more.
+        for unknown in [
+            None,
+            Some(Inside::Unread {
+                reason: "it could not be opened".to_owned(),
+            }),
+        ] {
+            let body = said(true, unknown);
+            assert!(
+                body.contains("in what it could open") && body.contains("password-protected"),
+                "{body}"
+            );
+        }
+        // And a plain file is not given an archive's caveat.
+        assert_eq!(said(false, None), "Defender found nothing.");
     }
 
     /// A shortcut is written with the identity and read back with it.
