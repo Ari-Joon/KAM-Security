@@ -1214,6 +1214,35 @@ async fn discard_dissection(app: tauri::AppHandle, token: String) -> Result<(), 
     .await
 }
 
+/// Check every file in Downloads that is not checked yet, one after another,
+/// as one job. Returns once it is under way: the page follows it from there,
+/// and it goes on if the page is left or the window is closed.
+#[tauri::command]
+async fn check_backlog(app: tauri::AppHandle) -> Result<(), String> {
+    off_the_window(move || downloads::check_backlog(&app)).await
+}
+
+/// Stop that job: it ends before its next file, and the check it has in hand
+/// is cancelled in the agent.
+#[tauri::command]
+async fn stop_backlog(app: tauri::AppHandle) -> Result<(), String> {
+    off_the_window(move || {
+        downloads::stop_backlog(&app.state::<downloads::Downloads>());
+        Ok(())
+    })
+    .await
+}
+
+/// Let go of what that job came to, once it has been read.
+#[tauri::command]
+async fn close_backlog(app: tauri::AppHandle) -> Result<(), String> {
+    off_the_window(move || {
+        app.state::<downloads::Downloads>().close_backlog();
+        Ok(())
+    })
+    .await
+}
+
 /// Add or remove the right-click entries.
 #[tauri::command]
 async fn set_context_menu(enabled: bool) -> Result<context_menu::MenuState, String> {
@@ -1437,6 +1466,9 @@ pub fn run() {
             open_dissection,
             extract_clean,
             discard_dissection,
+            check_backlog,
+            stop_backlog,
+            close_backlog,
             set_context_menu,
             take_launch,
             launch_waiting

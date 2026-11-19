@@ -22,10 +22,20 @@
 //! agent check the copy, and lines up Defender's answer with the archive's own
 //! list. [`extract`] writes out only what Defender found nothing in, when the
 //! person says so, and deletes the working copy.
+//!
+//! # Everything not checked yet, at one press
+//!
+//! Files that were in Downloads before this program first ran, or that
+//! arrived while it was closed, are listed as not checked and are only ever
+//! checked when somebody asks. [`check_backlog`] is one press for all of
+//! them: a thread of its own asks the agent about each in turn, exactly as
+//! "Check now" does, and keeps what came of it for the page to say. It lives
+//! here and not in the page so that leaving the page, or closing the window,
+//! does not lose it. See [`work_through`] for its rules.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -99,6 +109,9 @@ pub struct Downloads {
     /// Where each arriving file has got to. Shared with the watcher's
     /// threads, which write it.
     board: Arc<Mutex<Board>>,
+    /// The check of everything not checked yet: the one that is running, or
+    /// the last one, kept until the page has said what it came to.
+    backlog: Mutex<Option<Backlog>>,
 }
 
 impl Default for Downloads {
@@ -111,6 +124,7 @@ impl Default for Downloads {
             open: Mutex::new(None),
             stopped: Mutex::new(HashSet::new()),
             board: Arc::new(Mutex::new(Board::default())),
+            backlog: Mutex::new(None),
         }
     }
 }
@@ -194,6 +208,87 @@ impl Downloads {
     pub fn forget_failure(&self, path: &str) {
         if let Ok(mut failures) = self.failures.lock() {
             failures.retain(|noted, _| !noted.eq_ignore_ascii_case(path));
+        }
+    }
+
+    /// Say under a file why it was not checked, until a check of it happens.
+    fn note_failure(&self, path: &str, message: String) {
+        if let Ok(mut failures) = self.failures.lock() {
+            failures.insert(path.to_owned(), message);
+        }
+    }
+
+    /// The check of everything not checked yet, as it stands.
+    fn backlog(&self) -> Option<Backlog> {
+        self.backlog.lock().ok().and_then(|backlog| backlog.clone())
+    }
+
+    /// How far it has got, without what it has come to.
+    fn backlog_step(&self) -> Option<BacklogStep> {
+        let slot = self.backlog.lock().ok()?;
+        slot.as_ref().map(|backlog| BacklogStep {
+            job: backlog.job.clone(),
+            done: backlog.done,
+            total: backlog.total,
+            current: backlog.current.clone(),
+            progress: backlog.progress.clone(),
+        })
+    }
+
+    /// Change the run named `job`, if it is still the one on record.
+    fn in_backlog(&self, job: &str, change: impl FnOnce(&mut Backlog)) {
+        if let Ok(mut slot) = self.backlog.lock() {
+            if let Some(backlog) = slot.as_mut().filter(|backlog| backlog.job == job) {
+                change(backlog);
+            }
+        }
+    }
+
+    /// Take the one place there is for such a run, under a new name.
+    ///
+    /// Refused while one is running: a second press would otherwise start a
+    /// second run through the same files beside the first. A run that has
+    /// ended gives its place up, and with it what it came to.
+    fn begin_backlog(&self) -> Result<String, String> {
+        static RUNS: AtomicU64 = AtomicU64::new(0);
+        let mut slot = self
+            .backlog
+            .lock()
+            .map_err(|_| "the list of files to check could not be kept".to_owned())?;
+        if slot.as_ref().is_some_and(|backlog| backlog.ended.is_none()) {
+            return Err("Everything not checked yet is already being checked.".to_owned());
+        }
+        let job = format!(
+            "backlog-{}-{}",
+            std::process::id(),
+            RUNS.fetch_add(1, Ordering::SeqCst)
+        );
+        *slot = Some(Backlog::new(&job));
+        Ok(job)
+    }
+
+    /// Ask the run in hand to stop, and say which of the agent's jobs is the
+    /// check it has in hand, if it has one. `None` when nothing is running.
+    ///
+    /// The run is this program's own work and is told here. The check of the
+    /// file in hand is the agent's, and whoever calls this tells the agent.
+    fn ask_backlog_to_stop(&self) -> Option<Option<String>> {
+        let (job, in_hand) = self.backlog.lock().ok().and_then(|slot| {
+            slot.as_ref()
+                .filter(|backlog| backlog.ended.is_none())
+                .map(|backlog| (backlog.job.clone(), backlog.current_job.clone()))
+        })?;
+        self.stop(&job);
+        Some(in_hand)
+    }
+
+    /// Let go of a run that has ended, once the page has said what it came
+    /// to. One that is still running is left alone.
+    pub fn close_backlog(&self) {
+        if let Ok(mut slot) = self.backlog.lock() {
+            if slot.as_ref().is_some_and(|backlog| backlog.ended.is_some()) {
+                *slot = None;
+            }
         }
     }
 
@@ -345,7 +440,7 @@ pub struct LooseFile {
     in_flight: Option<InFlight>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Failure {
     path: String,
     message: String,
@@ -376,6 +471,9 @@ pub struct Page {
     /// Why notices about new downloads will not be seen, when Windows says
     /// they will not, or cannot say.
     notifications: Option<String>,
+    /// The check of everything not checked yet, while it runs and until what
+    /// it came to has been closed, so that a page drawn again finds it.
+    backlog: Option<Backlog>,
 }
 
 /// How many of the most recent checks the page asks for. The agent has its
@@ -395,43 +493,36 @@ fn history(paths: Vec<String>, recent: u32) -> Result<(Vec<DownloadRecord>, u64)
     }
 }
 
-/// Gather the page: the folder as it is now, and the history from the agent.
-pub fn page(state: &Downloads) -> Page {
-    let folder = known_folder();
-    let mut present: Vec<(String, String, std::fs::Metadata)> = Vec::new();
-    let mut folder_error = None;
-    if let Ok(folder) = &folder {
-        match std::fs::read_dir(folder) {
-            Ok(listing) => {
-                for item in listing.flatten() {
-                    let Ok(metadata) = item.metadata() else {
-                        continue;
-                    };
-                    let name = item.file_name().to_string_lossy().into_owned();
-                    if metadata.is_file() && !is_partial(&name) {
-                        present.push((item.path().to_string_lossy().into_owned(), name, metadata));
-                    }
-                }
-            }
-            Err(error) => {
-                folder_error = Some(format!("your Downloads folder could not be read: {error}"))
-            }
+/// One file directly inside Downloads: its path, its name, and what the
+/// folder's own listing says of it.
+type Present = (String, String, std::fs::Metadata);
+
+/// The files directly inside `folder`, leaving out the names a browser gives
+/// a download still in progress.
+fn files_in(folder: &Path) -> Result<Vec<Present>, String> {
+    let listing = std::fs::read_dir(folder)
+        .map_err(|error| format!("your Downloads folder could not be read: {error}"))?;
+    let mut present = Vec::new();
+    for item in listing.flatten() {
+        let Ok(metadata) = item.metadata() else {
+            continue;
+        };
+        let name = item.file_name().to_string_lossy().into_owned();
+        if metadata.is_file() && !is_partial(&name) {
+            present.push((item.path().to_string_lossy().into_owned(), name, metadata));
         }
     }
+    Ok(present)
+}
 
-    // The files in the folder are named in the request, so each one's row
-    // comes back however long ago it was checked. Asked for only by recency,
-    // a file checked before the newest thousand read as never checked.
-    let named = present.iter().map(|(path, _, _)| path.clone()).collect();
-    let (records, on_record, history_error) = match history(named, RECENT_ROWS) {
-        Ok((records, on_record)) => (records, on_record, None),
-        Err(reason) => (Vec::new(), 0, Some(reason)),
-    };
-    let protection = match kam_ipc::client::call(&Request::GetProtection) {
-        Ok(Response::Protection { enabled }) => Some(enabled),
-        _ => None,
-    };
-
+/// The files among `present` with no check on record that is about them as
+/// they are now, most recently arrived first. One on its way to being checked
+/// is among them, and says where it has got to.
+fn not_checked(
+    state: &Downloads,
+    present: Vec<Present>,
+    records: &[DownloadRecord],
+) -> Vec<LooseFile> {
     let mut unchecked = Vec::new();
     for (path, name, metadata) in present {
         // A row for a file that was gone before it could be checked is not a
@@ -455,6 +546,32 @@ pub fn page(state: &Downloads) -> Page {
         });
     }
     unchecked.sort_by(|a, b| b.arrived_at.cmp(&a.arrived_at));
+    unchecked
+}
+
+/// Gather the page: the folder as it is now, and the history from the agent.
+pub fn page(state: &Downloads) -> Page {
+    let folder = known_folder();
+    let (present, folder_error) = match folder.as_deref().map(files_in) {
+        Ok(Ok(present)) => (present, None),
+        Ok(Err(error)) => (Vec::new(), Some(error)),
+        Err(_) => (Vec::new(), None),
+    };
+
+    // The files in the folder are named in the request, so each one's row
+    // comes back however long ago it was checked. Asked for only by recency,
+    // a file checked before the newest thousand read as never checked.
+    let named = present.iter().map(|(path, _, _)| path.clone()).collect();
+    let (records, on_record, history_error) = match history(named, RECENT_ROWS) {
+        Ok((records, on_record)) => (records, on_record, None),
+        Err(reason) => (Vec::new(), 0, Some(reason)),
+    };
+    let protection = match kam_ipc::client::call(&Request::GetProtection) {
+        Ok(Response::Protection { enabled }) => Some(enabled),
+        _ => None,
+    };
+
+    let unchecked = not_checked(state, present, &records);
 
     // What is being held in quarantine, asked for only when a row could be
     // about one of them. A failure to read it is said, not taken for "none".
@@ -564,6 +681,7 @@ pub fn page(state: &Downloads) -> Page {
         menu: crate::context_menu::state(),
         protection,
         notifications: crate::notice::delivery_problem(),
+        backlog: state.backlog(),
     }
 }
 
@@ -1370,6 +1488,419 @@ pub fn open_on(app: &AppHandle, launch: Launch) {
         crate::tray::show_window(&handle);
         let _ = handle.emit(LAUNCH_EVENT, ());
     });
+}
+
+// --- everything not checked yet -------------------------------------------
+
+/// The event that says how far the check of everything not checked yet has
+/// got: which file it is on, and the stage the check of that file is at.
+pub const BACKLOG_EVENT: &str = "downloads://backlog";
+
+/// How a run through everything not checked yet ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "how", rename_all = "snake_case")]
+pub enum Ended {
+    /// Every file was dealt with.
+    Finished,
+    /// Somebody pressed Stop. `abandoned` is the file whose check was in
+    /// hand and was given up, when one was: nothing is recorded for it. The
+    /// files after it were never started.
+    Stopped { abandoned: Option<String> },
+    /// The service stopped answering. Every file left would have failed the
+    /// same way, for a reason that has nothing to do with the file.
+    NoAnswer { reason: String },
+}
+
+/// One press of "Check everything not checked yet": how far it has got, and
+/// what it has come to so far. Files are named by their full paths.
+#[derive(Debug, Clone, Serialize)]
+pub struct Backlog {
+    job: String,
+    /// How many files it set out to deal with.
+    total: usize,
+    /// How many it has dealt with: checked, found impossible to check, or
+    /// left alone.
+    done: usize,
+    /// The file in hand.
+    current: Option<String>,
+    /// The agent's name for the check of the file in hand, which is the job
+    /// a Stop has to cancel.
+    #[serde(skip)]
+    current_job: Option<String>,
+    /// The stage that check is at.
+    progress: Option<Progress>,
+    /// Files Defender was asked about and answered for, whatever the answer.
+    /// Each has its row.
+    checked: usize,
+    /// Of those, the ones Defender flagged.
+    flagged: Vec<String>,
+    /// Of those, the ones Defender could not finish checking.
+    unfinished: Vec<String>,
+    /// Files that could not be checked, each with why, in a sentence that
+    /// opens with the file's name.
+    failed: Vec<Failure>,
+    /// Files left alone because they are stored only online.
+    online_only: Vec<String>,
+    /// How it ended. `None` while it runs.
+    ended: Option<Ended>,
+}
+
+impl Backlog {
+    fn new(job: &str) -> Self {
+        Self {
+            job: job.to_owned(),
+            total: 0,
+            done: 0,
+            current: None,
+            current_job: None,
+            progress: None,
+            checked: 0,
+            flagged: Vec::new(),
+            unfinished: Vec::new(),
+            failed: Vec::new(),
+            online_only: Vec::new(),
+            ended: None,
+        }
+    }
+}
+
+/// How far a run has got, for the page to draw between two readings of the
+/// whole of it: small enough to send at every step of every check.
+#[derive(Debug, Clone, Serialize)]
+struct BacklogStep {
+    job: String,
+    done: usize,
+    total: usize,
+    current: Option<String>,
+    progress: Option<Progress>,
+}
+
+/// What has just moved in a run, for whoever is drawing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Moved {
+    /// The file in hand, or the stage its check is at.
+    Step,
+    /// A file has been dealt with, or the run has ended, so the list of
+    /// downloads is no longer what it was.
+    List,
+}
+
+/// What became of one file in a run.
+#[derive(Debug)]
+enum Dealt {
+    Checked(Box<DownloadRecord>),
+    /// Not checked. `said` is the sentence for the page's list, opening with
+    /// the file's name. `note` goes under the file, when it is still there
+    /// to have one.
+    Failed {
+        said: String,
+        note: Option<String>,
+    },
+    OnlineOnly,
+}
+
+/// Whether a file's contents are somewhere else, so that reading it would
+/// fetch them: a OneDrive file that is not kept on this PC, say. The three
+/// attributes Windows has for that are offline, recall on open, and recall on
+/// data access.
+fn stored_only_online(attributes: u32) -> bool {
+    const ELSEWHERE: u32 = 0x0000_1000 | 0x0004_0000 | 0x0040_0000;
+    attributes & ELSEWHERE != 0
+}
+
+/// A file's attributes, as its folder's listing gives them.
+///
+/// Asked of the folder and not of the file, because that opens nothing: it
+/// is the one way to be sure that finding out whether a file is stored only
+/// online does not itself fetch it. Recall on open is also only ever
+/// reported this way.
+fn listed_attributes(path: &Path) -> std::io::Result<u32> {
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+
+    let mut found = WIN32_FIND_DATAW::default();
+    let search = unsafe { FindFirstFileW(&HSTRING::from(path.as_os_str()), &mut found) }
+        // The low half of the code is Windows' own error number, which is
+        // what tells "not there" from every other reason.
+        .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xFFFF))?;
+    unsafe {
+        let _ = FindClose(search);
+    }
+    Ok(found.dwFileAttributes)
+}
+
+/// The agent's sentence about a file, opening with the file's name where it
+/// opened with the whole path: in a list of files from one folder the path
+/// is the same every time and the name is what tells them apart.
+fn about(name: &str, path: &str, message: &str) -> String {
+    match message.get(..path.len()) {
+        Some(start) if start.eq_ignore_ascii_case(path) => {
+            format!("{name}{}", &message[path.len()..])
+        }
+        _ => format!("{name}: {message}"),
+    }
+}
+
+/// What asking about one file came to: the agent's answer, or why there was
+/// none.
+type Asked = Result<Response, String>;
+
+/// Whoever is asked about each file: given the file, a name for that one
+/// check, and somewhere to report its stages.
+type Ask<'a> = dyn Fn(&str, &str, &mut dyn FnMut(Progress)) -> Asked + 'a;
+
+/// Ask the agent to check one file, as a press of "Check now" does.
+fn ask_the_agent(path: &str, job: &str, stage: &mut dyn FnMut(Progress)) -> Asked {
+    kam_ipc::client::call_streaming(
+        &Request::CheckDownload {
+            path: path.to_owned(),
+            job: job.to_owned(),
+            copy_of: None,
+        },
+        stage,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Work through `files`, one after another, as the one job named `job`.
+///
+/// # The rules
+///
+/// - Each file is asked about exactly as a press of "Check now" asks, so it
+///   is the same check, recorded the same way. In the program `ask` is the
+///   agent, and in a test it is whatever the test needs.
+/// - A file stored only online is left alone and named. Reading it would
+///   download it, and nobody asked for that by pressing one button for a
+///   whole folder. Whether it is one is asked of the folder's listing, which
+///   opens nothing.
+/// - A file that cannot be checked (gone, open in a program that can still
+///   change it, refused) is named with the reason, and the run goes on.
+/// - Stop ends the run before the next file. The check in hand is cancelled
+///   by whoever asked for the stop. If the agent answers that it stopped,
+///   that file is named as abandoned and nothing is recorded for it; a check
+///   that finished all the same is kept.
+/// - A service that stops answering ends the run too. Every file left would
+///   fail the same way, and a hundred identical failures say less than one
+///   sentence does.
+/// - No notification is raised for any file: this is not given the handle
+///   one needs. What the run came to is said once, on the page.
+fn work_through(
+    state: &Downloads,
+    job: &str,
+    files: &[PathBuf],
+    ask: &Ask<'_>,
+    moved: &dyn Fn(Moved),
+) {
+    let end = |how: Ended| {
+        state.in_backlog(job, |backlog| {
+            backlog.current = None;
+            backlog.current_job = None;
+            backlog.progress = None;
+            backlog.ended = Some(how);
+        });
+        state.forget_stop(job);
+        moved(Moved::List);
+    };
+
+    for (number, file) in files.iter().enumerate() {
+        if state.is_stopped(job) {
+            end(Ended::Stopped { abandoned: None });
+            return;
+        }
+        let path = file.to_string_lossy().into_owned();
+        let name = file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        let check = format!("{job}-{}", number + 1);
+        state.in_backlog(job, |backlog| {
+            backlog.current = Some(path.clone());
+            backlog.current_job = Some(check.clone());
+            backlog.progress = None;
+        });
+        moved(Moved::Step);
+
+        let dealt = match listed_attributes(file) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Dealt::Failed {
+                said: format!("{name} is no longer in Downloads."),
+                note: None,
+            },
+            // Not checked, in case it is one that reading would fetch.
+            Err(error) => {
+                let why = format!(
+                    "its entry in the folder could not be read ({error}), so whether it is \
+                     stored only online could not be told"
+                );
+                Dealt::Failed {
+                    said: format!("{name} was not checked: {why}."),
+                    note: Some(format!("Not checked: {why}.")),
+                }
+            }
+            Ok(attributes) if stored_only_online(attributes) => Dealt::OnlineOnly,
+            Ok(_) => {
+                let mut stage = |progress: Progress| {
+                    state.in_backlog(job, |backlog| backlog.progress = Some(progress));
+                    moved(Moved::Step);
+                };
+                match ask(&path, &check, &mut stage) {
+                    Ok(Response::DownloadChecked(record)) => Dealt::Checked(record),
+                    Ok(Response::Stopped) if state.is_stopped(job) => {
+                        end(Ended::Stopped {
+                            abandoned: Some(path),
+                        });
+                        return;
+                    }
+                    Ok(Response::Stopped) => Dealt::Failed {
+                        said: format!("{name}: the check was stopped before it finished."),
+                        note: Some("The check was stopped before it finished.".to_owned()),
+                    },
+                    Ok(Response::Error { message }) => Dealt::Failed {
+                        said: about(&name, &path, &message),
+                        note: Some(format!("Not checked: {message}")),
+                    },
+                    Ok(other) => {
+                        let message = format!("the agent answered something unexpected: {other:?}");
+                        Dealt::Failed {
+                            said: format!("{name}: {message}"),
+                            note: Some(format!("Not checked: {message}")),
+                        }
+                    }
+                    Err(reason) => {
+                        end(Ended::NoAnswer { reason });
+                        return;
+                    }
+                }
+            }
+        };
+
+        match &dealt {
+            // It has been checked now, so why it was not checked before no
+            // longer has anything to say.
+            Dealt::Checked(record) => {
+                state.forget_failure(&path);
+                state.forget_failure(&record.check.path);
+            }
+            Dealt::Failed { note, .. } => {
+                if let Some(note) = note {
+                    state.note_failure(&path, note.clone());
+                }
+            }
+            Dealt::OnlineOnly => state.note_failure(
+                &path,
+                "Not checked with the rest, because it is stored only online and checking it \
+                 would download it."
+                    .to_owned(),
+            ),
+        }
+        state.in_backlog(job, |backlog| {
+            backlog.done += 1;
+            match dealt {
+                Dealt::Checked(record) => {
+                    backlog.checked += 1;
+                    match record.check.scan.answer {
+                        Answer::Flagged => backlog.flagged.push(path),
+                        Answer::NotFinished => backlog.unfinished.push(path),
+                        Answer::NothingFound | Answer::GoneBeforeCheck => {}
+                    }
+                }
+                Dealt::Failed { said, .. } => backlog.failed.push(Failure {
+                    path,
+                    message: said,
+                }),
+                Dealt::OnlineOnly => backlog.online_only.push(path),
+            }
+        });
+        moved(Moved::List);
+    }
+    end(Ended::Finished);
+}
+
+/// The files a press of "Check everything not checked yet" is about: the
+/// ones the page shows as not checked, worked out the way the page works
+/// them out, without those already on their way to being checked.
+///
+/// A history that cannot be read is a refusal, not an empty one. Without it
+/// every file in the folder reads as not checked, and the run would check
+/// again everything that already has an answer.
+fn backlog_files(state: &Downloads) -> Result<Vec<PathBuf>, String> {
+    let folder = known_folder()?;
+    let present = files_in(&folder)?;
+    let named = present.iter().map(|(path, _, _)| path.clone()).collect();
+    let (records, _) = history(named, RECENT_ROWS).map_err(|reason| {
+        format!(
+            "The history of checked downloads could not be read ({reason}), so which files \
+             are not checked yet is not known, and none was checked."
+        )
+    })?;
+    Ok(not_checked(state, present, &records)
+        .into_iter()
+        .filter(|file| file.in_flight.is_none())
+        .map(|file| PathBuf::from(file.path))
+        .collect())
+}
+
+/// Start checking everything not checked yet. Returns once it is under way;
+/// the work is on a thread of its own, and the page follows it through
+/// [`BACKLOG_EVENT`] and by reading the page again.
+///
+/// It is not tied to the window. Closing the window is not a press of Stop,
+/// so the run goes on, and what it came to is there when the page is next
+/// opened, for as long as this program keeps running.
+pub fn check_backlog(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<Downloads>();
+    let job = state.begin_backlog()?;
+    let give_up = |reason: String| {
+        if let Ok(mut slot) = state.backlog.lock() {
+            *slot = None;
+        }
+        Err(reason)
+    };
+    let files = match backlog_files(&state) {
+        Ok(files) if files.is_empty() => {
+            return give_up("Nothing in Downloads is waiting to be checked.".to_owned())
+        }
+        Ok(files) => files,
+        Err(reason) => return give_up(reason),
+    };
+    state.in_backlog(&job, |backlog| backlog.total = files.len());
+
+    let worker = app.clone();
+    let name = job.clone();
+    let spawned = std::thread::Builder::new()
+        .name("kam-downloads-backlog".to_owned())
+        .spawn(move || {
+            let state = worker.state::<Downloads>();
+            work_through(
+                &state,
+                &name,
+                &files,
+                &ask_the_agent,
+                &|moved| match moved {
+                    Moved::Step => {
+                        if let Some(step) = state.backlog_step() {
+                            let _ = worker.emit(BACKLOG_EVENT, step);
+                        }
+                    }
+                    Moved::List => {
+                        let _ = worker.emit(CHANGED_EVENT, ());
+                    }
+                },
+            );
+        });
+    match spawned {
+        Ok(_) => Ok(()),
+        Err(error) => give_up(format!("the check could not be started: {error}")),
+    }
+}
+
+/// Stop checking everything not checked yet: the run here, and the check it
+/// has in hand in the agent.
+pub fn stop_backlog(state: &Downloads) {
+    if let Some(Some(check)) = state.ask_backlog_to_stop() {
+        // It may not have reached the agent yet, or may have just finished.
+        // Either way the run ends before the next file.
+        let _ = kam_ipc::client::call(&Request::CancelJob { job: check });
+    }
 }
 
 // --- taking archives apart ------------------------------------------------
@@ -2316,5 +2847,348 @@ mod tests {
     fn the_downloads_folder_is_known() {
         let folder = known_folder().unwrap();
         assert!(folder.is_absolute(), "{}", folder.display());
+    }
+
+    // --- everything not checked yet ----------------------------------------
+
+    /// The agent's answer to a check of `path` that came to `scan`.
+    fn answer(path: &str, scan: kam_scanner::defender_file::FileScan) -> Response {
+        Response::DownloadChecked(Box::new(DownloadRecord {
+            check: kam_scanner::downloads::DownloadCheck {
+                path: path.to_owned(),
+                name: Path::new(path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                bytes: 1,
+                sha256: "ab".to_owned(),
+                arrived_at: None,
+                origin: None,
+                signature: None,
+                scan,
+            },
+            checked_at: String::new(),
+            actions: Vec::new(),
+            dissection: None,
+            first_check: true,
+        }))
+    }
+
+    fn nothing_found() -> kam_scanner::defender_file::FileScan {
+        kam_scanner::defender_file::parse_report(Some(0), "")
+    }
+
+    /// Mark a scratch file the way Windows marks one whose contents are kept
+    /// somewhere else. Offline is the one of the three attributes an
+    /// ordinary program is allowed to set.
+    fn mark_online_only(path: &Path) {
+        use windows::core::HSTRING;
+        use windows::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_OFFLINE};
+        unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_OFFLINE) }
+            .unwrap();
+    }
+
+    /// Scratch files in a scratch Downloads folder, one for each name.
+    fn scratch_files(scratch: &Scratch, names: &[&str]) -> Vec<PathBuf> {
+        names
+            .iter()
+            .map(|name| {
+                let path = scratch.0.join("Downloads").join(name);
+                std::fs::write(&path, b"x").unwrap();
+                path
+            })
+            .collect()
+    }
+
+    /// One run over `files`, with `agent` standing in for the service. Says
+    /// which files it was asked about, in order.
+    fn run_backlog(
+        state: &Downloads,
+        files: &[PathBuf],
+        agent: &dyn Fn(&str) -> Asked,
+    ) -> Vec<String> {
+        let job = state.begin_backlog().unwrap();
+        state.in_backlog(&job, |backlog| backlog.total = files.len());
+        let asked = Mutex::new(Vec::new());
+        work_through(
+            state,
+            &job,
+            files,
+            &|path, _, stage| {
+                asked.lock().unwrap().push(path.to_owned());
+                stage(Progress {
+                    stage: "Asking Microsoft Defender".to_owned(),
+                    done: 0,
+                    total: None,
+                    detail: None,
+                });
+                agent(path)
+            },
+            &|_| {},
+        );
+        asked.into_inner().unwrap()
+    }
+
+    /// One press for everything not checked yet. Each file is asked about
+    /// as "Check now" asks. One that cannot be checked is named with why
+    /// and the run goes on, and one stored only online is never read.
+    #[test]
+    fn everything_not_checked_is_worked_through_and_each_outcome_is_kept() {
+        let scratch = Scratch::new("backlog");
+        let files = scratch_files(
+            &scratch,
+            &["a.txt", "b.exe", "online.bin", "c.iso", "d.docx", "e.zip"],
+        );
+        mark_online_only(&files[2]);
+        // Gone by the time its turn comes.
+        std::fs::remove_file(&files[5]).unwrap();
+        let text = |at: usize| files[at].to_string_lossy().into_owned();
+
+        let state = Downloads::default();
+        state.note_failure(
+            &text(0),
+            "Not checked when it arrived: the service did not answer".to_owned(),
+        );
+        let flagged = kam_scanner::defender_file::parse_report(
+            Some(2),
+            "Scanning C:\\b.exe found 1 threats.\r\nThreat : Trojan:Win32/Example\r\n\
+             Resources : 1 total\r\n    file : C:\\b.exe\r\n",
+        );
+        let unfinished = kam_scanner::defender_file::parse_report(Some(2), "");
+        assert_eq!(
+            (flagged.answer, unfinished.answer),
+            (Answer::Flagged, Answer::NotFinished)
+        );
+
+        let asked = run_backlog(&state, &files, &|path| match Path::new(path)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+        {
+            "a.txt" => Ok(answer(path, nothing_found())),
+            "b.exe" => Ok(answer(path, flagged.clone())),
+            "c.iso" => Ok(answer(path, unfinished.clone())),
+            "d.docx" => Ok(Response::Error {
+                message: format!(
+                    "{path} is open in another program that can still change it, so it was \
+                         not checked."
+                ),
+            }),
+            other => panic!("{other} should never have been read"),
+        });
+        assert_eq!(
+            asked,
+            [text(0), text(1), text(3), text(4)],
+            "the file stored only online, or the one that had gone, was asked about"
+        );
+
+        let backlog = state.backlog().unwrap();
+        assert_eq!(backlog.ended, Some(Ended::Finished));
+        assert_eq!((backlog.total, backlog.done, backlog.checked), (6, 6, 3));
+        assert_eq!(backlog.flagged, [text(1)]);
+        assert_eq!(backlog.unfinished, [text(3)]);
+        assert_eq!(backlog.online_only, [text(2)]);
+        assert_eq!(
+            backlog.failed,
+            [
+                Failure {
+                    path: text(4),
+                    message: "d.docx is open in another program that can still change it, so it \
+                              was not checked."
+                        .to_owned(),
+                },
+                Failure {
+                    path: text(5),
+                    message: "e.zip is no longer in Downloads.".to_owned(),
+                },
+            ]
+        );
+        assert!(backlog.current.is_none() && backlog.progress.is_none());
+
+        // Under each file that is still there and still not checked: why.
+        let failures = state.failures.lock().unwrap();
+        assert!(
+            !failures.contains_key(&text(0)),
+            "a file that has now been checked still says why it was not"
+        );
+        assert!(failures[&text(2)].contains("stored only online"));
+        assert!(failures[&text(4)].starts_with("Not checked: "));
+        assert!(!failures.contains_key(&text(5)));
+    }
+
+    /// Stop ends the run with the file in hand, whose check is given up, and
+    /// starts none of the files after it.
+    #[test]
+    fn stopping_abandons_the_file_in_hand_and_starts_no_other() {
+        let scratch = Scratch::new("backlog-stop");
+        let files = scratch_files(&scratch, &["a.txt", "b.txt", "c.txt", "d.txt"]);
+        let text = |at: usize| files[at].to_string_lossy().into_owned();
+        let state = Downloads::default();
+
+        let asked = run_backlog(&state, &files, &|path| {
+            if !path.ends_with("b.txt") {
+                return Ok(answer(path, nothing_found()));
+            }
+            // Stop is pressed while this file is being checked. The check in
+            // hand is named, so that the agent can be told to cancel it, and
+            // the agent then answers that it stopped.
+            let in_hand = state.ask_backlog_to_stop();
+            assert!(
+                matches!(&in_hand, Some(Some(check)) if check.ends_with("-2")),
+                "{in_hand:?}"
+            );
+            Ok(Response::Stopped)
+        });
+        assert_eq!(asked, [text(0), text(1)], "a file after the stop was read");
+        let backlog = state.backlog().unwrap();
+        assert_eq!(
+            backlog.ended,
+            Some(Ended::Stopped {
+                abandoned: Some(text(1))
+            })
+        );
+        assert_eq!((backlog.total, backlog.done, backlog.checked), (4, 1, 1));
+        assert!(!state.is_stopped(&backlog.job), "the stop outlived the run");
+        assert_eq!(state.ask_backlog_to_stop(), None, "nothing is running now");
+
+        // A check that finished before the stop reached it is kept, and the
+        // run still ends there.
+        state.close_backlog();
+        assert!(state.backlog().is_none());
+        let asked = run_backlog(&state, &files, &|path| {
+            if path.ends_with("b.txt") {
+                state.ask_backlog_to_stop();
+            }
+            Ok(answer(path, nothing_found()))
+        });
+        assert_eq!(asked.len(), 2);
+        let backlog = state.backlog().unwrap();
+        assert_eq!(backlog.ended, Some(Ended::Stopped { abandoned: None }));
+        assert_eq!((backlog.done, backlog.checked), (2, 2));
+    }
+
+    /// A service that stops answering ends the run, in one sentence, and the
+    /// files left are not each failed in turn. While a run is going a second
+    /// press starts no second run, and what it has come to cannot be closed.
+    #[test]
+    fn a_service_that_stops_answering_ends_the_run_and_only_one_run_goes_at_a_time() {
+        let scratch = Scratch::new("backlog-gone");
+        let files = scratch_files(&scratch, &["a.txt", "b.txt", "c.txt"]);
+        let state = Downloads::default();
+
+        let asked = run_backlog(&state, &files, &|path| {
+            assert!(
+                state.begin_backlog().is_err(),
+                "a second run was started beside the first"
+            );
+            state.close_backlog();
+            assert!(state.backlog().is_some(), "a run in hand was closed away");
+            if path.ends_with("b.txt") {
+                Err("the pipe is not there".to_owned())
+            } else {
+                Ok(answer(path, nothing_found()))
+            }
+        });
+        assert_eq!(asked.len(), 2, "the files left were each tried");
+        let backlog = state.backlog().unwrap();
+        assert_eq!(
+            backlog.ended,
+            Some(Ended::NoAnswer {
+                reason: "the pipe is not there".to_owned()
+            })
+        );
+        assert_eq!((backlog.total, backlog.done), (3, 1));
+        assert!(backlog.failed.is_empty());
+
+        state.close_backlog();
+        assert!(state.backlog().is_none());
+    }
+
+    /// Whether a file is stored only online is read from its folder's
+    /// listing, so that finding out cannot itself download it.
+    #[test]
+    fn a_file_stored_only_online_is_told_from_its_folders_listing() {
+        // What OneDrive puts on a file it keeps online: archive, sparse,
+        // reparse point, offline, unpinned, recall on data access.
+        assert!(stored_only_online(0x0050_1620));
+        for one in [0x1000, 0x4_0000, 0x40_0000] {
+            assert!(stored_only_online(one | 0x20), "{one:#x}");
+        }
+        // Kept on this PC: plain, read-only, hidden, compressed, and pinned
+        // ("Always keep on this device").
+        for kept in [0x20, 0x21, 0x22, 0x820, 0x8_0020] {
+            assert!(!stored_only_online(kept), "{kept:#x}");
+        }
+
+        let scratch = Scratch::new("online-only");
+        let files = scratch_files(&scratch, &["here.bin"]);
+        assert!(!stored_only_online(listed_attributes(&files[0]).unwrap()));
+        mark_online_only(&files[0]);
+        assert!(stored_only_online(listed_attributes(&files[0]).unwrap()));
+        assert_eq!(
+            listed_attributes(&scratch.0.join("Downloads").join("never.bin"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    /// The button is about the files the page shows as not checked: those
+    /// with no check on record, or changed since the one there is.
+    #[test]
+    fn the_files_not_checked_are_those_with_no_check_that_is_still_about_them() {
+        let scratch = Scratch::new("not-checked");
+        let files = scratch_files(
+            &scratch,
+            &["checked.bin", "changed.bin", "never.bin", "half.crdownload"],
+        );
+        let later = kam_core::clock::iso_from_unix_millis(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 60_000,
+        );
+        let row = |file: &Path, bytes: u64| {
+            let Response::DownloadChecked(mut record) =
+                answer(&file.to_string_lossy(), nothing_found())
+            else {
+                unreachable!()
+            };
+            record.check.bytes = bytes;
+            record.checked_at = later.clone();
+            *record
+        };
+        let records = [row(&files[0], 1), row(&files[1], 500)];
+
+        let present = files_in(&scratch.0.join("Downloads")).unwrap();
+        assert_eq!(present.len(), 3, "a download still in progress was listed");
+        let mut loose: Vec<(String, bool)> = not_checked(&Downloads::default(), present, &records)
+            .into_iter()
+            .map(|file| (file.name, file.changed_since_checked))
+            .collect();
+        loose.sort();
+        assert_eq!(
+            loose,
+            [
+                ("changed.bin".to_owned(), true),
+                ("never.bin".to_owned(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sentence_about_a_file_opens_with_its_name() {
+        let path = r"C:\Users\me\Downloads\a.exe";
+        assert_eq!(
+            about("a.exe", path, &format!("{path} could not be found")),
+            "a.exe could not be found"
+        );
+        assert_eq!(
+            about("a.exe", path, "Defender's scanner could not be started"),
+            "a.exe: Defender's scanner could not be started"
+        );
     }
 }
