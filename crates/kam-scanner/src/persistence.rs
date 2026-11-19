@@ -263,6 +263,79 @@ pub fn is_host(name: &str) -> bool {
     HOSTS.contains(&name.as_str())
 }
 
+/// The launchers above that come with software installed on top of Windows
+/// rather than with Windows itself.
+///
+/// These have no one place to be. Python is as often in a person's own AppData,
+/// or in a project's own folder, as it is in Program Files, and what it is told
+/// to run is still the thing to judge. Nor do they pass for part of Windows,
+/// which is what the rule in [`is_launcher`] is about.
+const COME_WITH_SOFTWARE: &[&str] = &[
+    "pwsh.exe",
+    "python.exe",
+    "pythonw.exe",
+    "node.exe",
+    "java.exe",
+    "javaw.exe",
+];
+
+/// Whether `executable`, whose file name is `name`, is a launcher whose
+/// payload is the thing to judge.
+///
+/// A launcher Windows provides counts only where Windows keeps it. It was
+/// recognised by its name wherever it was, so a program called `cmd.exe` in
+/// AppData was taken for Windows' own: what it was handed was judged, and the
+/// program itself never was, which is all a program needs to do to be passed
+/// over. Anything else of that name is what runs, and is judged as itself.
+fn is_launcher(name: &str, executable: &Path) -> bool {
+    HOSTS.contains(&name)
+        && (COME_WITH_SOFTWARE.contains(&name) || is_windows_launcher(name, executable))
+}
+
+/// Whether `executable` is the launcher of that name that Windows provides,
+/// in the folder Windows keeps it in.
+///
+/// Decided by which file it is, as the service host is: both sides are
+/// resolved first, so the real one reached through a link or an odd spelling
+/// is still the real one. Directly inside the folder, not anywhere under it,
+/// because `System32` has folders inside it that any account can write to.
+fn is_windows_launcher(name: &str, executable: &Path) -> bool {
+    let Some(windows) = std::env::var("SystemRoot")
+        .ok()
+        .and_then(|root| std::fs::canonicalize(root).ok())
+        .map(|root| crate::places::normalise(&root.to_string_lossy()))
+    else {
+        return false;
+    };
+    let Ok(real) = std::fs::canonicalize(executable) else {
+        return false;
+    };
+    let real = crate::places::normalise(&real.to_string_lossy());
+    let Some((folder, _)) = real.rsplit_once('\\') else {
+        return false;
+    };
+
+    let system = [
+        format!(r"{windows}\system32"),
+        format!(r"{windows}\syswow64"),
+    ];
+    if system.iter().any(|home| home == folder) {
+        return true;
+    }
+    match name {
+        "powershell.exe" => system
+            .iter()
+            .any(|home| folder == format!(r"{home}\windowspowershell\v1.0")),
+        // One copy for each version of the .NET Framework, each in a folder
+        // named for its version.
+        "msbuild.exe" => folder.rsplit_once('\\').is_some_and(|(parent, _)| {
+            parent == format!(r"{windows}\microsoft.net\framework")
+                || parent == format!(r"{windows}\microsoft.net\framework64")
+        }),
+        _ => false,
+    }
+}
+
 /// A command line taken apart.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resolved {
@@ -492,7 +565,7 @@ fn resolve_expanded(expanded: &str, depth: u8, expand: Expand<'_>) -> Resolved {
         .map(|name| name.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    if name == "conhost.exe" && depth < 2 {
+    if name == "conhost.exe" && depth < 2 && is_launcher(&name, &executable) {
         // Skip conhost's own switches and their values, then resolve whatever
         // it was asked to host.
         let tokens = tokenise(&rest);
@@ -534,7 +607,7 @@ fn resolve_expanded(expanded: &str, depth: u8, expand: Expand<'_>) -> Resolved {
         };
     }
 
-    if HOSTS.contains(&name.as_str()) {
+    if is_launcher(&name, &executable) {
         if let Some(payload) = payload_of(&name, &rest, expand) {
             return Resolved {
                 executable: Some(executable),
@@ -2074,6 +2147,103 @@ mod tests {
         }
         std::fs::remove_file(&script).unwrap();
         std::fs::remove_file(&project).unwrap();
+    }
+
+    /// A program named like one of Windows' launchers, kept anywhere else, is
+    /// what runs, and is judged as itself.
+    ///
+    /// Launchers were recognised by name wherever they were, so a `cmd.exe` in
+    /// a folder any program can write to was taken for Windows' own, and only
+    /// what it was handed was judged. Handed something harmless, the program
+    /// itself was never looked at.
+    #[test]
+    fn a_program_only_named_like_a_windows_launcher_is_judged_as_itself() {
+        let folder =
+            std::env::temp_dir().join(format!("kam-persist-{}-impostors", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let _cleanup = ScratchProfile(folder.clone());
+        let script = folder.join("run.cmd");
+        std::fs::write(&script, "@echo off\r\n").unwrap();
+        let module = folder.join("helper.dll");
+        std::fs::write(&module, "MZ").unwrap();
+        let project = folder.join("Loader.csproj");
+        std::fs::write(&project, "<Project/>").unwrap();
+
+        // Each in a shape the real launcher of that name is unwrapped in.
+        let handed = |launcher: &Path| -> Vec<(String, Option<PathBuf>, Option<&str>)> {
+            let launcher = launcher.display();
+            vec![
+                (
+                    format!(r#""{launcher}\cmd.exe" /c "{}""#, script.display()),
+                    Some(script.clone()),
+                    Some("cmd.exe"),
+                ),
+                (
+                    format!(r#""{launcher}\rundll32.exe" "{}",Entry"#, module.display()),
+                    Some(module.clone()),
+                    Some("rundll32.exe"),
+                ),
+                (
+                    format!(
+                        r#""{launcher}\conhost.exe" --headless cmd.exe /c "{}""#,
+                        script.display()
+                    ),
+                    Some(script.clone()),
+                    Some("cmd.exe"),
+                ),
+            ]
+        };
+
+        // Windows' own, in the shapes used below, are unwrapped: what the
+        // test asks of the copies is a real difference, not a bad command.
+        let windows = system32("cmd.exe");
+        let windows = windows.parent().unwrap();
+        for (command, payload, host) in handed(windows) {
+            let resolved = resolve(&command);
+            assert_eq!(resolved.payload, payload, "{command}");
+            assert_eq!(resolved.host.as_deref(), host, "{command}");
+        }
+
+        for name in ["cmd.exe", "rundll32.exe", "conhost.exe"] {
+            std::fs::write(folder.join(name), "MZ").unwrap();
+        }
+        for (command, _, _) in handed(&folder) {
+            let resolved = resolve(&command);
+            assert_eq!(resolved.host, None, "taken for Windows' own: {command}");
+            assert_eq!(resolved.payload, None, "{command}");
+            let named = resolved.executable.expect("the copy is what runs");
+            assert_eq!(
+                named.parent(),
+                Some(folder.as_path()),
+                "{command} was judged on {}",
+                named.display()
+            );
+        }
+
+        // The same for MSBuild, whose own copies are one to a .NET Framework.
+        std::fs::write(folder.join("MSBuild.exe"), "MZ").unwrap();
+        let built = resolve(&format!(
+            r#""{}" "{}""#,
+            folder.join("MSBuild.exe").display(),
+            project.display()
+        ));
+        assert_eq!(built.host, None);
+        assert_eq!(built.payload, None);
+
+        // And it reaches an entry: what such an entry runs is the copy.
+        let planted = entry(
+            "Planted".to_owned(),
+            Anchor::RunKey,
+            r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run".to_owned(),
+            format!(
+                r#""{}" /c "{}""#,
+                folder.join("cmd.exe").display(),
+                script.display()
+            ),
+            false,
+            None,
+        );
+        assert_eq!(planted.target(), Some(folder.join("cmd.exe").as_path()));
     }
 
     /// A profile in the temp folder, with a named SID, standing in for a
