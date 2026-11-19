@@ -207,9 +207,9 @@ pub fn find(
             // The newest write anywhere inside, not the folder's own date.
             // Windows moves a folder's own date only when something directly
             // in it is added, removed or renamed, so a program still writing
-            // to files deeper down left its folder looking idle: an installed
-            // browser's live profile read "last written to 267 days ago" on
-            // the development machine while a file in it was 8 days old.
+            // to files deeper down left its folder looking idle. The November
+            // 2026 review's example was an installed browser's live profile:
+            // "last written to 267 days ago", with a file in it 8 days old.
             let days = days_since(index.newest_write_in(*child), now_unix);
             let mut reasons = vec![format!(
                 "no installed application matches the name \"{}\"",
@@ -450,7 +450,7 @@ mod tests {
 
     /// A folder is dated by what is inside it, not by its own date.
     ///
-    /// The case measured on the development machine: a browser profile whose
+    /// The case the November 2026 review reported: a browser profile whose
     /// folder was last changed 267 days ago, holding a file written 8 days
     /// ago. Judged on the folder's own date it was listed as "Possibly
     /// leftover, last written to 267 days ago", with a Quarantine button, for

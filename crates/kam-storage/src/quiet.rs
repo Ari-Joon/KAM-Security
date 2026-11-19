@@ -2,11 +2,12 @@
 //!
 //! NTFS keeps a last-access time for every file. Where Windows maintains it
 //! (see [`crate::provenance::access_times`]), any read moves it, and that
-//! includes a read of nothing but a small stream beside the file. Measured on
-//! the development machine: three files with their last-access time set three
-//! days back, one read whole, one whose `Zone.Identifier` stream alone was
-//! read, one only listed. The first two came back stamped with the moment of
-//! the read.
+//! includes a read of nothing but a small stream beside the file. The November
+//! 2026 review showed it in a scratch folder, and the tests below show it
+//! again wherever Windows keeps the time: three files with their last-access
+//! time set three days back, one read whole, one whose `Zone.Identifier`
+//! stream alone was read, one only listed. The first two came back stamped
+//! with the moment of the read.
 //!
 //! A survey that reads thousands of files in order to describe them therefore
 //! stamps every one of them as opened just now. The one piece of evidence that
@@ -124,7 +125,7 @@ mod tests {
 
     /// Whether an ordinary read moves a file's last-access time here.
     ///
-    /// It does on the development machine and need not elsewhere: the setting
+    /// It did where these tests were written and need not elsewhere: the setting
     /// differs by machine, and where Windows is not recording opens there is
     /// nothing for a quiet read to protect and nothing these tests can show.
     /// So each test asks first, and says nothing either way when the answer is

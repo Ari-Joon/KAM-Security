@@ -441,10 +441,11 @@ mod tests {
 
     /// The setting is read by its lowest bit, whoever chose it.
     ///
-    /// This is the regression test for reading it backwards. The value on the
-    /// development machine is `0x80000002`, which Windows' own tool reports as
-    /// "System Managed, Last Access Time Updates ENABLED", and the old reading
-    /// (anything but 0 means off) called that not recorded. Current Windows
+    /// This is the regression test for reading it backwards. The value read
+    /// on the development machine, from a session's own shell, is
+    /// `0x80000002`, which Windows' own tool there reports as "System Managed,
+    /// Last Access Time Updates ENABLED", and the old reading (anything but 0
+    /// means off) called that not recorded. Current Windows
     /// always sets the high bit, so the old reading could no longer answer
     /// "recorded" on any up-to-date machine.
     #[test]

@@ -1073,8 +1073,9 @@ mod tests {
     }
 
     // What follows reads whole volumes made up in memory. The real reader
-    // needs administrative rights and a disk of the kind being tested, and the
-    // two kinds it got wrong are ones the development machine does not have.
+    // needs administrative rights and a disk of the kind being tested, and by
+    // the review's account the development machine has neither of the two
+    // kinds it got wrong.
     // These are built from the layout NTFS documents, by somebody reading that
     // layout, so they show that the reader does what the layout asks. They are
     // not a real disk of either kind.
@@ -1293,7 +1294,7 @@ mod tests {
     #[test]
     fn a_table_on_an_ordinary_disk_is_read_through_the_same_path() {
         // The control for the tests below: 512-byte sectors and 1 KB records,
-        // which is what the development machine's drive has.
+        // the layout nearly every drive has.
         let (clusters, bytes) = table_size(4096, 1024);
         let image = volume(512, 4096, 1024, clusters, bytes);
         let snapshot = read_from(&image, 'k').unwrap();

@@ -124,9 +124,9 @@ impl VolumeIndex {
     /// Windows moves a folder's own last-write time only when something
     /// directly inside it is added, removed or renamed. A program that keeps
     /// writing to the same files several levels down leaves its top folder
-    /// looking untouched for years. Measured on the development machine: of 99
-    /// top-level data folders with an own date over 180 days old, 13 held a
-    /// file written in the last 30 days.
+    /// looking untouched for years. The November 2026 review counted it, from
+    /// a session's own shell: of 99 top-level data folders it saw with an own
+    /// date over 180 days old, 13 held a file written in the last 30 days.
     ///
     /// Every folder's own time is counted as well as every file's, because a
     /// file that arrives carrying an old date (unpacked from an archive, or
