@@ -2411,16 +2411,27 @@ mod tests {
     #[test]
     fn a_download_is_quarantined_noted_on_its_row_and_restored() {
         let context = context(Mode::Console);
-        let me = UserContext::current();
+        // A throwaway profile with a Downloads folder of its own. This used
+        // to write its file into the real one, where a watching copy of the
+        // program sees it land and then go, and would now record it as a
+        // download that was gone before it could be checked.
+        let profile = std::env::temp_dir().join(format!(
+            "kam-dispatch-download-profile-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&profile);
+        let me = UserContext::new(
+            Some("S-1-5-21-0-0-0-4006".to_owned()),
+            &profile.to_string_lossy(),
+        );
         let downloads = std::path::PathBuf::from(kam_storage::downloads::folder_for(&me));
-        if !downloads.is_dir() {
-            return;
-        }
-        let file = downloads.join(format!("kam-download-test-{}.bin", std::process::id()));
+        assert!(downloads.starts_with(&profile), "{}", downloads.display());
+        std::fs::create_dir_all(&downloads).unwrap();
+        let file = downloads.join("download.bin");
         std::fs::write(&file, vec![3_u8; 1024]).unwrap();
         let path = file.to_string_lossy().into_owned();
         let Response::DownloadChecked(record) = check(&path, &me, &context) else {
-            let _ = std::fs::remove_file(&file);
+            let _ = std::fs::remove_dir_all(&profile);
             panic!("the download could not be checked");
         };
 
@@ -2431,11 +2442,15 @@ mod tests {
             &me,
         );
         let Response::Quarantined(manifest) = &held else {
-            let _ = std::fs::remove_file(&file);
+            let _ = std::fs::remove_dir_all(&profile);
             panic!("the download was not quarantined: {held:?}");
         };
         assert!(!file.exists());
-        let row = context.store.downloads_for("", 10).unwrap().remove(0);
+        let row = context
+            .store
+            .downloads_for("S-1-5-21-0-0-0-4006", 10)
+            .unwrap()
+            .remove(0);
         assert!(row.actions.contains(&manifest.id), "{}", row.actions);
         assert_eq!(row.sha256, record.check.sha256);
         // The Activity entry gives its reason after a colon, not a double
@@ -2459,7 +2474,7 @@ mod tests {
         );
         assert!(matches!(back, Response::Quarantined(_)), "{back:?}");
         assert!(file.exists());
-        std::fs::remove_file(&file).unwrap();
+        let _ = std::fs::remove_dir_all(&profile);
     }
 
     /// What the window reports about an archive needs a check on record, and
