@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use kam_core::audit::{Effect, Entry};
+use kam_core::changes::TakenBy;
 use kam_core::{Reporter, Store, UserContext};
 use kam_ipc::{Request, Response, SystemStatus};
 
@@ -488,6 +489,22 @@ pub fn handle(
 
         Request::RunCheck => {
             let findings = crate::check::run_and_record(&context.store, user);
+            // The weekly check also takes the comparison What changed would
+            // take, so that a week in which it ran is not drawn as a week
+            // nobody looked at. That is all it adds: the comparison is not
+            // one of its findings and changes none of them, and one that
+            // could not be taken is written down on its own.
+            if let Err(error) = take_comparison(context, TakenBy::WeeklyCheck) {
+                tracing::error!(%error, "the weekly check could not compare the machine with its history");
+                context.audit(
+                    "changes",
+                    "sweep",
+                    Effect::Observed,
+                    format!(
+                        "the weekly check could not compare the machine with its history: {error}"
+                    ),
+                );
+            }
             Response::Checked {
                 findings: findings
                     .into_iter()
@@ -745,37 +762,15 @@ pub fn handle(
             }
         }
 
-        Request::SweepForChanges => {
-            let look = crate::baseline::collect();
-            let readings = crate::baseline::readings();
-            match context
-                .store
-                .compare(&look.seen, &look.unreadable, &readings, &look.parts)
-            {
-                Ok(sweep) => {
-                    // Audited as an observation: somebody deliberately asked
-                    // what had changed, and the answer is part of the history
-                    // of what was looked at.
-                    //
-                    // The entry says what could not be checked as well as what
-                    // was found. A sweep that saw less than it wanted to must
-                    // not read later as a clean bill of health.
-                    context.audit(
-                        "changes",
-                        "sweep",
-                        Effect::Observed,
-                        sweep_line(look.seen.len(), &sweep),
-                    );
-                    Response::Changes(Box::new(sweep))
-                }
-                Err(error) => {
-                    tracing::error!(%error, "could not compare the machine with its history");
-                    Response::Error {
-                        message: format!("what changed could not be worked out: {error}"),
-                    }
+        Request::SweepForChanges => match take_comparison(context, TakenBy::Page) {
+            Ok(sweep) => Response::Changes(Box::new(sweep)),
+            Err(error) => {
+                tracing::error!(%error, "could not compare the machine with its history");
+                Response::Error {
+                    message: format!("what changed could not be worked out: {error}"),
                 }
             }
-        }
+        },
 
         // Not audited, as reading the log is not: reading what an earlier
         // comparison found is reading history, and takes nothing and changes
@@ -1576,16 +1571,48 @@ fn hostname() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".to_owned())
 }
 
-/// The Activity line for one comparison: how much was compared, what came of
-/// it, and what it could not vouch for.
+/// Take one comparison of the machine with its history, and write it down.
+///
+/// The page and the weekly check both come here, so the comparison the weekly
+/// check takes is the one the page would have taken: the machine and every
+/// account signed in at the time, as `baseline::collect` reads them. Nothing
+/// about who asked is passed in. The weekly check is started by Task
+/// Scheduler as the person who switched it on, and the page by whoever opens
+/// it, and neither can narrow what is compared to their own account.
+///
+/// Audited as an observation: a comparison is part of the history of what was
+/// looked at, and the entry says what could not be checked as well as what
+/// was found, so that one that saw less than it wanted to does not read later
+/// as a clean bill of health.
+fn take_comparison(context: &Context, by: TakenBy) -> kam_core::Result<kam_core::changes::Sweep> {
+    let look = crate::baseline::collect();
+    let readings = crate::baseline::readings();
+    let sweep = context
+        .store
+        .compare(&look.seen, &look.unreadable, &readings, &look.parts, by)?;
+    context.audit(
+        "changes",
+        "sweep",
+        Effect::Observed,
+        sweep_line(look.seen.len(), &sweep, by),
+    );
+    Ok(sweep)
+}
+
+/// The Activity line for one comparison: what took it, how much was compared,
+/// what came of it, and what it could not vouch for.
 ///
 /// What could not be read is counted, and apart from it what was recorded
 /// afresh without being compared. The second was counted as the first, so a
 /// comparison that had read everything said a source could not be read.
-fn sweep_line(compared: usize, sweep: &kam_core::changes::Sweep) -> String {
+fn sweep_line(compared: usize, sweep: &kam_core::changes::Sweep, by: TakenBy) -> String {
     let found = sweep.differences.len();
     let mut line = format!(
-        "compared {compared} things against the last sweep: {found} {}",
+        "{}compared {compared} things against the last sweep: {found} {}",
+        match by {
+            TakenBy::Page => "",
+            TakenBy::WeeklyCheck => "the weekly check ",
+        },
         if sweep.baseline {
             "differences (this was the first, so nothing was compared)"
         } else if found == 1 {
@@ -2137,7 +2164,7 @@ mod tests {
             afresh: vec!["Services were recorded as they are, and not compared.".to_owned()],
             ..Default::default()
         };
-        let line = sweep_line(312, &afresh_only);
+        let line = sweep_line(312, &afresh_only, TakenBy::Page);
         assert!(!line.contains("could not be read"), "{line}");
         assert!(
             line.ends_with("; 1 part was recorded afresh, not compared"),
@@ -2150,13 +2177,80 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            sweep_line(312, &both),
+            sweep_line(312, &both, TakenBy::Page),
             "compared 312 things against the last sweep: 0 differences; 1 source could not \
              be read; 2 parts were recorded afresh, not compared"
         );
         assert_eq!(
-            sweep_line(312, &kam_core::changes::Sweep::default()),
+            sweep_line(312, &kam_core::changes::Sweep::default(), TakenBy::Page),
             "compared 312 things against the last sweep: 0 differences"
+        );
+        // And one the weekly check took says so.
+        assert_eq!(
+            sweep_line(
+                312,
+                &kam_core::changes::Sweep::default(),
+                TakenBy::WeeklyCheck
+            ),
+            "the weekly check compared 312 things against the last sweep: 0 differences"
+        );
+    }
+
+    /// The weekly check takes a comparison, and it is the one the page would
+    /// have taken, whoever started it.
+    ///
+    /// The page took the only comparisons, so a week in which nobody opened it
+    /// was drawn as a week nobody looked at though the weekly check had run.
+    /// The check is started by Task Scheduler as the person who switched it
+    /// on, not through the window, so what it compares must not depend on who
+    /// asked: here it is started by one caller and the page opened by another.
+    /// The page's comparison then follows straight on from the check's, and
+    /// meets no account for the first time, which it would if the check had
+    /// looked at fewer accounts than the page does.
+    #[test]
+    fn the_weekly_check_takes_the_comparison_the_page_would() {
+        let context = context(Mode::Service);
+        let response = handle(Request::RunCheck, &context, &Reporter::silent(), &someone());
+        assert!(
+            matches!(response, Response::Checked { .. }),
+            "the check itself still answers as it did: {response:?}"
+        );
+        let swept = context
+            .store
+            .recent_audit(200)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.module == "changes" && entry.action == "sweep")
+            .expect("the weekly check's comparison is written down");
+        assert!(
+            swept.detail.starts_with("the weekly check compared"),
+            "{}",
+            swept.detail
+        );
+
+        let response = handle(
+            Request::SweepForChanges,
+            &context,
+            &Reporter::silent(),
+            &UserContext::current(),
+        );
+        let Response::Changes(sweep) = response else {
+            panic!("expected a comparison, got {response:?}");
+        };
+        assert!(
+            !sweep.baseline,
+            "the weekly check took no comparison, so the page's was the first"
+        );
+        let takers: Vec<Option<TakenBy>> = sweep.kept.iter().map(|one| one.taken_by).collect();
+        assert_eq!(
+            takers,
+            vec![Some(TakenBy::Page)],
+            "the baseline is not offered"
+        );
+        assert!(
+            sweep.afresh.is_empty(),
+            "the page met something the weekly check had not looked at: {:?}",
+            sweep.afresh
         );
     }
 

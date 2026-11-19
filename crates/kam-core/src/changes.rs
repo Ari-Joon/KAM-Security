@@ -449,6 +449,9 @@ pub struct Sweep {
     /// What the store knows this comparison by, to read its list again.
     #[serde(default)]
     pub id: i64,
+    /// What took this comparison.
+    #[serde(default)]
+    pub taken_by: Option<TakenBy>,
     /// Every comparison kept from the same twelve weeks as `history`, newest
     /// first, this one among them. The baseline is not, because it compared
     /// nothing.
@@ -457,6 +460,46 @@ pub struct Sweep {
     /// shown once, and the week it was taken in was all that was left of it.
     #[serde(default)]
     pub kept: Vec<Comparison>,
+}
+
+/// What took a comparison.
+///
+/// # Why the weekly check takes one
+///
+/// A comparison was taken only when somebody opened What changed, so a week
+/// in which nobody did was drawn as a week nobody looked at, though the
+/// weekly check had run in it. The weekly check now takes the comparison the
+/// page would have taken, and what took each one is kept and shown with its
+/// list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TakenBy {
+    /// Somebody opened What changed.
+    Page,
+    /// The weekly check: on its schedule, or by its Check now button.
+    WeeklyCheck,
+}
+
+impl TakenBy {
+    /// The name this is stored under. Stable across versions, because it is
+    /// stored.
+    pub fn stored(self) -> &'static str {
+        match self {
+            Self::Page => "page",
+            Self::WeeklyCheck => "weekly_check",
+        }
+    }
+
+    /// Read one back. `None` for a comparison from before what took it was
+    /// kept, and for a name this version does not know: neither is claimed
+    /// to be either.
+    pub fn from_stored(text: &str) -> Option<Self> {
+        match text {
+            "page" => Some(Self::Page),
+            "weekly_check" => Some(Self::WeeklyCheck),
+            _ => None,
+        }
+    }
 }
 
 /// One comparison as the store keeps it, offered by its date so that its list
@@ -468,6 +511,9 @@ pub struct Comparison {
     pub at: String,
     /// How many differences it found, Windows' own tasks among them.
     pub found: usize,
+    /// What took it. `None` for one taken before that was kept.
+    #[serde(default)]
+    pub taken_by: Option<TakenBy>,
 }
 
 /// One comparison's list, read again as it was shown.
@@ -475,6 +521,8 @@ pub struct Comparison {
 pub struct Kept {
     pub id: i64,
     pub at: String,
+    /// What took it. `None` for one taken before that was kept.
+    pub taken_by: Option<TakenBy>,
     /// When the comparison before it was taken, which is what it compared
     /// the machine against.
     pub previous_at: Option<String>,

@@ -495,6 +495,8 @@ export type Sweep = {
   unvouched: Difference[];
   /** What the store knows this comparison by, to read its list again. */
   id: number;
+  /** What took this comparison. */
+  taken_by: TakenBy | null;
   /**
    * Every comparison kept from the same twelve weeks as `history`, newest
    * first, this one among them. The baseline is not, because it compared
@@ -503,18 +505,27 @@ export type Sweep = {
   kept: Comparison[];
 };
 
+/**
+ * What took a comparison: somebody opening What changed, or the weekly check
+ * (on its schedule or by its Check now button). Null for one taken before
+ * this was kept, when only the page took them.
+ */
+export type TakenBy = "page" | "weekly_check";
+
 /** One comparison as it is kept, offered by date to be read again. */
 export type Comparison = {
   id: number;
   at: string;
   /** How many differences it found, Windows' own tasks among them. */
   found: number;
+  taken_by: TakenBy | null;
 };
 
 /** One earlier comparison's list, read again as it was shown. */
 export type Kept = {
   id: number;
   at: string;
+  taken_by: TakenBy | null;
   /** When the comparison before it was taken: what it compared against. */
   previous_at: string | null;
   differences: Difference[];

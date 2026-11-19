@@ -720,7 +720,7 @@ mod tests {
     /// lists read again, both survive the wire.
     #[test]
     fn a_comparison_and_a_list_read_again_survive_the_wire() {
-        use kam_core::changes::{Change, Comparison, Difference, Kept, Sweep};
+        use kam_core::changes::{Change, Comparison, Difference, Kept, Sweep, TakenBy};
 
         let difference = Difference {
             at: "2026-11-18T14:00:00.000Z".to_owned(),
@@ -738,11 +738,13 @@ mod tests {
         };
         round_trip(Response::Changes(Box::new(Sweep {
             id: 7,
+            taken_by: Some(TakenBy::Page),
             afresh: vec!["Services were recorded afresh.".to_owned()],
             kept: vec![Comparison {
                 id: 7,
                 at: "2026-11-18T14:00:00.000Z".to_owned(),
                 found: 1,
+                taken_by: Some(TakenBy::WeeklyCheck),
             }],
             differences: vec![difference.clone()],
             ..Sweep::default()
@@ -750,6 +752,7 @@ mod tests {
         round_trip(Response::Comparison(Box::new(Kept {
             id: 7,
             at: "2026-11-18T14:00:00.000Z".to_owned(),
+            taken_by: None,
             previous_at: Some("2026-11-11T14:00:00.000Z".to_owned()),
             differences: vec![difference],
             unreadable: Vec::new(),

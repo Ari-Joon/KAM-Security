@@ -854,7 +854,13 @@ impl Store {
         unreadable: &[crate::changes::Unreadable],
         readings: &[crate::changes::Reading],
     ) -> Result<crate::changes::Sweep> {
-        self.compare(seen, unreadable, readings, &[])
+        self.compare(
+            seen,
+            unreadable,
+            readings,
+            &[],
+            crate::changes::TakenBy::Page,
+        )
     }
 
     /// The same, told also which parts of the machine were looked at as a
@@ -868,12 +874,15 @@ impl Store {
     /// back in `afresh`. The machine beside it is compared as ever. See
     /// [`crate::changes::Part`] for why, and for when a part counts as looked
     /// at.
+    ///
+    /// `by` is what took the comparison, kept with it and shown with its list.
     pub fn compare(
         &self,
         seen: &[crate::changes::Sighting],
         unreadable: &[crate::changes::Unreadable],
         readings: &[crate::changes::Reading],
         parts: &[crate::changes::Part],
+        by: crate::changes::TakenBy,
     ) -> Result<crate::changes::Sweep> {
         use crate::changes::{Change, Difference, Part, Reading, FLAPS_BEFORE_RECURRING};
 
@@ -1267,8 +1276,8 @@ impl Store {
 
         connection
             .execute(
-                "INSERT INTO sweeps (at, unreadable, afresh) VALUES (?1, ?2, ?3)",
-                params![now, said.join("\n"), afresh_said.join("\n")],
+                "INSERT INTO sweeps (at, unreadable, afresh, taken_by) VALUES (?1, ?2, ?3, ?4)",
+                params![now, said.join("\n"), afresh_said.join("\n"), by.stored()],
             )
             .map_err(to_db_error)?;
         let id = connection.last_insert_rowid();
@@ -1364,7 +1373,8 @@ impl Store {
         // weeks, with how much each found.
         let mut lists = connection
             .prepare(
-                "SELECT id, at, (SELECT COUNT(*) FROM changes WHERE changes.sweep = sweeps.id)
+                "SELECT id, at, (SELECT COUNT(*) FROM changes WHERE changes.sweep = sweeps.id),
+                        taken_by
                    FROM sweeps
                   WHERE id > (SELECT MIN(id) FROM sweeps)
                     AND at >= datetime('now', '-84 days')
@@ -1377,6 +1387,10 @@ impl Store {
                     id: row.get(0)?,
                     at: row.get(1)?,
                     found: row.get::<_, i64>(2)?.max(0) as usize,
+                    taken_by: row
+                        .get::<_, Option<String>>(3)?
+                        .as_deref()
+                        .and_then(crate::changes::TakenBy::from_stored),
                 })
             })
             .map_err(to_db_error)?
@@ -1397,6 +1411,7 @@ impl Store {
             swept,
             unvouched,
             id,
+            taken_by: Some(by),
             kept,
         })
     }
@@ -1413,16 +1428,16 @@ impl Store {
         use crate::changes::{Change, Difference};
 
         let connection = self.lock()?;
-        let found: Option<(String, String, Option<String>)> = connection
+        let found: Option<(String, String, Option<String>, Option<String>)> = connection
             .query_row(
-                "SELECT at, unreadable, afresh FROM sweeps
+                "SELECT at, unreadable, afresh, taken_by FROM sweeps
                   WHERE id = ?1 AND id > (SELECT MIN(id) FROM sweeps)",
                 params![id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(to_db_error)?;
-        let Some((at, unreadable, afresh)) = found else {
+        let Some((at, unreadable, afresh, taken_by)) = found else {
             return Ok(None);
         };
         let previous_at: Option<String> = connection
@@ -1481,6 +1496,9 @@ impl Store {
         Ok(Some(crate::changes::Kept {
             id,
             at,
+            taken_by: taken_by
+                .as_deref()
+                .and_then(crate::changes::TakenBy::from_stored),
             previous_at,
             differences,
             unreadable: lines(&unreadable),
@@ -3292,6 +3310,8 @@ mod tests {
     /// taken in a week nobody opened the page was never shown at all.
     #[test]
     fn a_list_shown_once_can_be_read_again_as_it_was() {
+        use crate::changes::TakenBy;
+
         let store = Store::open_in_memory().unwrap();
         let how = [read_as("service", 1), read_as("run_key", 1)];
         let baseline = store
@@ -3303,9 +3323,11 @@ mod tests {
                 &[],
                 &how,
                 &[],
+                PAGE,
             )
             .unwrap();
 
+        // Taken by the weekly check, in a week nobody opened the page.
         let shown = store
             .compare(
                 &[
@@ -3323,9 +3345,11 @@ mod tests {
                     read_as("administrator", 1),
                 ],
                 &[],
+                TakenBy::WeeklyCheck,
             )
             .unwrap();
         assert_eq!(shown.differences.len(), 3, "{:?}", shown.differences);
+        assert_eq!(shown.taken_by, Some(TakenBy::WeeklyCheck));
 
         // More comparisons are taken, and they find nothing.
         let later = store
@@ -3337,6 +3361,7 @@ mod tests {
                 &[],
                 &how,
                 &[],
+                PAGE,
             )
             .unwrap();
         assert!(later.differences.is_empty());
@@ -3346,6 +3371,7 @@ mod tests {
             .unwrap()
             .expect("the list that was shown is kept");
         assert!(again.whole, "a list kept whole said it was not");
+        assert_eq!(again.taken_by, Some(TakenBy::WeeklyCheck));
         assert_eq!(again.at, shown.at);
         assert_eq!(again.previous_at, shown.previous_at);
         assert_eq!(again.unreadable, shown.unreadable);
@@ -3359,10 +3385,20 @@ mod tests {
             "the list read again is not the list that was shown"
         );
 
-        // Every comparison is offered with how much it found, newest first.
-        // The baseline compared nothing and has no list.
-        let offered: Vec<(i64, usize)> = later.kept.iter().map(|one| (one.id, one.found)).collect();
-        assert_eq!(offered, vec![(later.id, 0), (shown.id, 3)]);
+        // Every comparison is offered with how much it found and what took
+        // it, newest first. The baseline compared nothing and has no list.
+        let offered: Vec<(i64, usize, Option<TakenBy>)> = later
+            .kept
+            .iter()
+            .map(|one| (one.id, one.found, one.taken_by))
+            .collect();
+        assert_eq!(
+            offered,
+            vec![
+                (later.id, 0, Some(TakenBy::Page)),
+                (shown.id, 3, Some(TakenBy::WeeklyCheck)),
+            ]
+        );
         assert!(store.comparison(baseline.id).unwrap().is_none());
         assert!(store.comparison(later.id + 1).unwrap().is_none());
     }
@@ -3386,6 +3422,7 @@ mod tests {
 
         let old = store.comparison(second).unwrap().expect("its list is kept");
         assert!(!old.whole, "a list from before claimed to be whole");
+        assert_eq!(old.taken_by, None, "what took it was not kept then");
         let named: Vec<(&str, crate::changes::Change)> = old
             .differences
             .iter()
@@ -3408,6 +3445,9 @@ mod tests {
 
     const HER_RUN_KEY: &str =
         r"hkey_users\s-1-5-21-1-2-3-1001\software\microsoft\windows\currentversion\run";
+
+    /// A comparison taken by opening the page.
+    const PAGE: crate::changes::TakenBy = crate::changes::TakenBy::Page;
 
     /// Her account's own startup places, as a part of what is compared.
     fn hers() -> crate::changes::Part {
@@ -3445,7 +3485,7 @@ mod tests {
         let how = [read_as("service", 1), read_as("run_key", 1)];
         // The baseline, taken with nobody signed in.
         store
-            .compare(&[seen("service", "One", "a")], &[], &how, &[])
+            .compare(&[seen("service", "One", "a")], &[], &how, &[], PAGE)
             .unwrap();
 
         // She signs in. Her sign-in entry has been there for months, and the
@@ -3461,6 +3501,7 @@ mod tests {
                 &[],
                 &how,
                 &[hers()],
+                PAGE,
             )
             .unwrap();
         assert_eq!(
@@ -3485,6 +3526,7 @@ mod tests {
                 &[],
                 &how,
                 &[hers()],
+                PAGE,
             )
             .unwrap();
         assert_eq!(reported(&second), vec![("Updater", Change::Appeared)]);
@@ -3501,10 +3543,10 @@ mod tests {
         let how = [read_as("service", 1), read_as("run_key", 1)];
         let machine = seen("service", "One", "a");
         store
-            .compare(std::slice::from_ref(&machine), &[], &how, &[])
+            .compare(std::slice::from_ref(&machine), &[], &how, &[], PAGE)
             .unwrap();
         let empty = store
-            .compare(std::slice::from_ref(&machine), &[], &how, &[hers()])
+            .compare(std::slice::from_ref(&machine), &[], &how, &[hers()], PAGE)
             .unwrap();
         assert!(empty.differences.is_empty());
         assert_eq!(empty.afresh.len(), 1, "{:?}", empty.afresh);
@@ -3515,6 +3557,7 @@ mod tests {
                 &[],
                 &how,
                 &[hers()],
+                PAGE,
             )
             .unwrap();
         assert_eq!(reported(&planted), vec![("Planted", Change::Appeared)]);
@@ -3529,7 +3572,7 @@ mod tests {
         let how = [read_as("service", 1), read_as("run_key", 1)];
         let machine = seen("service", "One", "a");
         store
-            .compare(std::slice::from_ref(&machine), &[], &how, &[])
+            .compare(std::slice::from_ref(&machine), &[], &how, &[], PAGE)
             .unwrap();
 
         let signed_out = [crate::changes::Unreadable::covering(
@@ -3542,7 +3585,13 @@ mod tests {
             "an account signed out while it was being read",
         )];
         let unread = store
-            .compare(std::slice::from_ref(&machine), &signed_out, &how, &[hers()])
+            .compare(
+                std::slice::from_ref(&machine),
+                &signed_out,
+                &how,
+                &[hers()],
+                PAGE,
+            )
             .unwrap();
         assert!(unread.afresh.is_empty(), "{:?}", unread.afresh);
 
@@ -3555,6 +3604,7 @@ mod tests {
                 &[],
                 &how,
                 &[hers()],
+                PAGE,
             )
             .unwrap();
         assert!(
@@ -3582,6 +3632,7 @@ mod tests {
                 &[],
                 &how,
                 &[],
+                PAGE,
             )
             .unwrap();
 
@@ -3595,6 +3646,7 @@ mod tests {
                 &[],
                 &how,
                 &[hers()],
+                PAGE,
             )
             .unwrap();
         assert_eq!(reported(&after), vec![("Updater", Change::Appeared)]);

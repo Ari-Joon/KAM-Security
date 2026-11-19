@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import ChangeBars, { categoryOf } from "../components/ChangeBars";
 import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
-import type { ChangeKind, Difference, Kept, Sweep } from "../lib/types";
+import type { ChangeKind, Difference, Kept, Sweep, TakenBy } from "../lib/types";
 
 /**
  * What changed on this machine since the last time it was looked at.
@@ -125,9 +125,25 @@ function Row({ item, whole }: { item: Difference; whole: boolean }) {
   );
 }
 
+/**
+ * What took a comparison, finishing "taken ...". A comparison from before this
+ * was kept says so, and what is true of all of those: only this page took them.
+ */
+function takenBy(by: TakenBy | null): string {
+  switch (by) {
+    case "page":
+      return "when this page was opened";
+    case "weekly_check":
+      return "by the weekly check";
+    default:
+      return "before KAM kept what took each comparison (until then, only this page took them)";
+  }
+}
+
 /** What one comparison's list needs, whether it is the newest or read again. */
 type Shown = {
   at: string;
+  taken_by: TakenBy | null;
   previous_at: string | null;
   differences: Difference[];
   unreadable: string[];
@@ -146,10 +162,13 @@ type Shown = {
 function List({
   list,
   newest,
+  before,
   onNewest,
 }: {
   list: Shown;
   newest: string | null;
+  /** What took the comparison this one was compared against, when known. */
+  before: TakenBy | null;
   onNewest: () => void;
 }) {
   const { shown, windowsTasks } = useMemo(() => {
@@ -178,10 +197,11 @@ function List({
     <section className="panel">
       {newest !== null ? (
         <div className="notice notice-warn">
-          <strong>A past comparison,</strong> taken {fmt.timestamp(list.at)} and
-          kept as it was shown then. It says what had changed by that day, not
-          what the machine is like now: the newest comparison was taken{" "}
-          {fmt.timestamp(newest)}.{" "}
+          <strong>A past comparison,</strong> taken {fmt.timestamp(list.at)}
+          {list.taken_by ? " " : ", "}
+          {takenBy(list.taken_by)}, and kept as it was shown then. It says what
+          had changed by that day, not what the machine is like now: the newest
+          comparison was taken {fmt.timestamp(newest)}.{" "}
           <button className="link-button" style={{ padding: 0 }} onClick={onNewest}>
             Show the newest
           </button>
@@ -207,6 +227,14 @@ function List({
         {list.previous_at ? (
           newest !== null ? (
             <>Since {longDate(list.previous_at)}, the comparison before it.</>
+          ) : before === "weekly_check" ? (
+            /* The weekly check has compared the machine since this page was
+               last opened, and anything that changed before then is in its
+               list, not this one. */
+            <>
+              Since {longDate(list.previous_at)}, when the weekly check compared
+              the machine. What it found is kept under Earlier comparisons.
+            </>
           ) : (
             <>
               Since {longDate(list.previous_at)}, the last time this ran.
@@ -216,7 +244,8 @@ function List({
           )
         ) : (
           <>Since the previous sweep.</>
-        )}
+        )}{" "}
+        {newest === null ? <>Taken {takenBy(list.taken_by)}.</> : null}
       </p>
 
       {!list.whole ? (
@@ -362,6 +391,7 @@ export default function Changes({
 
   const newest: Shown = {
     at: sweep.at,
+    taken_by: sweep.taken_by ?? null,
     previous_at: sweep.previous_at,
     differences: sweep.differences,
     unreadable: sweep.unreadable,
@@ -370,6 +400,7 @@ export default function Changes({
   };
   const kept = sweep.kept ?? [];
   const shownId = past ? past.id : sweep.id;
+  const before = kept.find((one) => one.at === sweep.previous_at)?.taken_by ?? null;
 
   /** Read an earlier list again, or go back to the newest. */
   function open(id: number) {
@@ -500,9 +531,9 @@ export default function Changes({
       ) : (
         <>
           {past ? (
-            <List list={past} newest={sweep.at} onNewest={() => open(sweep.id)} />
+            <List list={past} newest={sweep.at} before={null} onNewest={() => open(sweep.id)} />
           ) : (
-            <List list={newest} newest={null} onNewest={() => open(sweep.id)} />
+            <List list={newest} newest={null} before={before} onNewest={() => open(sweep.id)} />
           )}
 
           <section className="panel">
@@ -526,6 +557,11 @@ export default function Changes({
                   >
                     {fmt.timestamp(one.at)}
                     {one.id === sweep.id ? ", the newest" : ""}
+                    {one.taken_by === "weekly_check"
+                      ? " · weekly check"
+                      : one.taken_by === "page"
+                        ? " · this page"
+                        : ""}
                     <span className="tab-count">
                       {opening === one.id
                         ? "opening"
