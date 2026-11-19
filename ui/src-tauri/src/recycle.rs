@@ -31,14 +31,18 @@
 //! counted before and after and the answer says which really happened.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use windows::core::PCWSTR;
+use windows::core::{implement, Ref, HRESULT, PCWSTR};
+use windows::Win32::Foundation::E_ABORT;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Shell::{
-    FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName, SHQueryRecycleBinW,
-    SHQUERYRBINFO,
+    FileOperation, IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Impl,
+    IShellItem, SHCreateItemFromParsingName, SHQueryRecycleBinW, SHQUERYRBINFO,
+    TSF_DELETE_RECYCLE_IF_POSSIBLE,
 };
 
 /// Suppress the confirmation prompt. The window has already asked.
@@ -144,6 +148,214 @@ impl Drop for Com {
 /// but the bin did not gain anything, that is reported in `warning` rather than
 /// being quietly presented as a recycle.
 pub fn to_recycle_bin(path: &Path) -> Result<Recycled, String> {
+    send(path, None)
+}
+
+/// Send one path to the Recycle Bin, or leave it exactly where it is.
+///
+/// # Why there is a second way to do this
+///
+/// [`to_recycle_bin`] asks Windows to recycle and then counts the bin to see
+/// whether it did. When an item is larger than the bin on its drive is set to
+/// hold, or the bin is switched off for that drive, Windows deletes the item
+/// outright, and with its own question suppressed it does so without a word.
+/// The count then says so, afterwards. That is an honest report of something
+/// that cannot be taken back.
+///
+/// For the leftovers and duplicate copies that function serves, the item is
+/// usually small and the report has been judged enough. The list of large old
+/// files is the opposite case in both respects: every row is large, which is
+/// exactly when the bin cannot take it, and the list promises a Recycle Bin
+/// button and no permanent delete. So that list uses this.
+///
+/// Windows tells whoever is watching a delete, before each item goes, whether
+/// it is about to be recycled. [`RecycleOrStop`] watches, and stops the delete
+/// when the answer is no. The file is then still there, and the person is
+/// told why.
+pub fn to_recycle_bin_or_leave(path: &Path) -> Result<Recycled, String> {
+    let stopped = Arc::new(AtomicBool::new(false));
+    let watcher: IFileOperationProgressSink = RecycleOrStop {
+        stopped: Arc::clone(&stopped),
+    }
+    .into();
+
+    let outcome = send(path, Some(&watcher));
+    if !stopped.load(Ordering::SeqCst) {
+        return outcome;
+    }
+    if path.exists() {
+        return Err(format!(
+            "{} was left where it is. Windows was not going to put it in the Recycle \
+             Bin, and would have deleted it outright: that happens when a file is \
+             larger than the Recycle Bin on its drive is set to hold, or when the bin \
+             is switched off for that drive",
+            path.display()
+        ));
+    }
+    // Stopped, and gone all the same. Not expected, and not to be reported as
+    // anything but what it is.
+    Ok(Recycled {
+        in_bin: false,
+        warning: Some(format!(
+            "{} was removed and did not reach the Recycle Bin, although Windows was \
+             told to leave it. It cannot be restored from there.",
+            path.display()
+        )),
+    })
+}
+
+/// Whether the flags Windows hands a watcher before a delete say the item is
+/// about to be recycled.
+///
+/// The delete is asked for with "recycle if possible". Windows clears that
+/// flag for an item it has decided it cannot recycle, and what it does next
+/// to such an item is delete it.
+fn will_be_recycled(flags: u32) -> bool {
+    flags & (TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32) != 0
+}
+
+/// Watches one delete, and stops it if the item is about to be destroyed
+/// instead of recycled. See [`to_recycle_bin_or_leave`].
+#[implement(IFileOperationProgressSink)]
+struct RecycleOrStop {
+    stopped: Arc<AtomicBool>,
+}
+
+// Windows calls every one of these as the operation goes along. Only the
+// moment before a delete is of interest; the rest answer "carry on".
+#[allow(non_snake_case)]
+impl IFileOperationProgressSink_Impl for RecycleOrStop_Impl {
+    fn PreDeleteItem(&self, dwflags: u32, _psiitem: Ref<IShellItem>) -> windows::core::Result<()> {
+        if will_be_recycled(dwflags) {
+            return Ok(());
+        }
+        self.stopped.store(true, Ordering::SeqCst);
+        Err(E_ABORT.into())
+    }
+
+    fn StartOperations(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn FinishOperations(&self, _hrresult: HRESULT) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn PreRenameItem(
+        &self,
+        _dwflags: u32,
+        _psiitem: Ref<IShellItem>,
+        _psznewname: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn PostRenameItem(
+        &self,
+        _dwflags: u32,
+        _psiitem: Ref<IShellItem>,
+        _psznewname: &PCWSTR,
+        _hrrename: HRESULT,
+        _psinewlycreated: Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn PreMoveItem(
+        &self,
+        _dwflags: u32,
+        _psiitem: Ref<IShellItem>,
+        _psidestinationfolder: Ref<IShellItem>,
+        _psznewname: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn PostMoveItem(
+        &self,
+        _dwflags: u32,
+        _psiitem: Ref<IShellItem>,
+        _psidestinationfolder: Ref<IShellItem>,
+        _psznewname: &PCWSTR,
+        _hrmove: HRESULT,
+        _psinewlycreated: Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn PreCopyItem(
+        &self,
+        _dwflags: u32,
+        _psiitem: Ref<IShellItem>,
+        _psidestinationfolder: Ref<IShellItem>,
+        _psznewname: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn PostCopyItem(
+        &self,
+        _dwflags: u32,
+        _psiitem: Ref<IShellItem>,
+        _psidestinationfolder: Ref<IShellItem>,
+        _psznewname: &PCWSTR,
+        _hrcopy: HRESULT,
+        _psinewlycreated: Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn PostDeleteItem(
+        &self,
+        _dwflags: u32,
+        _psiitem: Ref<IShellItem>,
+        _hrdelete: HRESULT,
+        _psinewlycreated: Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn PreNewItem(
+        &self,
+        _dwflags: u32,
+        _psidestinationfolder: Ref<IShellItem>,
+        _psznewname: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn PostNewItem(
+        &self,
+        _dwflags: u32,
+        _psidestinationfolder: Ref<IShellItem>,
+        _psznewname: &PCWSTR,
+        _psztemplatename: &PCWSTR,
+        _dwfileattributes: u32,
+        _hrnew: HRESULT,
+        _psinewitem: Ref<IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn UpdateProgress(&self, _iworktotal: u32, _iworksofar: u32) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn ResetTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn PauseTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn ResumeTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+/// Ask Windows to recycle one path, with or without somebody watching.
+fn send(path: &Path, watcher: Option<&IFileOperationProgressSink>) -> Result<Recycled, String> {
     if !path.exists() {
         return Err(format!("{} is not there", path.display()));
     }
@@ -166,7 +378,7 @@ pub fn to_recycle_bin(path: &Path) -> Result<Recycled, String> {
             .map_err(|error| format!("{} could not be opened: {error}", path.display()))?;
 
         operation
-            .DeleteItem(&item, None)
+            .DeleteItem(&item, watcher)
             .map_err(|error| format!("{} could not be queued: {error}", path.display()))?;
 
         operation.PerformOperations().map_err(|error| {
@@ -281,6 +493,67 @@ mod tests {
         if let (Some(before), Some(after)) = (before, bin_count()) {
             assert!(after > before, "the bin did not gain an item");
         }
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn the_flags_before_a_delete_say_whether_the_item_will_be_recycled() {
+        let recycle = TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32;
+        assert!(will_be_recycled(recycle));
+        assert!(will_be_recycled(recycle | 0x40 | 0x8));
+        assert!(!will_be_recycled(0));
+        // Other flags being set says nothing about the bin.
+        assert!(!will_be_recycled(0x40 | 0x8));
+    }
+
+    /// The watcher lets a delete that is going to the bin go ahead, and stops
+    /// one that is not, when called the way Windows calls it.
+    ///
+    /// A real delete that Windows would refuse to recycle cannot be arranged
+    /// here without changing how the Recycle Bin on this machine is set up,
+    /// which a test must not do. So the watcher is handed the flags Windows
+    /// would hand it, through the same interface.
+    #[test]
+    fn the_watcher_stops_a_delete_that_would_destroy_the_item_and_no_other() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let watcher: IFileOperationProgressSink = RecycleOrStop {
+            stopped: Arc::clone(&stopped),
+        }
+        .into();
+        let recycle = TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32;
+
+        unsafe { watcher.PreDeleteItem(recycle, None) }
+            .expect("a delete that is going to the bin was stopped");
+        assert!(!stopped.load(Ordering::SeqCst));
+
+        let refusal = unsafe { watcher.PreDeleteItem(0, None) }
+            .expect_err("a delete that would destroy the item was let through");
+        assert_eq!(refusal.code(), E_ABORT);
+        assert!(stopped.load(Ordering::SeqCst));
+    }
+
+    /// Being watched changes nothing for a file the bin can take: it goes to
+    /// the bin as before. This is also what shows, on the machine the tests
+    /// run on, that Windows does hand the watcher "recycle if possible" for a
+    /// file it is going to recycle. If it did not, every use of this would
+    /// leave the file where it was.
+    #[test]
+    fn a_file_the_bin_can_take_still_goes_to_it_when_the_delete_is_watched() {
+        let scratch =
+            std::env::temp_dir().join(format!("kam-recycle-watched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let victim = scratch.join("throwaway.txt");
+        std::fs::write(&victim, b"this can go").unwrap();
+
+        let result = to_recycle_bin_or_leave(&victim).expect("a small file should recycle");
+        assert!(!victim.exists(), "the file is still on disk");
+        assert!(
+            result.in_bin,
+            "a small file must reach the bin: {:?}",
+            result.warning
+        );
 
         let _ = std::fs::remove_dir_all(&scratch);
     }

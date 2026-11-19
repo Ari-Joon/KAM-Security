@@ -353,6 +353,32 @@ async fn recycle_item(path: String) -> Result<RecycleOutcome, String> {
     .await
 }
 
+/// Send one thing to the Recycle Bin, or leave it exactly where it is.
+///
+/// For the list of large old files, where a file too large for the bin is the
+/// ordinary case and not the rare one. [`recycle_item`] reports afterwards
+/// that Windows deleted such a file outright. This stops Windows before it
+/// does and says why the file is still there: see
+/// `recycle::to_recycle_bin_or_leave`. Recorded as [`recycle_item`] records,
+/// after it worked and for the reasons given there.
+#[tauri::command]
+async fn recycle_or_leave(path: String) -> Result<RecycleOutcome, String> {
+    off_the_window(move || {
+        let outcome = recycle::to_recycle_bin_or_leave(std::path::Path::new(&path))?;
+        if let Err(error) = kam_ipc::client::call(&Request::RecordRecycle {
+            path,
+            in_bin: outcome.in_bin,
+        }) {
+            eprintln!("the recycle could not be recorded in the audit log: {error}");
+        }
+        Ok(RecycleOutcome {
+            in_bin: outcome.in_bin,
+            warning: outcome.warning,
+        })
+    })
+    .await
+}
+
 /// For each item, whether this account could remove it itself.
 ///
 /// Lets the window offer recycling where it will work and quarantine where it
@@ -1544,6 +1570,7 @@ pub fn run() {
             sweep_for_changes,
             read_comparison,
             recycle_item,
+            recycle_or_leave,
             can_recycle_all,
             reveal_in_explorer,
             display_names,
