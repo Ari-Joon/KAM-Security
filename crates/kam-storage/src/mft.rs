@@ -89,6 +89,15 @@ const BOOT_READ_BYTES: usize = 4096;
 /// its check.
 const FIXUP_STRIDE: usize = 512;
 
+/// The largest cluster NTFS makes: 2 MB, since Windows 10. A boot sector that
+/// claims more is not describing a volume this can read.
+const MAX_CLUSTER_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The largest record this will read. NTFS writes records of 1 KB or 4 KB.
+/// The ceiling is far above both and still a size that is safe to ask for as
+/// memory, which the boot sector's own figure is not: it comes off the disk.
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
+
 /// One file or directory, as the table describes it.
 #[derive(Debug, Clone)]
 pub struct MftEntry {
@@ -204,12 +213,21 @@ fn parse_boot_sector(boot: &[u8]) -> Result<Geometry> {
         .get(0x0D)
         .ok_or_else(|| Error::Refused("truncated boot sector".to_owned()))?;
 
+    // Everything below is whatever the volume says, and a damaged or made-up
+    // volume can say anything. Each figure is worked out so that it cannot run
+    // off the end of the number, and then held to what NTFS can really be: a
+    // shift by a byte read from the disk used to be taken as given, and the
+    // record size it produced was then asked for as memory.
+    let unusable = || Error::Refused("the boot sector describes an unusable geometry".to_owned());
+
     // Values above 0x80 are a signed power of two rather than a count, which is
     // how volumes with clusters larger than 64 KB describe themselves.
     let sectors_per_cluster = if sectors_per_cluster_raw <= 0x80 {
         sectors_per_cluster_raw as u64
     } else {
-        1_u64 << (256 - sectors_per_cluster_raw as u32)
+        1_u64
+            .checked_shl(256 - sectors_per_cluster_raw as u32)
+            .ok_or_else(unusable)?
     };
 
     let mft_start_cluster =
@@ -220,20 +238,27 @@ fn parse_boot_sector(boot: &[u8]) -> Result<Geometry> {
         .ok_or_else(|| Error::Refused("truncated boot sector".to_owned()))?
         as i8;
 
-    let bytes_per_cluster = bytes_per_sector * sectors_per_cluster;
+    let bytes_per_cluster = bytes_per_sector
+        .checked_mul(sectors_per_cluster)
+        .ok_or_else(unusable)?;
 
     // Positive means a cluster count; negative means 2^-n bytes directly, which
-    // is what every modern volume uses (-10, for 1024-byte records).
+    // is what every modern volume uses (-10, for 1024-byte records). Widened
+    // before the sign is dropped: -128 has no positive form in one byte.
     let record_bytes = if clusters_per_record > 0 {
-        clusters_per_record as u64 * bytes_per_cluster
+        (clusters_per_record as u64).checked_mul(bytes_per_cluster)
     } else {
-        1_u64 << (-clusters_per_record) as u32
-    };
+        1_u64.checked_shl(i32::from(clusters_per_record).unsigned_abs())
+    }
+    .ok_or_else(unusable)?;
 
-    if bytes_per_sector == 0 || bytes_per_cluster == 0 || record_bytes == 0 {
-        return Err(Error::Refused(
-            "the boot sector describes an unusable geometry".to_owned(),
-        ));
+    let sector_is_real = bytes_per_sector.is_power_of_two()
+        && (FIXUP_STRIDE as u64..=BOOT_READ_BYTES as u64).contains(&bytes_per_sector);
+    let cluster_is_real = (bytes_per_sector..=MAX_CLUSTER_BYTES).contains(&bytes_per_cluster);
+    let record_is_real = (FIXUP_STRIDE as u64..=MAX_RECORD_BYTES).contains(&record_bytes)
+        && record_bytes.is_multiple_of(FIXUP_STRIDE as u64);
+    if !(sector_is_real && cluster_is_real && record_is_real) {
+        return Err(unusable());
     }
 
     Ok(Geometry {
@@ -312,7 +337,13 @@ struct Run {
 /// the run's length, and how many hold its starting offset. The offset is
 /// *signed* and *relative to the previous run*, so a fragmented file can point
 /// backwards on the disk.
-fn parse_runs(mapping: &[u8]) -> Vec<Run> {
+///
+/// `None` when the list is not one NTFS writes: a length or a position wider
+/// than the eight bytes a 64-bit number has, or positions that add up to
+/// somewhere off the number line. The header allows fifteen bytes for each,
+/// and both used to be shifted into place as given. A list like that comes
+/// from a damaged or made-up volume, and what it "says" is not to be read.
+fn parse_runs(mapping: &[u8]) -> Option<Vec<Run>> {
     let mut runs = Vec::new();
     let mut cursor = 0_usize;
     let mut previous_lcn = 0_i64;
@@ -326,6 +357,9 @@ fn parse_runs(mapping: &[u8]) -> Vec<Run> {
 
         let length_bytes = (header & 0x0F) as usize;
         let offset_bytes = (header >> 4) as usize;
+        if length_bytes > 8 || offset_bytes > 8 {
+            return None;
+        }
         if length_bytes == 0 || cursor + length_bytes + offset_bytes > mapping.len() {
             break;
         }
@@ -338,23 +372,24 @@ fn parse_runs(mapping: &[u8]) -> Vec<Run> {
 
         if offset_bytes == 0 {
             // A sparse run: it occupies virtual space but no clusters.
-            cursor += offset_bytes;
-            previous_lcn += 0;
             continue;
         }
 
-        // Sign-extend from the top byte of the offset field.
+        // Sign-extend from the top byte of the offset field. Eight bytes fill
+        // the number, sign and all, so there is nothing to extend.
         let mut offset = 0_i64;
         for index in 0..offset_bytes {
             offset |= (mapping[cursor + index] as i64) << (index * 8);
         }
-        let sign_bit = 1_i64 << (offset_bytes * 8 - 1);
-        if offset & sign_bit != 0 {
-            offset -= 1_i64 << (offset_bytes * 8);
+        if offset_bytes < 8 {
+            let sign_bit = 1_i64 << (offset_bytes * 8 - 1);
+            if offset & sign_bit != 0 {
+                offset -= 1_i64 << (offset_bytes * 8);
+            }
         }
         cursor += offset_bytes;
 
-        previous_lcn += offset;
+        previous_lcn = previous_lcn.checked_add(offset)?;
         if previous_lcn >= 0 && clusters > 0 {
             runs.push(Run {
                 start_cluster: previous_lcn as u64,
@@ -363,7 +398,7 @@ fn parse_runs(mapping: &[u8]) -> Vec<Run> {
         }
     }
 
-    runs
+    Some(runs)
 }
 
 /// Undo the update sequence protection applied to a multi-sector structure.
@@ -684,10 +719,15 @@ fn read_from(volume: &impl RawVolume, drive_letter: char) -> Result<MftSnapshot>
 
     // Record 0 describes the $MFT itself, including where the rest of it lives.
     let mut first = vec![0_u8; geometry.record_bytes as usize];
-    volume.read_at(
-        geometry.mft_start_cluster * geometry.bytes_per_cluster,
-        &mut first,
-    )?;
+    let table_at = geometry
+        .mft_start_cluster
+        .checked_mul(geometry.bytes_per_cluster)
+        .ok_or_else(|| {
+            Error::Refused(
+                "the boot sector puts the file table beyond the end of any drive".to_owned(),
+            )
+        })?;
+    volume.read_at(table_at, &mut first)?;
     apply_fixups(&mut first)
         .ok_or_else(|| Error::Refused("the $MFT record failed its fixup check".to_owned()))?;
 
@@ -754,6 +794,8 @@ fn read_from(volume: &impl RawVolume, drive_letter: char) -> Result<MftSnapshot>
         let mut sequence = 0_usize;
 
         'reading: for run in &runs {
+            // Neither can run over: `mft_runs` refused any piece whose end,
+            // in bytes, does not fit in the number.
             let mut remaining = run.clusters * geometry.bytes_per_cluster;
             let mut offset = run.start_cluster * geometry.bytes_per_cluster;
 
@@ -950,7 +992,28 @@ fn mft_runs(record: &[u8], bytes_per_cluster: u64) -> Result<Vec<Run>> {
             let mapping = record
                 .get(cursor + mapping_offset..cursor + length)
                 .ok_or_else(malformed)?;
-            let runs = parse_runs(mapping);
+            let runs = parse_runs(mapping).ok_or_else(malformed)?;
+
+            // Each piece is found by multiplying its place and its length out
+            // into bytes, and the reading loop does exactly that. A list that
+            // names a place beyond the end of any drive would wrap round, and
+            // the reader would go looking somewhere the list never meant.
+            // Settled here, once, so the loop's own sums cannot run over.
+            let reachable = runs.iter().all(|run| {
+                let start = run.start_cluster.checked_mul(bytes_per_cluster);
+                let length = run.clusters.checked_mul(bytes_per_cluster);
+                matches!(
+                    (start, length),
+                    (Some(start), Some(length)) if start.checked_add(length).is_some()
+                )
+            });
+            if !reachable {
+                return Err(Error::Refused(
+                    "the file table's own list of where it is kept names a place beyond the \
+                     end of any drive, so the table was not read"
+                        .to_owned(),
+                ));
+            }
 
             // The table's length in bytes, which only this first piece of the
             // attribute carries. Measured against what holds records rather
@@ -1021,7 +1084,7 @@ mod tests {
         // 0x21: one length byte, two offset bytes. Length 0x18, offset 0x0233.
         // 0x11: one and one. Length 0x08, offset +0x20 from the previous start.
         let mapping = [0x21, 0x18, 0x33, 0x02, 0x11, 0x08, 0x20, 0x00];
-        let runs = parse_runs(&mapping);
+        let runs = parse_runs(&mapping).unwrap();
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].clusters, 0x18);
         assert_eq!(runs[0].start_cluster, 0x0233);
@@ -1034,10 +1097,135 @@ mod tests {
         // Second run starts 0x10 clusters *before* the first: fragmentation
         // does not have to run forwards.
         let mapping = [0x11, 0x10, 0x40, 0x11, 0x08, 0xF0, 0x00];
-        let runs = parse_runs(&mapping);
+        let runs = parse_runs(&mapping).unwrap();
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].start_cluster, 0x40);
         assert_eq!(runs[1].start_cluster, 0x40 - 0x10);
+    }
+
+    /// A boot sector is the first thing read from a volume, and it says
+    /// whatever the volume says. One byte of it was used as a shift and
+    /// another as a power of two, as given, and the record size that came out
+    /// was then asked for as memory. A damaged disk or a made-up one plugged
+    /// into the PC could say anything there.
+    #[test]
+    fn a_boot_sector_with_sizes_no_volume_has_is_refused() {
+        let refused = |boot: &[u8], what: &str| {
+            assert!(
+                matches!(parse_boot_sector(boot), Err(Error::Refused(_))),
+                "{what} was accepted"
+            );
+        };
+
+        // Sectors per cluster given as two to a power no number holds, and as
+        // one that fits a number but no volume.
+        for raw in [0x81_u8, 0xC0, 0xE0] {
+            let mut boot = boot_sector(8, -10);
+            boot[0x0D] = raw;
+            refused(&boot, &format!("sectors per cluster byte {raw:#x}"));
+        }
+
+        // A record of two to the power of 100 bytes, of 128, of 40 (a
+        // terabyte), and of 3 (eight bytes, less than one protected stretch).
+        for power in [-100_i8, -128, -40, -3] {
+            refused(&boot_sector(8, power), &format!("a record of 2^{power}"));
+        }
+        // No clusters per record at all.
+        refused(&boot_sector(8, 0), "a record of no clusters");
+
+        // A sector size that is not one a disk has.
+        for sector in [0_u16, 513, 8192] {
+            let mut boot = boot_sector(8, -10);
+            boot[0x0B..0x0D].copy_from_slice(&sector.to_le_bytes());
+            refused(&boot, &format!("a sector of {sector} bytes"));
+        }
+
+        // And the sizes real volumes have still read as they did.
+        let large_clusters = {
+            let mut boot = boot_sector(8, -10);
+            // 0xF5 is two to the power of eleven sectors: one megabyte.
+            boot[0x0D] = 0xF5;
+            parse_boot_sector(&boot).unwrap()
+        };
+        assert_eq!(large_clusters.bytes_per_cluster, 1024 * 1024);
+        assert_eq!(
+            parse_boot_sector(&boot_sector(8, -12))
+                .unwrap()
+                .record_bytes,
+            4096
+        );
+    }
+
+    /// A list of pieces gives each length and each position in up to fifteen
+    /// bytes, by its own header, and a 64-bit number has eight. Wider fields
+    /// were shifted into place as given.
+    #[test]
+    fn a_list_of_pieces_wider_than_a_number_is_not_read() {
+        // Nine bytes of length.
+        let mut mapping = vec![0x19_u8];
+        mapping.extend_from_slice(&[0xFF; 10]);
+        mapping.push(0);
+        assert!(parse_runs(&mapping).is_none());
+
+        // Nine bytes of position.
+        let mut mapping = vec![0x91_u8, 0x01];
+        mapping.extend_from_slice(&[0x01; 9]);
+        mapping.push(0);
+        assert!(parse_runs(&mapping).is_none());
+
+        // Eight bytes of position is the widest there is, and is read: here
+        // the second piece starts one cluster before the first.
+        let mut mapping = vec![0x81_u8, 0x04];
+        mapping.extend_from_slice(&0x1000_i64.to_le_bytes());
+        mapping.extend_from_slice(&[0x81, 0x04]);
+        mapping.extend_from_slice(&(-1_i64).to_le_bytes());
+        mapping.push(0);
+        let runs = parse_runs(&mapping).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].start_cluster, 0x1000);
+        assert_eq!(runs[1].start_cluster, 0x0FFF);
+
+        // Positions that add up to somewhere off the number line.
+        let mut mapping = Vec::new();
+        for _ in 0..2 {
+            mapping.extend_from_slice(&[0x81, 0x04]);
+            mapping.extend_from_slice(&i64::MAX.to_le_bytes());
+        }
+        mapping.push(0);
+        assert!(parse_runs(&mapping).is_none());
+    }
+
+    /// The table's own record says where the table is. A piece placed beyond
+    /// the end of any drive was multiplied out into bytes as given, which
+    /// wraps round to somewhere the list never named.
+    #[test]
+    fn a_table_listed_beyond_the_end_of_any_drive_is_refused() {
+        // One piece of sixteen clusters at the last cluster a number can name.
+        let mut mapping = vec![0x81_u8, 0x10];
+        mapping.extend_from_slice(&i64::MAX.to_le_bytes());
+        mapping.push(0);
+        let mut record = file_record(
+            1024,
+            IN_USE,
+            &[file_name(5, "$MFT"), data_with_mapping(&mapping, 8 * 1024)],
+        );
+        apply_fixups(&mut record).expect("the made-up record is well formed");
+
+        let refusal = mft_runs(&record, 4096).map(|_| ()).unwrap_err();
+        assert!(
+            refusal.to_string().contains("beyond the end of any drive"),
+            "{refusal}"
+        );
+
+        // The same from the boot sector's side: the table's first cluster.
+        let (clusters, bytes) = table_size(4096, 1024);
+        let mut image = volume(512, 4096, 1024, clusters, bytes);
+        put(&mut image.bytes, 0x30, &u64::MAX.to_le_bytes());
+        let refusal = read_from(&image, 'k').map(|_| ()).unwrap_err();
+        assert!(
+            refusal.to_string().contains("beyond the end of any drive"),
+            "{refusal}"
+        );
     }
 
     #[test]
@@ -1123,7 +1311,6 @@ mod tests {
     /// An unnamed `$DATA` whose contents live in clusters, as a list of
     /// (clusters, first cluster) pieces. `bytes` is the length it states.
     fn data_in_clusters(pieces: &[(u8, u16)], bytes: u64) -> Vec<u8> {
-        const HEADER: usize = 0x40;
         let mut mapping = Vec::new();
         let mut previous = 0_i32;
         for (clusters, first) in pieces {
@@ -1135,6 +1322,13 @@ mod tests {
             previous = *first as i32;
         }
         mapping.push(0);
+        data_with_mapping(&mapping, bytes)
+    }
+
+    /// The same, with the list of pieces given as the bytes NTFS would hold,
+    /// for a test that needs a list no healthy volume has.
+    fn data_with_mapping(mapping: &[u8], bytes: u64) -> Vec<u8> {
+        const HEADER: usize = 0x40;
 
         let mut attribute = vec![0_u8; rounded_to_eight(HEADER + mapping.len())];
         let length = attribute.len() as u32;
@@ -1145,7 +1339,7 @@ mod tests {
         put(&mut attribute, 0x28, &bytes.to_le_bytes());
         put(&mut attribute, 0x30, &bytes.to_le_bytes());
         put(&mut attribute, 0x38, &bytes.to_le_bytes());
-        put(&mut attribute, HEADER, &mapping);
+        put(&mut attribute, HEADER, mapping);
         attribute
     }
 
