@@ -149,10 +149,43 @@ fn describe(root: &str) -> Option<Volume> {
     })
 }
 
+/// The serial number of the volume in a lettered drive, or `None` when it
+/// cannot be read.
+///
+/// Formatting a volume gives it a new one, and a replacement disk has its
+/// own, so this is what tells two summaries of "C:" apart when they are of
+/// different drives. See [`crate::growth`].
+pub fn serial_number(letter: char) -> Option<u32> {
+    let root = wide(&format!("{}:\\", letter.to_ascii_uppercase()));
+    let mut serial = 0_u32;
+    unsafe {
+        GetVolumeInformationW(
+            PCWSTR(root.as_ptr()),
+            None,
+            Some(&mut serial),
+            None,
+            None,
+            None,
+        )
+    }
+    .ok()?;
+    Some(serial)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_system_drive_has_a_serial_number_and_a_drive_that_is_not_there_has_none() {
+        // A number Windows gave the volume, not a property of this machine
+        // that the test depends on: only that one can be read.
+        assert!(serial_number('C').is_some());
+        assert!(serial_number('c').is_some());
+        // No machine has a drive with a letter that is not a letter.
+        assert_eq!(serial_number('1'), None);
+    }
 
     #[test]
     fn the_system_drive_is_enumerated_and_sane() {

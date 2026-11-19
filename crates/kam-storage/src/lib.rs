@@ -23,6 +23,7 @@ pub mod apps;
 pub mod caches;
 pub mod downloads;
 pub mod duplicates;
+pub mod growth;
 pub mod index;
 pub mod mft;
 pub mod old_files;

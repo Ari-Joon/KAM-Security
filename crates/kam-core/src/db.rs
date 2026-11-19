@@ -15,7 +15,7 @@ use crate::audit::{AuditLog, Effect, Entry, Record};
 use crate::{Error, Result};
 
 /// Bumped whenever the schema below changes. Stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE audit (
@@ -323,6 +323,40 @@ CREATE TABLE compared_parts (
     part      TEXT PRIMARY KEY COLLATE NOCASE,
     looked_at TEXT NOT NULL
 );
+";
+
+/// A small summary of each scan of a whole drive, so the next can be
+/// compared with it: "what grew since last time" needs a last time.
+///
+/// # One person's, holding only what they were sent
+///
+/// A summary names folders in every profile on the drive, as the scan it
+/// summarises does. So it is kept for the account that asked, by SID, and
+/// read back for that account alone: one person's summaries are not another's
+/// to read, any more than their downloads are. `folders` is the list the scan
+/// sent that person, written by the agent as JSON because its shape belongs
+/// to the crate that measures (see [`SCHEMA_V6`]).
+///
+/// # Kept small
+///
+/// The last [`SUMMARIES_KEPT`] of each drive, and the first of each month
+/// before those. Letting the others go is the store keeping itself to size,
+/// not a deletion anybody needs to be asked about: these are KAM Security's
+/// own notes, not anybody's files.
+const SCHEMA_V10: &str = "
+CREATE TABLE scan_summaries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    sid         TEXT    NOT NULL,
+    taken_at    TEXT    NOT NULL,
+    drive       TEXT    NOT NULL COLLATE NOCASE,
+    serial      INTEGER,
+    method      TEXT    NOT NULL,
+    total_bytes INTEGER NOT NULL,
+    file_count  INTEGER NOT NULL,
+    folders     TEXT    NOT NULL
+);
+
+CREATE INDEX scan_summaries_caller_idx ON scan_summaries (sid, drive, id DESC);
 ";
 
 /// One thing the watcher has on record. See [`SCHEMA_V8`].
@@ -1629,6 +1663,136 @@ impl Store {
     }
 }
 
+/// How many of the most recent summaries of a drive are kept for each person,
+/// before one a month. See [`SCHEMA_V10`].
+pub const SUMMARIES_KEPT: usize = 12;
+
+/// One summary of a scan of a whole drive, as the store keeps it. See
+/// [`SCHEMA_V10`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanSummaryRow {
+    /// Given by the store when the summary is kept.
+    pub id: i64,
+    /// Written by the store's own clock when the summary is kept.
+    pub taken_at: String,
+    /// `C:`.
+    pub drive: String,
+    pub serial: Option<u32>,
+    /// How the drive was read, as the agent spells it.
+    pub method: String,
+    pub total_bytes: u64,
+    pub file_count: u64,
+    /// The folders, as JSON the agent wrote. Empty in a list of summaries,
+    /// which does not read them.
+    pub folders: String,
+}
+
+fn scan_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanSummaryRow> {
+    Ok(ScanSummaryRow {
+        id: row.get(0)?,
+        taken_at: row.get(1)?,
+        drive: row.get(2)?,
+        serial: row
+            .get::<_, Option<i64>>(3)?
+            .and_then(|serial| u32::try_from(serial).ok()),
+        method: row.get(4)?,
+        total_bytes: row.get::<_, i64>(5)?.max(0) as u64,
+        file_count: row.get::<_, i64>(6)?.max(0) as u64,
+        folders: row.get(7)?,
+    })
+}
+
+impl Store {
+    /// Keep a summary of a scan for one person, and let go of their
+    /// summaries of that drive that are no longer kept.
+    ///
+    /// `id` and `taken_at` in the row are the store's to give, and what is
+    /// passed in for them is ignored. Returns the ones given.
+    pub fn record_scan_summary(&self, sid: &str, row: &ScanSummaryRow) -> Result<(i64, String)> {
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(to_db_error)?;
+        let kept = transaction
+            .query_row(
+                "INSERT INTO scan_summaries
+                     (sid, taken_at, drive, serial, method, total_bytes, file_count, folders)
+                 VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?2, ?3, ?4, ?5, ?6, ?7)
+                 RETURNING id, taken_at",
+                params![
+                    sid,
+                    row.drive,
+                    row.serial.map(i64::from),
+                    row.method,
+                    row.total_bytes as i64,
+                    row.file_count as i64,
+                    row.folders
+                ],
+                |inserted| Ok((inserted.get(0)?, inserted.get(1)?)),
+            )
+            .map_err(to_db_error)?;
+        prune_scan_summaries(&transaction, sid, &row.drive)?;
+        transaction.commit().map_err(to_db_error)?;
+        Ok(kept)
+    }
+
+    /// One person's summaries of one drive, newest first, without their
+    /// folders.
+    pub fn scan_summaries(&self, sid: &str, drive: &str) -> Result<Vec<ScanSummaryRow>> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, taken_at, drive, serial, method, total_bytes, file_count, ''
+                   FROM scan_summaries WHERE sid = ?1 AND drive = ?2
+                  ORDER BY id DESC",
+            )
+            .map_err(to_db_error)?;
+        let rows = statement
+            .query_map(params![sid, drive], scan_summary_row)
+            .map_err(to_db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(to_db_error)
+    }
+
+    /// One of this person's summaries, with its folders. `None` when they
+    /// have no summary by that number, which is also the answer for one kept
+    /// for somebody else.
+    pub fn scan_summary(&self, sid: &str, id: i64) -> Result<Option<ScanSummaryRow>> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT id, taken_at, drive, serial, method, total_bytes, file_count, folders
+                   FROM scan_summaries WHERE sid = ?1 AND id = ?2",
+                params![sid, id],
+                scan_summary_row,
+            )
+            .optional()
+            .map_err(to_db_error)
+    }
+}
+
+/// Let go of one person's summaries of one drive that are no longer kept:
+/// all but the newest [`SUMMARIES_KEPT`] and the first of each month.
+///
+/// Newest by the order they were kept in, which a clock put back cannot
+/// reorder. The month is the store clock's, in UTC.
+fn prune_scan_summaries(connection: &Connection, sid: &str, drive: &str) -> Result<()> {
+    connection
+        .execute(
+            "DELETE FROM scan_summaries
+              WHERE sid = ?1 AND drive = ?2
+                AND id NOT IN (SELECT id FROM scan_summaries
+                                WHERE sid = ?1 AND drive = ?2
+                                ORDER BY id DESC LIMIT ?3)
+                AND id NOT IN (SELECT MIN(id) FROM scan_summaries
+                                WHERE sid = ?1 AND drive = ?2
+                                GROUP BY substr(taken_at, 1, 7))",
+            params![sid, drive, SUMMARIES_KEPT as i64],
+        )
+        .map_err(to_db_error)?;
+    Ok(())
+}
+
 impl AuditLog for Store {
     fn record(&self, entry: Entry) -> Result<()> {
         let connection = self.lock()?;
@@ -1688,7 +1852,7 @@ fn one_line(detail: &str) -> String {
 }
 
 /// Every schema step, with the version it brings the store to.
-const MIGRATIONS: [(i64, &str); 9] = [
+const MIGRATIONS: [(i64, &str); 10] = [
     (1, SCHEMA_V1),
     (2, SCHEMA_V2),
     (3, SCHEMA_V3),
@@ -1698,6 +1862,7 @@ const MIGRATIONS: [(i64, &str); 9] = [
     (7, SCHEMA_V7),
     (8, SCHEMA_V8),
     (9, SCHEMA_V9),
+    (10, SCHEMA_V10),
 ];
 
 fn migrate(connection: &Connection) -> Result<()> {
@@ -3915,5 +4080,223 @@ mod tests {
         store.forget_watched().unwrap();
         assert_eq!(store.watched("machine").unwrap(), None);
         assert_eq!(store.watched("S-1-5-21-1-1001").unwrap(), None);
+    }
+
+    fn summary(drive: &str, total: u64) -> ScanSummaryRow {
+        ScanSummaryRow {
+            id: 0,
+            taken_at: String::new(),
+            drive: drive.to_owned(),
+            serial: Some(0x1A2B_3C4D),
+            method: "master_file_table".to_owned(),
+            total_bytes: total,
+            file_count: 1_776_812,
+            folders:
+                r#"{"floor":104857600,"folders":[{"path":"C:\\Users","bytes":2000,"files":3}]}"#
+                    .to_owned(),
+        }
+    }
+
+    /// A store from before scan summaries gains somewhere to keep them, and
+    /// keeps everything it already held.
+    #[test]
+    fn a_version_nine_store_is_brought_up_to_ten_and_keeps_what_it_held() {
+        let connection = a_swept_version_six_store();
+        migrate_through(&connection, &MIGRATIONS[..9]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO watched_scopes (scope, learned_at)
+                 VALUES ('machine', '2026-11-18T10:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute_batch("SELECT id FROM scan_summaries")
+                .is_err(),
+            "the premise: a version nine store has no scan summaries"
+        );
+
+        migrate_through(&connection, &MIGRATIONS[..10]).expect("the upgrade to ten should apply");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 10);
+        let kept: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sightings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, 3, "the baseline did not survive the upgrade");
+        let scopes: i64 = connection
+            .query_row("SELECT COUNT(*) FROM watched_scopes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            scopes, 1,
+            "the watcher's memory did not survive the upgrade"
+        );
+
+        // And the upgraded store keeps a summary and gives it back.
+        let store = Store {
+            connection: Mutex::new(connection),
+        };
+        assert!(store
+            .scan_summaries("S-1-5-21-1-1001", "C:")
+            .unwrap()
+            .is_empty());
+        let (id, taken_at) = store
+            .record_scan_summary("S-1-5-21-1-1001", &summary("C:", 900))
+            .unwrap();
+        let back = store.scan_summary("S-1-5-21-1-1001", id).unwrap().unwrap();
+        assert_eq!(back.taken_at, taken_at);
+        assert_eq!(
+            back,
+            ScanSummaryRow {
+                id,
+                taken_at,
+                ..summary("C:", 900)
+            }
+        );
+    }
+
+    /// The step that adds scan summaries, stopped partway, is finished by the
+    /// next start.
+    #[test]
+    fn an_interrupted_upgrade_to_ten_is_finished_by_the_next_start() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_through(&connection, &MIGRATIONS[..9]).unwrap();
+        let interrupted = [(
+            10,
+            "CREATE TABLE scan_summaries (id INTEGER PRIMARY KEY);
+             this is where the process was stopped;",
+        )];
+        assert!(migrate_through(&connection, &interrupted).is_err());
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 9);
+
+        migrate_through(&connection, &MIGRATIONS[..10])
+            .expect("the next start should finish the upgrade");
+        connection
+            .execute_batch(
+                "SELECT id, sid, taken_at, drive, serial, method, total_bytes, file_count, folders
+                   FROM scan_summaries;",
+            )
+            .expect("the table the upgrade adds is there, whole");
+    }
+
+    /// One person's summaries are theirs: listed for them, given back to
+    /// them, and to nobody else, even by number.
+    #[test]
+    fn one_persons_scan_summaries_are_not_anothers_to_read() {
+        let store = Store::open_in_memory().unwrap();
+        let (mine, _) = store
+            .record_scan_summary("S-1-5-21-1-1001", &summary("C:", 100))
+            .unwrap();
+        let (theirs, _) = store
+            .record_scan_summary("S-1-5-21-1-1002", &summary("C:", 200))
+            .unwrap();
+        store
+            .record_scan_summary("S-1-5-21-1-1001", &summary("D:", 300))
+            .unwrap();
+
+        let listed = store.scan_summaries("S-1-5-21-1-1001", "c:").unwrap();
+        assert_eq!(listed.len(), 1, "one drive, one person: {listed:?}");
+        assert_eq!(listed[0].id, mine);
+        assert_eq!(listed[0].folders, "", "a list does not read the folders");
+
+        assert!(store
+            .scan_summary("S-1-5-21-1-1001", mine)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store.scan_summary("S-1-5-21-1-1001", theirs).unwrap(),
+            None,
+            "a summary kept for somebody else was given back by its number"
+        );
+    }
+
+    /// The newest twelve of a drive are kept, and the first of each month
+    /// before them. Nobody else's summaries, and no other drive's, are
+    /// touched by letting the others go.
+    #[test]
+    fn the_last_twelve_summaries_and_the_first_of_each_month_before_them_are_kept() {
+        let store = Store::open_in_memory().unwrap();
+        {
+            let connection = store.lock().unwrap();
+            // Three a month from January to October, oldest first, and the
+            // same for another person and for another drive.
+            for (sid, drive) in [
+                ("S-1-5-21-1-1001", "C:"),
+                ("S-1-5-21-1-1002", "C:"),
+                ("S-1-5-21-1-1001", "D:"),
+            ] {
+                for month in 1..=10 {
+                    for day in [3, 13, 23] {
+                        connection
+                            .execute(
+                                "INSERT INTO scan_summaries
+                                     (sid, taken_at, drive, serial, method, total_bytes,
+                                      file_count, folders)
+                                 VALUES (?1, ?2, ?3, 1, 'master_file_table', 1, 1, '{}')",
+                                params![
+                                    sid,
+                                    format!("2020-{month:02}-{day:02}T12:00:00.000Z"),
+                                    drive
+                                ],
+                            )
+                            .unwrap();
+                    }
+                }
+            }
+            prune_scan_summaries(&connection, "S-1-5-21-1-1001", "C:").unwrap();
+        }
+
+        let dates = |sid: &str, drive: &str| -> Vec<String> {
+            let mut dates: Vec<String> = store
+                .scan_summaries(sid, drive)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.taken_at[..10].to_owned())
+                .collect();
+            dates.sort();
+            dates
+        };
+        let kept = dates("S-1-5-21-1-1001", "C:");
+        // The first of each month from January to June, and the newest
+        // twelve: every one from July to October.
+        let mut expected: Vec<String> =
+            (1..=6).map(|month| format!("2020-{month:02}-03")).collect();
+        for month in 7..=10 {
+            for day in [3, 13, 23] {
+                expected.push(format!("2020-{month:02}-{day:02}"));
+            }
+        }
+        expected.sort();
+        assert_eq!(kept, expected);
+        assert_eq!(kept.len(), 6 + SUMMARIES_KEPT);
+
+        assert_eq!(dates("S-1-5-21-1-1002", "C:").len(), 30, "another person's");
+        assert_eq!(dates("S-1-5-21-1-1001", "D:").len(), 30, "another drive's");
+    }
+
+    /// Keeping a summary lets go of what is no longer kept, there and then.
+    #[test]
+    fn keeping_a_summary_lets_go_of_the_ones_no_longer_kept() {
+        let store = Store::open_in_memory().unwrap();
+        for total in 0..20 {
+            store
+                .record_scan_summary("S-1-5-21-1-1001", &summary("C:", total))
+                .unwrap();
+        }
+        let kept = store.scan_summaries("S-1-5-21-1-1001", "C:").unwrap();
+        let totals: Vec<u64> = kept.iter().map(|row| row.total_bytes).collect();
+        // The newest twelve, newest first.
+        let newest: Vec<u64> = (8..20).rev().collect();
+        assert_eq!(totals[..SUMMARIES_KEPT], newest[..]);
+        // And the first of the month they were all kept in, by the store's
+        // clock. Should the month turn while this runs, the first of the new
+        // one is kept as well, and nothing else.
+        assert!(totals[SUMMARIES_KEPT..].contains(&0), "{totals:?}");
+        assert!(totals.len() <= SUMMARIES_KEPT + 2, "{totals:?}");
     }
 }

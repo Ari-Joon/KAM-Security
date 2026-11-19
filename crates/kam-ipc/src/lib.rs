@@ -102,6 +102,19 @@ pub enum Request {
     /// a network or device path before opening anything, finds the folder
     /// itself, and answers with folders only, cut as the map of a drive is.
     ScanFolder { path: String },
+    /// The caller's own summaries of their scans of one drive, and what grew
+    /// and shrank between two of them.
+    ///
+    /// `later` is the summary compared to, the newest when absent. `earlier`
+    /// is the one compared with, the one kept before `later` when absent.
+    /// Only summaries kept for the caller are ever read.
+    GetGrowth {
+        drive: String,
+        #[serde(default)]
+        later: Option<i64>,
+        #[serde(default)]
+        earlier: Option<i64>,
+    },
     /// What every installed application really occupies on `drive`, and which
     /// directories nothing installed accounts for. Needs the master file table,
     /// so the agent must be privileged.
@@ -486,6 +499,8 @@ pub enum Response {
     Scan(Box<Scan>),
     /// One folder, read on its own for the map.
     Folder(Box<FolderScan>),
+    /// The caller's own summaries of a drive's scans, and two compared.
+    Growth(Box<kam_storage::growth::Growth>),
     Applications {
         apps: Vec<AppFootprint>,
         summary: FootprintSummary,
@@ -814,6 +829,133 @@ mod tests {
         }))
         .unwrap();
         assert!(!unmarked.folded);
+    }
+
+    /// A comparison of two scans goes over and comes back in each of its
+    /// forms, and its own `kind` sits inside the answer, where it cannot
+    /// meet the reply's.
+    #[test]
+    fn what_grew_since_last_time_survives_the_wire() {
+        use kam_storage::growth::{
+            Change, Comparison, Differences, Growth, SummaryHeader, FOLDER_FLOOR,
+        };
+
+        let header = |id: i64| SummaryHeader {
+            id,
+            taken_at: "2026-11-19T15:42:00.000Z".to_owned(),
+            drive: "C:".to_owned(),
+            serial: Some(0x1A2B_3C4D),
+            method: kam_storage::ScanMethod::MasterFileTable,
+            total_bytes: 1_067_000_000_000,
+            file_count: 1_776_812,
+        };
+        let compared = Comparison::Compared(Differences {
+            floor: FOLDER_FLOOR,
+            total_change: -1_000,
+            grew: vec![Change {
+                path: r"C:\Users\someone\models".to_owned(),
+                before: None,
+                after: Some(5_000_000_000),
+                files_before: None,
+                files_after: Some(40),
+                by: 5_000_000_000 - (FOLDER_FLOOR - 1),
+                exact: false,
+            }],
+            shrank: Vec::new(),
+            grew_left_out: 0,
+            shrank_left_out: 3,
+            unplaced: 0,
+        });
+        for comparison in [
+            Comparison::NothingKept,
+            Comparison::NothingEarlier,
+            Comparison::NotComparable {
+                why: "One of the two scans read the drive's file table.".to_owned(),
+            },
+            compared,
+        ] {
+            let growth = Growth {
+                drive: "C:".to_owned(),
+                summaries: vec![header(2), header(1)],
+                later: Some(header(2)),
+                earlier: Some(header(1)),
+                comparison,
+            };
+            round_trip(Response::Growth(Box::new(growth)));
+        }
+
+        let request = serde_json::to_string(&Request::GetGrowth {
+            drive: "C:".to_owned(),
+            later: Some(2),
+            earlier: None,
+        })
+        .unwrap();
+        let back: Request = serde_json::from_str(&request).unwrap();
+        assert!(matches!(
+            back,
+            Request::GetGrowth {
+                later: Some(2),
+                earlier: None,
+                ..
+            }
+        ));
+    }
+
+    /// A scan of a whole drive carries its large folders and what became of
+    /// its summary, and a scan from an agent that sent neither reads as one
+    /// with neither.
+    #[test]
+    fn a_scan_with_its_summary_survives_the_wire() {
+        use kam_storage::growth::{FolderList, FolderTotal, SummaryKept, FOLDER_FLOOR};
+        use kam_storage::scan::Node;
+
+        let scan = Scan {
+            root: r"C:\".to_owned(),
+            method: kam_storage::ScanMethod::MasterFileTable,
+            fallback_reason: None,
+            total_bytes: 3_000_000_000,
+            file_count: 10,
+            directory_count: 2,
+            unreadable: 0,
+            elapsed_ms: 2_400,
+            tree: Node {
+                name: r"C:\".to_owned(),
+                path: r"C:\".to_owned(),
+                bytes: 3_000_000_000,
+                files: 0,
+                children: Vec::new(),
+                is_aggregate: false,
+                folded: true,
+            },
+            largest_files: Vec::new(),
+            folders: Some(FolderList {
+                floor: FOLDER_FLOOR,
+                folders: vec![FolderTotal {
+                    path: r"C:\Users".to_owned(),
+                    bytes: 3_000_000_000,
+                    files: 10,
+                }],
+                unplaced: 0,
+            }),
+            summary: Some(SummaryKept::Kept {
+                id: 7,
+                taken_at: "2026-11-19T15:42:00.000Z".to_owned(),
+            }),
+        };
+        round_trip(Response::Scan(Box::new(scan.clone())));
+        round_trip(Response::Scan(Box::new(Scan {
+            summary: Some(SummaryKept::NotKept {
+                why: "the store could not be written".to_owned(),
+            }),
+            ..scan.clone()
+        })));
+
+        let mut wire = serde_json::to_value(&scan).unwrap();
+        let object = wire.as_object_mut().unwrap();
+        object.remove("folders");
+        object.remove("summary");
+        let older: Scan = serde_json::from_value(wire).unwrap();
+        assert!(older.folders.is_none() && older.summary.is_none());
     }
 
     #[test]

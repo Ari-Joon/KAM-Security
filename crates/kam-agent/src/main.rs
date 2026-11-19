@@ -15,6 +15,7 @@ mod check;
 mod dispatch;
 mod downloads;
 mod expiry;
+mod growth;
 mod server;
 mod service;
 mod store_acl;

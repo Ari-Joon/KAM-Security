@@ -110,6 +110,15 @@ pub struct Scan {
     pub tree: Node,
     /// Largest individual files found, newest measurement first.
     pub largest_files: Vec<FileEntry>,
+    /// Every folder of the drive holding [`crate::growth::FOLDER_FLOOR`] or
+    /// more, when the scan was of a whole drive: what a summary of it keeps,
+    /// to be compared with later. It is sent as well as kept, so that a
+    /// summary holds nothing the person who asked for the scan was not sent.
+    #[serde(default)]
+    pub folders: Option<crate::growth::FolderList>,
+    /// What became of that summary. Set by the agent, which keeps it.
+    #[serde(default)]
+    pub summary: Option<crate::growth::SummaryKept>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,7 +191,7 @@ pub fn scan(root: &Path) -> Result<Scan> {
                 // unprivileged agent, and the reason travels to the UI so the
                 // slow answer is explained rather than mysterious.
                 tracing::info!(%error, "master file table unavailable; walking instead");
-                let mut scan = walk_scan(root)?;
+                let mut scan = walk_scan_with(root, true)?;
                 scan.fallback_reason = Some(error.to_string());
                 return Ok(scan);
             }
@@ -204,6 +213,12 @@ fn volume_letter(path: &Path) -> Option<char> {
 
 /// Walk `root` and measure everything beneath it.
 pub fn walk_scan(root: &Path) -> Result<Scan> {
+    walk_scan_with(root, false)
+}
+
+/// [`walk_scan`], keeping every large folder for a summary when `root` is a
+/// whole drive. Taken from the whole walk, before it is cut down to be sent.
+fn walk_scan_with(root: &Path, keep_folders: bool) -> Result<Scan> {
     let started = Instant::now();
     let counters = Counters::default();
 
@@ -213,6 +228,7 @@ pub fn walk_scan(root: &Path) -> Result<Scan> {
 
     let mut walked = walk(root, 0, threads, &counters);
     walked.node.name = root.display().to_string();
+    let folders = keep_folders.then(|| crate::growth::from_tree(&walked.node));
 
     // Every subtree merged its candidates upward, so the root holds them all.
     let mut largest: Vec<FileEntry> = walked
@@ -239,6 +255,8 @@ pub fn walk_scan(root: &Path) -> Result<Scan> {
         elapsed_ms: started.elapsed().as_millis() as u64,
         tree,
         largest_files: largest,
+        folders,
+        summary: None,
     })
 }
 
@@ -273,6 +291,9 @@ fn from_index(index: &VolumeIndex, root: &Path, elapsed_ms: u64) -> Scan {
         elapsed_ms,
         tree: prune(tree, 0, DEFAULT_MAX_DEPTH, DEFAULT_MAX_CHILDREN),
         largest_files: largest_files(index, &root_label),
+        // Only ever a whole drive: a table is read for nothing smaller.
+        folders: Some(crate::growth::from_index(index, &root_label)),
+        summary: None,
     }
 }
 
@@ -894,6 +915,97 @@ mod tests {
             .iter()
             .find(|child| child.name == name)
             .unwrap_or_else(|| panic!("{name} is not inside {}", node.path))
+    }
+
+    /// A scan of a whole drive carries every folder of 100 MB or more for
+    /// its summary, those below where the map stops included. A scan of
+    /// anything smaller than a drive carries none.
+    #[test]
+    fn a_scan_of_a_whole_drive_carries_its_large_folders_and_a_smaller_one_carries_none() {
+        let mut drive = Drive::new();
+        drive.file(r"a\b\c\d\e\f\deep.bin", 300 * 1024 * 1024, 0);
+        drive.file(r"a\small.bin", 1_000, 0);
+        let scan = from_index(&drive.index(), Path::new(r"C:\"), 0);
+        let folders = scan.folders.expect("a whole drive keeps its large folders");
+        let paths: Vec<&str> = folders
+            .folders
+            .iter()
+            .map(|folder| folder.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                r"C:\a",
+                r"C:\a\b",
+                r"C:\a\b\c",
+                r"C:\a\b\c\d",
+                r"C:\a\b\c\d\e",
+                r"C:\a\b\c\d\e\f"
+            ]
+        );
+        assert_eq!(scan.summary, None, "a summary is the agent's to keep");
+
+        let root = real_scratch("no-summary");
+        write(&Path::new(&root).join("x.bin"), 10);
+        assert!(walk_scan(Path::new(&root)).unwrap().folders.is_none());
+        // The drive's own route, given a folder to try it on.
+        let walked = walk_scan_with(Path::new(&root), true).unwrap();
+        assert_eq!(walked.folders.map(|list| list.folders.len()), Some(0));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A file of `bytes` that takes no room on the drive: marked sparse
+    /// before it is lengthened, so its length is a number and nothing more.
+    fn sparse(path: &Path, bytes: u64) {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::IO::DeviceIoControl;
+        const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let file = std::fs::File::create(path).unwrap();
+        let mut returned = 0_u32;
+        unsafe {
+            DeviceIoControl(
+                HANDLE(file.as_raw_handle()),
+                FSCTL_SET_SPARSE,
+                None,
+                0,
+                None,
+                0,
+                Some(&mut returned),
+                None,
+            )
+        }
+        .expect("the temporary folder's drive should make a sparse file");
+        file.set_len(bytes).unwrap();
+    }
+
+    /// The large folders of a walked drive come from the whole walk, not from
+    /// the tree cut down to be sent: a folder six deep is one of them.
+    #[test]
+    fn a_walked_drive_keeps_its_large_folders_from_below_where_the_map_stops() {
+        let root = real_scratch("walk-summary");
+        let base = Path::new(&root);
+        sparse(&base.join(r"a\b\c\d\e\f\big.bin"), 300 * 1024 * 1024);
+
+        let scan = walk_scan_with(base, true).unwrap();
+        let folders = scan
+            .folders
+            .expect("the drive's route keeps its large folders");
+        let deepest = format!(r"{root}\a\b\c\d\e\f");
+        assert!(
+            folders.folders.iter().any(|folder| folder.path == deepest),
+            "the folder six down is missing: {:?}",
+            folders.folders
+        );
+        // The tree that is sent still stops four folders down.
+        let floor = child(child(child(child(&scan.tree, "a"), "b"), "c"), "d");
+        assert!(floor.children.is_empty() && floor.folded);
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// The map says which of its rectangles have more beneath them.

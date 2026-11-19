@@ -190,6 +190,7 @@ pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
         | Request::ListVolumes
         | Request::ScanPath { .. }
         | Request::ScanFolder { .. }
+        | Request::GetGrowth { .. }
         | Request::ListApplications { .. }
         | Request::ListQuarantine
         | Request::SweepForChanges
@@ -275,9 +276,17 @@ pub fn handle(
             }
         },
 
-        Request::ScanPath { path } => scan_path(&path, context),
+        Request::ScanPath { path } => scan_path(&path, context, user),
 
         Request::ScanFolder { path } => scan_folder(&path, context),
+
+        // A read of the caller's own notes, so not recorded: see the rule at
+        // the top of this file.
+        Request::GetGrowth {
+            drive,
+            later,
+            earlier,
+        } => crate::growth::answer(&drive, later, earlier, context, user),
 
         Request::ListApplications { drive } => {
             let Some(letter) = drive.chars().next().filter(|c| c.is_ascii_alphabetic()) else {
@@ -1292,7 +1301,7 @@ const DOWNLOADS_REPLY_BYTES: usize = kam_ipc::MAX_FRAME_BYTES / 4;
 /// Both lists this is for arrive with the most useful first, so what is kept
 /// is the largest and what is left out is the tail. The caller says what was
 /// left out; nothing here is dropped without a count.
-fn fitting<T: serde::Serialize>(mut items: Vec<T>, budget: usize) -> (Vec<T>, Vec<T>) {
+pub(crate) fn fitting<T: serde::Serialize>(mut items: Vec<T>, budget: usize) -> (Vec<T>, Vec<T>) {
     let mut used = 0_usize;
     let mut keep = items.len();
     for (position, item) in items.iter().enumerate() {
@@ -1480,7 +1489,7 @@ fn delete_quarantined(ids: &[String], context: &Context) -> Response {
     }
 }
 
-fn scan_path(path: &str, context: &Context) -> Response {
+fn scan_path(path: &str, context: &Context, user: &UserContext) -> Response {
     let target = std::path::Path::new(path);
 
     // A relative path would be resolved against the agent's working directory,
@@ -1499,7 +1508,10 @@ fn scan_path(path: &str, context: &Context) -> Response {
     }
 
     match kam_storage::scan(target) {
-        Ok(scan) => {
+        Ok(mut scan) => {
+            // A scan of a whole drive leaves a summary for the person who
+            // asked, so the next one can say what grew.
+            crate::growth::keep_summary(&mut scan, context, user);
             // Audited: a scan is something the user asked for, so it belongs in
             // the record of what happened, even though it changes nothing.
             context.audit(
