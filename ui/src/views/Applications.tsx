@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
 import PathLink from "../components/PathLink";
-import MeasuredAt from "../components/MeasuredAt";
+import MeasuredAt, { whenMeasured } from "../components/MeasuredAt";
+import { KeptNote, NotKeptNote, UnreadableNote } from "../components/Kept";
+import { recall, remember, type Kept } from "../lib/remembered";
 import type {
   AppFootprint,
   ApplicationReport,
@@ -61,6 +63,52 @@ function ago(seconds: number | null): string | null {
 function daysSince(seconds: number | null): number | null {
   if (seconds === null) return null;
   return Math.floor((Date.now() / 1000 - seconds) / 86400);
+}
+
+/** What this page keeps of its last measurement for the next time it opens. */
+type KeptMeasurement = { drive: string; report: ApplicationReport };
+
+/** Why a row of the registry's list has no size before anything is measured. */
+const NOT_YET = "the drive has not been measured yet";
+
+/**
+ * The registry's list as it is now, with the sizes from a kept measurement
+ * put beside the programs it measured.
+ *
+ * A size goes only to the same program, at the same version, from the same
+ * publisher: one installed or updated since is not what was measured. Each
+ * measured entry is used once, so two entries alike in all three do not
+ * both take one size. Names, versions, dates and launches stay the
+ * registry's own, read now.
+ */
+function withKeptSizes(
+  listing: AppFootprint[],
+  measured: AppFootprint[],
+): { apps: AppFootprint[]; sized: Set<AppFootprint> } {
+  const key = (app: AppFootprint) => `${app.name}\u0000${app.publisher}\u0000${app.version}`;
+  const unclaimed = new Map<string, AppFootprint[]>();
+  for (const app of measured) {
+    const same = unclaimed.get(key(app));
+    if (same) {
+      same.push(app);
+    } else {
+      unclaimed.set(key(app), [app]);
+    }
+  }
+  const sized = new Set<AppFootprint>();
+  const apps = listing.map((app) => {
+    const then = unclaimed.get(key(app))?.shift();
+    if (!then) return app;
+    const joined = {
+      ...app,
+      actual_bytes: then.actual_bytes,
+      shared_bytes: then.shared_bytes,
+      locations: then.locations,
+    };
+    sized.add(joined);
+    return joined;
+  });
+  return { apps, sized };
 }
 
 const KIND_LABEL: Record<string, string> = {
@@ -360,6 +408,40 @@ export default function Applications({ volumes, onMeasured }: Props) {
   const [grouped, setGrouped] = useState(false);
   /** The registry's own list, shown while the disk is being read. */
   const [preview, setPreview] = useState<AppFootprint[] | null>(null);
+  /** Why the registry's list could not be read when the page opened. */
+  const [listError, setListError] = useState<string | null>(null);
+  /** The last measurement, as kept for the next time the page opens. */
+  const [kept, setKept] = useState<Kept<KeptMeasurement> | null>(null);
+  /** Why the measurement kept from before could not be read back. */
+  const [keptUnreadable, setKeptUnreadable] = useState<string | null>(null);
+  /** Why the last measurement could not be kept for next time. */
+  const [notKept, setNotKept] = useState<string | null>(null);
+
+  // On opening: the registry's list at once, which is a fifth of a second
+  // and needs nothing, and the sizes from the last measurement, as kept.
+  useEffect(() => {
+    let open = true;
+    api
+      .applicationsPreview()
+      .then((listing) => {
+        if (open) setPreview((current) => current ?? listing);
+      })
+      .catch((cause) => {
+        if (open) setListError(reason(cause));
+      });
+    recall<KeptMeasurement>("applications")
+      .then((found) => {
+        if (!open || found === null) return;
+        setKept(found);
+        setDrive(found.result.drive);
+      })
+      .catch((cause) => {
+        if (open) setKeptUnreadable(reason(cause));
+      });
+    return () => {
+      open = false;
+    };
+  }, []);
 
   /**
    * Measure, in two parts, because the two halves cost wildly different
@@ -393,9 +475,18 @@ export default function Applications({ volumes, onMeasured }: Props) {
 
     try {
       const measured = await api.applications(drive);
+      const at = Date.now();
       setReport(measured);
-      setMeasuredAt(Date.now());
+      setMeasuredAt(at);
       setPreview(null);
+      // Kept without the lists Cleanup shows, which this page does not.
+      const keeping: KeptMeasurement = {
+        drive,
+        report: { ...measured, orphans: [], downloads: [], old_files: [] },
+      };
+      setKept({ measuredAt: at, result: keeping });
+      setKeptUnreadable(null);
+      setNotKept(await remember("applications", at, keeping));
     } catch (cause) {
       setError(reason(cause));
       setUnmeasured(reason(cause));
@@ -643,15 +734,37 @@ export default function Applications({ volumes, onMeasured }: Props) {
   // it failed. This read `report === null && preview !== null` alone, so after
   // a failure the page went on saying it was measuring, indefinitely.
   const measuring = running && report === null && preview !== null;
+  // The registry's list with the last measurement's sizes beside it: when
+  // the page opens on a kept measurement, until it measures again. A
+  // measurement that fails says so instead, rather than leaving older sizes
+  // standing in for it.
+  const showingKept =
+    !running && report === null && unmeasured === null && kept !== null && preview !== null;
+  const keptSizes = useMemo(
+    () => (kept && preview ? withKeptSizes(preview, kept.result.report.apps) : null),
+    [kept, preview],
+  );
+  /** The registry's list alone, before this account has measured anything. */
+  const neverMeasured =
+    !running && report === null && preview !== null && unmeasured === null && kept === null;
   const notMeasured =
-    !running && report === null && preview !== null
-      ? (unmeasured ?? "the measurement did not finish")
+    !running && report === null && preview !== null && !showingKept
+      ? (unmeasured ?? NOT_YET)
       : null;
+  /** Why one row of the list has no size beside it, or null when it has one. */
+  const keptWhy = kept
+    ? `it was not installed, or not at this version, when ${kept.result.drive} was measured at ${whenMeasured(kept.measuredAt)}`
+    : NOT_YET;
+  const rowNotMeasured = (app: AppFootprint): string | null =>
+    showingKept ? (keptSizes?.sized.has(app) ? null : keptWhy) : notMeasured;
+  /** Whichever list is in hand. */
+  const listed: AppFootprint[] =
+    report?.apps ?? (showingKept && keptSizes ? keptSizes.apps : preview) ?? [];
   /** Whichever list is in hand, for the counts beside the filters. */
-  const everything = report?.apps ?? preview ?? [];
+  const everything = listed;
 
   const shown = useMemo(() => {
-    const apps = report?.apps ?? preview ?? [];
+    const apps = listed;
     const needle = query.trim().toLowerCase();
 
     const kept = apps.filter((app) => {
@@ -699,7 +812,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
       }
     });
     return order;
-  }, [report, preview, query, filter, sort]);
+  }, [listed, query, filter, sort]);
 
   const shownBytes = useMemo(
     () => shown.reduce((total, app) => total + app.actual_bytes, 0),
@@ -728,7 +841,10 @@ export default function Applications({ volumes, onMeasured }: Props) {
       .sort((a, b) => b.bytes - a.bytes);
   }, [shown, grouped]);
 
-  const summary = report?.summary;
+  /** The measurement the figures are from: this page's, or the one kept. */
+  const measurement = report ?? (showingKept ? (kept?.result.report ?? null) : null);
+  const summary = measurement?.summary;
+  const figuresAt = report ? measuredAt : (kept?.measuredAt ?? 0);
 
   return (
     <>
@@ -767,6 +883,27 @@ export default function Applications({ volumes, onMeasured }: Props) {
         </div>
 
         {error && <pre className="error">{error}</pre>}
+        {listError && !report && (
+          <div className="notice notice-warn">
+            The list of installed programs could not be read from the registry:{" "}
+            {listError.replace(/\.$/, "")}.
+          </div>
+        )}
+        {keptUnreadable && !report && !running && (
+          <UnreadableNote
+            what="The last measurement"
+            why={keptUnreadable}
+            again="Press Measure to measure again."
+          />
+        )}
+        {notKept && <NotKeptNote why={notKept} />}
+        {showingKept && kept && (
+          <KeptNote
+            what={`the measurement of ${kept.result.drive}`}
+            at={kept.measuredAt}
+            again="The list of programs below is the registry's, read now; only the sizes are from then. Press Measure to measure them again."
+          />
+        )}
         {note && <div className="notice notice-ok">{note}</div>}
         {leftoverWarning && (
           <div className="notice notice-warn">{leftoverWarning}</div>
@@ -945,28 +1082,28 @@ export default function Applications({ volumes, onMeasured }: Props) {
                 {fmt.count(summary.without_reported_size)}
               </span>
             </div>
-            {report && (
+            {measurement && (
               <div
                 className="stat"
                 title={
-                  `File table ${report.timings.read_table} ms ` +
-                  `(${report.timings.read_table_io} ms of it waiting on the disk), ` +
-                  `index ${report.timings.build_index} ms, ` +
-                  `applications ${report.timings.applications} ms, ` +
-                  `leftovers ${report.timings.orphans} ms, ` +
-                  `downloads ${report.timings.downloads} ms`
+                  `File table ${measurement.timings.read_table} ms ` +
+                  `(${measurement.timings.read_table_io} ms of it waiting on the disk), ` +
+                  `index ${measurement.timings.build_index} ms, ` +
+                  `applications ${measurement.timings.applications} ms, ` +
+                  `leftovers ${measurement.timings.orphans} ms, ` +
+                  `downloads ${measurement.timings.downloads} ms`
                 }
               >
                 <span className="stat-label">Measured in</span>
                 <span className="stat-value">
-                  {fmt.duration(report.timings.total)}
+                  {fmt.duration(measurement.timings.total)}
                   <span className="unit">
-                    {fmt.count(report.timings.records)} records
+                    {fmt.count(measurement.timings.records)} records
                   </span>
                 </span>
               </div>
             )}
-            {report && <MeasuredAt at={measuredAt} />}
+            {measurement && <MeasuredAt at={figuresAt} />}
           </div>
         )}
 
@@ -987,19 +1124,28 @@ export default function Applications({ volumes, onMeasured }: Props) {
         <section className="panel">
           <div className="panel-head">
             <h2>
-              {measuring || notMeasured !== null
+              {measuring || notMeasured !== null || showingKept
                 ? "Installed applications"
                 : "By real size"}
             </h2>
             {measuring && <span className="measuring">Measuring real sizes…</span>}
-            {notMeasured !== null && <span className="measuring">Not measured</span>}
+            {notMeasured !== null && (
+              <span className="measuring">{neverMeasured ? "Not measured yet" : "Not measured"}</span>
+            )}
+            {showingKept && kept && (
+              <span className="measuring">Sizes from {whenMeasured(kept.measuredAt)}</span>
+            )}
           </div>
           <p className="muted">
             {measuring
               ? "This is what the installers say about themselves, read from the registry. The measured sizes are being read off the disk now and will replace the claims when they arrive; searching, sorting and grouping all work in the meantime."
-              : notMeasured !== null
-                ? `This is what the installers say about themselves, read from the registry. Their real sizes were not measured: ${notMeasured}. The Actual column says so rather than showing a number nobody read.`
-                : "A folder matched by more than one application (several NVIDIA packages sharing one data directory, for instance) is listed but not added to any of their totals. Totals understate rather than double-count."}
+              : neverMeasured
+                ? "This is what the installers say about themselves, read from the registry just now. Their real sizes come from Measure, which reads them off the disk; until then the Actual column says they were not measured rather than showing a number nobody read."
+                : notMeasured !== null
+                  ? `This is what the installers say about themselves, read from the registry. Their real sizes were not measured: ${notMeasured}. The Actual column says so rather than showing a number nobody read.`
+                  : showingKept && kept
+                    ? `Names, publishers, versions, dates and launches are read from the registry now. Sizes are from the measurement of ${kept.result.drive} at ${whenMeasured(kept.measuredAt)}: a program installed or updated since then has none until you measure again, and says so. A folder matched by more than one application is listed but not added to any of their totals.`
+                    : "A folder matched by more than one application (several NVIDIA packages sharing one data directory, for instance) is listed but not added to any of their totals. Totals understate rather than double-count."}
           </p>
 
           <div className="app-controls">
@@ -1053,7 +1199,13 @@ export default function Applications({ volumes, onMeasured }: Props) {
             <span>Application</span>
             <span className="right">Reported</span>
             <span className="right">
-              {measuring ? "Measuring…" : notMeasured !== null ? "Not measured" : "Actual"}
+              {measuring
+                ? "Measuring…"
+                : notMeasured !== null
+                  ? "Not measured"
+                  : showingKept && kept
+                    ? `Measured ${whenMeasured(kept.measuredAt)}`
+                    : "Actual"}
             </span>
             <span />
           </div>
@@ -1077,7 +1229,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
                       key={`${app.name}-${app.version}`}
                       app={app}
                       measuring={measuring}
-                      notMeasured={notMeasured}
+                      notMeasured={rowNotMeasured(app)}
                       onReveal={(path) => void reveal(path)}
                       onUninstall={setConfirming}
                     />
@@ -1092,7 +1244,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
                   key={`${app.name}-${app.version}`}
                   app={app}
                   measuring={measuring}
-                  notMeasured={notMeasured}
+                  notMeasured={rowNotMeasured(app)}
                   onReveal={(path) => void reveal(path)}
                   onUninstall={setConfirming}
                 />
@@ -1110,7 +1262,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
         />
       )}
 
-      {!report && !preview && !running && !error && (
+      {!report && !preview && !running && !error && !listError && !keptUnreadable && (
         <section className="panel">
           <p className="empty">Nothing measured yet. Pick a drive and press Measure.</p>
         </section>

@@ -12,6 +12,8 @@ import { GridLegend } from "../components/StateGrid";
 import FileRow from "../components/FileRow";
 import PathLink from "../components/PathLink";
 import MeasuredAt, { whenMeasured } from "../components/MeasuredAt";
+import { KeptNote, NotKeptNote, UnreadableNote } from "../components/Kept";
+import { recall, remember } from "../lib/remembered";
 import type {
   AccessTimes,
   Cache,
@@ -47,6 +49,33 @@ type Props = { volumes: Volume[]; onChanged: () => void };
  * removed, so the same index came to point at a different file.
  */
 type DupeSet = DuplicateGroup & { id: string; suggestedPath: string | null };
+
+/**
+ * What this page keeps of each of its searches for the next time it opens:
+ * each list as it stands, so a row acted on does not come back.
+ */
+type KeptSurvey = {
+  drive: string;
+  orphans: Orphan[];
+  rootsElsewhere: string[];
+  downloads: Download[] | null;
+  downloadSummary: DownloadSummary | null;
+  oldFiles: OldFile[] | null;
+  oldSummary: OldFileSummary | null;
+  oldRest: { files: number; bytes: number };
+};
+type KeptDuplicates = { drive: string; sets: DupeSet[]; summary: DuplicateSummary | null };
+type KeptCaches = { caches: Cache[] };
+
+/** The three searches whose answers this page keeps. */
+type Search = "survey" | "duplicates" | "caches";
+
+/** A record by search, without one search's entry. */
+function without<V>(record: Partial<Record<Search, V>>, search: Search) {
+  const next = { ...record };
+  delete next[search];
+  return next;
+}
 
 /** The agent's suggested keeper, as a path. */
 function suggestedPathOf(group: DuplicateGroup): string | null {
@@ -395,6 +424,25 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const [foundAt, setFoundAt] = useState(0);
   const [duplicatesAt, setDuplicatesAt] = useState(0);
   const [cachesAt, setCachesAt] = useState(0);
+  /** The drive each search that is on screen looked at. */
+  const [surveyDrive, setSurveyDrive] = useState("C:\\");
+  const [duplicatesDrive, setDuplicatesDrive] = useState("C:\\");
+  /**
+   * When each answer kept from before this page opened was found. A search
+   * answered since has a newer time, so an answer on screen is the kept one
+   * exactly while its time is this one.
+   */
+  const [keptAt, setKeptAt] = useState<Partial<Record<Search, number>>>({});
+  /** Why an answer kept from before could not be read back. */
+  const [unreadableKept, setUnreadableKept] = useState<Partial<Record<Search, string>>>({});
+  /** Why an answer could not be kept for the next time the page opens. */
+  const [notKept, setNotKept] = useState<Partial<Record<Search, string>>>({});
+  /** Searches started since the page opened, which a kept answer must not cover. */
+  const searched = useRef<Record<Search, boolean>>({
+    survey: false,
+    duplicates: false,
+    caches: false,
+  });
   /** The sets as they are now, for a removal that finishes after a redraw. */
   const duplicatesNow = useRef<DupeSet[] | null>(null);
   duplicatesNow.current = duplicates;
@@ -528,12 +576,114 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     void loadMoves();
   }, []);
 
+  // Each search's last answer, as it was kept, so the page does not open
+  // empty. Never over an answer to a search started since the page opened.
+  useEffect(() => {
+    let open = true;
+    const unreadable = (search: Search) => (cause: unknown) => {
+      if (open && !searched.current[search]) {
+        setUnreadableKept((current) => ({ ...current, [search]: reason(cause) }));
+      }
+    };
+    recall<KeptSurvey>("cleanup-survey")
+      .then((found) => {
+        if (!open || found === null || searched.current.survey) return;
+        const kept = found.result;
+        setDrive(kept.drive);
+        setSurveyDrive(kept.drive);
+        setOrphans(kept.orphans);
+        setRootsElsewhere(kept.rootsElsewhere);
+        setDownloads(kept.downloads);
+        setDownloadSummary(kept.downloadSummary);
+        setOldFiles(kept.oldFiles);
+        setOldSummary(kept.oldSummary);
+        setOldRest(kept.oldRest);
+        setFoundAt(found.measuredAt);
+        setKeptAt((current) => ({ ...current, survey: found.measuredAt }));
+      })
+      .catch(unreadable("survey"));
+    recall<KeptDuplicates>("cleanup-duplicates")
+      .then((found) => {
+        if (!open || found === null || searched.current.duplicates) return;
+        setDuplicatesDrive(found.result.drive);
+        setDuplicates(found.result.sets);
+        setDuplicateSummary(found.result.summary);
+        setDuplicatesAt(found.measuredAt);
+        setKeptAt((current) => ({ ...current, duplicates: found.measuredAt }));
+      })
+      .catch(unreadable("duplicates"));
+    recall<KeptCaches>("cleanup-caches")
+      .then((found) => {
+        if (!open || found === null || searched.current.caches) return;
+        setCaches(found.result.caches);
+        setCachesAt(found.measuredAt);
+        setKeptAt((current) => ({ ...current, caches: found.measuredAt }));
+      })
+      .catch(unreadable("caches"));
+    return () => {
+      open = false;
+    };
+  }, []);
+
+  /** Keep one search's answer as it now stands, and say if it could not be. */
+  function keep<T>(search: Search, kind: Parameters<typeof remember>[0], at: number, result: T) {
+    void remember(kind, at, result).then((failed) =>
+      setNotKept((current) =>
+        failed === null ? without(current, search) : { ...current, [search]: failed },
+      ),
+    );
+  }
+
+  // Each answer is kept as it stands: after a search, and again after every
+  // row that leaves it, so a row acted on does not come back when the page
+  // is next opened. A search that failed or was stopped leaves its lists
+  // empty and keeps nothing, so the last answer that did finish stays kept.
+  useEffect(() => {
+    if (orphans === null || foundAt === 0) return;
+    keep<KeptSurvey>("survey", "cleanup-survey", foundAt, {
+      drive: surveyDrive,
+      orphans,
+      rootsElsewhere,
+      downloads,
+      downloadSummary,
+      oldFiles,
+      oldSummary,
+      oldRest,
+    });
+  }, [orphans, rootsElsewhere, downloads, downloadSummary, oldFiles, oldSummary, oldRest, foundAt, surveyDrive]);
+
+  useEffect(() => {
+    if (duplicates === null || duplicatesAt === 0) return;
+    keep<KeptDuplicates>("duplicates", "cleanup-duplicates", duplicatesAt, {
+      drive: duplicatesDrive,
+      sets: duplicates,
+      summary: duplicateSummary,
+    });
+  }, [duplicates, duplicateSummary, duplicatesAt, duplicatesDrive]);
+
+  useEffect(() => {
+    if (caches === null || cachesAt === 0) return;
+    keep<KeptCaches>("caches", "cleanup-caches", cachesAt, { caches });
+  }, [caches, cachesAt]);
+
+  // A search that fails empties its lists and leaves its time alone, so the
+  // lists being there is part of the answer on screen being the kept one.
+  const surveyKept = orphans !== null && keptAt.survey !== undefined && keptAt.survey === foundAt;
+  const duplicatesKept =
+    duplicates !== null &&
+    keptAt.duplicates !== undefined &&
+    keptAt.duplicates === duplicatesAt;
+  const cachesKept = caches !== null && keptAt.caches !== undefined && keptAt.caches === cachesAt;
+
   async function find() {
     setRunning(true);
     setError(null);
     setNote(null);
+    searched.current.survey = true;
     try {
       const report = await api.applications(drive);
+      setSurveyDrive(drive);
+      setUnreadableKept((current) => without(current, "survey"));
       setOrphans(report.orphans);
       setRootsElsewhere(report.orphan_summary.roots_elsewhere ?? []);
       setDownloads(report.downloads);
@@ -633,6 +783,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     setFindingDuplicates(true);
     setError(null);
     setDuplicateProgress(null);
+    searched.current.duplicates = true;
+    const searching = drive;
     try {
       // The longest job in the product: it reads file contents rather than
       // the file table, so it is the one that most needs to say what it is
@@ -651,6 +803,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         setDuplicateSummary(null);
         return;
       }
+      setDuplicatesDrive(searching);
+      setUnreadableKept((current) => without(current, "duplicates"));
       setDuplicates(asSets(result.groups));
       setDuplicateSummary(result.summary);
       setDuplicatesAt(Date.now());
@@ -697,9 +851,11 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   async function loadCaches() {
     setMeasuringCaches(true);
     setError(null);
+    searched.current.caches = true;
     try {
       setCaches(await api.caches());
       setCachesAt(Date.now());
+      setUnreadableKept((current) => without(current, "caches"));
     } catch (cause) {
       setError(reason(cause));
       // Same as the other searches: a failed measurement does not leave the
@@ -1301,6 +1457,22 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           </div>
         )}
 
+        {unreadableKept.survey && orphans === null && !running && (
+          <UnreadableNote
+            what="The last search for leftovers, downloads and large old files"
+            why={unreadableKept.survey}
+            again="Press Find leftovers to search again."
+          />
+        )}
+        {notKept.survey && <NotKeptNote why={notKept.survey} />}
+        {surveyKept && (
+          <KeptNote
+            what={`the search of ${surveyDrive} for leftovers, downloads and large old files`}
+            at={foundAt}
+            again="A file or folder in it may have changed or gone since then. Press Find leftovers to search again."
+          />
+        )}
+
         {leftoversNow && (
           <div className="stat-row tight">
             <div className="stat">
@@ -1540,6 +1712,22 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           <ProgressBar
             progress={duplicateProgress}
             onStop={duplicateJob ? () => void stopJob(duplicateJob) : undefined}
+          />
+        )}
+
+        {unreadableKept.duplicates && duplicates === null && !findingDuplicates && (
+          <UnreadableNote
+            what="The last search for identical files"
+            why={unreadableKept.duplicates}
+            again="Search again to find them."
+          />
+        )}
+        {notKept.duplicates && <NotKeptNote why={notKept.duplicates} />}
+        {duplicatesKept && (
+          <KeptNote
+            what={`the search of ${duplicatesDrive} for identical files`}
+            at={duplicatesAt}
+            again="A copy may have changed or gone since then, so search again before removing anything from this list."
           />
         )}
 
@@ -1861,6 +2049,22 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           the contents go, never the folder, and nothing here touches history,
           passwords or sessions.
         </p>
+
+        {unreadableKept.caches && caches === null && !measuringCaches && (
+          <UnreadableNote
+            what="The last measurement of caches"
+            why={unreadableKept.caches}
+            again="Press Measure to measure them again."
+          />
+        )}
+        {notKept.caches && <NotKeptNote why={notKept.caches} />}
+        {cachesKept && (
+          <KeptNote
+            what="the measurement of caches and scratch space"
+            at={cachesAt}
+            again="Press Measure to measure them again."
+          />
+        )}
 
         {clearable && clearable.length === 0 && (
           <p className="empty">Nothing worth clearing. Genuinely.</p>

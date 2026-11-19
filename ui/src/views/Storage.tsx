@@ -2,8 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import Treemap from "../components/Treemap";
 import FileRow from "../components/FileRow";
 import GrowthPanel from "../components/Growth";
+import { KeptNote, NotKeptNote, UnreadableNote } from "../components/Kept";
 import MeasuredAt, { whenMeasured } from "../components/MeasuredAt";
 import { api, reason } from "../lib/api";
+import { recall, remember } from "../lib/remembered";
 import * as fmt from "../lib/format";
 import type { FolderScan, Scan, ScanMethod, TreeNode, Volume } from "../lib/types";
 
@@ -34,6 +36,9 @@ type Step = { node: TreeNode; read: FolderRead | null; rectangle: number | null 
 
 /** How many folder reads are kept at once. Each can be a few megabytes. */
 const READS_KEPT = 24;
+
+/** What this page keeps of its last scan for the next time it is opened. */
+type KeptScan = { target: string; scan: Scan };
 
 const METHOD: Record<ScanMethod, string> = {
   master_file_table: "from the file table",
@@ -149,6 +154,15 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
   const [opening, setOpening] = useState<TreeNode | null>(null);
   /** The folder that could not be opened, and the service's reason. */
   const [notOpened, setNotOpened] = useState<{ name: string; why: string } | null>(null);
+  /**
+   * When the scan on screen was taken, if it is the one kept from before
+   * this page was opened rather than one taken since.
+   */
+  const [keptAt, setKeptAt] = useState<number | null>(null);
+  /** Why the scan kept from before could not be read back, when it could not. */
+  const [unreadable, setUnreadable] = useState<string | null>(null);
+  /** Why the last scan could not be kept for next time, when it could not. */
+  const [notKept, setNotKept] = useState<string | null>(null);
   const startedAt = useRef(0);
   /**
    * Counts scans. A folder read belongs to the map it was clicked on, so one
@@ -159,6 +173,30 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
   useEffect(() => {
     if (initialRoot) setTarget(initialRoot);
   }, [initialRoot]);
+
+  // The last scan, as it was kept, so the page does not open empty. Not over
+  // a scan started meanwhile, and not in place of a drive handed over from
+  // Overview, which is what the next press of Scan should measure.
+  useEffect(() => {
+    let open = true;
+    recall<KeptScan>("storage")
+      .then((kept) => {
+        if (!open || kept === null || scanNumber.current !== 0) return;
+        if (!initialRoot) setTarget(kept.result.target);
+        setScan(kept.result.scan);
+        setScannedAt(kept.measuredAt);
+        setKeptAt(kept.measuredAt);
+        setTrail([{ node: kept.result.scan.tree, read: null, rectangle: null }]);
+      })
+      .catch((cause) => {
+        if (open && scanNumber.current === 0) setUnreadable(reason(cause));
+      });
+    return () => {
+      open = false;
+    };
+    // Once, when the page opens: a drive handed over later changes only
+    // what is selected, not which scan is shown.
+  }, []);
 
   // A full drive takes about a minute. A spinner with no numbers on it reads as
   // a hang, so the elapsed time keeps ticking where the user can see it.
@@ -186,11 +224,21 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
     setElapsed(0);
     startedAt.current = Date.now();
     scanNumber.current += 1;
+    const scanned = target;
     try {
-      const result = await api.scan(target);
+      const result = await api.scan(scanned);
+      const at = Date.now();
       setScan(result);
-      setScannedAt(Date.now());
+      setScannedAt(at);
+      setKeptAt(null);
+      setUnreadable(null);
       setTrail([{ node: result.tree, read: null, rectangle: null }]);
+      // Kept without its list of large folders: the service keeps that, as
+      // this scan's summary, and the page does not draw it.
+      setNotKept(await remember<KeptScan>("storage", at, {
+        target: scanned,
+        scan: { ...result, folders: null },
+      }));
     } catch (cause) {
       setError(reason(cause));
       setScan(null);
@@ -320,6 +368,22 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
         </div>
 
         {error && <pre className="error">{error}</pre>}
+
+        {unreadable && !scan && !running && (
+          <UnreadableNote
+            what="The last scan"
+            why={unreadable}
+            again="Press Scan to measure the drive again."
+          />
+        )}
+        {notKept && <NotKeptNote why={notKept} />}
+        {scan && keptAt !== null && (
+          <KeptNote
+            what={`the scan of ${scan.root}`}
+            at={keptAt}
+            again="Press Scan to see the drive as it is now."
+          />
+        )}
 
         {scan && scan.method === "directory_walk" && scan.fallback_reason && (
           // The reason is the service's own and is the only part that says
@@ -511,7 +575,7 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
         </>
       )}
 
-      {!scan && !running && !error && (
+      {!scan && !running && !error && !unreadable && (
         <section className="panel">
           <p className="empty">
             Nothing measured yet. Pick a drive and press Scan.
