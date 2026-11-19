@@ -6,6 +6,8 @@ import { runJob, stopJob, type Progress } from "../lib/jobs";
 import ProgressBar from "../components/ProgressBar";
 import PathLink from "../components/PathLink";
 import type {
+  Backlog,
+  BacklogStep,
   DissectionView,
   DownloadsPage,
   Extraction,
@@ -19,8 +21,9 @@ import type {
 } from "../lib/types";
 
 /**
- * Active downloads: every file that lands in Downloads, checked by Defender
- * as it arrives.
+ * Active downloads: each file that lands in Downloads while KAM Security is
+ * running, checked by Defender as it arrives, and one button for the files
+ * that were there already or arrived while it was closed.
  *
  * Three rules shape every sentence here. Defender decides what is flagged and
  * the page reports its answer by name, never a score. A check that did not
@@ -268,6 +271,12 @@ export default function Downloads({ launches }: { launches: number }) {
   const [moving, setMoving] = useState<string | null>(null);
   /** How far the automatic check of an arriving file has got. */
   const [auto, setAuto] = useState<AutoCheck | null>(null);
+  /** How far the check of everything not checked yet has got, between two loads. */
+  const [step, setStep] = useState<BacklogStep | null>(null);
+  /** Why that check could not be started, said beside its button. */
+  const [backlogError, setBacklogError] = useState<string | null>(null);
+  /** The run that Stop has been pressed on, until it has ended. */
+  const [stopping, setStopping] = useState<string | null>(null);
   /** The open dissection, so it is not fetched again while it is on screen. */
   const openToken = useRef<string | null>(null);
   /** Archives closed or extracted here, which a reload must not reopen. */
@@ -421,6 +430,39 @@ export default function Downloads({ launches }: { launches: number }) {
     }
   }
 
+  /**
+   * Check everything not checked yet, as one job. The window's own half runs
+   * it and keeps what it comes to, so this only starts it: the page then
+   * reads how far it has got, and finds it again after being left.
+   */
+  async function checkAll() {
+    setBacklogError(null);
+    try {
+      await api.checkBacklog();
+    } catch (cause) {
+      setBacklogError(reason(cause));
+    } finally {
+      void load();
+    }
+  }
+
+  async function stopAll(job: string) {
+    setStopping(job);
+    try {
+      await api.stopBacklog();
+    } catch {
+      // It may have ended between the press and the request.
+    }
+  }
+
+  async function closeAll() {
+    try {
+      await api.closeBacklog();
+    } finally {
+      void load();
+    }
+  }
+
   useEffect(() => {
     void load();
     const unlisten = listen("downloads://changed", () => void load());
@@ -429,6 +471,9 @@ export default function Downloads({ launches }: { launches: number }) {
     const unlistenProgress = listen<AutoCheck>("downloads://progress", (event) =>
       setAuto(event.payload),
     );
+    const unlistenBacklog = listen<BacklogStep>("downloads://backlog", (event) =>
+      setStep(event.payload),
+    );
     // An archive that is open stays open when this page is left: the window's
     // own half keeps it, and closes it when the window closes. Leaving the
     // page used to delete its private copy, and with the original already in
@@ -436,6 +481,7 @@ export default function Downloads({ launches }: { launches: number }) {
     return () => {
       void unlisten.then((stop) => stop());
       void unlistenProgress.then((stop) => stop());
+      void unlistenBacklog.then((stop) => stop());
     };
   }, [load]);
 
@@ -498,6 +544,17 @@ export default function Downloads({ launches }: { launches: number }) {
     rows.map((row) => (row.kind === "record" ? row.record.path : row.file.path).toLowerCase()),
   );
   const unplaced = Object.values(said).filter((entry) => !placed.has(entry.path.toLowerCase()));
+
+  // The check of everything not checked yet. What the page last read says
+  // what it has come to; the steps since say which file it is on now.
+  const backlog = page?.backlog ?? null;
+  const checkingAll = backlog !== null && backlog.ended === null;
+  const live: BacklogStep | null =
+    backlog && step && step.job === backlog.job && step.done >= backlog.done ? step : backlog;
+  const inHand = checkingAll ? (live?.current?.toLowerCase() ?? null) : null;
+  // What a press of the button would be about: not checked, and not already
+  // on its way to being checked.
+  const waitingForACheck = (page?.unchecked ?? []).filter((file) => file.in_flight === null).length;
 
   return (
     <>
@@ -598,6 +655,16 @@ export default function Downloads({ launches }: { launches: number }) {
         </section>
       )}
 
+      {backlog && live && (
+        <BacklogPanel
+          backlog={backlog}
+          live={live}
+          stopping={stopping === backlog.job}
+          onStop={() => void stopAll(backlog.job)}
+          onClose={() => void closeAll()}
+        />
+      )}
+
       {view && (
         <DissectionPanel
           view={view}
@@ -638,7 +705,7 @@ export default function Downloads({ launches }: { launches: number }) {
       )}
 
       <section className="panel">
-        <div className="panel-head">
+        <div className="panel-head dl-list-head">
           <h2>Downloads</h2>
           {page && !page.history_error && (
             <span className="panel-count">
@@ -647,7 +714,22 @@ export default function Downloads({ launches }: { launches: number }) {
               {page.unchecked.length === 1 ? "file" : "files"} here not checked
             </span>
           )}
+          <div className="dl-head-actions">
+            {/* One press for the files that were here before KAM Security
+                was, or arrived while it was closed. Not offered when the
+                history could not be read: every file would then read as not
+                checked. */}
+            {page && !page.history_error && waitingForACheck > 0 && (
+              <button
+                onClick={() => void checkAll()}
+                disabled={busy || checkingAll || moving !== null}
+              >
+                Check everything not checked yet
+              </button>
+            )}
+          </div>
         </div>
+        {backlogError && <p className="small held-warn wrap">{backlogError}</p>}
         {!page && loading && <p className="empty">Reading…</p>}
         {page && rows.length === 0 && (
           <p className="empty">Nothing has arrived in Downloads since this was set up.</p>
@@ -668,6 +750,7 @@ export default function Downloads({ launches }: { launches: number }) {
                 said={said[row.record.path.toLowerCase()]?.text}
                 focused={focus === row.record.path.toLowerCase()}
                 busy={busy || moving !== null}
+                checkingAll={checkingAll}
                 onCheck={() => void check(row.record.path)}
                 onDissect={() => void dissect(row.record.path)}
                 onQuarantine={() => void quarantine(row.record.path)}
@@ -686,6 +769,8 @@ export default function Downloads({ launches }: { launches: number }) {
                     : null
                 }
                 busy={busy || moving !== null}
+                checkingAll={checkingAll}
+                inHand={inHand === row.file.path.toLowerCase()}
                 onCheck={() => void check(row.file.path)}
                 onDissect={() => void dissect(row.file.path)}
               />
@@ -737,11 +822,198 @@ export default function Downloads({ launches }: { launches: number }) {
   );
 }
 
+/** Most names said in one sentence. The count beside them covers every one. */
+const NAMES_SHOWN = 40;
+
+/** File names, from full paths, as one comma-separated run. */
+function Names({ paths }: { paths: string[] }) {
+  const hidden = paths.length - NAMES_SHOWN;
+  return (
+    <>
+      {paths.slice(0, NAMES_SHOWN).map((path, index) => (
+        <span key={path} title={path}>
+          {index > 0 && ", "}
+          {fmt.splitPath(path).name}
+        </span>
+      ))}
+      {hidden > 0 && <> and {fmt.count(hidden)} more</>}
+    </>
+  );
+}
+
+function files(count: number): string {
+  return `${fmt.count(count)} ${count === 1 ? "file" : "files"}`;
+}
+
+/**
+ * The check of everything not checked yet: how far it has got while it runs,
+ * and what it came to once it has ended.
+ *
+ * The bar is of files dealt with out of files to deal with, which is a
+ * number that can be checked against the list. What Defender is doing with
+ * the file in hand is said in words under it, because Defender does not say
+ * how far through a file it is.
+ *
+ * What it came to never adds up to a grade. It says how many files were
+ * checked and names the ones Defender flagged; each file's own row carries
+ * Defender's answer.
+ */
+function BacklogPanel({
+  backlog,
+  live,
+  stopping,
+  onStop,
+  onClose,
+}: {
+  backlog: Backlog;
+  live: BacklogStep;
+  stopping: boolean;
+  onStop: () => void;
+  onClose: () => void;
+}) {
+  const ended = backlog.ended;
+  if (ended === null) {
+    const name = live.current ? fmt.splitPath(live.current).name : null;
+    const stage = live.progress;
+    return (
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Checking everything not checked yet</h2>
+        </div>
+        <ProgressBar
+          progress={{
+            stage: stopping
+              ? "Stopping"
+              : name
+                ? `Checking ${name}`
+                : "Finding the files not checked yet",
+            done: live.done,
+            total: live.total > 0 ? live.total : null,
+            detail: stage
+              ? `${stage.stage}${
+                  stage.total ? `: ${fmt.count(stage.done)} of ${fmt.count(stage.total)}` : ""
+                }`
+              : null,
+          }}
+          onStop={stopping ? undefined : onStop}
+        />
+        <p className="small muted">
+          The count is of files dealt with. Each one gets the same check as "Check now" and
+          is recorded the same way. No Windows notification is raised for them: what it all
+          came to is said here when it ends. A file stored only online is left alone, because
+          checking it would download it. This goes on if you leave the page or close the
+          window, and Stop ends it before the next file.
+        </p>
+      </section>
+    );
+  }
+
+  const left = backlog.total - backlog.done;
+  const abandoned =
+    ended.how === "stopped" && ended.abandoned ? fmt.splitPath(ended.abandoned).name : null;
+  const rest = `The other ${fmt.count(left)} ${left === 1 ? "is as it was" : "are as they were"}: not checked.`;
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>
+          The check of everything not checked yet{" "}
+          {ended.how === "finished" ? "has finished" : "was stopped"}
+        </h2>
+        <button className="ghost" onClick={onClose}>
+          Close
+        </button>
+      </div>
+
+      {ended.how === "stopped" && (
+        <p className="small wrap">
+          Stopped after {fmt.count(backlog.done)} of {files(backlog.total)}. {rest}
+          {abandoned && (
+            <>
+              {" "}
+              That includes {abandoned}, whose check was in hand and was given up, so nothing
+              is recorded for it.
+            </>
+          )}
+        </p>
+      )}
+      {ended.how === "no_answer" && (
+        <p className="small held-warn wrap">
+          It ended after {fmt.count(backlog.done)} of {files(backlog.total)}, because the KAM
+          Security service did not answer ({ended.reason}). {rest}
+        </p>
+      )}
+
+      {backlog.done === 0 ? (
+        <p className="dl-counts">No file had been dealt with.</p>
+      ) : (
+        <p className="dl-counts">
+          Of {files(backlog.done)}: {fmt.count(backlog.checked)} checked,{" "}
+          {fmt.count(backlog.failed.length)} could not be checked,{" "}
+          {fmt.count(backlog.online_only.length)} skipped because{" "}
+          {backlog.online_only.length === 1 ? "it is" : "they are"} stored only online.
+        </p>
+      )}
+
+      {backlog.checked > 0 &&
+        (backlog.flagged.length > 0 ? (
+          <p className="small held-warn wrap">
+            Defender flagged {fmt.count(backlog.flagged.length)} of those checked:{" "}
+            <Names paths={backlog.flagged} />.
+          </p>
+        ) : (
+          <p className="small muted">Defender flagged none of those checked.</p>
+        ))}
+      {backlog.unfinished.length > 0 && (
+        <p className="small held-warn wrap">
+          Defender could not finish checking {fmt.count(backlog.unfinished.length)} of them:{" "}
+          <Names paths={backlog.unfinished} />.
+        </p>
+      )}
+      {backlog.checked > 0 && (
+        <p className="small muted">
+          Each file that was checked has its own row below, with Defender's answer.
+        </p>
+      )}
+
+      {backlog.failed.length > 0 && (
+        <>
+          <p className="small wrap">
+            Not checked, and why. The reason is also under each of these that is still in the
+            list below.
+          </p>
+          <ul className="dl-done">
+            {backlog.failed.slice(0, NAMES_SHOWN).map((failure) => (
+              <li key={failure.path} className="small held-warn wrap" title={failure.path}>
+                {failure.message}
+              </li>
+            ))}
+          </ul>
+          {backlog.failed.length > NAMES_SHOWN && (
+            <p className="small muted">
+              And {fmt.count(backlog.failed.length - NAMES_SHOWN)} more.
+            </p>
+          )}
+        </>
+      )}
+      {backlog.online_only.length > 0 && (
+        <p className="small wrap">
+          Skipped, because{" "}
+          {backlog.online_only.length === 1
+            ? "it is stored only online and checking it would have downloaded it"
+            : "they are stored only online and checking them would have downloaded them"}
+          : <Names paths={backlog.online_only} />.
+        </p>
+      )}
+    </section>
+  );
+}
+
 function RecordRow({
   record,
   said,
   focused,
   busy,
+  checkingAll,
   onCheck,
   onDissect,
   onQuarantine,
@@ -751,6 +1023,8 @@ function RecordRow({
   said: string | undefined;
   focused: boolean;
   busy: boolean;
+  /** Everything not checked yet is being checked, so no other check is started. */
+  checkingAll: boolean;
   onCheck: () => void;
   onDissect: () => void;
   onQuarantine: () => void;
@@ -869,11 +1143,11 @@ function RecordRow({
         )}
       {record.present && (
         <div className="dl-actions">
-          <button className="ghost" onClick={onCheck} disabled={busy}>
+          <button className="ghost" onClick={onCheck} disabled={busy || checkingAll}>
             Check again
           </button>
           {record.archive === "zip" && !flaggedWhole && (
-            <button className="ghost" onClick={onDissect} disabled={busy}>
+            <button className="ghost" onClick={onDissect} disabled={busy || checkingAll}>
               Extract what Defender did not flag
             </button>
           )}
@@ -912,6 +1186,8 @@ function LooseRow({
   said,
   focused,
   busy,
+  checkingAll,
+  inHand,
   onCheck,
   onDissect,
   progress,
@@ -921,6 +1197,10 @@ function LooseRow({
   said: string | undefined;
   focused: boolean;
   busy: boolean;
+  /** Everything not checked yet is being checked, so no other check is started. */
+  checkingAll: boolean;
+  /** This is the file that check has in hand now. */
+  inHand: boolean;
   onCheck: () => void;
   onDissect: () => void;
   progress: Progress | null;
@@ -978,7 +1258,10 @@ function LooseRow({
           )}
         </div>
       )}
-      {!flight && (
+      {/* The file the check of everything has in hand says so too. Its Stop
+          is the one on that check, which is about all of them. */}
+      {!flight && inHand && <div className="dl-answer pending">Being checked now</div>}
+      {!flight && !inHand && (
         <div className="dl-answer pending">
           {file.changed_since_checked
             ? "Changed since it was checked, so not checked as it is now"
@@ -989,12 +1272,12 @@ function LooseRow({
       {said && <p className="small held-warn wrap">{said}</p>}
       <div className="dl-actions">
         {!flight && (
-          <button className="ghost" onClick={onCheck} disabled={busy}>
+          <button className="ghost" onClick={onCheck} disabled={busy || checkingAll}>
             Check now
           </button>
         )}
         {!flight && file.archive === "zip" && (
-          <button className="ghost" onClick={onDissect} disabled={busy}>
+          <button className="ghost" onClick={onDissect} disabled={busy || checkingAll}>
             Extract what Defender did not flag
           </button>
         )}

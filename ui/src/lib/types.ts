@@ -1235,7 +1235,43 @@ export type DownloadsPage = {
   menu: MenuState;
   protection: boolean | null;
   notifications: string | null;
+  /** The check of everything not checked yet, running or just ended. */
+  backlog: Backlog | null;
 };
+
+/** How far one check has got: the same shape as `Progress` in jobs.ts. */
+type CheckStage = { stage: string; done: number; total: number | null; detail: string | null };
+
+/**
+ * One press of "Check everything not checked yet": how far it has got and
+ * what it has come to. Files are named by their full paths.
+ */
+export type Backlog = {
+  job: string;
+  total: number;
+  /** Dealt with: checked, found impossible to check, or left alone. */
+  done: number;
+  /** The file in hand, and the stage the check of it is at. */
+  current: string | null;
+  progress: CheckStage | null;
+  /** Files Defender answered for, whatever the answer. */
+  checked: number;
+  flagged: string[];
+  unfinished: string[];
+  /** Not checked, each with why, in a sentence that opens with the name. */
+  failed: { path: string; message: string }[];
+  /** Left alone because reading them would download them. */
+  online_only: string[];
+  /** Null while it runs. */
+  ended:
+    | { how: "finished" }
+    | { how: "stopped"; abandoned: string | null }
+    | { how: "no_answer"; reason: string }
+    | null;
+};
+
+/** How far that run has got, sent at every step between two readings of it. */
+export type BacklogStep = Pick<Backlog, "job" | "done" | "total" | "current" | "progress">;
 
 export type DissectionView = {
   token: string;

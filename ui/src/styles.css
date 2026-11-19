@@ -3324,6 +3324,24 @@ button.ghost {
   margin-top: 10px;
 }
 
+/* The list's heading carries the actions that are about the whole list. In
+   a narrow window they move to a line of their own, where a plain heading
+   would have squeezed a button's words onto two. */
+.dl-list-head {
+  flex-wrap: wrap;
+}
+
+.dl-head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.dl-head-actions button {
+  white-space: nowrap;
+}
+
 .dl-counts {
   margin: 12px 0 0;
   font-size: 14px;

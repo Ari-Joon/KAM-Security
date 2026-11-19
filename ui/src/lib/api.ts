@@ -186,6 +186,15 @@ export const api = {
     invoke<DissectionView | null>("open_dissection", { token }),
   extractClean: (token: string) => invoke<Extraction>("extract_clean", { token }),
   discardDissection: (token: string) => invoke<void>("discard_dissection", { token }),
+  /**
+   * Check every file in Downloads that is not checked yet, as one job. It
+   * resolves once the job is under way; the page then reads how far it has
+   * got, and it goes on if the page is left or the window is closed.
+   */
+  checkBacklog: () => invoke<void>("check_backlog"),
+  stopBacklog: () => invoke<void>("stop_backlog"),
+  /** Let go of what that job came to, once it has been read. */
+  closeBacklog: () => invoke<void>("close_backlog"),
   setContextMenu: (enabled: boolean) => invoke<MenuState>("set_context_menu", { enabled }),
   /**
    * The next file asked about from Explorer or a notification, taken once.
