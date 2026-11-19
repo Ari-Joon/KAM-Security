@@ -85,7 +85,24 @@ pub struct Remnants {
     pub locations: Vec<Remnant>,
 
     /// Shortcuts pointing into those directories, or at a target now gone.
+    ///
+    /// Empty in the agent's answer, always. Where a shortcut leads, and
+    /// whether that is still there, are questions about the person's own
+    /// session (see [`crate::shortcuts`]), so the window fills this in, as
+    /// them, with [`shortcuts_left`].
     pub shortcuts: Vec<LeftoverShortcut>,
+
+    /// Whether anybody looked for shortcuts at all. False in the agent's
+    /// answer, and false if the window then could not read them, so an empty
+    /// list above is only "none left" when this is true.
+    #[serde(default)]
+    pub shortcuts_checked: bool,
+
+    /// Shortcuts on this machine that would not open. With nothing to say
+    /// where one of those leads, it cannot be said to be this program's or
+    /// not, so "it left nothing behind" is not known while this is above zero.
+    #[serde(default)]
+    pub shortcuts_unread: usize,
 
     pub total_bytes: u64,
 
@@ -98,6 +115,25 @@ pub struct Remnants {
 impl Remnants {
     pub fn is_empty(&self) -> bool {
         self.locations.is_empty() && self.shortcuts.is_empty()
+    }
+
+    /// The agent's answer about folders, with what the person's own session
+    /// found of shortcuts added to it.
+    ///
+    /// `left` is `None` when shortcuts could not be read, and the answer then
+    /// goes on saying they were not checked. Nothing is added for a program
+    /// that is still installed: its shortcuts are its own and lead where they
+    /// should.
+    pub fn with_shortcuts(mut self, left: Option<ShortcutsLeft>) -> Self {
+        if self.still_installed {
+            return self;
+        }
+        if let Some(left) = left {
+            self.shortcuts = left.shortcuts;
+            self.shortcuts_unread = left.unread;
+            self.shortcuts_checked = true;
+        }
+        self
     }
 }
 
@@ -327,48 +363,107 @@ fn left_behind(
         });
     }
 
-    // Shortcuts pointing into any of those directories, plus any pointing at a
-    // target that is simply gone — the install-directory case, where the
-    // folder went but the icon did not.
-    let mut found = shortcuts::pointing_into(paths, user);
-    let known: std::collections::HashSet<String> = found
+    // No shortcuts from here. This runs in the agent, and what a shortcut
+    // points at is the person's to say: see `shortcuts_left`.
+    remnants
+}
+
+/// The shortcuts a removed program left behind, and how many could not be read.
+#[derive(Debug, Default)]
+pub struct ShortcutsLeft {
+    pub shortcuts: Vec<LeftoverShortcut>,
+    /// Shortcuts that would not open, so nothing says where they lead.
+    pub unread: usize,
+}
+
+/// The shortcuts still pointing into the directories a removed program used.
+///
+/// # Run this as the person, in their session
+///
+/// The agent used to do this, as LocalSystem, as part of [`of`]. A shortcut
+/// is read by Windows' shell, which answers for whoever asks: it places a
+/// shortcut kept relative to a known folder under the asking account's
+/// folder, and a target on a mapped drive exists only for the session that
+/// mapped it. So the service could report a working shortcut as "points at
+/// something that is gone", in the list of what an uninstall left behind.
+/// The window calls this instead, as the person, which is the same question
+/// Explorer would be asking when they click the shortcut.
+///
+/// Called for anybody else it still answers, and calls nothing gone: every
+/// target comes back as not established (see [`crate::shortcuts`]).
+///
+/// `None` when Windows would not let shortcuts be read at all, which is not
+/// the same as there being none.
+pub fn shortcuts_left(paths: &[String], user: &UserContext) -> Option<ShortcutsLeft> {
+    let every = shortcuts::try_all(user)?;
+    Some(leftover_among(every, paths, user))
+}
+
+/// Pick out, from every shortcut on the machine, the ones that lead into
+/// `paths`.
+fn leftover_among(every: Vec<Shortcut>, paths: &[String], user: &UserContext) -> ShortcutsLeft {
+    let unread = every
         .iter()
-        .map(|shortcut| canonical(&shortcut.path))
+        .filter(|shortcut| shortcut.target.is_none() && shortcut.target_unknown.is_some())
+        .count();
+
+    // An empty root would match every target on a network share, and a
+    // request can carry anything.
+    let roots: Vec<String> = paths
+        .iter()
+        .map(|path| canonical(path))
+        .filter(|root| !root.is_empty())
         .collect();
 
-    for shortcut in shortcuts::all(user) {
-        if !shortcut.broken || known.contains(&canonical(&shortcut.path)) {
-            continue;
-        }
-        // Only ones whose dead target sat inside a directory this application
-        // owned. Matching on the shortcut's *name* would sweep up anything
-        // with a similar title.
-        let Some(target) = shortcut.target.as_deref() else {
-            continue;
-        };
-        let target = canonical(target);
-        if paths.iter().any(|path| {
-            let root = canonical(path);
-            target.starts_with(&format!("{root}\\"))
-        }) {
-            found.push(shortcut);
-        }
-    }
+    // By where each points, never by what it is called: matching on the
+    // shortcut's *name* would sweep up anything with a similar title.
+    let mut found: Vec<Shortcut> = every
+        .into_iter()
+        .filter(|shortcut| {
+            let Some(target) = shortcut.target.as_deref() else {
+                return false;
+            };
+            let target = canonical(target);
+            roots
+                .iter()
+                .any(|root| target == *root || target.starts_with(&format!("{root}\\")))
+        })
+        .collect();
 
     found.sort_by_key(|shortcut| shortcut.path.to_lowercase());
     found.dedup_by(|a, b| canonical(&a.path) == canonical(&b.path));
-    remnants.shortcuts = found
-        .into_iter()
-        .map(|shortcut| {
-            let (quarantinable, quarantine_refusal) = quarantine_answer(&shortcut.path, user);
-            LeftoverShortcut {
-                shortcut,
-                quarantinable,
-                quarantine_refusal,
-            }
-        })
-        .collect();
-    remnants
+    ShortcutsLeft {
+        shortcuts: found
+            .into_iter()
+            .map(|shortcut| offered(shortcut, user))
+            .collect(),
+        unread,
+    }
+}
+
+/// A leftover shortcut, with whether quarantine would take it.
+///
+/// Never, while what it points at has not been established. A shortcut is
+/// only a leftover if its target has gone, and one whose target could not be
+/// checked may be a working shortcut to a program that is still there. The
+/// fence is not asked in that case, so that its answer cannot be yes.
+fn offered(shortcut: Shortcut, user: &UserContext) -> LeftoverShortcut {
+    if let Some(why) = &shortcut.target_unknown {
+        return LeftoverShortcut {
+            quarantinable: false,
+            quarantine_refusal: Some(format!(
+                "what this shortcut points at could not be established ({why}), so \
+                 removing it is not offered"
+            )),
+            shortcut,
+        };
+    }
+    let (quarantinable, quarantine_refusal) = quarantine_answer(&shortcut.path, user);
+    LeftoverShortcut {
+        shortcut,
+        quarantinable,
+        quarantine_refusal,
+    }
 }
 
 #[cfg(test)]
@@ -710,6 +805,192 @@ mod tests {
         assert!(!gone.still_installed);
         assert_eq!(gone.locations.len(), 1);
         assert_eq!(gone.locations[0].bytes, 2048);
+    }
+
+    fn shortcut(name: &str, path: &str, target: Option<&str>) -> Shortcut {
+        Shortcut {
+            path: path.to_owned(),
+            name: name.to_owned(),
+            place: crate::shortcuts::Place::StartMenu,
+            target: target.map(str::to_owned),
+            app_id: None,
+            broken: false,
+            target_unknown: None,
+            machine_wide: false,
+            bytes: 1200,
+        }
+    }
+
+    /// The agent's own answer leaves shortcuts to the window, and says so.
+    ///
+    /// It used to read them itself, as LocalSystem, and say which pointed at
+    /// something that was gone. An empty list from it now means nobody has
+    /// looked, and the answer is marked that way so that it cannot be read as
+    /// "none left".
+    #[test]
+    fn the_agents_answer_holds_no_shortcuts_and_says_they_were_not_checked() {
+        let profile = Profile::new("no-shortcuts");
+        let folder = profile.local().join("DeadVendor");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("a.bin"), vec![0_u8; 64]).unwrap();
+
+        let outcome = of(
+            "kam-test-no-such-program",
+            &[text(&folder)],
+            &[LocationKind::LocalData],
+            &profile.user(),
+        );
+        assert_eq!(outcome.locations.len(), 1, "the folder is still measured");
+        assert!(outcome.shortcuts.is_empty());
+        assert!(!outcome.shortcuts_checked);
+    }
+
+    #[test]
+    fn leftover_shortcuts_are_the_ones_that_lead_into_the_programs_folders() {
+        let roots = [r"C:\Program Files\Thing".to_owned(), String::new()];
+        let mut would_not_open = shortcut("Mystery", r"C:\Menu\Mystery.lnk", None);
+        would_not_open.target_unknown = Some("the shortcut would not open".to_owned());
+
+        let every = vec![
+            shortcut(
+                "Thing",
+                r"C:\Menu\Thing.lnk",
+                Some(r"C:\Program Files\Thing\thing.exe"),
+            ),
+            shortcut(
+                "Thing folder",
+                r"C:\Menu\Thing folder.lnk",
+                Some(r"c:/program files/thing/"),
+            ),
+            // A neighbour whose name merely starts the same way.
+            shortcut(
+                "Thing Else",
+                r"C:\Menu\Thing Else.lnk",
+                Some(r"C:\Program Files\Thing Else\else.exe"),
+            ),
+            // On a network share: an empty root must not be taken as leading
+            // everywhere.
+            shortcut(
+                "Shared",
+                r"C:\Menu\Shared.lnk",
+                Some(r"\\server\tools\x.exe"),
+            ),
+            // A Store entry: no file target, and nothing wrong with that.
+            shortcut("Store app", r"C:\Menu\Store app.lnk", None),
+            would_not_open,
+        ];
+
+        let left = leftover_among(every, &roots, &UserContext::current());
+        let names: Vec<&str> = left
+            .shortcuts
+            .iter()
+            .map(|leftover| leftover.shortcut.name.as_str())
+            .collect();
+        // In the order of the shortcuts' own paths.
+        assert_eq!(names, ["Thing folder", "Thing"]);
+        assert_eq!(
+            left.unread, 1,
+            "the shortcut that would not open should be counted, not dropped"
+        );
+    }
+
+    /// A shortcut whose target was not established is never offered.
+    ///
+    /// The file here sits directly inside a data root, which is the one place
+    /// the quarantine fence says yes, so that the fence's own answer cannot be
+    /// what keeps the box away.
+    #[test]
+    fn a_shortcut_whose_target_was_not_established_is_never_offered_for_removal() {
+        let profile = Profile::new("unestablished");
+        let lnk = profile.local().join("Thing.lnk");
+        std::fs::write(&lnk, b"stands in for a shortcut").unwrap();
+        let user = profile.user();
+
+        // The control: with its target known, the fence would take this one.
+        let known = offered(
+            shortcut("Thing", &text(&lnk), Some(r"C:\Gone\thing.exe")),
+            &user,
+        );
+        assert!(
+            known.quarantinable,
+            "the fixture is not somewhere quarantine says yes: {:?}",
+            known.quarantine_refusal
+        );
+
+        let mut unknown = shortcut("Thing", &text(&lnk), Some(r"Z:\Tools\thing.exe"));
+        unknown.target_unknown =
+            Some(r"Windows would not say whether Z:\Tools\thing.exe is still there".to_owned());
+        let answer = offered(unknown, &user);
+        assert!(
+            !answer.quarantinable,
+            "a shortcut that may well be working was offered for removal"
+        );
+        let why = answer.quarantine_refusal.expect("it should say why");
+        assert!(why.contains("could not be established"), "{why}");
+    }
+
+    #[test]
+    fn what_the_window_found_is_added_to_the_agents_answer() {
+        let agents = || Remnants {
+            name: "thing".to_owned(),
+            ..Default::default()
+        };
+        let found = || ShortcutsLeft {
+            shortcuts: vec![LeftoverShortcut {
+                shortcut: shortcut("Thing", r"C:\Menu\Thing.lnk", Some(r"C:\Gone\thing.exe")),
+                quarantinable: false,
+                quarantine_refusal: None,
+            }],
+            unread: 2,
+        };
+
+        let judged = agents().with_shortcuts(Some(found()));
+        assert!(judged.shortcuts_checked);
+        assert_eq!(judged.shortcuts.len(), 1);
+        assert_eq!(judged.shortcuts_unread, 2);
+
+        // Shortcuts that could not be read at all leave it saying so.
+        let unread = agents().with_shortcuts(None);
+        assert!(!unread.shortcuts_checked);
+        assert!(unread.shortcuts.is_empty());
+
+        // And a program that is still installed is given none, whatever was
+        // found: they are its own.
+        let installed = Remnants {
+            still_installed: true,
+            ..agents()
+        }
+        .with_shortcuts(Some(found()));
+        assert!(installed.shortcuts.is_empty());
+    }
+
+    /// The whole of it, with real shortcuts read as the person.
+    #[test]
+    fn real_shortcuts_into_a_removed_programs_folder_are_found_and_judged() {
+        let scratch = crate::shortcuts::testing::Scratch::new("leftover");
+        let present = scratch.program().join("thing.exe");
+        std::fs::write(&present, b"not really a program").unwrap();
+        let absent = scratch.program().join("removed.exe");
+        if !scratch.shortcut("Thing", &present) || !scratch.shortcut("Removed", &absent) {
+            // The shell would not write a shortcut here; nothing to show.
+            return;
+        }
+
+        let left = shortcuts_left(&[text(&scratch.program())], &scratch.user())
+            .expect("shortcuts should be readable");
+        let named = |name: &str| {
+            left.shortcuts
+                .iter()
+                .find(|leftover| leftover.shortcut.name == name)
+                .unwrap_or_else(|| panic!("{name} was not listed"))
+        };
+        assert!(!named("Thing").shortcut.broken);
+        assert!(named("Removed").shortcut.broken);
+        assert_eq!(
+            left.shortcuts.len(),
+            2,
+            "only the two that lead into the folder belong to it"
+        );
     }
 
     #[test]

@@ -295,6 +295,33 @@ function LeftoverRefusal({
 /** Keeps the text of a row with no box in line with the rows that have one. */
 const NO_BOX = { flex: "none", width: 13 } as const;
 
+/**
+ * What could not be said about a removed program's shortcuts, in sentences.
+ *
+ * The window reads shortcuts itself, as you, because where one leads is a
+ * question about your own session and the service is not in it. Two things
+ * can still go unread: all of them, or some that would not open. Either is a
+ * thing not known, and an empty list of leftover shortcuts is only "none
+ * left" when this comes back empty too.
+ */
+function shortcutGaps(left: Remnants): string[] {
+  const gaps: string[] = [];
+  if (left.shortcuts_checked !== true) {
+    gaps.push(
+      `Shortcuts could not be read, so whether any of ${left.name}'s are left is not known.`,
+    );
+  }
+  const unread = left.shortcuts_unread ?? 0;
+  if (unread > 0) {
+    gaps.push(
+      unread === 1
+        ? `1 shortcut on this PC would not open, so whether it was ${left.name}'s is not known.`
+        : `${fmt.count(unread)} shortcuts on this PC would not open, so whether any of them was ${left.name}'s is not known.`,
+    );
+  }
+  return gaps;
+}
+
 export default function Applications({ volumes, onMeasured }: Props) {
   const [drive, setDrive] = useState("C:\\");
   const [report, setReport] = useState<ApplicationReport | null>(null);
@@ -451,22 +478,27 @@ export default function Applications({ volumes, onMeasured }: Props) {
           setRefusedMoves({});
           setChosen(new Set());
           const anything = left.locations.length > 0 || left.shortcuts.length > 0;
-          // "Left nothing behind" is a claim about every place it used. A
-          // place that was not examined makes it a claim nobody checked.
+          // "Left nothing behind" is a claim about every place it used and
+          // every shortcut it had. A place that was not examined, or a
+          // shortcut that could not be read, makes it a claim nobody checked.
           const unexamined = left.refused.length;
+          const gaps = shortcutGaps(left);
+          if (unexamined > 0) {
+            gaps.unshift(
+              `${unexamined} of the places ${app.name} used could not be examined, ` +
+                `so whether anything is left there is not known.`,
+            );
+          }
           setRemnants(anything || unexamined > 0 ? left : null);
           setNote(
             anything
               ? `${app.name} was uninstalled, but some of it is still on disk.`
-              : unexamined > 0
+              : gaps.length > 0
                 ? `${app.name} was uninstalled.`
                 : `${app.name} was uninstalled and left nothing behind.`,
           );
-          if (!anything && unexamined > 0) {
-            setLeftoverWarning(
-              `${unexamined} of the places ${app.name} used could not be examined, ` +
-                `so whether anything is left there is not known.`,
-            );
+          if (!anything && gaps.length > 0) {
+            setLeftoverWarning(gaps.join(" "));
           }
           return true;
         })
@@ -812,6 +844,11 @@ export default function Applications({ volumes, onMeasured }: Props) {
                             : "Taskbar"}{" "}
                         shortcut
                         {shortcut.broken ? " · points at something that is gone" : ""}
+                        {/* Not the same as gone, and not said as if it were:
+                            this one may still work. */}
+                        {shortcut.target_unknown
+                          ? " · what it points at could not be checked"
+                          : ""}
                         {shortcut.machine_wide ? " · for everyone on this PC" : ""}
                       </span>
                       <LeftoverRefusal
@@ -841,6 +878,12 @@ export default function Applications({ volumes, onMeasured }: Props) {
                 </ul>
               </div>
             )}
+
+            {shortcutGaps(remnants).map((gap) => (
+              <div key={gap} className="footnote">
+                {gap}
+              </div>
+            ))}
 
             <div className="confirm-actions">
               <button

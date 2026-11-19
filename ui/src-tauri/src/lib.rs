@@ -894,6 +894,12 @@ async fn stream_job<T: Send + 'static>(
 /// The paths come from the footprint measured before the uninstall, because
 /// afterwards the registry entry is gone and there is nothing left to measure
 /// from. The agent fences them regardless of what is sent.
+///
+/// The folders are the agent's to measure. The shortcuts are judged here,
+/// by this process, because it is the person: where a shortcut leads and
+/// whether that is still there are answered by Windows for whoever asks, and
+/// the agent asking as LocalSystem could be told that a working shortcut
+/// points at nothing. See `kam_storage::shortcuts`.
 #[tauri::command]
 async fn find_remnants(
     name: String,
@@ -901,10 +907,20 @@ async fn find_remnants(
     kinds: Vec<kam_storage::apps::LocationKind>,
 ) -> Result<kam_storage::remnants::Remnants, String> {
     off_the_window(move || {
+        let used = paths.clone();
         match kam_ipc::client::call(&Request::FindRemnants { name, paths, kinds })
             .map_err(|error| error.to_string())?
         {
-            Response::Remnants(report) => Ok(*report),
+            Response::Remnants(report) => {
+                // Not looked for while the program is still installed: the
+                // answer would be its own working shortcuts.
+                let left = if report.still_installed {
+                    None
+                } else {
+                    kam_storage::remnants::shortcuts_left(&used, &kam_core::UserContext::current())
+                };
+                Ok((*report).with_shortcuts(left))
+            }
             Response::Error { message } => Err(message),
             other => Err(unexpected(&other)),
         }

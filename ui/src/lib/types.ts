@@ -783,7 +783,14 @@ export type Shortcut = {
   name: string;
   place: ShortcutPlace;
   target: string | null;
+  /** True only when the target is known to be gone. */
   broken: boolean;
+  /**
+   * Why what it points at could not be established, when it could not. A
+   * shortcut in this state may be a working one and is never offered for
+   * removal.
+   */
+  target_unknown?: string | null;
   machine_wide: boolean;
   bytes: number;
 };
@@ -817,7 +824,15 @@ export type Remnants = {
    */
   still_installed?: boolean;
   locations: Remnant[];
+  /**
+   * Judged by the window, as you, and never by the agent: where a shortcut
+   * leads is a question about your own session.
+   */
   shortcuts: (Shortcut & QuarantineAnswer)[];
+  /** False when shortcuts could not be read, so an empty list is not "none". */
+  shortcuts_checked?: boolean;
+  /** Shortcuts that would not open, so nothing says whose they are. */
+  shortcuts_unread?: number;
   total_bytes: number;
   /**
    * Paths the agent declined to look at, reported rather than dropped: outside
