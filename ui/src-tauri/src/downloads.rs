@@ -460,6 +460,10 @@ pub struct Page {
     /// How many checks are on record in all, which can be more than
     /// `records` holds: the page says so when it is.
     on_record: u64,
+    /// When the history was asked for. "Clear the list" removes what was on
+    /// record by then, so that a check recorded while the person is reading
+    /// the question is not removed before they have been shown it.
+    read_at: String,
     history_error: Option<String>,
     unchecked: Vec<LooseFile>,
     failures: Vec<Failure>,
@@ -566,6 +570,8 @@ pub fn page(state: &Downloads) -> Page {
     // comes back however long ago it was checked. Asked for only by recency,
     // a file checked before the newest thousand read as never checked.
     let named = present.iter().map(|(path, _, _)| path.clone()).collect();
+    // Taken before asking, so that nothing recorded later can be older.
+    let read_at = kam_core::clock::now_utc_iso();
     let (records, on_record, history_error) = match history(named, RECENT_ROWS) {
         Ok((records, on_record)) => (records, on_record, None),
         Err(reason) => (Vec::new(), 0, Some(reason)),
@@ -677,6 +683,7 @@ pub fn page(state: &Downloads) -> Page {
             .unwrap_or(WatchStatus::Starting),
         records,
         on_record,
+        read_at,
         history_error,
         unchecked,
         failures,
@@ -2584,6 +2591,32 @@ mod tests {
             "get a clean copy from its publisher",
         ] {
             assert!(standalone(wrong), "{wrong} was let through");
+        }
+    }
+
+    /// Removing a row is real and permanent, so what it does and does not
+    /// do is said beside the buttons, in the words the owner asked for, and
+    /// the one that clears the whole list says so again before it does.
+    /// Read from the page's own source, where the words a person reads are.
+    #[test]
+    fn the_page_says_what_removing_a_row_does_and_does_not_do() {
+        let page: String = include_str!("../../src/views/Downloads.tsx")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for said in [
+            "\"Remove from this list\" on a row, and \"Clear the list\" above, delete KAM \
+             Security's record of a check for good.",
+            "The file itself is not touched",
+            "A file still in Downloads goes back to \"Not checked yet\".",
+            "The Activity log keeps its own entry of each check.",
+            // The question "Clear the list" asks, once.
+            "No file is touched.",
+            "This cannot be undone.",
+            // Searching a list that is not the whole of it says so.
+            "Searching, filtering and sorting cover only the rows shown here.",
+        ] {
+            assert!(page.contains(said), "the page no longer says: {said}");
         }
     }
 

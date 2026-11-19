@@ -1228,6 +1228,8 @@ export type DownloadsPage = {
   records: PageRecord[];
   /** How many checks are on record in all; can be more than `records` holds. */
   on_record: number;
+  /** When the history was asked for: what "Clear the list" clears up to. */
+  read_at: string;
   history_error: string | null;
   unchecked: LooseFile[];
   failures: { path: string; message: string }[];

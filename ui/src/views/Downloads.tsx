@@ -4,6 +4,17 @@ import { api, reason } from "../lib/api";
 import * as fmt from "../lib/format";
 import { runJob, stopJob, type Progress } from "../lib/jobs";
 import { unseenSentence } from "../lib/unseen";
+import {
+  EVERYTHING,
+  find,
+  narrowed,
+  rowsOf,
+  tally,
+  type Finding,
+  type Place,
+  type Result,
+  type Sort,
+} from "../lib/downloadList";
 import ProgressBar from "../components/ProgressBar";
 import PathLink from "../components/PathLink";
 import type {
@@ -41,9 +52,21 @@ type Running = {
   progress: Progress | null;
 };
 
-type Row =
-  | { kind: "record"; at: string; record: PageRecord }
-  | { kind: "loose"; at: string; file: LooseFile };
+/** The filters, in the words they are offered in. */
+const RESULT_FILTERS: [Result, string][] = [
+  ["flagged", "Flagged by Defender"],
+  ["unfinished", "Check did not finish"],
+  ["unchecked", "Not checked yet"],
+];
+const PLACE_FILTERS: [Place, string][] = [
+  ["here", "Still here"],
+  ["gone", "Gone"],
+];
+
+/** `values` with `value` put in, or taken out if it was there. */
+function toggled<T>(values: T[], value: T): T[] {
+  return values.includes(value) ? values.filter((other) => other !== value) : [...values, value];
+}
 
 function signatureLabel(signature: Signature | null): string | null {
   if (!signature) return null;
@@ -297,6 +320,20 @@ export default function Downloads({
   const [newSince, setNewSince] = useState<string | null>(null);
   /** Why it could not be put on record that the page was opened. */
   const [lookedError, setLookedError] = useState<string | null>(null);
+  /** What the list has been narrowed to, and the order it is in. */
+  const [finding, setFinding] = useState<Finding>(EVERYTHING);
+  /**
+   * "Clear the list" has been pressed and is waiting for its one yes. What
+   * it was about is fixed at the press: how many rows the question names,
+   * and the moment the list on screen was read, which is as far as it clears.
+   */
+  const [clearing, setClearing] = useState<{ rows: number; older: number; upTo: string } | null>(
+    null,
+  );
+  /** True while rows are being removed, so nothing is pressed twice. */
+  const [removing, setRemoving] = useState(false);
+  /** What came of clearing the list, said above it. */
+  const [listNote, setListNote] = useState<{ text: string; failed: boolean } | null>(null);
   /** Whether that has been put on record once since the page was opened. */
   const lookedOnce = useRef(false);
   /** Whether the history was read the last time the page was. */
@@ -466,6 +503,62 @@ export default function Downloads({
     }
   }
 
+  /**
+   * Take one row off the list, for good. The record of the check goes and
+   * the file is not touched, so a file still in Downloads is listed again as
+   * not checked. It asks nothing first: it is one row, and the button says
+   * what it does.
+   */
+  async function removeRecord(record: PageRecord) {
+    setRemoving(true);
+    setListNote(null);
+    // What was said about a row goes with the row, unless there is still a
+    // file for it to be said under.
+    const stillListed = record.present || record.replaced;
+    try {
+      const removed = await api.removeDownloadRecord(record.path, record.sha256);
+      if (stillListed) {
+        say(
+          record.path,
+          removed > 0
+            ? "Its record was removed from this list. The file itself was not touched."
+            : "Its record had already gone from this list.",
+        );
+      } else {
+        setSaid((current) => {
+          const rest = { ...current };
+          delete rest[record.path.toLowerCase()];
+          return rest;
+        });
+      }
+    } catch (cause) {
+      say(record.path, `Not removed from this list: ${reason(cause)}`);
+    } finally {
+      setRemoving(false);
+      void load();
+    }
+  }
+
+  /** Remove every row that was on record when the question was asked. */
+  async function clearList(upTo: string) {
+    setRemoving(true);
+    try {
+      const removed = await api.clearDownloadRecords(upTo);
+      setListNote({
+        text: `${fmt.count(removed)} ${removed === 1 ? "row was" : "rows were"} removed from this list. No file was touched.`,
+        failed: false,
+      });
+      // Nothing said about a row outlives the row.
+      setSaid({});
+    } catch (cause) {
+      setListNote({ text: `The list was not cleared: ${reason(cause)}`, failed: true });
+    } finally {
+      setRemoving(false);
+      setClearing(null);
+      void load();
+    }
+  }
+
   async function setMenu(enabled: boolean) {
     setMenuError(null);
     try {
@@ -568,6 +661,9 @@ export default function Downloads({
       .then((launch) => {
         if (!launch) return;
         setFocus(launch.path.toLowerCase());
+        // The file asked about has to be on screen, whatever the list had
+        // been narrowed to before.
+        setFinding(EVERYTHING);
         if (launch.action === "check") void check(launch.path);
         else if (launch.action === "extract") void dissect(launch.path);
         // Nothing to run for a notice that was clicked: look for the next.
@@ -579,14 +675,10 @@ export default function Downloads({
       });
   }, [launches, busy, archiveFree, nudge, check, dissect]);
 
-  const rows: Row[] = page
-    ? [
-        ...page.records.map(
-          (record): Row => ({ kind: "record", at: record.arrived_at ?? record.checked_at, record }),
-        ),
-        ...page.unchecked.map((file): Row => ({ kind: "loose", at: file.arrived_at ?? "", file })),
-      ].sort((a, b) => b.at.localeCompare(a.at))
-    : [];
+  // Every row the page has, and the ones somebody has asked to see of them.
+  const rows = page ? rowsOf(page) : [];
+  const shown = find(rows, finding);
+  const counts = tally(rows);
   const failures = new Map(
     (page?.failures ?? []).map((failure) => [failure.path.toLowerCase(), failure.message]),
   );
@@ -785,15 +877,63 @@ export default function Downloads({
             {page && !page.history_error && waitingForACheck > 0 && (
               <button
                 onClick={() => void checkAll()}
-                disabled={busy || checkingAll || moving !== null}
+                disabled={busy || checkingAll || moving !== null || removing}
               >
                 Check everything not checked yet
+              </button>
+            )}
+            {/* Every row on record, not only the ones on screen, and it says
+                how many before it does anything. */}
+            {page && !page.history_error && page.on_record > 0 && (
+              <button
+                className="ghost"
+                onClick={() => {
+                  setListNote(null);
+                  setClearing({
+                    rows: page.on_record,
+                    older: Math.max(0, page.on_record - page.records.length),
+                    upTo: page.read_at,
+                  });
+                }}
+                disabled={busy || checkingAll || moving !== null || removing}
+              >
+                Clear the list
               </button>
             )}
           </div>
         </div>
         {backlogError && <p className="small held-warn wrap">{backlogError}</p>}
         {lookedError && <p className="small held-warn wrap">{lookedError}</p>}
+        {clearing && (
+          <div className="confirm">
+            <p>
+              Remove {clearing.rows === 1 ? "the 1 check" : `all ${fmt.count(clearing.rows)} checks`}{" "}
+              on record for your account from this list, for good?
+              {clearing.older > 0 && (
+                <>
+                  {" "}
+                  That is every one of them, including the {fmt.count(clearing.older)} older{" "}
+                  {clearing.older === 1 ? "one" : "ones"} not shown here.
+                </>
+              )}{" "}
+              No file is touched. A file still in Downloads goes back to "Not checked yet", and
+              the Activity log keeps its own entry of each check. This cannot be undone.
+            </p>
+            <div className="confirm-actions">
+              <button onClick={() => void clearList(clearing.upTo)} disabled={removing}>
+                {removing ? "Removing…" : clearing.rows === 1 ? "Remove it" : "Remove them"}
+              </button>
+              <button className="ghost" onClick={() => setClearing(null)} disabled={removing}>
+                {clearing.rows === 1 ? "Keep it" : "Keep them"}
+              </button>
+            </div>
+          </div>
+        )}
+        {listNote && (
+          <p className={`small wrap ${listNote.failed ? "held-warn" : "muted"}`}>
+            {listNote.text}
+          </p>
+        )}
         {freshSentence && (
           <p className="small held-warn wrap">
             New since this page was last opened: {freshSentence}. Each is marked "new" in the
@@ -802,17 +942,111 @@ export default function Downloads({
         )}
         {!page && loading && <p className="empty">Reading…</p>}
         {page && rows.length === 0 && (
-          <p className="empty">Nothing has arrived in Downloads since this was set up.</p>
+          <p className="empty">
+            Nothing is on this list: no file is in your Downloads folder, and no check is on
+            record.
+          </p>
+        )}
+        {page && rows.length > 0 && (
+          <>
+            {/* Search, order and filters, with the look of the lists on
+                Applications and Firewall. They work over the rows the page
+                has, which the note below says when that is not all of them. */}
+            <div className="app-controls">
+              <input
+                type="search"
+                className="app-search"
+                placeholder="Search by file name"
+                aria-label="Search by file name"
+                value={finding.query}
+                onChange={(event) => {
+                  const query = event.target.value;
+                  setFinding((current) => ({ ...current, query }));
+                }}
+              />
+              <select
+                value={finding.sort}
+                onChange={(event) => {
+                  const sort = event.target.value as Sort;
+                  setFinding((current) => ({ ...current, sort }));
+                }}
+                aria-label="Sort by"
+              >
+                <option value="arrival">Newest arrival first</option>
+                <option value="size">Largest first</option>
+                <option value="name">Name, A to Z</option>
+              </select>
+              <span className="app-count">
+                {shown.length === rows.length
+                  ? `${fmt.count(rows.length)} ${rows.length === 1 ? "row" : "rows"}`
+                  : `${fmt.count(shown.length)} of ${fmt.count(rows.length)} rows`}
+              </span>
+            </div>
+            <div className="conn-filters">
+              <span className="panel-count">Show only</span>
+              {RESULT_FILTERS.map(([value, label]) => (
+                <button
+                  key={value}
+                  className={`chip${finding.results.includes(value) ? " chip-on" : ""}`}
+                  aria-pressed={finding.results.includes(value)}
+                  onClick={() =>
+                    setFinding((current) => ({
+                      ...current,
+                      results: toggled(current.results, value),
+                    }))
+                  }
+                >
+                  {label} {fmt.count(counts[value])}
+                </button>
+              ))}
+              <span className="panel-count">and only</span>
+              {PLACE_FILTERS.map(([value, label]) => (
+                <button
+                  key={value}
+                  className={`chip${finding.places.includes(value) ? " chip-on" : ""}`}
+                  aria-pressed={finding.places.includes(value)}
+                  onClick={() =>
+                    setFinding((current) => ({
+                      ...current,
+                      places: toggled(current.places, value),
+                    }))
+                  }
+                >
+                  {label} {fmt.count(counts[value])}
+                </button>
+              ))}
+              {narrowed(finding) && (
+                <button
+                  className="chip"
+                  onClick={() => setFinding((current) => ({ ...EVERYTHING, sort: current.sort }))}
+                >
+                  Show everything
+                </button>
+              )}
+            </div>
+          </>
         )}
         {page && page.on_record > page.records.length && (
           <p className="small muted">
             Showing {fmt.count(page.records.length)} of the {fmt.count(page.on_record)} checks
             on record: the most recent, and the newest for each file in the folder now. The
-            older ones are still on record.
+            older ones are still on record. Searching, filtering and sorting cover only the
+            rows shown here.
           </p>
         )}
+        {page && page.on_record > 0 && (
+          <p className="small muted">
+            "Remove from this list" on a row, and "Clear the list" above, delete KAM
+            Security's record of a check for good. The file itself is not touched, and one
+            that is in quarantine stays there. A file still in Downloads goes back to "Not
+            checked yet". The Activity log keeps its own entry of each check.
+          </p>
+        )}
+        {page && rows.length > 0 && shown.length === 0 && (
+          <p className="empty">Nothing on the list matches what it has been narrowed to.</p>
+        )}
         <ul className="dl-list">
-          {rows.map((row) =>
+          {shown.map((row) =>
             row.kind === "record" ? (
               <RecordRow
                 key={`r-${row.record.path}-${row.record.sha256}`}
@@ -820,12 +1054,13 @@ export default function Downloads({
                 said={said[row.record.path.toLowerCase()]?.text}
                 focused={focus === row.record.path.toLowerCase()}
                 fresh={isNew(row.record)}
-                busy={busy || moving !== null}
+                busy={busy || moving !== null || removing}
                 checkingAll={checkingAll}
                 onCheck={() => void check(row.record.path)}
                 onDissect={() => void dissect(row.record.path)}
                 onQuarantine={() => void quarantine(row.record.path)}
                 onPutBack={(id) => void putBack(row.record.path, id)}
+                onRemove={() => void removeRecord(row.record)}
               />
             ) : (
               <LooseRow
@@ -839,7 +1074,7 @@ export default function Downloads({
                     ? auto.progress
                     : null
                 }
-                busy={busy || moving !== null}
+                busy={busy || moving !== null || removing}
                 checkingAll={checkingAll}
                 inHand={inHand === row.file.path.toLowerCase()}
                 onCheck={() => void check(row.file.path)}
@@ -1090,6 +1325,7 @@ function RecordRow({
   onDissect,
   onQuarantine,
   onPutBack,
+  onRemove,
 }: {
   record: PageRecord;
   said: string | undefined;
@@ -1103,6 +1339,7 @@ function RecordRow({
   onDissect: () => void;
   onQuarantine: () => void;
   onPutBack: (id: string) => void;
+  onRemove: () => void;
 }) {
   const signer = signatureLabel(record.signature);
   const flaggedProgram =
@@ -1118,6 +1355,19 @@ function RecordRow({
   useEffect(() => {
     if (focused) ref.current?.scrollIntoView({ block: "center" });
   }, [focused]);
+  // On every row, whatever became of its file: a row for a file long gone
+  // used to have no button at all, and stayed on the list for good. It
+  // removes the record of the check and never the file, without asking.
+  const remove = (
+    <button
+      className="ghost"
+      onClick={onRemove}
+      disabled={busy}
+      title="Deletes KAM Security's record of this check, for good. The file itself is not touched."
+    >
+      Remove from this list
+    </button>
+  );
 
   return (
     <li ref={ref} className={`dl-row${focused ? " dl-focused" : ""}`}>
@@ -1233,6 +1483,7 @@ function RecordRow({
               Quarantine
             </button>
           )}
+          {remove}
           <PathLink path={record.path} className="link-button">
             Show in Explorer
           </PathLink>
@@ -1245,12 +1496,15 @@ function RecordRow({
           <button className="ghost" onClick={() => onPutBack(record.held ?? "")} disabled={busy}>
             Put it back
           </button>
+          {remove}
           <span className="small muted">
             It is in quarantine. Putting it back returns it to where it was
-            {record.archive === "zip" && ", where it can be taken apart again"}.
+            {record.archive === "zip" && ", where it can be taken apart again"}. Removing this
+            row leaves it there, to be put back from Cleanup.
           </span>
         </div>
       )}
+      {!record.present && !record.held && <div className="dl-actions">{remove}</div>}
     </li>
   );
 }

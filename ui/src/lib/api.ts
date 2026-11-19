@@ -174,6 +174,19 @@ export const api = {
   /** Quarantine one download. The agent fences it to the Downloads folder. */
   quarantineDownload: (path: string) => invoke<Manifest>("quarantine_download", { path }),
   /**
+   * Remove one row from the download history, for good. The record goes and
+   * the file is not touched. Resolves to how many rows went: none when it had
+   * already gone.
+   */
+  removeDownloadRecord: (path: string, sha256: string) =>
+    invoke<number>("remove_download_record", { path, sha256 }),
+  /**
+   * Remove every row the history held when the page read it (`upTo` is the
+   * page's `read_at`), for good. A check recorded since is kept.
+   */
+  clearDownloadRecords: (upTo: string) =>
+    invoke<number>("clear_download_records", { upTo }),
+  /**
    * Take a zip apart. Quarantines the original first when Defender flagged it.
    * Nothing is extracted until extractClean. The answer carries no view when
    * it was stopped, and says what had become of the original by then.

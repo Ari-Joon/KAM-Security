@@ -1157,6 +1157,40 @@ async fn quarantine_download(path: String) -> Result<Manifest, String> {
     .await
 }
 
+/// Remove one row from this person's download history, for good. The record
+/// goes and the file is not touched. Answers with how many rows went, which
+/// is none when it had already gone.
+#[tauri::command]
+async fn remove_download_record(path: String, sha256: String) -> Result<u64, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::RemoveDownloadRecord { path, sha256 })
+            .map_err(|error| error.to_string())?
+        {
+            Response::DownloadRecordsRemoved { removed } => Ok(removed),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
+}
+
+/// Remove every row this person's download history held when the page read
+/// it, at `up_to`, for good. A check recorded since then is kept. Answers
+/// with how many rows went.
+#[tauri::command]
+async fn clear_download_records(up_to: String) -> Result<u64, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::ClearDownloadRecords { up_to })
+            .map_err(|error| error.to_string())?
+        {
+            Response::DownloadRecordsRemoved { removed } => Ok(removed),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
+}
+
 /// Take a zip apart: a private copy, the original quarantined first when
 /// Defender flagged it, and every member with Defender's answer. Nothing is
 /// extracted until [`extract_clean`]. The answer says what became of the
@@ -1480,6 +1514,8 @@ pub fn run() {
             downloads_page,
             check_download,
             quarantine_download,
+            remove_download_record,
+            clear_download_records,
             dissect_archive,
             stop_dissection,
             open_dissection,
