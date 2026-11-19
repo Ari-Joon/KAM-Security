@@ -935,6 +935,18 @@ export default function Cleanup({ volumes, onChanged }: Props) {
    * of zero area would be invisible anyway, and a *label* with no block behind
    * it would suggest the answer is "nothing" when the answer is "not asked".
    */
+  /**
+   * What the cache survey measured, as the two things it is.
+   *
+   * A cache can be cleared. The rest is large, looks as though it could go,
+   * and cannot: the hibernation file, what one website stored in a browser,
+   * downloaded models. It is measured so that it is accounted for and shown
+   * with what it is for, and it has no button. It is kept out of the map and
+   * out of every total below, which are of what this page can reclaim.
+   */
+  const clearable = caches && caches.filter((cache) => cache.safety !== "explained");
+  const explained = (caches ?? []).filter((cache) => cache.safety === "explained");
+
   const reclaim: ReclaimNode[] = [];
   if (orphans && orphans.length > 0) {
     reclaim.push({
@@ -956,16 +968,16 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       })),
     });
   }
-  if (caches && caches.length > 0) {
+  if (clearable && clearable.length > 0) {
     reclaim.push({
       key: "caches",
       label: "Caches",
-      bytes: caches.reduce((sum, cache) => sum + cache.bytes, 0),
+      bytes: clearable.reduce((sum, cache) => sum + cache.bytes, 0),
       // The one category on this page removed outright, which is why it is the
       // one colour that says so.
       reversal: "permanent",
-      detail: `${fmt.count(caches.length)} ${caches.length === 1 ? "kind" : "kinds"} of scratch space`,
-      children: caches.map((cache) => ({
+      detail: `${fmt.count(clearable.length)} ${clearable.length === 1 ? "kind" : "kinds"} of scratch space`,
+      children: clearable.map((cache) => ({
         key: cache.id,
         label: cache.name,
         bytes: cache.bytes,
@@ -1644,28 +1656,28 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           passwords or sessions.
         </p>
 
-        {caches && caches.length === 0 && (
+        {clearable && clearable.length === 0 && (
           <p className="empty">Nothing worth clearing. Genuinely.</p>
         )}
 
-        {caches && caches.length > 0 && (
+        {clearable && clearable.length > 0 && (
           <>
             <div className="stat-row tight">
               <div className="stat">
                 <span className="stat-label">Places</span>
-                <span className="stat-value">{fmt.count(caches.length)}</span>
+                <span className="stat-value">{fmt.count(clearable.length)}</span>
               </div>
               <div className="stat">
                 <span className="stat-label">Holding</span>
                 <span className="stat-value strong">
-                  {fmt.bytes(caches.reduce((total, cache) => total + cache.bytes, 0))}
+                  {fmt.bytes(clearable.reduce((total, cache) => total + cache.bytes, 0))}
                 </span>
               </div>
               <div className="stat">
                 <span className="stat-label">Costs you nothing</span>
                 <span className="stat-value">
                   {fmt.bytes(
-                    caches
+                    clearable
                       .filter((cache) => cache.safety === "routine")
                       .reduce((total, cache) => total + cache.bytes, 0),
                   )}
@@ -1675,7 +1687,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             </div>
 
             <ul className="caches">
-              {caches.map((cache) => (
+              {clearable.map((cache) => (
                 <li key={cache.id} className={`cache cache-${cache.safety}`}>
                   <div className="cache-head">
                     <button
@@ -1779,8 +1791,84 @@ export default function Cleanup({ volumes, onChanged }: Props) {
                           ? " 1 was open in another program and was left alone."
                           : ` ${fmt.count(cleared[cache.id].files_in_use)} were open in another program and were left alone.`)}
                       {cleared[cache.id].refused.length > 0 &&
-                        ` ${fmt.count(cleared[cache.id].refused.length)} could not be read.`}
+                        (cleared[cache.id].refused.length === 1
+                          ? " 1 place was left alone:"
+                          : ` ${fmt.count(cleared[cache.id].refused.length)} places were left alone:`)}
                     </p>
+                  )}
+                  {/* The service's own reasons, which were only counted. A
+                      folder left alone because it turned out to lead
+                      somewhere else is something to be told, not a number. */}
+                  {cleared[cache.id] && cleared[cache.id].refused.length > 0 && (
+                    <ul className="orphan-reasons">
+                      {cleared[cache.id].refused.map((why) => (
+                        <li key={why}>{why}</li>
+                      ))}
+                    </ul>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+
+        {/*
+          Not caches. The largest things on a drive that a person might take
+          for one, each with what it is for and what decides its size, and no
+          button: the service refuses to clear any of them. Listed apart, and
+          kept out of the map and the totals above, so that nothing here reads
+          as space this page offers to reclaim.
+        */}
+        {explained.length > 0 && (
+          <>
+            <p className="modal-label">Large, and not a cache</p>
+            <p className="muted">
+              {fmt.bytes(explained.reduce((total, item) => total + item.bytes, 0))}{" "}
+              that looks as though it could go and is not cleared from here.
+              It is measured so that the space is accounted for, and each says
+              what it is for and what decides how large it is.
+            </p>
+            <ul className="caches">
+              {explained.map((item) => (
+                <li key={item.id} className="cache">
+                  <div className="cache-head">
+                    <button
+                      className="cache-toggle"
+                      onClick={() => setOpenCache(openCache === item.id ? null : item.id)}
+                    >
+                      <span className="app-caret">
+                        {openCache === item.id ? "▾" : "▸"}
+                      </span>
+                      <span className="cache-name">{item.name}</span>
+                      <span className="conf conf-medium">Explained, not cleared</span>
+                    </button>
+                    <span className="cache-size">{fmt.bytes(item.bytes)}</span>
+                  </div>
+
+                  {openCache === item.id && (
+                    <div className="cache-detail">
+                      <p>{item.what}</p>
+                      <p className="cache-cost">
+                        <strong>What controls it:</strong> {item.managed_by}
+                      </p>
+                      <ul className="files">
+                        {item.locations.map((location) => (
+                          <FileRow
+                            key={location.path}
+                            path={location.path}
+                            bytes={location.bytes}
+                            onReveal={(target) => void reveal(target)}
+                            note={
+                              <span>
+                                {fmt.count(location.files)}{" "}
+                                {location.files === 1 ? "file" : "files"}
+                                {location.partial && " (measured to a ceiling)"}
+                              </span>
+                            }
+                          />
+                        ))}
+                      </ul>
+                    </div>
                   )}
                 </li>
               ))}

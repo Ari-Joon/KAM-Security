@@ -74,6 +74,10 @@ pub enum Safety {
     /// Safe, but you give something up: a slower first launch, a re-download,
     /// or a door closing behind you.
     Considered,
+    /// Not a cache, and never cleared from here. Measured and shown so that
+    /// the space is accounted for, with what it is for and which of Windows'
+    /// or the program's own settings controls it. See [`EXPLAINED`].
+    Explained,
 }
 
 /// One place on disk belonging to a cache.
@@ -97,6 +101,10 @@ pub struct Cache {
     /// What clearing it costs. Empty when the honest answer is "nothing".
     pub cost: String,
     pub safety: Safety,
+    /// For something explained and not cleared: what decides how large it is,
+    /// and where that is changed. Empty for a cache.
+    #[serde(default)]
+    pub managed_by: String,
     pub locations: Vec<CacheLocation>,
     pub bytes: u64,
     pub files: u64,
@@ -127,6 +135,29 @@ struct Entry {
     locate: fn(&UserContext) -> Vec<PathBuf>,
 }
 
+/// Space that is large, looks as though it could go, and is not a cache.
+///
+/// A list of what can be cleared says nothing about the rest, and the rest is
+/// where a person goes looking next: a 25 GB file at the top of the drive, 20
+/// GB inside a browser's folder that the cache entry did not touch. Leaving
+/// those unexplained invites deleting them by hand. So each is measured and
+/// shown with what it is for and what controls its size, and that is all.
+///
+/// These are kept in a list of their own so that the list of what `clear`
+/// will empty is the one above and nothing else. Nothing here is ever looked
+/// up to be cleared, and asking is refused by name.
+struct Explanation {
+    id: &'static str,
+    name: &'static str,
+    /// What the space is for, and what goes wrong without it.
+    what: &'static str,
+    /// What decides how large it is, and where the person changes that. A
+    /// fact about Windows or the program, never advice.
+    managed_by: &'static str,
+    /// Folders, or single files: several of these are one file.
+    locate: fn(&UserContext) -> Vec<PathBuf>,
+}
+
 fn windir() -> PathBuf {
     PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned()))
 }
@@ -150,10 +181,32 @@ fn program_files_x86() -> PathBuf {
     )
 }
 
+fn program_files() -> PathBuf {
+    PathBuf::from(std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_owned()))
+}
+
 /// `AppData\LocalLow`, where programs running with reduced rights keep what
 /// others keep in Local AppData. Some graphics drivers write their caches here.
 fn local_low(user: &UserContext) -> PathBuf {
     PathBuf::from(user.profile()).join(r"AppData\LocalLow")
+}
+
+/// Where each Chromium browser keeps its profiles, below Local AppData.
+const CHROMIUM_BROWSERS: &[&str] = &[
+    r"Google\Chrome\User Data",
+    r"Microsoft\Edge\User Data",
+    r"BraveSoftware\Brave-Browser\User Data",
+    r"Vivaldi\User Data",
+    r"Opera Software\Opera Stable",
+    r"Opera Software\Opera GX Stable",
+];
+
+/// What websites themselves stored in a Chromium browser, per profile.
+///
+/// Beside the caches and under other names, and not a cache: a site's own
+/// files and databases, which only that site can make again, if it can.
+fn chromium_site_storage(root: &Path) -> Vec<PathBuf> {
+    browser_profiles(root, &["File System", "IndexedDB"])
 }
 
 /// Every profile directory of a browser family, since people have several.
@@ -362,14 +415,7 @@ const CATALOGUE: &[Entry] = &[
             let local = PathBuf::from(user.local_app_data());
             let roaming = PathBuf::from(user.roaming_app_data());
             let mut found = Vec::new();
-            for chromium in [
-                r"Google\Chrome\User Data",
-                r"Microsoft\Edge\User Data",
-                r"BraveSoftware\Brave-Browser\User Data",
-                r"Vivaldi\User Data",
-                r"Opera Software\Opera Stable",
-                r"Opera Software\Opera GX Stable",
-            ] {
+            for chromium in CHROMIUM_BROWSERS {
                 found.extend(chromium_caches(&local.join(chromium)));
             }
             // Firefox splits its cache out of the profile entirely.
@@ -506,7 +552,7 @@ const CATALOGUE: &[Entry] = &[
         name: "Steam's web cache",
         what: "Store and library pages Steam's built-in browser keeps so they open faster.",
         cost: "Steam loads its store and library pages from the network again.",
-        safety: Safety::Routine,
+        safety: Safety::Considered,
         locate: |user| {
             // The cache folders by name, and not the folder that holds them:
             // the built-in browser keeps its cookies there too, and nothing
@@ -531,7 +577,7 @@ const CATALOGUE: &[Entry] = &[
                them, so that a chat opens without fetching them again.",
         cost: "Pictures, videos and files in chats load from the network again. You stay \
                signed in.",
-        safety: Safety::Routine,
+        safety: Safety::Considered,
         locate: |user| {
             let roaming = PathBuf::from(user.roaming_app_data());
             let mut found = inside(
@@ -559,7 +605,7 @@ const CATALOGUE: &[Entry] = &[
         what: "Compiled copies of VS Code's own scripts, the packages of extensions it has \
                already installed, and its logs.",
         cost: "VS Code starts a little slower once.",
-        safety: Safety::Routine,
+        safety: Safety::Considered,
         locate: |user| {
             inside(
                 &PathBuf::from(user.roaming_app_data()).join("Code"),
@@ -663,6 +709,243 @@ const CATALOGUE: &[Entry] = &[
                 ],
             )
         },
+    },
+];
+
+/// What is explained and never cleared. See [`Explanation`].
+///
+/// Every sentence here says what a thing is for and what controls it. None
+/// says what to do about it: whether 25 GB is worth hibernation is the
+/// person's to weigh, and this is not a list of recommendations.
+const EXPLAINED: &[Explanation] = &[
+    Explanation {
+        id: "hibernation-file",
+        name: "The hibernation file",
+        what: "Windows writes the contents of memory here so the PC can hibernate, and \
+               uses it to start quickly after a shut-down. It is sized from the memory \
+               this PC has, not from what is in use.",
+        managed_by: "Turning hibernation off removes the file, and Fast Startup with it: \
+                     powercfg /h off, run as administrator. powercfg /h on brings both back.",
+        locate: |_| vec![system_drive().join("hiberfil.sys")],
+    },
+    Explanation {
+        id: "page-file",
+        name: "The page file",
+        what: "Windows moves memory that is not being used here when programs ask for \
+               more than the PC has. The smaller file beside it does the same for apps \
+               from the Store.",
+        managed_by: "Its size is set in System Properties, Advanced, Performance, Virtual \
+                     memory. Left to Windows, it grows and shrinks by itself.",
+        locate: |_| {
+            vec![
+                system_drive().join("pagefile.sys"),
+                system_drive().join("swapfile.sys"),
+            ]
+        },
+    },
+    Explanation {
+        id: "restore-points",
+        name: "Restore points and earlier versions of files",
+        what: "Windows' own folder at the top of the drive. Most of what is in it is \
+               restore points and earlier versions of files, kept so that the system, or \
+               one file, can be put back as it was on an earlier day.",
+        managed_by: "System Properties, System Protection, Configure sets how much of the \
+                     drive they may use, and deletes them.",
+        locate: |_| vec![system_drive().join("System Volume Information")],
+    },
+    Explanation {
+        id: "website-storage",
+        name: "Data that websites saved in a browser",
+        what: "Files and databases that websites themselves stored on this PC through \
+               the browser: offline copies of documents and mail, a web app's own storage. \
+               It is not a cache. The browser cannot fetch it again, and removing it can \
+               lose work that was only saved here.",
+        managed_by: "Each browser lists it by site, largest first, and deletes it one site \
+                     at a time. In Chrome: Settings, Privacy and security, Third-party \
+                     cookies, See all site data and permissions.",
+        locate: |user| {
+            let local = PathBuf::from(user.local_app_data());
+            CHROMIUM_BROWSERS
+                .iter()
+                .flat_map(|browser| chromium_site_storage(&local.join(browser)))
+                .collect()
+        },
+    },
+    Explanation {
+        id: "ai-models",
+        name: "Downloaded AI models",
+        what: "Models fetched by tools such as the Hugging Face libraries, Whisper and \
+               Ollama. Each is a file of up to several gigabytes, downloaded the first \
+               time a program asked for it.",
+        managed_by: "The tool that downloaded a model removes it: huggingface-cli \
+                     delete-cache for Hugging Face, and ollama rm followed by the model's \
+                     name for Ollama. A model that has been removed is downloaded again \
+                     the next time something asks for it.",
+        locate: |user| {
+            inside(
+                &PathBuf::from(user.profile()),
+                &[r".cache\huggingface", r".cache\whisper", r".ollama\models"],
+            )
+        },
+    },
+    Explanation {
+        id: "windows-installer-cache",
+        name: "Windows Installer's copies",
+        what: "The installer packages of programs installed on this PC, kept by Windows \
+               in its Installer folder. Windows needs each one to repair, update or \
+               uninstall the program it belongs to.",
+        managed_by: "Windows adds one when a program is installed and removes it when \
+                     that program is uninstalled. Removing one by hand breaks that \
+                     program's uninstaller.",
+        locate: |_| vec![windir().join("Installer")],
+    },
+    Explanation {
+        id: "setup-package-cache",
+        name: "Setup programs' package cache",
+        what: "Installer packages kept in the Package Cache folder by setup programs \
+               that install several parts at once, such as Visual C++ and .NET. They are \
+               needed to repair, change or uninstall what they installed.",
+        managed_by: "Each is removed when the program it belongs to is uninstalled. \
+                     Removing one by hand breaks that program's uninstaller.",
+        locate: |_| vec![program_data().join("Package Cache")],
+    },
+    Explanation {
+        id: "visual-studio-packages",
+        name: "Visual Studio's installer packages",
+        what: "Packages the Visual Studio Installer keeps so that Visual Studio or the \
+               Build Tools can be repaired or changed without downloading them again. \
+               The same folder holds the records both are found by, which is why it is \
+               not emptied from here.",
+        managed_by: "Whether packages are kept is the Visual Studio Installer's own \
+                     setting. Microsoft's documentation calls it the package cache and \
+                     describes how to switch it off or move it.",
+        locate: |_| vec![program_data().join(r"Microsoft\VisualStudio\Packages")],
+    },
+    Explanation {
+        id: "driver-packages",
+        name: "Driver packages and graphics driver files",
+        what: "Windows' store of the driver packages installed on this PC, the graphics \
+               driver's own repair data, and the models games load for upscaling.",
+        managed_by: "Windows keeps a driver package for as long as a device might need it. \
+                     An old one is removed with pnputil /delete-driver, run as \
+                     administrator, which refuses a package that is in use.",
+        locate: |_| {
+            vec![
+                windir().join(r"System32\DriverStore\FileRepository"),
+                program_files().join(r"NVIDIA Corporation\Installer2"),
+                program_data().join(r"NVIDIA\NGX"),
+            ]
+        },
+    },
+    Explanation {
+        id: "defender-records",
+        name: "Microsoft Defender's own records",
+        what: "Defender's history of what it scanned and found, and the definitions it \
+               has downloaded.",
+        managed_by: "Defender removes old entries itself. Tamper Protection stops other \
+                     programs changing these folders.",
+        locate: |_| {
+            inside(
+                &program_data().join(r"Microsoft\Windows Defender"),
+                &["Scans", "Definition Updates"],
+            )
+        },
+    },
+    Explanation {
+        id: "device-backups",
+        name: "iPhone and iPad backups",
+        what: "Each folder is a complete backup of one device, made by iTunes or by \
+               Apple Devices.",
+        managed_by: "A backup is deleted from inside iTunes or Apple Devices, under Edit, \
+                     Preferences, Devices, which shows the device and the date of each.",
+        locate: |user| {
+            vec![
+                PathBuf::from(user.roaming_app_data()).join(r"Apple Computer\MobileSync\Backup"),
+                PathBuf::from(user.profile()).join(r"Apple\MobileSync\Backup"),
+            ]
+        },
+    },
+    Explanation {
+        id: "outlook-mailboxes",
+        name: "Outlook mailbox files",
+        what: "Mail that Outlook keeps on this PC. An .ost file is Outlook's offline copy \
+               of a mailbox and is rebuilt from the server. A .pst file may be the only \
+               copy of the mail inside it.",
+        managed_by: "Outlook's account settings decide how much mail is kept offline, and \
+                     a .pst file is opened and closed from inside Outlook.",
+        locate: |user| {
+            let local = PathBuf::from(user.local_app_data());
+            vec![
+                local.join(r"Microsoft\Outlook"),
+                local.join(r"Microsoft\Olk"),
+                PathBuf::from(user.profile()).join(r"Documents\Outlook Files"),
+            ]
+        },
+    },
+    Explanation {
+        id: "virtual-disks",
+        name: "Docker and Linux virtual disks",
+        what: "Each file is a whole virtual disk, used by Docker or by a Linux system \
+               running under Windows. It grows as things are stored inside it and does \
+               not shrink when they are deleted inside it.",
+        managed_by: "Docker Desktop frees its disk under Troubleshoot, Clean / Purge data. \
+                     A Linux disk is made smaller by stopping it with wsl --shutdown and \
+                     then compacting the disk file.",
+        locate: |user| {
+            let local = PathBuf::from(user.local_app_data());
+            let mut found = vec![local.join(r"Docker\wsl"), local.join("wsl")];
+            // A distribution from the Store keeps its disk in its own package.
+            if let Ok(packages) = std::fs::read_dir(local.join("Packages")) {
+                for package in packages.flatten() {
+                    found.push(package.path().join(r"LocalState\ext4.vhdx"));
+                }
+            }
+            found
+        },
+    },
+    Explanation {
+        id: "android-emulators",
+        name: "Android emulators",
+        what: "Each folder is a whole virtual phone with its own data, or the system \
+               image one is made from.",
+        managed_by: "Android Studio's Device Manager lists the virtual devices and \
+                     deletes them, and its SDK Manager removes system images.",
+        locate: |user| {
+            vec![
+                PathBuf::from(user.profile()).join(r".android\avd"),
+                PathBuf::from(user.local_app_data()).join(r"Android\Sdk\system-images"),
+            ]
+        },
+    },
+    Explanation {
+        id: "pnpm-store",
+        name: "pnpm's package store",
+        what: "Every package pnpm has installed for any project, kept once. Projects \
+               link into this store instead of holding copies of their own.",
+        managed_by: "pnpm store prune removes what no project still uses. Removing the \
+                     folder by hand breaks the projects that link into it until they are \
+                     installed again.",
+        locate: |user| vec![PathBuf::from(user.local_app_data()).join(r"pnpm\store")],
+    },
+    Explanation {
+        id: "amd-installer-files",
+        name: "Files AMD's installers unpacked",
+        what: "AMD's driver and chipset installers unpack themselves into a folder named \
+               AMD at the top of the system drive and leave the files there. The drivers \
+               themselves are installed elsewhere.",
+        managed_by: "Nothing removes these by itself. The folder can be deleted in \
+                     Explorer, which sends it to the Recycle Bin. It is not emptied from \
+                     here because a folder of that name may hold something else as well.",
+        locate: |_| vec![system_drive().join("AMD")],
+    },
+    Explanation {
+        id: "memory-dump",
+        name: "The memory dump from the last crash",
+        what: "The whole of memory, written to one file when Windows last stopped with a \
+               blue screen. It is of use to somebody working out why.",
+        managed_by: "Windows overwrites it at the next such stop, and its own Disk Cleanup \
+                     removes it under System error memory dump files.",
+        locate: |_| vec![windir().join("MEMORY.DMP")],
     },
 ];
 
@@ -813,19 +1096,72 @@ fn build(entry: &Entry, user: &UserContext, anchors: &Anchors) -> Option<Cache> 
         what: entry.what.to_owned(),
         cost: entry.cost.to_owned(),
         safety: entry.safety,
+        managed_by: String::new(),
         bytes: locations.iter().map(|location| location.bytes).sum(),
         files: locations.iter().map(|location| location.files).sum(),
         locations,
     })
 }
 
-/// Measure every cache that is actually present, largest first.
+/// Measure one explained place, which may be a folder or a single file.
+///
+/// A link is not measured, as everywhere else here. A file is measured by the
+/// length Windows records for it, which is all that can be asked of the
+/// hibernation and page files: nothing may open them while Windows runs.
+fn sized(path: &Path) -> Option<CacheLocation> {
+    let data = std::fs::symlink_metadata(path).ok()?;
+    if data.file_type().is_symlink() {
+        return None;
+    }
+    let (bytes, files, partial) = if data.is_dir() {
+        measure(path)
+    } else {
+        (data.len(), 1, false)
+    };
+    (files > 0).then(|| CacheLocation {
+        path: path.to_string_lossy().into_owned(),
+        bytes,
+        files,
+        partial,
+    })
+}
+
+fn explain(explanation: &Explanation, user: &UserContext) -> Option<Cache> {
+    let locations: Vec<CacheLocation> = (explanation.locate)(user)
+        .iter()
+        .filter_map(|path| sized(path))
+        .collect();
+    if locations.is_empty() {
+        return None;
+    }
+
+    Some(Cache {
+        id: explanation.id.to_owned(),
+        name: explanation.name.to_owned(),
+        what: explanation.what.to_owned(),
+        // Nothing is cleared, so there is no cost of clearing to state.
+        cost: String::new(),
+        safety: Safety::Explained,
+        managed_by: explanation.managed_by.to_owned(),
+        bytes: locations.iter().map(|location| location.bytes).sum(),
+        files: locations.iter().map(|location| location.files).sum(),
+        locations,
+    })
+}
+
+/// Measure every cache that is actually present, and everything explained
+/// beside them, largest first. [`Cache::safety`] tells the two apart.
 pub fn survey(user: &UserContext) -> Vec<Cache> {
     let anchors = Anchors::of(user);
     let mut caches: Vec<Cache> = CATALOGUE
         .iter()
         .filter_map(|entry| build(entry, user, &anchors))
         .collect();
+    caches.extend(
+        EXPLAINED
+            .iter()
+            .filter_map(|explanation| explain(explanation, user)),
+    );
     caches.sort_by_key(|cache| std::cmp::Reverse(cache.bytes));
     caches
 }
@@ -1109,6 +1445,19 @@ fn empty(path: &Path, result: &mut Cleared) {
 /// The id is looked up in the catalogue above; an unknown one is refused
 /// without touching anything. No caller supplies a path.
 pub fn clear(id: &str, user: &UserContext) -> std::result::Result<Cleared, String> {
+    // Asked by name and refused by name. An explained entry is not in the
+    // catalogue, so it could not be cleared whatever happened here. It is
+    // answered first so that the refusal says what the thing is and what does
+    // control it, where "not something this knows how to clear" would read as
+    // a fault.
+    if let Some(explanation) = EXPLAINED.iter().find(|entry| entry.id == id) {
+        return Err(format!(
+            "{} is listed so that the space is explained. It is not a cache, and \
+             nothing here clears it. {}",
+            explanation.name, explanation.managed_by
+        ));
+    }
+
     let Some(entry) = CATALOGUE.iter().find(|entry| entry.id == id) else {
         return Err(format!("{id} is not something this knows how to clear"));
     };
@@ -1147,6 +1496,14 @@ pub fn clear(id: &str, user: &UserContext) -> std::result::Result<Cleared, Strin
 /// anyway; answering "needs an administrator" costs nothing, and answering the
 /// other way would be a guess in the permissive direction.
 pub fn is_machine_wide(id: &str, user: &UserContext) -> bool {
+    // An explained entry is never cleared, so there is no change here for an
+    // administrator to agree to. Answering "no" lets the request reach
+    // `clear`, which refuses it by name and has the refusal recorded, where
+    // "this needs administrator rights" would promise something that a yes
+    // could not deliver.
+    if EXPLAINED.iter().any(|entry| entry.id == id) {
+        return false;
+    }
     let Some(entry) = CATALOGUE.iter().find(|entry| entry.id == id) else {
         return true;
     };
@@ -1801,6 +2158,40 @@ mod tests {
         std::fs::remove_dir_all(&profile).unwrap();
     }
 
+    /// "Costs nothing" is said only of an entry that states no cost.
+    ///
+    /// The page labels a routine entry "Costs nothing" and clears it on one
+    /// press. Of the entries added in November 2026, the ones that give
+    /// something up, however small, say what and ask first.
+    #[test]
+    fn an_added_entry_that_states_a_cost_is_not_called_free() {
+        let added = [
+            "nvidia-driver-downloads",
+            "nvidia-app-logs",
+            "chrome-on-device-model",
+            "steam-web-cache",
+            "chat-caches",
+            "vscode-cache",
+            "game-engine-caches",
+            "adobe-media-cache",
+            "windows-upgrade-files",
+            "windows-servicing-logs",
+            "edge-update-downloads",
+            "launcher-logs",
+        ];
+        for id in added {
+            let entry = CATALOGUE
+                .iter()
+                .find(|entry| entry.id == id)
+                .unwrap_or_else(|| panic!("{id} is not in the catalogue"));
+            assert_eq!(
+                entry.safety == Safety::Routine,
+                entry.cost.is_empty(),
+                "{id} is called free and states a cost, or the other way round"
+            );
+        }
+    }
+
     /// Nothing a person reads from this list carries a dash, and every entry
     /// says what it holds.
     #[test]
@@ -1818,6 +2209,122 @@ mod tests {
                 "{}",
                 entry.id
             );
+        }
+    }
+
+    /// Something explained is refused by name, whoever asks and however.
+    ///
+    /// It is not in the list `clear` empties, so nothing could be removed
+    /// either way. What this pins is that the refusal says what the thing is
+    /// and what does control it, and that asking never becomes a question of
+    /// administrator rights, which would suggest that a yes could clear it.
+    #[test]
+    fn something_explained_is_never_cleared_and_says_what_controls_it() {
+        let user = someone();
+        for explanation in EXPLAINED {
+            let refusal = clear(explanation.id, &user).expect_err(explanation.id);
+            assert!(
+                refusal.contains("nothing here clears it")
+                    && refusal.contains(explanation.managed_by),
+                "{}: the refusal should say what controls it: {refusal}",
+                explanation.id
+            );
+            assert!(
+                !is_machine_wide(explanation.id, &user),
+                "{} would be put to an administrator, as if consent could clear it",
+                explanation.id
+            );
+            assert!(
+                CATALOGUE.iter().all(|entry| entry.id != explanation.id),
+                "{} is also in the list that is emptied",
+                explanation.id
+            );
+        }
+    }
+
+    /// A made-up person's AI models are measured, explained, and left alone.
+    #[test]
+    fn something_explained_is_measured_and_survives_being_asked_to_clear() {
+        let profile = long_scratch("explained");
+        let models = profile.join(".ollama").join("models");
+        std::fs::create_dir_all(models.join("blobs")).unwrap();
+        std::fs::write(models.join("blobs").join("sha256-0001"), vec![3_u8; 8192]).unwrap();
+        let user = UserContext::new(None, &profile.to_string_lossy());
+
+        let listed = survey(&user);
+        let found = listed
+            .iter()
+            .find(|cache| cache.id == "ai-models")
+            .expect("the models are there and should be listed");
+        assert_eq!(found.safety, Safety::Explained);
+        assert_eq!(found.bytes, 8192);
+        assert!(found.cost.is_empty());
+        assert!(
+            found.managed_by.contains("ollama rm"),
+            "{}",
+            found.managed_by
+        );
+
+        assert!(clear("ai-models", &user).is_err());
+        assert!(
+            models.join("blobs").join("sha256-0001").exists(),
+            "something that is only explained was removed"
+        );
+
+        std::fs::remove_dir_all(&profile).unwrap();
+    }
+
+    #[test]
+    fn a_single_file_is_measured_as_the_one_file_it_is() {
+        // The hibernation file, the page file and a memory dump are each one
+        // file, and the list could only hold folders.
+        let folder = long_scratch("single-file");
+        let file = folder.join("hiberfil.sys");
+        std::fs::write(&file, vec![0_u8; 5000]).unwrap();
+
+        let measured = sized(&file).expect("a file that is there is measured");
+        assert_eq!((measured.bytes, measured.files), (5000, 1));
+        assert!(!measured.partial);
+
+        assert!(sized(&folder.join("not-there.sys")).is_none());
+        // An empty folder holds nothing to explain.
+        std::fs::create_dir(folder.join("empty")).unwrap();
+        assert!(sized(&folder.join("empty")).is_none());
+
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    /// What is explained is described, and never advised on.
+    #[test]
+    fn every_explanation_states_facts_and_gives_no_advice() {
+        let mut ids: Vec<&str> = CATALOGUE.iter().map(|entry| entry.id).collect();
+        ids.extend(EXPLAINED.iter().map(|explanation| explanation.id));
+        let before = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "two entries share an id");
+
+        for explanation in EXPLAINED {
+            for text in [explanation.name, explanation.what, explanation.managed_by] {
+                assert!(
+                    !text.is_empty(),
+                    "{} leaves something unsaid",
+                    explanation.id
+                );
+                assert!(
+                    !text.contains('\u{2014}') && !text.contains('\u{2013}'),
+                    "{} has a dash in: {text}",
+                    explanation.id
+                );
+                let lowered = text.to_lowercase();
+                for advice in ["you should", "we recommend", "safe to", "it is safe"] {
+                    assert!(
+                        !lowered.contains(advice),
+                        "{} gives advice (\"{advice}\"): {text}",
+                        explanation.id
+                    );
+                }
+            }
         }
     }
 

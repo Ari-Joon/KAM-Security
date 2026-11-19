@@ -495,15 +495,24 @@ pub fn handle(
 
         Request::SurveyCaches => {
             let caches = kam_storage::caches::survey(user);
-            let total: u64 = caches.iter().map(|cache| cache.bytes).sum();
+            // Two counts, because the survey now also measures what is only
+            // explained, and "caches holding" must not take that in.
+            let (explained, clearable): (Vec<_>, Vec<_>) = caches
+                .iter()
+                .partition(|cache| cache.safety == kam_storage::caches::Safety::Explained);
+            let held = |list: &[&kam_storage::Cache]| -> u64 {
+                list.iter().map(|cache| cache.bytes).sum()
+            };
             context.audit(
                 "storage",
                 "survey_caches",
                 Effect::Observed,
                 format!(
-                    "{} caches holding {} for {}",
-                    caches.len(),
-                    human_bytes(total),
+                    "{} caches holding {}, and {} other places explained holding {}, for {}",
+                    clearable.len(),
+                    human_bytes(held(&clearable)),
+                    explained.len(),
+                    human_bytes(held(&explained)),
                     user.profile()
                 ),
             );
@@ -2118,6 +2127,49 @@ mod tests {
             .filter(|entry| entry.action == "clear_cache")
             .count();
         assert_eq!(refusals, 6, "every attempt should have been recorded");
+    }
+
+    /// Asked to clear something that is only explained, the agent refuses by
+    /// name, for anybody, and writes the refusal down.
+    ///
+    /// The hibernation file, a browser's site data and the rest are measured
+    /// and shown with no Clear button. A request for one is therefore not
+    /// something the window sends, and is recorded as the refusal it is. It
+    /// is not put to an administrator first: there is nothing a yes could do.
+    #[test]
+    fn something_that_is_only_explained_is_refused_and_the_refusal_recorded() {
+        let context = context(Mode::Service);
+        let user = someone();
+
+        for id in [
+            "hibernation-file",
+            "website-storage",
+            "visual-studio-packages",
+        ] {
+            let request = Request::ClearCache { id: id.to_owned() };
+            assert!(
+                !needs_administrator(&request, &user),
+                "{id} would be answered with a request for administrator rights"
+            );
+            let response = handle(request, &context, &Reporter::silent(), &user);
+            let Response::Error { message } = response else {
+                panic!("{id} was not refused: {response:?}");
+            };
+            assert!(
+                message.contains("nothing here clears it"),
+                "{id}: the refusal should say why: {message}"
+            );
+        }
+
+        let recorded: Vec<_> = context
+            .store
+            .recent_audit(50)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.action == "clear_cache")
+            .collect();
+        assert_eq!(recorded.len(), 3, "every attempt should have been recorded");
+        assert!(recorded.iter().all(|entry| entry.effect == Effect::Refused));
     }
 
     /// Only a copy in a folder of the caller's is ever removed.

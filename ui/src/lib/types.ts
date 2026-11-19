@@ -201,7 +201,12 @@ export type Removal = {
   refused: string[];
 };
 
-export type CacheSafety = "routine" | "considered";
+/**
+ * "explained" is not a cache at all: space that is measured and described so
+ * that it is accounted for, and never cleared from here. The agent refuses a
+ * clear of one by name.
+ */
+export type CacheSafety = "routine" | "considered" | "explained";
 
 export type CacheLocation = {
   path: string;
@@ -217,6 +222,11 @@ export type Cache = {
   /** What clearing it costs you. Empty when the answer is genuinely nothing. */
   cost: string;
   safety: CacheSafety;
+  /**
+   * For something explained: what decides how large it is and where that is
+   * changed. Empty for a cache.
+   */
+  managed_by: string;
   locations: CacheLocation[];
   bytes: number;
   files: number;
