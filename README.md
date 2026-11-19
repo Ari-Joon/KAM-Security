@@ -356,14 +356,17 @@ its name.
 ## Downloads
 
 Most of what ends up running on a machine arrived through the Downloads
-folder, so **Active downloads** watches it. When a file finishes arriving
-(its size has held still and nothing is still writing it), Defender is asked
-about it straight away, and the answer is recorded with the file's size,
-SHA-256, the site it came from and, for a program, who signed it. Defender
-decides what is flagged. The page shows its answer by name and never adds
-anything up into a score, and nothing is moved or deleted unless you press a
-button. The watching waits on Windows to say something changed, so it costs
-nothing while nothing arrives.
+folder, so **Active downloads** watches it while KAM Security is running.
+When a file finishes arriving (its size has held still and nothing is still
+writing it), Defender is asked about it straight away, and the answer is
+recorded with the file's size, SHA-256, the site it came from and, for a
+program, who signed it. Defender decides what is flagged. The page shows its
+answer by name and never adds anything up into a score, and nothing is moved
+or deleted unless you press a button. The watching waits on Windows to say
+something changed, so it costs nothing while nothing arrives. A file that is
+gone before it could be checked, which is what Defender's real-time protection
+does to one it objects to, is recorded as exactly that, with what Defender's
+own history says about it.
 
 The check is report-only, and that turned out to matter. Asked to report
 rather than act, Defender records **nothing**: tested with the EICAR test
@@ -371,21 +374,36 @@ archive, it named the threat and the file inside the zip on its console and
 left no entry in its detection history or its event log. Letting it act so
 that it records would mean letting it act on a path in a folder anybody can
 write to. So the console is read, under rules that cannot make anything look
-cleaner than it is: Defender's exit code decides whether anything was found,
+better than it is: Defender's exit code decides whether anything was found,
 its own counts must match the list that follows, and a check that did not
-finish is said, never shown as clean.
+finish says so and is never shown as Defender having found nothing. A
+password-protected archive is the same trap from the other side. Defender
+reports no threat in what it could not open, so the page reads the archive's
+own list and says how many of its files Defender could not look inside.
+
+The service checks a file only through the one handle your own account was
+able to open, and holds it until the check is over. The file it was asked
+about and the file it read are then the same file, and nothing can swap one
+for the other in between. For the same reason it will not check a file that
+another program still has open for writing. The page says so, and the file
+can be checked again once that program has finished with it.
 
 A zip can be taken apart. If Defender flagged it, the original goes to
-quarantine first. A private copy is checked, every file inside is listed with
-Defender's answer, and one button extracts the files it did not flag into a new
-folder beside it, "name (checked by KAM)". Nothing Defender flagged is ever
-written, and neither is a password-protected file (Defender could not look
-inside it), a link, or a name built to land somewhere else. Every extracted
-file keeps the mark Windows puts on downloads, so SmartScreen still sees it.
-Defender sometimes flags an archive as a whole rather than a file in it, and
-then there are no clean parts to separate, so none are offered. A file
-Defender removes the moment it is written is listed as removed, with the
-detection that took it, and is not counted as extracted.
+quarantine first, and its row keeps a button that puts it back. A private copy
+is made and held open from the moment it is written, Defender is asked about
+that copy, and its fingerprint has to be the one the check came back with
+before anything is offered. Every file inside is listed with Defender's
+answer, and one button extracts the files it did not flag into a new folder in
+your Downloads folder, "name (checked by KAM)". Nothing Defender flagged is
+ever written, and neither is a password-protected file (Defender could not
+look inside it), a link, a name built to land somewhere else, or a file whose
+name could be mistaken for the one Defender named. Every extracted file keeps
+the mark Windows puts on downloads, so SmartScreen still sees it, and one that
+could not be given the mark is listed by name. Defender sometimes flags an
+archive as a whole rather than a file in it, and then no part of it can be
+told apart from the rest, so nothing is offered. A file Defender removes the
+moment it is written is listed as removed, with the detection that took it,
+and is not counted as extracted.
 
 Defender's names carry their own category, and the page says what each one
 means. `HackTool:` and `PUA:` are Defender saying a program is a dual-use or
@@ -402,9 +420,9 @@ process that would mean anywhere. A test fails if an archive reader ever
 reaches the service.
 
 Right-click any file for "Check with KAM Security", or a zip for "Extract with
-KAM Security" (on Windows 11, under "Show more options"). Both are added for
-your account the first time KAM Security runs and can be unticked on the
-page. New downloads also raise a Windows notification, which needs a KAM
+KAM Security" (on Windows 11, under "Show more options"). Several files chosen
+at once are dealt with in turn. Both entries are added for your account the
+first time KAM Security runs and can be unticked on the page. New downloads also raise a Windows notification, which needs a KAM
 Security shortcut in your Start menu, so the app keeps one there. If Windows
 notifications are switched off, the page says so rather than staying quiet.
 Other archives (7z, RAR, disc images) are checked as a whole.
