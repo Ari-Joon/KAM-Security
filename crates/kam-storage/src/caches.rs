@@ -1004,15 +1004,44 @@ struct Anchors(Vec<(String, String)>);
 
 impl Anchors {
     fn of(user: &UserContext) -> Self {
-        let mut folders = vec![
-            PathBuf::from(user.profile()),
-            program_data(),
-            windir(),
-            program_files_x86(),
-            system_drive(),
-        ];
-        // Wherever Steam says its libraries are.
-        folders.extend(crate::steam::library_roots(user));
+        Self::with_libraries(
+            &[
+                PathBuf::from(user.profile()),
+                program_data(),
+                windir(),
+                program_files_x86(),
+                system_drive(),
+            ],
+            &crate::steam::library_roots(user),
+        )
+    }
+
+    /// The fixed starting places, and the Steam libraries that are not inside
+    /// one of them.
+    ///
+    /// A library is wherever Steam's own settings say, and the caller can edit
+    /// those. A starting place may be reached through a link, so if any
+    /// library could be one, naming a junction as a "library" would make the
+    /// junction a starting place and take the fence away from everything
+    /// below it. So a library inside a fixed place is judged from that place
+    /// like anything else in it. Only a library on a drive of its own starts
+    /// from itself, and a clear that reaches one of those is machine-wide and
+    /// needs an administrator anyway.
+    fn with_libraries(fixed: &[PathBuf], libraries: &[PathBuf]) -> Self {
+        let within_a_fixed_place = |library: &PathBuf| {
+            let spelled = crate::paths::plain(&library.to_string_lossy());
+            fixed.iter().any(|folder| {
+                crate::paths::below(&spelled, &crate::paths::plain(&folder.to_string_lossy()))
+                    .is_some()
+            })
+        };
+        let mut folders = fixed.to_vec();
+        folders.extend(
+            libraries
+                .iter()
+                .filter(|library| !within_a_fixed_place(library))
+                .cloned(),
+        );
         Self::from_folders(&folders)
     }
 
@@ -2009,6 +2038,48 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
         std::fs::remove_dir_all(&moved).unwrap();
+    }
+
+    /// Calling a link a Steam library does not make it a starting place.
+    ///
+    /// Steam's list of libraries is a file the caller can edit. A starting
+    /// place may be a link, so a "library" inside the caller's own profile
+    /// that was really a junction would have been trusted as one, and the
+    /// clear would have gone through it.
+    #[test]
+    fn a_steam_library_inside_a_fixed_place_is_judged_from_that_place() {
+        let profile = long_scratch("library-link");
+        let victim = long_scratch("library-link-victim");
+        let scratch_files = victim.join("steamapps").join("temp");
+        std::fs::create_dir_all(&scratch_files).unwrap();
+        std::fs::write(scratch_files.join("precious.txt"), b"not the caller's").unwrap();
+        let library = profile.join("library");
+        if !junction(&library, &victim) {
+            let _ = std::fs::remove_dir_all(&profile);
+            let _ = std::fs::remove_dir_all(&victim);
+            return;
+        }
+        let location = library.join("steamapps").join("temp");
+
+        let anchors = Anchors::with_libraries(
+            std::slice::from_ref(&profile),
+            std::slice::from_ref(&library),
+        );
+        assert!(!anchors.holds(&location));
+        let mut result = nothing_cleared();
+        empty_root(&location, &anchors, &mut result);
+        assert!(
+            scratch_files.join("precious.txt").exists(),
+            "a junction named as a Steam library was trusted as a starting place"
+        );
+
+        // The control: a library that is not inside a fixed place does start
+        // from itself, which is what a library on another drive is.
+        let elsewhere = Anchors::with_libraries(&[], std::slice::from_ref(&library));
+        assert!(elsewhere.holds(&location));
+
+        let _ = std::fs::remove_dir_all(&profile);
+        std::fs::remove_dir_all(&victim).unwrap();
     }
 
     #[test]
