@@ -82,8 +82,10 @@ export function serviceWords(
         headline: "KAM Security's service is not answering.",
         sentences: [
           stopped,
-          "While it is not answering, the watching and the checks it does are not running: nothing is watching what starts itself, and new downloads are not checked as they arrive.",
-          "What is on screen was read before it stopped, and anything that needs the service will fail until it answers.",
+          "While it is not answering, the watching and the checks it does are not running: it is not watching what starts itself, and it cannot check new downloads as they arrive.",
+          notice.last_answered !== null
+            ? "What is on screen was read before it stopped, and anything that needs the service will fail until it answers."
+            : "Nothing has been read from it, and anything that needs the service will fail until it answers.",
           "This window keeps asking, and says here when it answers again.",
         ],
         quoted: `Why there was no answer: ${notice.reason.replace(/\.$/, "")}.`,
@@ -114,7 +116,7 @@ export function serviceWords(
         sentences: [
           `It is running, and said: ${notice.message.replace(/\.$/, "")}.`,
           "Until it serves this window, nothing on these pages can be read from it.",
-          "Every turn-away is written into its Activity log, so this window asks again only once a minute.",
+          "This window asks it again in a minute.",
         ],
         quoted: null,
       };
@@ -124,7 +126,7 @@ export function serviceWords(
         tone: "plain",
         headline: "KAM Security's service is answering again.",
         sentences: [
-          `It answered at ${when(notice.at)}, after not answering this window from ${when(notice.from)}.`,
+          `It answered as usual at ${when(notice.at)}, after not doing so from ${when(notice.from)}.`,
           "A page that was open in between shows what it read before then: open it again to read it afresh.",
         ],
         quoted: null,

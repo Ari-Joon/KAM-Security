@@ -255,7 +255,7 @@ fn job_work(
         // runs for hours, so it can be stopped. Defender is asked to report,
         // not to act (see the request's own note), so anything in the answer
         // is still where it was, and the decision about it is the person's.
-        Asked::DefenderScan { scan } => match ask_streaming(
+        Asked::DefenderScan { scan, .. } => match ask_streaming(
             &Request::DefenderScan {
                 kind: scan.clone(),
                 job: job.to_owned(),
@@ -301,6 +301,18 @@ struct Examined {
 /// `kam-rules`. Nothing is trusted about the paths beyond what this process
 /// could already do for itself: it reads files as the signed-in person.
 fn match_rules(survey: ProvenanceReport, report: &mut dyn FnMut(kam_core::Progress)) -> Examined {
+    match_rules_with(survey, report, |paths| {
+        kam_rules::Engine::load().map(|engine| engine.scan(paths))
+    })
+}
+
+/// As [`match_rules`], with the rules given, so a test can give ones that
+/// break.
+fn match_rules_with(
+    survey: ProvenanceReport,
+    report: &mut dyn FnMut(kam_core::Progress),
+    rules: impl FnOnce(&[String]) -> kam_core::Result<kam_rules::RuleReport>,
+) -> Examined {
     let paths: Vec<String> = survey
         .findings
         .iter()
@@ -313,11 +325,18 @@ fn match_rules(survey: ProvenanceReport, report: &mut dyn FnMut(kam_core::Progre
         detail: None,
     });
     // The rules are an addition to the survey, not a condition of it. A
-    // survey that worked is kept when they cannot run, and says why.
-    let rules = match kam_rules::Engine::load() {
-        Ok(engine) => engine.scan(&paths),
-        Err(error) => kam_rules::RuleReport {
+    // survey that worked is kept when they cannot run, and says why, even
+    // when the rule engine breaks part way: caught here, so that the job's
+    // own net does not throw the survey away with it.
+    let matched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rules(&paths)));
+    let rules = match matched {
+        Ok(Ok(rules)) => rules,
+        Ok(Err(error)) => kam_rules::RuleReport {
             problems: vec![format!("The rule scan did not run: {error}")],
+            ..Default::default()
+        },
+        Err(_) => kam_rules::RuleReport {
+            problems: vec!["The rule scan stopped unexpectedly, before it finished.".to_owned()],
             ..Default::default()
         },
     };
@@ -1801,4 +1820,55 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// A rule pass that cannot run, or that breaks part way, is said in the
+    /// rules' own problems, and the survey it was given is kept.
+    #[test]
+    fn a_rule_pass_that_breaks_keeps_the_survey_it_was_given() {
+        let survey = || ProvenanceReport {
+            examined: 7,
+            ..Default::default()
+        };
+
+        let mut stages = Vec::new();
+        let broken = match_rules_with(
+            survey(),
+            &mut |progress| stages.push(progress.stage),
+            |_| panic!("the rule engine broke"),
+        );
+        assert_eq!(broken.report.examined, 7);
+        assert!(
+            broken.rules.problems[0].contains("stopped unexpectedly"),
+            "{:?}",
+            broken.rules.problems
+        );
+        assert_eq!(stages, vec!["Matching rules".to_owned()]);
+
+        let refused = match_rules_with(survey(), &mut |_| {}, |_| {
+            Err(kam_core::Error::Refused(
+                "rule globals could not be declared".to_owned(),
+            ))
+        });
+        assert_eq!(refused.report.examined, 7);
+        assert!(
+            refused.rules.problems[0].starts_with("The rule scan did not run"),
+            "{:?}",
+            refused.rules.problems
+        );
+
+        let matched = match_rules_with(survey(), &mut |_| {}, |_| {
+            Ok(kam_rules::RuleReport {
+                rules_loaded: 3,
+                ..Default::default()
+            })
+        });
+        assert_eq!(matched.rules.rules_loaded, 3);
+        assert!(matched.rules.problems.is_empty());
+    }
 }

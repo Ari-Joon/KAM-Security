@@ -37,9 +37,12 @@ pub const EVERY: Duration = Duration::from_secs(5);
 /// How long a question waits for its answer before counting as none.
 pub const PATIENCE: Duration = Duration::from_secs(5);
 
-/// How long after being turned away the next question is asked. The service
-/// writes every caller it turns away into the Activity log, so asking every
-/// few seconds would write an entry every few seconds.
+/// How long after being turned away the next question is asked. A window
+/// turned away is usually one not installed beside the service, and the
+/// service writes each such caller into the Activity log before it reads the
+/// question, so asking every few seconds would write an entry every few
+/// seconds. Its other refusals (too many callers at once, an account with no
+/// profile) are not written there, and wait the same minute.
 pub const AFTER_REFUSAL: Duration = Duration::from_secs(60);
 
 /// How long "answering again" is said before it goes.
@@ -547,7 +550,8 @@ mod tests {
     }
 
     /// Being turned away is said in the service's own words, and the window
-    /// then asks far less often, because each refusal is an Activity entry.
+    /// then asks far less often: a window not installed beside the service is
+    /// an Activity entry each time it asks.
     #[test]
     fn being_turned_away_is_said_and_asked_about_less_often() {
         let mut state = State::default();

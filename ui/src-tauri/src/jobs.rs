@@ -73,8 +73,18 @@ pub enum Asked {
     CleanupCaches,
     /// Cleanup: loose files with an obvious home.
     CleanupLoose { drive: String },
-    /// Scanner: a scan by Microsoft Defender.
-    DefenderScan { scan: ScanKind },
+    /// Scanner: a scan by Microsoft Defender. `definitions` and
+    /// `definitions_age_days` are what the page had read of Defender's
+    /// definitions when it started the scan, kept with the run so that the
+    /// result can say what it was looking with however much later it is
+    /// read. The scan does not use them.
+    DefenderScan {
+        scan: ScanKind,
+        #[serde(default)]
+        definitions: Option<String>,
+        #[serde(default)]
+        definitions_age_days: Option<i64>,
+    },
     /// Scanner: where the programs that start themselves came from, and the
     /// rules matched against them.
     Examine,
@@ -430,6 +440,8 @@ mod tests {
             },
             Asked::DefenderScan {
                 scan: ScanKind::Quick,
+                definitions: Some("1.401.0.0".to_owned()),
+                definitions_age_days: Some(0),
             },
             Asked::Examine,
         ]
@@ -464,6 +476,18 @@ mod tests {
         distinct.sort_unstable();
         distinct.dedup();
         assert_eq!(distinct.len(), places.len(), "two jobs share a place");
+
+        // A scan asked for without what it was looking with is still read.
+        let bare: Asked =
+            serde_json::from_str(r#"{"slot":"defender-scan","scan":{"kind":"full"}}"#).unwrap();
+        assert_eq!(
+            bare,
+            Asked::DefenderScan {
+                scan: ScanKind::Full,
+                definitions: None,
+                definitions_age_days: None,
+            }
+        );
     }
 
     /// Exactly the results a page keeps in `remembered` are handed over to
@@ -574,6 +598,8 @@ mod tests {
             .begin(
                 Asked::DefenderScan {
                     scan: ScanKind::Full,
+                    definitions: None,
+                    definitions_age_days: None,
                 },
                 1,
             )
