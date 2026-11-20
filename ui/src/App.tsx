@@ -2,7 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api, reason } from "./lib/api";
+import type { ServiceChecked, ServiceNotice as Notice } from "./lib/service";
 import { unseenSentence, unseenShort } from "./lib/unseen";
+import ServiceNotice from "./components/ServiceNotice";
 import type { Sweep as SweepReport } from "./lib/types";
 import type { AuditRecord, SystemStatus, UnseenDownloads, Volume } from "./lib/types";
 import Overview from "./views/Overview";
@@ -158,27 +160,45 @@ export default function App() {
    * agent that never answered is not "nothing recorded".
    */
   const [auditRead, setAuditRead] = useState(false);
-  const [shellProtocol, setShellProtocol] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  /** What the window last found when it asked the service. Null until asked. */
+  const [service, setService] = useState<Notice | null>(null);
   const [storageRoot, setStorageRoot] = useState<string | null>(null);
 
-  /** Poll the cheap calls. The scan is deliberately not part of this. */
-  const refresh = useCallback(async () => {
+  /**
+   * Ask whether the service is answering and, while it is, read the cheap
+   * things every page shares. The scan is deliberately not part of this.
+   *
+   * Resolves to how long to wait before asking again. The next round starts
+   * only once this one has finished, so a service that has stopped answering
+   * is never sent a second question while it still owes the first: the old
+   * timer fired every five seconds whether or not the last round had come
+   * back.
+   */
+  const refresh = useCallback(async (): Promise<number> => {
+    let checked: ServiceChecked;
     try {
-      const next = await api.status();
-      setStatus(next);
-      setError(null);
-      const [audit, drives] = await Promise.all([
-        api.recentAudit(AUDIT_LIMIT),
-        api.volumes(),
-      ]);
-      setEntries(audit);
-      setAuditRead(true);
-      setVolumes(drives);
-    } catch (cause) {
-      setStatus(null);
-      setError(reason(cause));
+      checked = await api.serviceCheck();
+    } catch {
+      // The window's own half did not answer, so nothing new is known.
+      return 5000;
     }
+    setService(checked.notice);
+    setStatus(checked.status);
+    if (checked.status) {
+      try {
+        const [audit, drives] = await Promise.all([
+          api.recentAudit(AUDIT_LIMIT),
+          api.volumes(),
+        ]);
+        setEntries(audit);
+        setAuditRead(true);
+        setVolumes(drives);
+      } catch {
+        // Asked again next round. Whether the service is answering is the
+        // notice's to say, from the question above, not from these.
+      }
+    }
+    return checked.next_in_ms;
   }, []);
 
   // A file somebody asked about from Explorer's right-click menu or from a
@@ -203,10 +223,17 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    api.protocolVersion().then(setShellProtocol).catch(() => {});
-    void refresh();
-    const timer = setInterval(() => void refresh(), 5000);
-    return () => clearInterval(timer);
+    let stopped = false;
+    let timer: number | undefined;
+    const round = async () => {
+      const wait = await refresh();
+      if (!stopped) timer = window.setTimeout(() => void round(), wait);
+    };
+    void round();
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
   }, [refresh]);
 
   /** Download results nobody has looked at yet. Null until first asked. */
@@ -263,8 +290,13 @@ export default function App() {
   }, [section, sweep, runSweep]);
 
   const connected = status !== null;
-  const mismatched =
-    connected && shellProtocol !== null && shellProtocol !== status.protocol_version;
+  /** Said under "Agent unreachable", in the notice's own terms. */
+  const unreachable =
+    service?.state === "refused"
+      ? "Turned this window away"
+      : service?.state === "other_version"
+        ? "From a different install"
+        : "Not answering";
 
   function openStorage(root: string) {
     setStorageRoot(root);
@@ -318,30 +350,14 @@ export default function App() {
                 ? status.running_as_service
                   ? "Windows service · LocalSystem"
                   : "Console process"
-                : "Not listening"}
+                : unreachable}
             </span>
           </div>
         </div>
       </aside>
 
       <main className="content">
-        {mismatched && (
-          <div className="notice notice-warn">
-            This shell speaks protocol {shellProtocol}, the agent speaks{" "}
-            {status.protocol_version}. They were built from different versions.
-            Update both rather than trusting what is shown.
-          </div>
-        )}
-
-        {!connected && error && (
-          <div className="notice notice-down">
-            <strong>Cannot reach the agent.</strong> Nothing is listening on its
-            pipe, or it refused this program: it only serves clients installed
-            in its own directory.
-            <pre className="error">{error}</pre>
-            <code>cargo run -p kam-agent -- --console</code>
-          </div>
-        )}
+        <ServiceNotice notice={service} />
 
         {section === "overview" && (
           <Overview

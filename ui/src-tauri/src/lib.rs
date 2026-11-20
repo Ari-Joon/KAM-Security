@@ -17,6 +17,7 @@ mod notice;
 mod recycle;
 mod remembered;
 mod seen;
+mod service;
 mod startup;
 mod uninstall;
 mod update;
@@ -24,7 +25,7 @@ mod windows_update;
 mod winget;
 
 use kam_core::audit::Record;
-use kam_ipc::{Request, Response, SystemStatus};
+use kam_ipc::{Request, Response};
 use kam_quarantine::{Manifest, MoveRecord};
 use kam_scanner::provenance::Report as ProvenanceReport;
 use kam_scanner::{DefenderStatus, Threat};
@@ -59,14 +60,18 @@ async fn off_the_window<T: Send + 'static>(
         .map_err(|error| format!("the work stopped before it finished: {error}"))?
 }
 
+/// Whether KAM Security's service is answering, what it says about itself
+/// when it is, and when to ask again. One question at a time, never waiting
+/// longer than `service::PATIENCE`: see `service`.
 #[tauri::command]
-async fn agent_status() -> Result<SystemStatus, String> {
+async fn service_check(app: tauri::AppHandle) -> Result<service::Checked, String> {
+    let watch = std::sync::Arc::clone(&app.state::<std::sync::Arc<service::Watch>>());
     off_the_window(move || {
-        match kam_ipc::client::call(&Request::GetSystemStatus).map_err(|error| error.to_string())? {
-            Response::SystemStatus(status) => Ok(status),
-            Response::Error { message } => Err(message),
-            other => Err(unexpected(&other)),
-        }
+        Ok(service::check(
+            &watch,
+            || service::classify(kam_ipc::client::call(&Request::GetSystemStatus)),
+            service::PATIENCE,
+        ))
     })
     .await
 }
@@ -1529,13 +1534,6 @@ async fn defender_exclusions() -> Result<kam_scanner::exclusions::Exclusions, St
     }
 }
 
-/// Version of the protocol this build speaks, so the UI can say plainly when it
-/// and the agent disagree rather than silently mis-rendering.
-#[tauri::command]
-fn protocol_version() -> u32 {
-    kam_ipc::PROTOCOL_VERSION
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 /// Whether this launch turned starting at sign-in on by default.
 struct FirstRun(bool);
@@ -1620,6 +1618,7 @@ pub fn run() {
             tray::install(app.handle())?;
             app.manage(FirstRun(startup::apply_first_run_default()));
             app.manage(downloads::Downloads::default());
+            app.manage(std::sync::Arc::new(service::Watch::default()));
 
             // The first copy can be started from the right-click menu too.
             let arguments: Vec<String> = std::env::args().collect();
@@ -1661,7 +1660,7 @@ pub fn run() {
         .on_window_event(tray::on_window_event)
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            agent_status,
+            service_check,
             recent_audit,
             list_volumes,
             scan_path,
@@ -1722,7 +1721,6 @@ pub fn run() {
             reveal_in_explorer,
             display_names,
             run_uninstaller,
-            protocol_version,
             check_for_update,
             open_release_page,
             start_at_sign_in,

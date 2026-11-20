@@ -1713,6 +1713,28 @@ select {
   border: 1px solid rgba(244, 112, 122, 0.3);
 }
 
+/* What the window found when it asked the service. It stays in view as a
+   long page scrolls, on the page's own ground so nothing shows through it,
+   and a notice with no tone of its own still has an edge. */
+.service-notice {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--bg);
+}
+
+.service-notice > .notice:not(.notice-warn):not(.notice-down) {
+  border: 1px solid var(--border-strong);
+}
+
+.service-why {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+
 .notice code {
   display: inline-block;
   margin-top: 8px;

@@ -18,7 +18,6 @@ import type {
   Scan,
   FolderScan,
   Growth,
-  SystemStatus,
   Volume,
   ProvenanceReport,
   BehaviourReport,
@@ -51,6 +50,7 @@ import type {
   DeviceFacts,
   DefenderExclusions,
 } from "./types";
+import type { ServiceChecked } from "./service";
 
 /**
  * Typed wrappers over the Tauri commands.
@@ -60,7 +60,11 @@ import type {
  * request on one connection.
  */
 export const api = {
-  status: () => invoke<SystemStatus>("agent_status"),
+  /**
+   * Ask whether KAM Security's service is answering, with the smallest
+   * request there is. One question at a time: see `service` in the shell.
+   */
+  serviceCheck: () => invoke<ServiceChecked>("service_check"),
   recentAudit: (limit: number) => invoke<AuditRecord[]>("recent_audit", { limit }),
   volumes: () => invoke<Volume[]>("list_volumes"),
   scan: (path: string) => invoke<Scan>("scan_path", { path }),
@@ -192,7 +196,6 @@ export const api = {
   reveal: (path: string) => invoke<void>("reveal_in_explorer", { path }),
   uninstall: (name: string, command: string) =>
     invoke<void>("run_uninstaller", { name, command }),
-  protocolVersion: () => invoke<number>("protocol_version"),
   checkForUpdate: () => invoke<UpdateCheck>("check_for_update"),
   startAtSignIn: () => invoke<StartState>("start_at_sign_in"),
   setStartAtSignIn: (enabled: boolean) =>
