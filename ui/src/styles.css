@@ -1715,10 +1715,12 @@ select {
 
 /* What the window found when it asked the service. It stays in view as a
    long page scrolls, on the page's own ground so nothing shows through it,
-   and a notice with no tone of its own still has an edge. */
+   and a notice with no tone of its own still has an edge. It sticks at the
+   top edge of .content rather than below that box's 26px top padding, which
+   would leave a strip for the page to scroll past above it. */
 .service-notice {
   position: sticky;
-  top: 0;
+  top: -26px;
   z-index: 20;
   background: var(--bg);
 }
