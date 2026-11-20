@@ -44,6 +44,7 @@ import type {
   MenuState,
   Launch,
   UnseenDownloads,
+  TrafficReport,
 } from "./types";
 
 /**
@@ -104,6 +105,8 @@ export const api = {
    */
   displayNames: (names: string[]) => invoke<string[]>("display_names", { names }),
   connections: () => invoke<ConnectionReport>("connections"),
+  /** The hosts file, hand-set DNS servers, this account's proxy and Windows' own. */
+  trafficSettings: () => invoke<TrafficReport>("traffic_settings"),
   blockProgram: (path: string) => invoke<string>("block_program", { path }),
   unblockProgram: (rule: string) => invoke<void>("unblock_program", { rule }),
   scanRules: (paths: string[]) => invoke<RuleReport>("scan_rules", { paths }),

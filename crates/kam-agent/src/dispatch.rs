@@ -216,6 +216,10 @@ pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
         | Request::CheckDownload { .. }
         | Request::ListDownloads { .. }
         | Request::CountDownloadsSince { .. } => false,
+
+        // Reading where traffic is sent: any account can read these from
+        // Windows' own settings.
+        Request::GetTrafficSettings => false,
     }
 }
 
@@ -1220,6 +1224,13 @@ pub fn handle(
                 }
             }
         },
+
+        // Not audited, as the firewall's own state is not: the page reads it
+        // on every visit and it changes nothing. The proxy shown is the
+        // caller's own, read from their hive.
+        Request::GetTrafficSettings => {
+            Response::TrafficSettings(Box::new(kam_scanner::traffic::survey(user)))
+        }
     }
 }
 

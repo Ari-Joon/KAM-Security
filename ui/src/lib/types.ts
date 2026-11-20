@@ -978,6 +978,58 @@ export type ConnectionReport = {
   unread: string[];
 };
 
+/**
+ * Something that could not be read, as the agent says it. `what` is the
+ * sentence for a person; `kinds` and `scopes` are what it rules nothing out
+ * about, for What changed.
+ */
+export type Gap = {
+  kinds: string[];
+  scopes: string[];
+  what: string;
+};
+
+/** Where this PC's traffic is sent. Every line is a setting as read. */
+export type HostsEntry = {
+  name: string;
+  /** As the file writes them, in its order. */
+  addresses: string[];
+};
+
+export type HostsFile = {
+  path: string;
+  entries: HostsEntry[];
+  /** When the file was last written, or null when that could not be read. */
+  changed: string | null;
+};
+
+export type HandSetDns = {
+  /** The adapter's name as Windows shows it, or its id. */
+  adapter: string;
+  interface: string;
+  family: "ipv4" | "ipv6";
+  location: string;
+  servers: string[];
+};
+
+export type ProxySetting = {
+  /** The account's profile folder, or null for Windows' own (WinHTTP). */
+  account: string | null;
+  location: string;
+  server: string | null;
+  bypass: string | null;
+  script: string | null;
+};
+
+export type TrafficReport = {
+  /** Null when the file could not be read, which is then among `unreadable`. */
+  hosts: HostsFile | null;
+  dns: HandSetDns[];
+  adapters_read: number;
+  proxies: ProxySetting[];
+  unreadable: Gap[];
+};
+
 /** What an uninstaller left behind, and the shortcuts pointing at it. */
 export type ShortcutPlace = "start_menu" | "desktop" | "taskbar";
 

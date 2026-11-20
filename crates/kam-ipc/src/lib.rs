@@ -475,6 +475,12 @@ pub enum Request {
     /// whose Windows notifications are off and who would otherwise be told
     /// nothing. A read, asked for whenever the list changes, so not audited.
     CountDownloadsSince { since: String },
+
+    /// Where this PC's traffic is sent: the hosts file, DNS servers set by
+    /// hand, the caller's own proxy and Windows' own. A read, shown on every
+    /// visit to the Firewall page, so not audited, as the firewall's own
+    /// state is not.
+    GetTrafficSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -623,6 +629,8 @@ pub enum Response {
         flagged: u64,
         unfinished: u64,
     },
+    /// Where this PC's traffic is sent, and what of that could not be read.
+    TrafficSettings(Box<kam_scanner::traffic::Report>),
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {
         message: String,
@@ -1046,5 +1054,50 @@ mod tests {
         .unwrap();
         assert!(!unasked.quarantinable);
         assert!(unasked.quarantine_refusal.is_none());
+    }
+
+    /// Where this PC's traffic is sent survives the wire, gaps and all.
+    #[test]
+    fn where_traffic_is_sent_survives_the_wire() {
+        use kam_core::changes::Unreadable;
+        use kam_scanner::traffic::{
+            Family, HandSet, Hosts, HostsEntry, Proxy, Report, PROXY, WINHTTP_LOCATION,
+        };
+
+        round_trip(Response::TrafficSettings(Box::new(Report {
+            hosts: Some(Hosts {
+                path: r"C:\Windows\System32\drivers\etc\hosts".to_owned(),
+                entries: vec![HostsEntry {
+                    name: "onlineconfigservice.ubi.com".to_owned(),
+                    addresses: vec!["192.168.1.155".to_owned()],
+                }],
+                changed: Some("2026-08-28T16:58:00.000Z".to_owned()),
+            }),
+            dns: vec![HandSet {
+                adapter: "Wi-Fi".to_owned(),
+                interface: "{11111111-2222-3333-4444-555555555555}".to_owned(),
+                family: Family::Ipv4,
+                location: r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{11111111-2222-3333-4444-555555555555}".to_owned(),
+                servers: vec!["1.1.1.1".to_owned()],
+            }],
+            adapters_read: 2,
+            proxies: vec![Proxy {
+                account: Some(r"C:\Users\someone".to_owned()),
+                location: r"HKEY_USERS\S-1-5-21-1-2-3-1001\Software\Microsoft\Windows\CurrentVersion\Internet Settings".to_owned(),
+                server: Some("127.0.0.1:8080".to_owned()),
+                bypass: Some("*.local".to_owned()),
+                script: None,
+            }],
+            unreadable: vec![Unreadable::within(
+                PROXY,
+                WINHTTP_LOCATION,
+                "Windows' own proxy could not be read from WinHTTP",
+            )],
+        })));
+        let request = serde_json::to_string(&Request::GetTrafficSettings).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Request>(&request).unwrap(),
+            Request::GetTrafficSettings
+        ));
     }
 }

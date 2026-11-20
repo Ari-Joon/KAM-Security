@@ -21,8 +21,11 @@ pub mod hardening;
 pub mod persistence;
 pub mod places;
 pub mod provenance;
+#[cfg(test)]
+mod scratch;
 mod shortcut;
 pub mod signature;
+pub mod traffic;
 pub mod wmi;
 
 pub use defender::{DefenderStatus, Threat};

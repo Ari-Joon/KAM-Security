@@ -12,6 +12,8 @@ import type {
   FirewallReport,
   FirewallRule,
   ProfileState,
+  ProxySetting,
+  TrafficReport,
 } from "../lib/types";
 
 /**
@@ -26,6 +28,206 @@ import type {
  * machine, so blocking asks first, says exactly what it will do, and is
  * undoable from the same screen.
  */
+
+/** A date as a person writes it: 28 August 2026. */
+function longDate(iso: string): string {
+  const when = new Date(iso);
+  if (Number.isNaN(when.getTime())) return iso;
+  return when.toLocaleDateString(undefined, { day: "numeric", month: "long", year: "numeric" });
+}
+
+/** How many of a hosts file's entries are shown before "show all". */
+const HOSTS_SHOWN = 12;
+
+/** One proxy setting, as a sentence about whose it is and what it does. */
+function proxySentence(proxy: ProxySetting): string {
+  const whose = proxy.account === null ? "Windows itself (WinHTTP)" : "This account";
+  if (proxy.server === null && proxy.script === null) {
+    return proxy.account === null
+      ? "Windows itself (WinHTTP, which services and Windows Update use) sends its traffic straight out, through no proxy."
+      : "No proxy is set for this account.";
+  }
+  const parts: string[] = [];
+  if (proxy.server !== null) {
+    parts.push(
+      `${whose} sends web traffic through the proxy ${proxy.server}` +
+        (proxy.bypass ? `, except for ${proxy.bypass}.` : "."),
+    );
+  }
+  if (proxy.script !== null) {
+    parts.push(
+      `An automatic configuration script at ${proxy.script} decides, request by request, where ${
+        proxy.account === null ? "Windows' own" : "this account's"
+      } web traffic goes.`,
+    );
+  }
+  return parts.join(" ");
+}
+
+/**
+ * Where this PC's traffic is sent: the hosts file, DNS servers set by hand,
+ * and proxies.
+ *
+ * Each line is a setting as read, with where it was read from. A hosts
+ * entry, a hand-set DNS server and a proxy are things people set on purpose
+ * as often as anything else sets them, so nothing here says whether one
+ * should be there. A part that could not be read is named, and nothing is
+ * said about it either way.
+ */
+function TrafficSettings({ report, error }: { report: TrafficReport | null; error: string | null }) {
+  const [allHosts, setAllHosts] = useState(false);
+  const unread = (kind: string) =>
+    report?.unreadable.some((gap) => gap.kinds.includes(kind)) ?? false;
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>Where this PC's traffic is sent</h2>
+      </div>
+      <p className="panel-lede">
+        Three settings decide where traffic goes before any website sees it:
+        the hosts file, DNS servers set by hand, and proxies. People set each of
+        these on purpose: ad blockers, VPNs, games and developers' tools all do.
+        This says what is set and where, and leaves the rest to you.
+      </p>
+
+      {error && (
+        <div className="notice notice-down">
+          <strong>These settings could not be read.</strong> Nothing is claimed
+          about them either way.
+          <pre className="error">{error}</pre>
+        </div>
+      )}
+
+      {!report && !error && <p className="empty">Reading…</p>}
+
+      {report && (
+        <>
+          {report.unreadable.length > 0 && (
+            <div className="notice notice-warn">
+              <strong>Not everything could be read.</strong> Nothing is claimed
+              about what is listed here.
+              <ul className="concerns">
+                {report.unreadable.map((gap) => (
+                  <li key={gap.what}>{gap.what}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {report.hosts && (
+            <>
+              <p className="detail">
+                <strong>The hosts file.</strong>{" "}
+                {report.hosts.entries.length === 0
+                  ? "It sends no name to a fixed address."
+                  : `It sends ${fmtCount(report.hosts.entries.length, "name")} to a fixed address.`}{" "}
+                {report.hosts.changed
+                  ? `It was last changed on ${longDate(report.hosts.changed)}.`
+                  : report.hosts.entries.length > 0
+                    ? "When it was last changed could not be read."
+                    : ""}
+              </p>
+              {report.hosts.entries.length > 0 && (
+                <ul className="entries">
+                  {(allHosts ? report.hosts.entries : report.hosts.entries.slice(0, HOSTS_SHOWN)).map(
+                    (entry) => (
+                      <li className="entry" key={entry.name.toLowerCase()}>
+                        <div className="entry-body">
+                          <div className="entry-title">
+                            <span className="module">{entry.name}</span>
+                            <span className="action">goes to {entry.addresses.join(" and ")}</span>
+                          </div>
+                        </div>
+                      </li>
+                    ),
+                  )}
+                </ul>
+              )}
+              {report.hosts.entries.length > HOSTS_SHOWN && (
+                <button className="link-button" onClick={() => setAllHosts(!allHosts)}>
+                  {allHosts ? "Show fewer" : `Show all ${report.hosts.entries.length}`}
+                </button>
+              )}
+              <p className="small muted">Read from {report.hosts.path}.</p>
+            </>
+          )}
+          {!report.hosts && (
+            <p className="detail">
+              <strong>The hosts file.</strong> It could not be read, as the note
+              above says, so nothing is claimed about what it holds.
+            </p>
+          )}
+
+          {report.dns.length === 0 ? (
+            unread("dns_servers") ? (
+              <p className="detail">
+                <strong>DNS servers set by hand.</strong> No adapter that could
+                be read has any, but not every adapter could be read, as the
+                note above says.
+              </p>
+            ) : (
+              <p className="detail">
+                <strong>DNS servers set by hand.</strong> No network adapter has
+                any, so each uses the ones its network gives it.{" "}
+                {report.adapters_read > 0
+                  ? `${fmtCount(report.adapters_read, "adapter")} read.`
+                  : ""}
+              </p>
+            )
+          ) : (
+            <p className="detail">
+              <strong>DNS servers set by hand.</strong>{" "}
+              {fmtCount(report.dns.length, "setting")} on{" "}
+              {fmtCount(new Set(report.dns.map((set) => set.interface.toLowerCase())).size, "adapter")}:
+            </p>
+          )}
+          {report.dns.length > 0 && (
+            <ul className="entries">
+              {report.dns.map((set) => (
+                <li className="entry" key={set.location}>
+                  <div className="entry-body">
+                    <div className="entry-title">
+                      <span className="module">
+                        {set.adapter} ({set.family === "ipv4" ? "IPv4" : "IPv6"})
+                      </span>
+                      <span className="action">asks {set.servers.join(", ")}</span>
+                    </div>
+                    <div className="small muted">Set by hand in {set.location}</div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <p className="detail">
+            <strong>Proxies.</strong>{" "}
+            {report.proxies.length === 0
+              ? "No proxy setting could be read, as the note above says."
+              : ""}
+          </p>
+          {report.proxies.length > 0 && (
+            <ul className="entries">
+              {report.proxies.map((proxy) => (
+                <li className="entry" key={proxy.location}>
+                  <div className="entry-body">
+                    <div className="detail">{proxySentence(proxy)}</div>
+                    <div className="small muted">Read from {proxy.location}</div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+/** "1 name", "3 names". */
+function fmtCount(value: number, noun: string): string {
+  return `${value.toLocaleString()} ${noun}${value === 1 ? "" : "s"}`;
+}
 
 function profileLabel(profile: ProfileState["profile"]): string {
   return profile === "domain" ? "Domain" : profile === "private" ? "Private" : "Public";
@@ -714,6 +916,8 @@ export default function Firewall() {
   /** Names looked up for rules registered under a pointer, by that pointer. */
   const [names, setNames] = useState<Record<string, string>>({});
   const [live, setLive] = useState<ConnectionReport | null>(null);
+  const [traffic, setTraffic] = useState<TrafficReport | null>(null);
+  const [trafficError, setTrafficError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -840,6 +1044,15 @@ export default function Firewall() {
       // The connection table is the secondary half; losing it should not
       // take the rules with it.
       setLive(null);
+    }
+    // Read on its own, so neither the firewall nor the connections failing
+    // takes it with them, and it failing takes neither.
+    try {
+      setTraffic(await api.trafficSettings());
+      setTrafficError(null);
+    } catch (cause) {
+      setTraffic(null);
+      setTrafficError(reason(cause));
     }
   }, [lookUpNames]);
 
@@ -1041,6 +1254,8 @@ export default function Firewall() {
           </div>
         </>
       )}
+
+      <TrafficSettings report={traffic} error={trafficError} />
 
       <section className="panel">
         <div className="panel-head">

@@ -1092,6 +1092,20 @@ async fn connections() -> Result<kam_firewall::connections::ConnectionReport, St
     .await
 }
 
+/// Where this PC's traffic is sent: the hosts file, hand-set DNS servers and
+/// proxies. The agent reads the account's proxy from that account's own hive.
+#[tauri::command]
+async fn traffic_settings() -> Result<kam_scanner::traffic::Report, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetTrafficSettings).map_err(|e| e.to_string())? {
+            Response::TrafficSettings(report) => Ok(*report),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
+}
+
 /// Stop a program reaching the network.
 ///
 /// The first command in the product that changes the machine. The agent
@@ -1622,6 +1636,7 @@ pub fn run() {
             find_remnants,
             firewall,
             connections,
+            traffic_settings,
             block_program,
             unblock_program,
             scan_rules,

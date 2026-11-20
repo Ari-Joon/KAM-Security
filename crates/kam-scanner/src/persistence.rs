@@ -1864,6 +1864,22 @@ pub fn survey_of_account(user: &UserContext) -> Option<Survey> {
     (!gone).then(|| in_order(survey))
 }
 
+/// Whether an account's hive is not there, read just now.
+///
+/// For the readers that read something else in that hive after this module
+/// does, and need the same guard [`survey_of_account`] keeps: a key in a hive
+/// that has gone answers "not there", which for most settings is an ordinary
+/// answer and would be taken for one switched off. False for the account this
+/// process runs as, whose hive is always there.
+pub fn hive_gone(user: &UserContext) -> bool {
+    let (hive, prefix) = user.hive();
+    !prefix.is_empty()
+        && matches!(
+            registry::Key::look(hive, prefix.trim_end_matches('\\'), View::Native),
+            Err(Unopened::Absent)
+        )
+}
+
 /// Where one account's own Startup folder is.
 fn startup_folder_of(user: &UserContext) -> PathBuf {
     PathBuf::from(user.roaming_app_data()).join(r"Microsoft\Windows\Start Menu\Programs\Startup")
