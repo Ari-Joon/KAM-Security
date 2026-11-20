@@ -3,37 +3,28 @@ import type {
   AppFootprint,
   StartState,
   UpdateCheck,
-  ApplicationReport,
-  Cache,
   CheckFinding,
   Cleared,
   DefenderReport,
   DuplicateGroup,
-  DuplicateReport,
   Manifest,
   MoveRecord,
-  OrganiseReport,
   Threat,
   AuditRecord,
-  Scan,
   FolderScan,
   Growth,
   Volume,
-  ProvenanceReport,
   BehaviourReport,
   CanaryReport,
   ExtensionReport,
   HardeningReport,
-  RuleReport,
   Verdict,
   FirewallReport,
   ConnectionReport,
   Remnants,
   Removal,
-  ScanKind,
   Sweep,
   Kept,
-  ScanOutcome,
   Schedule,
   DownloadsPage,
   DownloadRecord,
@@ -51,6 +42,7 @@ import type {
   DefenderExclusions,
 } from "./types";
 import type { ServiceChecked } from "./service";
+import type { Asked, JobSlot, PageJob, PageJobOutcome } from "./jobs";
 
 /**
  * Typed wrappers over the Tauri commands.
@@ -67,7 +59,24 @@ export const api = {
   serviceCheck: () => invoke<ServiceChecked>("service_check"),
   recentAudit: (limit: number) => invoke<AuditRecord[]>("recent_audit", { limit }),
   volumes: () => invoke<Volume[]>("list_volumes"),
-  scan: (path: string) => invoke<Scan>("scan_path", { path }),
+  /**
+   * Start a page's long job in the window's own half. Resolves once it is
+   * under way, or rejects with why it could not be started: one of each job
+   * runs at a time. See `usePageJob` for following it.
+   */
+  startPageJob: (asked: Asked) => invoke<PageJob>("start_job", { asked }),
+  /** A page's job as it stands, or null when its place is empty. */
+  pageJob: (slot: JobSlot) => invoke<PageJob | null>("job_state", { slot }),
+  /** What a page's job came to, once it has ended. Asking does not take it. */
+  pageJobOutcome: <T>(slot: JobSlot) =>
+    invoke<PageJobOutcome<T> | null>("job_outcome", { slot }),
+  /**
+   * The page has what that run came to. The shell lets go of an answer the
+   * page keeps for itself, and keeps any other for the page to show again.
+   */
+  pageJobTaken: (slot: JobSlot, job: string) => invoke<void>("job_taken", { slot, job }),
+  /** Stop a page's job, when the service can stop it. */
+  stopPageJob: (slot: JobSlot) => invoke<void>("stop_job", { slot }),
   /** One folder of the map, read on its own, below where a scan stops. */
   scanFolder: (path: string) => invoke<FolderScan>("scan_folder", { path }),
   /**
@@ -77,11 +86,7 @@ export const api = {
    */
   growth: (drive: string, later: number | null, earlier: number | null) =>
     invoke<Growth>("get_growth", { drive, later, earlier }),
-  applications: (drive: string) =>
-    invoke<ApplicationReport>("list_applications", { drive }),
   applicationsPreview: () => invoke<AppFootprint[]>("list_applications_preview"),
-  duplicates: (drive: string, job: string) =>
-    invoke<DuplicateReport | null>("find_duplicates", { drive, job }),
   /**
    * A set of identical files as it stands once one copy has gone, or null
    * when one file is all that is left. Worked out in the shell by the code
@@ -102,8 +107,6 @@ export const api = {
   setCanaries: (planted: boolean) => invoke<CanaryReport>("set_canaries", { planted }),
   setCanaryAuditing: (enabled: boolean) =>
     invoke<CanaryReport>("set_canary_auditing", { enabled }),
-  provenance: (job: string) =>
-    invoke<ProvenanceReport | null>("survey_provenance", { job }),
   cancelJob: (job: string) => invoke<void>("cancel_job", { job }),
   findRemnants: (name: string, paths: string[], kinds: string[]) =>
     invoke<Remnants>("find_remnants", { name, paths, kinds }),
@@ -120,12 +123,9 @@ export const api = {
   rootCertificates: () => invoke<RootReport>("root_certificates"),
   blockProgram: (path: string) => invoke<string>("block_program", { path }),
   unblockProgram: (rule: string) => invoke<void>("unblock_program", { rule }),
-  scanRules: (paths: string[]) => invoke<RuleReport>("scan_rules", { paths }),
   virustotalKeyPresent: () => invoke<boolean>("virustotal_key_present"),
   setVirustotalKey: (key: string) => invoke<boolean>("set_virustotal_key", { key }),
   virustotalLookup: (path: string) => invoke<Verdict>("virustotal_lookup", { path }),
-  organise: (drive: string) =>
-    invoke<OrganiseReport>("find_organise_proposals", { drive }),
   applyMove: (from: string, to: string) =>
     invoke<MoveRecord>("apply_move", { from, to }),
   undoMove: (id: string) => invoke<MoveRecord>("undo_move", { id }),
@@ -136,7 +136,6 @@ export const api = {
     invoke<Manifest>("quarantine_copy", { path, keep, reason, chosen }),
   checkStillTwins: (remove: string, keep: string) =>
     invoke<void>("check_still_twins", { remove, keep }),
-  caches: () => invoke<Cache[]>("survey_caches"),
   schedule: () => invoke<Schedule>("schedule"),
   setSchedule: (enabled: boolean, day: string, hour: number) =>
     invoke<Schedule>("set_schedule", { enabled, day, hour }),
@@ -182,17 +181,6 @@ export const api = {
   sweepForChanges: () => invoke<Sweep>("sweep_for_changes"),
   /** One earlier comparison's list, read again as it was shown. Takes no comparison. */
   readComparison: (id: number) => invoke<Kept>("read_comparison", { id }),
-  /**
-   * Ask Windows Defender to scan.
-   *
-   * Long: a quick scan is minutes, a full scan is hours. Streams progress and
-   * can be stopped, like the duplicate search. Resolves to null when stopped.
-   *
-   * Defender is asked to report rather than to act, so anything in `found` is
-   * still exactly where it was.
-   */
-  defenderScan: (kind: ScanKind, job: string) =>
-    invoke<ScanOutcome | null>("defender_scan", { kind, job }),
   reveal: (path: string) => invoke<void>("reveal_in_explorer", { path }),
   uninstall: (name: string, command: string) =>
     invoke<void>("run_uninstaller", { name, command }),

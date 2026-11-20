@@ -5,7 +5,9 @@ import PathLink from "../components/PathLink";
 import MeasuredAt, { whenMeasured } from "../components/MeasuredAt";
 import { KeptNote, NotKeptNote, UnreadableNote } from "../components/Kept";
 import NewerVersions from "../components/NewerVersions";
+import type { PageJobOutcome } from "../lib/jobs";
 import { recall, remember, type Kept } from "../lib/remembered";
+import { usePageJob } from "../lib/usePageJob";
 import type {
   AppFootprint,
   ApplicationReport,
@@ -374,9 +376,8 @@ function shortcutGaps(left: Remnants): string[] {
 export default function Applications({ volumes, onMeasured }: Props) {
   const [drive, setDrive] = useState("C:\\");
   const [report, setReport] = useState<ApplicationReport | null>(null);
-  /** When the measurement on screen arrived, by this window's clock. */
+  /** When the measurement on screen finished, by this computer's clock. */
   const [measuredAt, setMeasuredAt] = useState(0);
-  const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<AppFootprint | null>(null);
@@ -417,6 +418,54 @@ export default function Applications({ volumes, onMeasured }: Props) {
   const [keptUnreadable, setKeptUnreadable] = useState<string | null>(null);
   /** Why the last measurement could not be kept for next time. */
   const [notKept, setNotKept] = useState<string | null>(null);
+  /**
+   * Whether a measurement has arrived since the page opened, so the one kept
+   * from before, read back a moment later, is not put over it.
+   */
+  const arrived = useRef(false);
+
+  /**
+   * What a measurement came to, whether it ended while this page was open or
+   * while it was not. It is kept for next time before this returns, because
+   * the window's own half lets go of it once this has run.
+   */
+  async function measured(outcome: PageJobOutcome<ApplicationReport>) {
+    const ended = outcome.view.ended;
+    const result = outcome.answer;
+    if (ended?.how === "finished" && result !== null) {
+      arrived.current = true;
+      const measuredDrive =
+        outcome.view.asked.slot === "applications" ? outcome.view.asked.drive : drive;
+      setReport(result);
+      setMeasuredAt(ended.at);
+      setPreview(null);
+      setError(null);
+      setUnmeasured(null);
+      // Kept without the lists Cleanup shows, which this page does not.
+      const keeping: KeptMeasurement = {
+        drive: measuredDrive,
+        report: { ...result, orphans: [], downloads: [], old_files: [] },
+      };
+      setKept({ measuredAt: ended.at, result: keeping });
+      setKeptUnreadable(null);
+      setNotKept(await remember("applications", ended.at, keeping));
+    } else if (ended?.how === "failed") {
+      setError(ended.reason);
+      setUnmeasured(ended.reason);
+      setReport(null);
+      // The preview stays: knowing what is installed is still worth having
+      // when the measurement is what failed. It is marked as not measured
+      // rather than left saying it is being measured.
+    }
+    onMeasured();
+  }
+  const measureJob = usePageJob<ApplicationReport>("applications", measured);
+  const running = measureJob.running;
+  /** The drive being measured now, which the picker shows meanwhile. */
+  const measuringDrive =
+    measureJob.running && measureJob.view?.asked.slot === "applications"
+      ? measureJob.view.asked.drive
+      : null;
 
   // On opening: the registry's list at once, which is a fifth of a second
   // and needs nothing, and the sizes from the last measurement, as kept.
@@ -432,7 +481,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
       });
     recall<KeptMeasurement>("applications")
       .then((found) => {
-        if (!open || found === null) return;
+        if (!open || found === null || arrived.current) return;
         setKept(found);
         setDrive(found.result.drive);
       })
@@ -457,16 +506,21 @@ export default function Applications({ volumes, onMeasured }: Props) {
    * of nothing on screen for a list that already existed. Now the list appears
    * at once and can be searched, sorted and grouped immediately; only the size
    * column has to wait, and it says it is waiting rather than showing a zero.
+   *
+   * The measuring is the window's own half's to do, so it carries on if this
+   * page is left, and `measured` takes what it came to. While one is going,
+   * asking again (after an uninstaller, say) follows that one.
    */
+  const startMeasuring = measureJob.start;
   const measure = useCallback(async () => {
-    setRunning(true);
+    if (running) return;
     setError(null);
     setUnmeasured(null);
     setReport(null);
 
-    // Not awaited before the measurement starts: the point is that the
-    // expensive half is already underway while this is being drawn.
-    const showing = api
+    // Not awaited: the point is that the expensive half is already underway
+    // while this is being drawn.
+    void api
       .applicationsPreview()
       .then((listing) => setPreview(listing))
       .catch(() => {
@@ -475,32 +529,11 @@ export default function Applications({ volumes, onMeasured }: Props) {
       });
 
     try {
-      const measured = await api.applications(drive);
-      const at = Date.now();
-      setReport(measured);
-      setMeasuredAt(at);
-      setPreview(null);
-      // Kept without the lists Cleanup shows, which this page does not.
-      const keeping: KeptMeasurement = {
-        drive,
-        report: { ...measured, orphans: [], downloads: [], old_files: [] },
-      };
-      setKept({ measuredAt: at, result: keeping });
-      setKeptUnreadable(null);
-      setNotKept(await remember("applications", at, keeping));
+      await startMeasuring({ slot: "applications", drive });
     } catch (cause) {
       setError(reason(cause));
-      setUnmeasured(reason(cause));
-      setReport(null);
-      // The preview stays: knowing what is installed is still worth having
-      // when the measurement is what failed. It is marked as not measured
-      // rather than left saying it is being measured.
-    } finally {
-      await showing;
-      setRunning(false);
-      onMeasured();
     }
-  }, [drive, onMeasured]);
+  }, [drive, running, startMeasuring]);
 
   /**
    * Re-measure when the window comes back after an uninstaller ran.
@@ -862,7 +895,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
       <section className="panel">
         <div className="scan-bar">
           <select
-            value={drive}
+            value={measuringDrive ?? drive}
             onChange={(event) => setDrive(event.target.value)}
             disabled={running}
           >

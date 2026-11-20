@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, reason } from "../lib/api";
 import ProgressBar from "../components/ProgressBar";
-import { runJob, stopJob, type Progress } from "../lib/jobs";
+import type { PageJobOutcome } from "../lib/jobs";
+import { usePageJob } from "../lib/usePageJob";
 import * as fmt from "../lib/format";
 import { useRecyclable } from "../lib/recyclable";
 import ReclaimMap, {
@@ -16,6 +17,7 @@ import { KeptNote, NotKeptNote, UnreadableNote } from "../components/Kept";
 import { recall, remember } from "../lib/remembered";
 import type {
   AccessTimes,
+  ApplicationReport,
   Cache,
   Cleared,
   Confidence,
@@ -24,10 +26,12 @@ import type {
   Download,
   DownloadSummary,
   DuplicateGroup,
+  DuplicateReport,
   DuplicateSummary,
   MoveRecord,
   OldFile,
   OldFileSummary,
+  OrganiseReport,
   OrganiseSummary,
   Proposal,
   Manifest,
@@ -66,6 +70,34 @@ type KeptSurvey = {
 };
 type KeptDuplicates = { drive: string; sets: DupeSet[]; summary: DuplicateSummary | null };
 type KeptCaches = { caches: Cache[] };
+
+/**
+ * A search for leftovers, downloads and large old files as this page holds
+ * it, from what the search sent.
+ *
+ * What it found beyond the list of large old files it sent is worked out
+ * here, once, so that the figures stay true as rows leave the list: what is
+ * on screen is added up from the rows, and this is added to it.
+ */
+function surveyed(drive: string, report: ApplicationReport): KeptSurvey {
+  return {
+    drive,
+    orphans: report.orphans,
+    rootsElsewhere: report.orphan_summary.roots_elsewhere ?? [],
+    downloads: report.downloads,
+    downloadSummary: report.download_summary,
+    oldFiles: report.old_files,
+    oldSummary: report.old_file_summary,
+    oldRest: {
+      files: Math.max(0, report.old_file_summary.found - report.old_files.length),
+      bytes: Math.max(
+        0,
+        report.old_file_summary.total_bytes -
+          report.old_files.reduce((sum, file) => sum + file.bytes, 0),
+      ),
+    },
+  };
+}
 
 /** The three searches whose answers this page keeps. */
 type Search = "survey" | "duplicates" | "caches";
@@ -446,15 +478,12 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   /** The sets as they are now, for a removal that finishes after a redraw. */
   const duplicatesNow = useRef<DupeSet[] | null>(null);
   duplicatesNow.current = duplicates;
-  const [findingDuplicates, setFindingDuplicates] = useState(false);
-  const [duplicateProgress, setDuplicateProgress] = useState<Progress | null>(null);
-  const [duplicateJob, setDuplicateJob] = useState<string | null>(null);
   const [proposals, setProposals] = useState<Proposal[] | null>(null);
   const [organiseSummary, setOrganiseSummary] = useState<OrganiseSummary | null>(null);
-  const [organising, setOrganising] = useState(false);
+  /** When the search for loose files on screen finished. */
+  const [looseAt, setLooseAt] = useState(0);
   const [moves, setMoves] = useState<MoveRecord[]>([]);
   const [held, setHeld] = useState<Manifest[]>([]);
-  const [running, setRunning] = useState(false);
   /**
    * Every row with an action in flight, by key.
    *
@@ -472,7 +501,11 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const [inFlight, setInFlight] = useState<ReadonlySet<string>>(new Set());
   const [onlyActionable, setOnlyActionable] = useState(true);
   const [caches, setCaches] = useState<Cache[] | null>(null);
-  const [measuringCaches, setMeasuringCaches] = useState(false);
+  /**
+   * Whether the measurement of caches running now was started by a clear, so
+   * that a failure says it was the measuring again that failed.
+   */
+  const afterClear = useRef(false);
   const [clearingCache, setClearingCache] = useState<string | null>(null);
   /** The cache whose cost is being put to the reader before it is cleared. */
   const [confirmCache, setConfirmCache] = useState<string | null>(null);
@@ -627,12 +660,137 @@ export default function Cleanup({ volumes, onChanged }: Props) {
 
   /** Keep one search's answer as it now stands, and say if it could not be. */
   function keep<T>(search: Search, kind: Parameters<typeof remember>[0], at: number, result: T) {
-    void remember(kind, at, result).then((failed) =>
+    return remember(kind, at, result).then((failed) =>
       setNotKept((current) =>
         failed === null ? without(current, search) : { ...current, [search]: failed },
       ),
     );
   }
+
+  // What each search came to, whether it ended while this page was open or
+  // while it was not. The window's own half runs the searches, so they carry
+  // on when the page is left. An answer this page keeps is kept here, before
+  // the handler returns, as well as when it is drawn: the window's own half
+  // lets go of it once the handler has run, and a page left before drawing it
+  // would otherwise lose it.
+
+  async function surveyArrived(outcome: PageJobOutcome<ApplicationReport>) {
+    searched.current.survey = true;
+    const ended = outcome.view.ended;
+    if (ended?.how === "finished" && outcome.answer !== null) {
+      const asked = outcome.view.asked;
+      const searchedDrive = asked.slot === "cleanup-survey" ? asked.drive : drive;
+      const found = surveyed(searchedDrive, outcome.answer);
+      setSurveyDrive(found.drive);
+      setUnreadableKept((current) => without(current, "survey"));
+      setOrphans(found.orphans);
+      setRootsElsewhere(found.rootsElsewhere);
+      setDownloads(found.downloads);
+      setDownloadSummary(found.downloadSummary);
+      setOldFiles(found.oldFiles);
+      setOldSummary(found.oldSummary);
+      setOldRest(found.oldRest);
+      setOldNotice(null);
+      setFoundAt(ended.at);
+      await keep<KeptSurvey>("survey", "cleanup-survey", ended.at, found);
+    } else if (ended?.how === "failed") {
+      setError(ended.reason);
+      // Everything this run would have replaced goes, the totals included.
+      // The totals stayed, so a failed re-run left the last run's numbers on
+      // screen as though they were this one's.
+      setOrphans(null);
+      setRootsElsewhere([]);
+      setDownloads(null);
+      setDownloadSummary(null);
+      setOldFiles(null);
+      setOldSummary(null);
+      setOldNotice(null);
+    }
+    onChanged();
+  }
+  const surveyJob = usePageJob<ApplicationReport>("cleanup-survey", surveyArrived);
+  const running = surveyJob.running;
+
+  async function duplicatesArrived(outcome: PageJobOutcome<DuplicateReport>) {
+    searched.current.duplicates = true;
+    const ended = outcome.view.ended;
+    if (ended?.how === "finished" && outcome.answer !== null) {
+      const asked = outcome.view.asked;
+      const searchedDrive = asked.slot === "cleanup-duplicates" ? asked.drive : drive;
+      const sets = asSets(outcome.answer.groups);
+      setDuplicatesDrive(searchedDrive);
+      setUnreadableKept((current) => without(current, "duplicates"));
+      setDuplicates(sets);
+      setDuplicateSummary(outcome.answer.summary);
+      setDuplicatesAt(ended.at);
+      await keep<KeptDuplicates>("duplicates", "cleanup-duplicates", ended.at, {
+        drive: searchedDrive,
+        sets,
+        summary: outcome.answer.summary,
+      });
+    } else if (ended?.how === "stopped") {
+      // Stopped, not failed.
+      setDuplicates(null);
+      setDuplicateSummary(null);
+    } else if (ended?.how === "failed") {
+      setError(ended.reason);
+      // The summary feeds the stat row and the block on the map, and both went
+      // on showing the previous run's figures after this one failed.
+      setDuplicates(null);
+      setDuplicateSummary(null);
+    }
+    onChanged();
+  }
+  // The longest job in the product: it reads file contents rather than the
+  // file table, so it is the one that most needs to say what it is doing and
+  // to be stoppable.
+  const duplicatesJob = usePageJob<DuplicateReport>("cleanup-duplicates", duplicatesArrived);
+  const findingDuplicates = duplicatesJob.running;
+
+  async function cachesArrived(outcome: PageJobOutcome<Cache[]>) {
+    searched.current.caches = true;
+    const again = afterClear.current;
+    afterClear.current = false;
+    const ended = outcome.view.ended;
+    if (ended?.how === "finished" && outcome.answer !== null) {
+      setCaches(outcome.answer);
+      setCachesAt(ended.at);
+      setUnreadableKept((current) => without(current, "caches"));
+      await keep<KeptCaches>("caches", "cleanup-caches", ended.at, {
+        caches: outcome.answer,
+      });
+    } else if (ended?.how === "failed") {
+      // After a clear, the figures from before it are wrong, so they go
+      // rather than stay; and a failed measurement does not leave the last
+      // one's figures standing in for it either.
+      setError(
+        again ? `Measuring again after the clear failed: ${ended.reason}` : ended.reason,
+      );
+      setCaches(null);
+    }
+  }
+  const cachesJob = usePageJob<Cache[]>("cleanup-caches", cachesArrived);
+  const measuringCaches = cachesJob.running;
+
+  /**
+   * What the search for loose files came to. This page does not keep it, so
+   * the window's own half does, for as long as the program runs, and it is
+   * handed over again each time the page opens.
+   */
+  function looseArrived(outcome: PageJobOutcome<OrganiseReport>) {
+    const ended = outcome.view.ended;
+    if (ended?.how === "finished" && outcome.answer !== null) {
+      setProposals(outcome.answer.proposals);
+      setOrganiseSummary(outcome.answer.summary);
+      setLooseAt(ended.at);
+    } else if (ended?.how === "failed") {
+      setError(ended.reason);
+      setProposals(null);
+      setOrganiseSummary(null);
+    }
+  }
+  const looseJob = usePageJob<OrganiseReport>("cleanup-loose", looseArrived);
+  const organising = looseJob.running;
 
   // Each answer is kept as it stands: after a search, and again after every
   // row that leaves it, so a row acted on does not come back when the page
@@ -676,45 +834,13 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const cachesKept = caches !== null && keptAt.caches !== undefined && keptAt.caches === cachesAt;
 
   async function find() {
-    setRunning(true);
     setError(null);
     setNote(null);
     searched.current.survey = true;
     try {
-      const report = await api.applications(drive);
-      setSurveyDrive(drive);
-      setUnreadableKept((current) => without(current, "survey"));
-      setOrphans(report.orphans);
-      setRootsElsewhere(report.orphan_summary.roots_elsewhere ?? []);
-      setDownloads(report.downloads);
-      setDownloadSummary(report.download_summary);
-      setOldFiles(report.old_files);
-      setOldSummary(report.old_file_summary);
-      setOldRest({
-        files: Math.max(0, report.old_file_summary.found - report.old_files.length),
-        bytes: Math.max(
-          0,
-          report.old_file_summary.total_bytes -
-            report.old_files.reduce((sum, file) => sum + file.bytes, 0),
-        ),
-      });
-      setOldNotice(null);
-      setFoundAt(Date.now());
+      await surveyJob.start({ slot: "cleanup-survey", drive });
     } catch (cause) {
       setError(reason(cause));
-      // Everything this run would have replaced goes, the totals included.
-      // The totals stayed, so a failed re-run left the last run's numbers on
-      // screen as though they were this one's.
-      setOrphans(null);
-      setRootsElsewhere([]);
-      setDownloads(null);
-      setDownloadSummary(null);
-      setOldFiles(null);
-      setOldSummary(null);
-      setOldNotice(null);
-    } finally {
-      setRunning(false);
-      onChanged();
     }
   }
 
@@ -729,18 +855,11 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   }
 
   async function findProposals() {
-    setOrganising(true);
     setError(null);
     try {
-      const report = await api.organise(drive);
-      setProposals(report.proposals);
-      setOrganiseSummary(report.summary);
+      await looseJob.start({ slot: "cleanup-loose", drive });
     } catch (cause) {
       setError(reason(cause));
-      setProposals(null);
-      setOrganiseSummary(null);
-    } finally {
-      setOrganising(false);
     }
   }
 
@@ -780,45 +899,12 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   }
 
   async function findDuplicates() {
-    setFindingDuplicates(true);
     setError(null);
-    setDuplicateProgress(null);
     searched.current.duplicates = true;
-    const searching = drive;
     try {
-      // The longest job in the product: it reads file contents rather than
-      // the file table, so it is the one that most needs to say what it is
-      // doing and to be stoppable.
-      const { result } = await runJob(
-        (job) => {
-          setDuplicateJob(job);
-          return api.duplicates(drive, job);
-        },
-        setDuplicateProgress,
-      );
-
-      if (result === null) {
-        // Stopped, not failed.
-        setDuplicates(null);
-        setDuplicateSummary(null);
-        return;
-      }
-      setDuplicatesDrive(searching);
-      setUnreadableKept((current) => without(current, "duplicates"));
-      setDuplicates(asSets(result.groups));
-      setDuplicateSummary(result.summary);
-      setDuplicatesAt(Date.now());
+      await duplicatesJob.start({ slot: "cleanup-duplicates", drive });
     } catch (cause) {
       setError(reason(cause));
-      // The summary feeds the stat row and the block on the map, and both went
-      // on showing the previous run's figures after this one failed.
-      setDuplicates(null);
-      setDuplicateSummary(null);
-    } finally {
-      setDuplicateProgress(null);
-      setDuplicateJob(null);
-      setFindingDuplicates(false);
-      onChanged();
     }
   }
 
@@ -849,20 +935,12 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   }, [duplicates, onlyActionable]);
 
   async function loadCaches() {
-    setMeasuringCaches(true);
     setError(null);
     searched.current.caches = true;
     try {
-      setCaches(await api.caches());
-      setCachesAt(Date.now());
-      setUnreadableKept((current) => without(current, "caches"));
+      await cachesJob.start({ slot: "cleanup-caches" });
     } catch (cause) {
       setError(reason(cause));
-      // Same as the other searches: a failed measurement does not leave the
-      // last one's figures standing in for it.
-      setCaches(null);
-    } finally {
-      setMeasuringCaches(false);
     }
   }
 
@@ -891,15 +969,20 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       setNote(`Freed ${fmt.bytes(result.bytes_freed)} from ${cache.name}.`);
       // Measure again rather than subtracting: what was in use stayed, and
       // guessing at the new figure would put a number on screen that nothing
-      // checked.
+      // checked. It is the same measurement as Measure, so it carries on if
+      // the page is left. One already going is what will be shown instead.
+      searched.current.caches = true;
+      afterClear.current = true;
       try {
-        setCaches(await api.caches());
-        setCachesAt(Date.now());
+        await cachesJob.start({ slot: "cleanup-caches" });
       } catch (cause) {
-        // The clear happened; the figures from before it are now wrong, so
-        // they go rather than stay.
-        setCaches(null);
-        setError(`Measuring again after the clear failed: ${reason(cause)}`);
+        afterClear.current = false;
+        if (!measuringCaches) {
+          // The clear happened; the figures from before it are now wrong, so
+          // they go rather than stay.
+          setCaches(null);
+          setError(`Measuring again after the clear failed: ${reason(cause)}`);
+        }
       }
     } catch (cause) {
       setError(reason(cause));
@@ -1375,6 +1458,12 @@ export default function Cleanup({ volumes, onChanged }: Props) {
     ...(oldFiles ?? []).map((file) => file.path),
   ]);
 
+  // The search for loose files is kept by the window's own half and handed
+  // over again each time the page opens, so a file moved since it was found
+  // is left out here rather than offered to be moved a second time.
+  const movedAway = new Set(moves.filter((move) => !move.undone).map((move) => move.from));
+  const looseLeft = proposals?.filter((proposal) => !movedAway.has(proposal.from)) ?? null;
+
   const orderedDownloads = useMemo(
     () => ordered(downloads ?? [], downloadOrder),
     [downloads, downloadOrder],
@@ -1722,10 +1811,10 @@ export default function Cleanup({ volumes, onChanged }: Props) {
           profile and this program's own store.
         </p>
 
-        {findingDuplicates && duplicateProgress && (
+        {findingDuplicates && duplicatesJob.view?.progress && (
           <ProgressBar
-            progress={duplicateProgress}
-            onStop={duplicateJob ? () => void stopJob(duplicateJob) : undefined}
+            progress={duplicatesJob.view.progress}
+            onStop={duplicatesJob.view.stoppable ? duplicatesJob.stop : undefined}
           />
         )}
 
@@ -2320,16 +2409,17 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             {fmt.count(organiseSummary.proposals)} of{" "}
             {fmt.count(organiseSummary.examined)} loose files{" "}
             {organiseSummary.proposals === 1 ? "has" : "have"} an obvious home.
+            Found by the search at {whenMeasured(looseAt)}.
           </p>
         )}
 
-        {proposals && proposals.length === 0 && (
+        {looseLeft && looseLeft.length === 0 && (
           <p className="empty">Nothing loose that matches a folder you already use.</p>
         )}
 
-        {proposals && proposals.length > 0 && (
+        {looseLeft && looseLeft.length > 0 && (
           <ul className="proposals">
-            {proposals.map((proposal) => (
+            {looseLeft.map((proposal) => (
               <li key={proposal.from} className="proposal">
                 <div className="proposal-body">
                   <span className="proposal-name">{proposal.name}</span>

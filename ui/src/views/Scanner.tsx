@@ -2,13 +2,15 @@ import { useCallback, useEffect, useState } from "react";
 import { api, reason } from "../lib/api";
 import DefenderExclusions from "../components/DefenderExclusions";
 import DeviceFacts from "../components/DeviceFacts";
+import { whenMeasured } from "../components/MeasuredAt";
 import ProgressBar from "../components/ProgressBar";
 import StateGrid, {
   GridLegend,
   useGridSelection,
   type GridTile,
 } from "../components/StateGrid";
-import { newJobId, runJob, stopJob, type Progress } from "../lib/jobs";
+import { secondsSince, type PageJobOutcome } from "../lib/jobs";
+import { usePageJob } from "../lib/usePageJob";
 import * as fmt from "../lib/format";
 import type {
   Anchor,
@@ -624,46 +626,58 @@ const COVERS: Record<"quick" | "full", string> = {
 };
 
 function DefenderScan({ status }: { status: DefenderStatus | null }) {
-  const [running, setRunning] = useState<null | "quick" | "full">(null);
-  const [job, setJob] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [outcome, setOutcome] = useState<ScanOutcome | null>(null);
+  /** When the scan on screen ended, by this computer's clock. */
+  const [endedAt, setEndedAt] = useState(0);
   const [error, setError] = useState<string | null>(null);
+
+  /**
+   * What a scan came to, whether it ended while this page was open or while
+   * it was not. The window's own half runs it and keeps this, for as long as
+   * the program runs, so it is shown again each time the page opens.
+   */
+  function scanned(result: PageJobOutcome<ScanOutcome>) {
+    const ended = result.view.ended;
+    if (ended?.how === "finished" && result.answer !== null) {
+      setOutcome(result.answer);
+      setEndedAt(ended.at);
+      setError(null);
+    } else if (ended?.how === "stopped") {
+      // Stopped before Defender had anything to say, which is not a result
+      // and must not be shown as one.
+      setOutcome(null);
+    } else if (ended?.how === "failed") {
+      setOutcome(null);
+      setError(ended.reason);
+    }
+  }
+  const scanJob = usePageJob<ScanOutcome>("defender-scan", scanned);
+  const asked = scanJob.running ? scanJob.view?.asked : undefined;
+  const running =
+    asked?.slot === "defender-scan" && asked.scan.kind !== "path" ? asked.scan.kind : null;
+  const startedAt = scanJob.running ? (scanJob.view?.started_at ?? null) : null;
 
   // Defender does not report progress in any form this can read, so the honest
   // thing to show is how long it has been going rather than a bar that would be
-  // inventing a fraction.
+  // inventing a fraction. It counts from when the scan started, which may be
+  // before this page was opened.
   useEffect(() => {
-    if (!running) return;
-    setElapsed(0);
-    const started = Date.now();
-    const tick = window.setInterval(
-      () => setElapsed(Math.round((Date.now() - started) / 1000)),
-      1000,
-    );
-    return () => window.clearInterval(tick);
-  }, [running]);
+    if (startedAt === null) return;
+    const tick = () => setElapsed(secondsSince(startedAt, Date.now()));
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [startedAt]);
 
   async function start(which: "quick" | "full") {
-    const id = newJobId();
-    setRunning(which);
-    setJob(id);
     setOutcome(null);
     setError(null);
     try {
-      const result = await api.defenderScan({ kind: which }, id);
-      // Null means stopped, which is not a result and must not be shown as one.
-      setOutcome(result);
+      await scanJob.start({ slot: "defender-scan", scan: { kind: which } });
     } catch (cause) {
       setError(reason(cause));
-    } finally {
-      setRunning(null);
-      setJob(null);
     }
-  }
-
-  async function stop() {
-    if (job) await stopJob(job);
   }
 
   return (
@@ -671,7 +685,7 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
       <div className="panel-head">
         <h2>Scan with Defender</h2>
         {running ? (
-          <button onClick={() => void stop()}>Stop</button>
+          <button onClick={scanJob.stop}>Stop</button>
         ) : (
           <div className="panel-actions">
             <button onClick={() => void start("quick")}>Quick scan</button>
@@ -727,13 +741,14 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
             {running === "quick" ? "Quick scan" : "Full scan"} running,{" "}
             {fmt.duration(elapsed * 1000)} so far.
           </p>
-          {/* It said "You can leave this page", which was not true: leaving
-              unmounts this panel, and with it the result and the Stop
-              button. */}
+          {/* Leaving the page used to lose the result and the Stop button,
+              and this said so. The scan is now the window's own half's to
+              run and keep, so leaving loses neither. */}
           <p className="small muted">
-            If you leave this page the scan carries on in Defender, but this
-            page will not show its result or be able to stop it. Windows
-            Security's Protection history lists anything Defender records.
+            It carries on if you open another page or close this window, and
+            this page shows it again, with its Stop button, when you come
+            back. Windows Security's Protection history lists anything
+            Defender records.
           </p>
           <p className="small muted">Covering {COVERS[running]}</p>
           {/* No bar, and no percentage. Defender publishes neither, so any
@@ -762,8 +777,8 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
       {outcome && (
         <div className="scan-outcome">
           <p>
-            {outcome.label} {outcome.completed ? "finished" : "was stopped"} after{" "}
-            {fmt.duration(outcome.seconds * 1000)}.
+            {outcome.label} {outcome.completed ? "finished" : "was stopped"} at{" "}
+            {whenMeasured(endedAt)}, after {fmt.duration(outcome.seconds * 1000)}.
           </p>
           {!outcome.completed && (
             <p className="held-warn">
@@ -1920,6 +1935,9 @@ function fmtStamp(iso: string): string {
   return Number.isNaN(when.getTime()) ? iso : when.toLocaleString();
 }
 
+/** What "Examine" comes to: the survey, and what the rules matched in it. */
+type Examined = { report: ProvenanceReport; rules: RuleReport };
+
 /**
  * Where a file came from and what it does at boot.
  *
@@ -1932,10 +1950,9 @@ function fmtStamp(iso: string): string {
 function Provenance() {
   const [report, setReport] = useState<ProvenanceReport | null>(null);
   const [rules, setRules] = useState<RuleReport | null>(null);
+  /** When the examination on screen finished, by this computer's clock. */
+  const [examinedAt, setExaminedAt] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [running, setRunning] = useState(false);
-  const [progress, setProgress] = useState<Progress | null>(null);
-  const [job, setJob] = useState<string | null>(null);
   const [stopped, setStopped] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [hasKey, setHasKey] = useState(false);
@@ -1948,62 +1965,46 @@ function Provenance() {
     refreshKey();
   }, [refreshKey]);
 
-  const run = useCallback(async () => {
-    setRunning(true);
+  /**
+   * What an examination came to, whether it ended while this page was open
+   * or while it was not. The window's own half runs it and keeps this, for as
+   * long as the program runs, so it is shown again each time the page opens.
+   *
+   * The agent finds the candidates, which needs privilege, and says what it
+   * is doing as it goes. The rules then run in the window's own half, which
+   * does not: see `kam-rules` for why that split is deliberate. A rule pass
+   * that could not run is said in the rules' own problems, and does not
+   * throw away a survey that worked.
+   */
+  function examined(result: PageJobOutcome<Examined>) {
+    const ended = result.view.ended;
+    if (ended?.how === "finished" && result.answer !== null) {
+      setReport(result.answer.report);
+      setRules(result.answer.rules);
+      setExaminedAt(ended.at);
+      setStopped(false);
+      setError(null);
+    } else if (ended?.how === "stopped") {
+      // Stopped, which is not a failure.
+      setStopped(true);
+    } else if (ended?.how === "failed") {
+      setError(ended.reason);
+    }
+  }
+  const examineJob = usePageJob<Examined>("examine", examined);
+  const running = examineJob.running;
+  const progress = running ? (examineJob.view?.progress ?? null) : null;
+
+  async function run() {
     setError(null);
     setRules(null);
     setStopped(false);
-    setProgress(null);
     try {
-      // The agent finds the candidates, which needs privilege, and streams what
-      // it is doing as it goes. The rules then run here in the shell, which
-      // does not — see `kam-rules` for why that split is deliberate.
-      const { job, result: survey } = await runJob(
-        (job) => {
-          setJob(job);
-          return api.provenance(job);
-        },
-        setProgress,
-      );
-      void job;
-
-      if (survey === null) {
-        // Stopped, which is not a failure.
-        setStopped(true);
-        return;
-      }
-      setReport(survey);
-
-      setProgress({
-        stage: "Matching rules",
-        done: 0,
-        total: survey.findings.length,
-        detail: null,
-      });
-      try {
-        setRules(await api.scanRules(survey.findings.map((f) => f.path)));
-      } catch (cause) {
-        // The rule pass is an addition, not a prerequisite. Losing it should
-        // not throw away a provenance report that already succeeded.
-        setRules({
-          matches: [],
-          files_scanned: 0,
-          skipped: [],
-          failed: [],
-          rules_loaded: 0,
-          user_rules_directory: "",
-          user_rules_loaded: 0,
-          problems: [`The rule scan did not run: ${reason(cause)}`],
-        });
-      }
+      await examineJob.start({ slot: "examine" });
     } catch (cause) {
       setError(reason(cause));
-    } finally {
-      setProgress(null);
-      setJob(null);
-      setRunning(false);
     }
-  }, []);
+  }
 
   const matchesFor = useCallback(
     (path: string) =>
@@ -2037,7 +2038,7 @@ function Provenance() {
       {running && progress && (
         <ProgressBar
           progress={progress}
-          onStop={job ? () => void stopJob(job) : undefined}
+          onStop={examineJob.view?.stoppable ? examineJob.stop : undefined}
         />
       )}
 
@@ -2100,7 +2101,8 @@ function Provenance() {
                   </>
                 )}
               </>
-            )}
+            )}{" "}
+            Examined at {whenMeasured(examinedAt)}.
           </div>
 
           {/* Everything the rules did not finish reading, said out loud: a

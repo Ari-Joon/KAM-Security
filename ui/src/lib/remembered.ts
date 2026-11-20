@@ -44,19 +44,39 @@ export async function recall<T>(kind: RememberedKind): Promise<Kept<T> | null> {
 }
 
 /**
+ * The write of each kind in progress, so that the next waits for it.
+ *
+ * Every write of a kind goes through one file beside the kept one, so two at
+ * once could trip over each other, and the later of two could land first.
+ * Cleanup keeps a search's answer the moment it arrives and again as rows
+ * leave it, which can be twice within a moment.
+ */
+const writing = new Map<RememberedKind, Promise<string | null>>();
+
+/**
  * Keep a page's latest result, in place of the one before. Resolves to the
  * reason it could not be kept, or null when it was.
  */
-export async function remember<T>(
+export function remember<T>(
   kind: RememberedKind,
   measuredAt: number,
   result: T,
 ): Promise<string | null> {
   const stored: Stored<T> = { shape: SHAPE, measured_at: measuredAt, result };
+  let text: string;
   try {
-    await invoke<void>("remember_result", { kind, result: JSON.stringify(stored) });
-    return null;
+    text = JSON.stringify(stored);
   } catch (cause) {
-    return reason(cause);
+    return Promise.resolve(reason(cause));
   }
+  const written = (writing.get(kind) ?? Promise.resolve(null)).then(async () => {
+    try {
+      await invoke<void>("remember_result", { kind, result: text });
+      return null;
+    } catch (cause) {
+      return reason(cause);
+    }
+  });
+  writing.set(kind, written);
+  return written;
 }

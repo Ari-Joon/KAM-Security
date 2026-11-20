@@ -5,7 +5,9 @@ import GrowthPanel from "../components/Growth";
 import { KeptNote, NotKeptNote, UnreadableNote } from "../components/Kept";
 import MeasuredAt, { whenMeasured } from "../components/MeasuredAt";
 import { api, reason } from "../lib/api";
+import { secondsSince, type PageJobOutcome } from "../lib/jobs";
 import { recall, remember } from "../lib/remembered";
+import { usePageJob } from "../lib/usePageJob";
 import * as fmt from "../lib/format";
 import type { FolderScan, Scan, ScanMethod, TreeNode, Volume } from "../lib/types";
 
@@ -141,9 +143,8 @@ function ReadNote({
 export default function Storage({ volumes, initialRoot, onScanned }: Props) {
   const [target, setTarget] = useState(initialRoot ?? "C:\\");
   const [scan, setScan] = useState<Scan | null>(null);
-  /** When the scan on screen arrived, by this window's clock. */
+  /** When the scan on screen finished, by this computer's clock. */
   const [scannedAt, setScannedAt] = useState(0);
-  const [running, setRunning] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
   // Path from the scanned root down to whatever the treemap is showing.
@@ -163,12 +164,55 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
   const [unreadable, setUnreadable] = useState<string | null>(null);
   /** Why the last scan could not be kept for next time, when it could not. */
   const [notKept, setNotKept] = useState<string | null>(null);
-  const startedAt = useRef(0);
   /**
-   * Counts scans. A folder read belongs to the map it was clicked on, so one
-   * that answers after a new scan has replaced that map is let go.
+   * Counts scans started and scans arrived. A folder read belongs to the map
+   * it was clicked on, so one that answers after a new scan has replaced that
+   * map is let go; and the scan kept from before is not put over either.
    */
   const scanNumber = useRef(0);
+
+  /**
+   * What a scan came to, whether it ended while this page was open or while
+   * it was not. The scan is kept for next time before this returns, because
+   * the window's own half lets go of it once this has run.
+   */
+  async function scanned(outcome: PageJobOutcome<Scan>) {
+    scanNumber.current += 1;
+    // Whatever was read below the old map goes with it.
+    setReads({});
+    setNotOpened(null);
+    const ended = outcome.view.ended;
+    const result = outcome.answer;
+    if (ended?.how === "finished" && result !== null) {
+      const asked = outcome.view.asked;
+      const scannedPath = asked.slot === "storage" ? asked.path : target;
+      setScan(result);
+      setScannedAt(ended.at);
+      setKeptAt(null);
+      setUnreadable(null);
+      setError(null);
+      setTrail([{ node: result.tree, read: null, rectangle: null }]);
+      // Kept without its list of large folders: the service keeps that, as
+      // this scan's summary, and the page does not draw it.
+      setNotKept(
+        await remember<KeptScan>("storage", ended.at, {
+          target: scannedPath,
+          scan: { ...result, folders: null },
+        }),
+      );
+    } else if (ended?.how === "failed") {
+      setError(ended.reason);
+      setScan(null);
+      setTrail([]);
+    }
+    onScanned();
+  }
+  const scanJob = usePageJob<Scan>("storage", scanned);
+  const running = scanJob.running;
+  /** The drive or folder being scanned now, which the picker shows meanwhile. */
+  const scanning =
+    scanJob.running && scanJob.view?.asked.slot === "storage" ? scanJob.view.asked.path : null;
+  const startedAt = scanJob.running ? (scanJob.view?.started_at ?? null) : null;
 
   useEffect(() => {
     if (initialRoot) setTarget(initialRoot);
@@ -199,14 +243,15 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
   }, []);
 
   // A full drive takes about a minute. A spinner with no numbers on it reads as
-  // a hang, so the elapsed time keeps ticking where the user can see it.
+  // a hang, so the elapsed time keeps ticking where the user can see it. It
+  // counts from when the scan started, which may be before this page opened.
   useEffect(() => {
-    if (!running) return;
-    const timer = setInterval(() => {
-      setElapsed(Math.round((Date.now() - startedAt.current) / 1000));
-    }, 250);
+    if (startedAt === null) return;
+    const tick = () => setElapsed(secondsSince(startedAt, Date.now()));
+    tick();
+    const timer = setInterval(tick, 250);
     return () => clearInterval(timer);
-  }, [running]);
+  }, [startedAt]);
 
   /// Opening Explorer can fail if the item has since gone; say so rather than
   /// letting the click do nothing.
@@ -218,37 +263,18 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
     }
   }
 
+  /**
+   * Start a scan. The window's own half runs it, so it carries on if this
+   * page is left, and `scanned` takes what it came to.
+   */
   async function run() {
-    setRunning(true);
     setError(null);
     setElapsed(0);
-    startedAt.current = Date.now();
     scanNumber.current += 1;
-    const scanned = target;
     try {
-      const result = await api.scan(scanned);
-      const at = Date.now();
-      setScan(result);
-      setScannedAt(at);
-      setKeptAt(null);
-      setUnreadable(null);
-      setTrail([{ node: result.tree, read: null, rectangle: null }]);
-      // Kept without its list of large folders: the service keeps that, as
-      // this scan's summary, and the page does not draw it.
-      setNotKept(await remember<KeptScan>("storage", at, {
-        target: scanned,
-        scan: { ...result, folders: null },
-      }));
+      await scanJob.start({ slot: "storage", path: target });
     } catch (cause) {
       setError(reason(cause));
-      setScan(null);
-      setTrail([]);
-    } finally {
-      // Whatever was read below the old map went with it.
-      setReads({});
-      setNotOpened(null);
-      setRunning(false);
-      onScanned();
     }
   }
 
@@ -343,7 +369,7 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
       <section className="panel">
         <div className="scan-bar">
           <select
-            value={target}
+            value={scanning ?? target}
             onChange={(event) => setTarget(event.target.value)}
             disabled={running}
           >
@@ -352,8 +378,8 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
                 {volume.root} {volume.label ? `(${volume.label})` : ""}
               </option>
             ))}
-            {!volumes.some((volume) => volume.root === target) && (
-              <option value={target}>{target}</option>
+            {!volumes.some((volume) => volume.root === (scanning ?? target)) && (
+              <option value={scanning ?? target}>{scanning ?? target}</option>
             )}
           </select>
           <button className="primary" onClick={() => void run()} disabled={running}>
@@ -361,8 +387,8 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
           </button>
           {running && (
             <span className="muted">
-              A full drive takes about a minute. The agent stays responsive
-              meanwhile.
+              A full drive takes about a minute. It carries on if you open
+              another page, and its result is shown here when you come back.
             </span>
           )}
         </div>

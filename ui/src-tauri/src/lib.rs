@@ -13,6 +13,7 @@ pub mod consent;
 mod context_menu;
 mod device;
 mod downloads;
+mod jobs;
 mod notice;
 mod recycle;
 mod remembered;
@@ -31,7 +32,7 @@ use kam_scanner::provenance::Report as ProvenanceReport;
 use kam_scanner::{DefenderStatus, Threat};
 use kam_storage::{
     AppFootprint, Download, DownloadSummary, DuplicateGroup, DuplicateSummary, FootprintSummary,
-    OrganiseSummary, Orphan, OrphanSummary, Proposal, Scan, Volume,
+    OrganiseSummary, Orphan, OrphanSummary, Proposal, Volume,
 };
 use tauri::{Emitter, Manager};
 
@@ -102,23 +103,228 @@ async fn list_volumes() -> Result<Vec<Volume>, String> {
     .await
 }
 
-/// Measure a directory tree.
-///
-/// Takes about a minute on a full system drive. The agent serves each
-/// connection on its own thread and this waits off the window's thread, so
-/// the window stays responsive while it runs.
+/// Start one of the long jobs a page runs, and return once it is under way.
+/// What it is doing and what it came to are read from `jobs` from then on, by
+/// the page that started it or by that page opened again later.
 #[tauri::command]
-async fn scan_path(path: String) -> Result<Scan, String> {
+async fn start_job(app: tauri::AppHandle, asked: jobs::Asked) -> Result<jobs::View, String> {
+    off_the_window(move || jobs::start(&app, asked, job_work)).await
+}
+
+/// The long job in a page's place as it stands now, if there is one.
+#[tauri::command]
+async fn job_state(app: tauri::AppHandle, slot: String) -> Result<Option<jobs::View>, String> {
+    off_the_window(move || Ok(app.state::<jobs::Jobs>().view(&slot))).await
+}
+
+/// What the job in a page's place came to, once it has ended.
+#[tauri::command]
+async fn job_outcome(app: tauri::AppHandle, slot: String) -> Result<Option<jobs::Outcome>, String> {
+    off_the_window(move || Ok(app.state::<jobs::Jobs>().outcome(&slot))).await
+}
+
+/// The page has what the run named `job` came to. See `jobs::Jobs::taken`.
+#[tauri::command]
+async fn job_taken(app: tauri::AppHandle, slot: String, job: String) -> Result<(), String> {
     off_the_window(move || {
-        match kam_ipc::client::call(&Request::ScanPath { path })
-            .map_err(|error| error.to_string())?
-        {
-            Response::Scan(scan) => Ok(*scan),
-            Response::Error { message } => Err(message),
-            other => Err(unexpected(&other)),
-        }
+        app.state::<jobs::Jobs>().taken(&slot, &job);
+        Ok(())
     })
     .await
+}
+
+/// Stop the job in a page's place, when it is one the service can stop.
+#[tauri::command]
+async fn stop_job(app: tauri::AppHandle, slot: String) -> Result<(), String> {
+    off_the_window(move || {
+        if let Some(job) = app.state::<jobs::Jobs>().to_stop(&slot) {
+            // It may have ended between the press and this, which is the
+            // ordinary case rather than a failure worth reporting.
+            let _ = kam_ipc::client::call(&Request::CancelJob { job });
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Ask the service, handing on what it says about how far it has got.
+fn ask_streaming(
+    request: &Request,
+    report: &mut dyn FnMut(kam_core::Progress),
+) -> Result<Response, String> {
+    kam_ipc::client::call_streaming(request, report).map_err(|error| error.to_string())
+}
+
+/// An answer, written as the page reads it.
+fn answer<T: serde::Serialize>(value: &T) -> jobs::Came {
+    serde_json::to_value(value)
+        .map(Some)
+        .map_err(|error| format!("its answer could not be read: {error}"))
+}
+
+/// What each long job asks of the service. Run by `jobs`, on a thread of its
+/// own, never on the window's.
+fn job_work(
+    asked: &jobs::Asked,
+    job: &str,
+    report: &mut dyn FnMut(kam_core::Progress),
+) -> jobs::Came {
+    use jobs::Asked;
+
+    match asked {
+        // About a minute on a full system drive.
+        Asked::Storage { path } => {
+            match ask_streaming(&Request::ScanPath { path: path.clone() }, report)? {
+                Response::Scan(scan) => answer(&scan),
+                Response::Error { message } => Err(message),
+                other => Err(unexpected(&other)),
+            }
+        }
+        // What every installed application really occupies. Needs a
+        // privileged agent, because it reads the whole master file table.
+        // Applications and Cleanup each ask it, for different parts of what
+        // it finds, so each has its own place.
+        Asked::Applications { drive } | Asked::CleanupSurvey { drive } => {
+            match ask_streaming(
+                &Request::ListApplications {
+                    drive: drive.clone(),
+                },
+                report,
+            )? {
+                Response::Applications {
+                    apps,
+                    summary,
+                    orphans,
+                    orphan_summary,
+                    downloads,
+                    download_summary,
+                    old_files,
+                    old_file_summary,
+                    timings,
+                } => answer(&ApplicationReport {
+                    apps,
+                    summary,
+                    orphans,
+                    orphan_summary,
+                    downloads,
+                    download_summary: *download_summary,
+                    old_files,
+                    old_file_summary: *old_file_summary,
+                    timings: *timings,
+                }),
+                Response::Error { message } => Err(message),
+                other => Err(unexpected(&other)),
+            }
+        }
+        // It reads file contents rather than the file table, so it takes tens
+        // of seconds where the survey takes three, says how far it has got,
+        // and can be stopped.
+        Asked::CleanupDuplicates { drive } => match ask_streaming(
+            &Request::FindDuplicates {
+                drive: drive.clone(),
+                job: job.to_owned(),
+            },
+            report,
+        )? {
+            Response::Duplicates { groups, summary } => {
+                answer(&DuplicateReport { groups, summary })
+            }
+            Response::Stopped => Ok(None),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        },
+        // Every cache and scratch directory holding anything, largest first.
+        Asked::CleanupCaches => match ask_streaming(&Request::SurveyCaches, report)? {
+            Response::Caches { caches } => answer(&caches),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        },
+        Asked::CleanupLoose { drive } => match ask_streaming(
+            &Request::FindOrganiseProposals {
+                drive: drive.clone(),
+            },
+            report,
+        )? {
+            Response::Organise { proposals, summary } => {
+                answer(&OrganiseReport { proposals, summary })
+            }
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        },
+        // In the agent because `MpCmdRun` wants to be LocalSystem. A full scan
+        // runs for hours, so it can be stopped. Defender is asked to report,
+        // not to act (see the request's own note), so anything in the answer
+        // is still where it was, and the decision about it is the person's.
+        Asked::DefenderScan { scan } => match ask_streaming(
+            &Request::DefenderScan {
+                kind: scan.clone(),
+                job: job.to_owned(),
+            },
+            report,
+        )? {
+            Response::DefenderScanned(outcome) => answer(&outcome),
+            Response::Stopped => Ok(None),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        },
+        // Read-only by construction: the agent gathers evidence and says what
+        // it means, and there is deliberately no command that acts on it.
+        Asked::Examine => match ask_streaming(
+            &Request::SurveyProvenance {
+                job: job.to_owned(),
+            },
+            &mut *report,
+        )? {
+            Response::Provenance(survey) => answer(&match_rules(survey, report)),
+            // Stopping is not a failure, so it is not one in the answer.
+            Response::Stopped => Ok(None),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        },
+    }
+}
+
+/// What "Examine" came to: where the programs came from, and what the rules
+/// matched in them.
+#[derive(serde::Serialize)]
+struct Examined {
+    report: ProvenanceReport,
+    rules: kam_rules::RuleReport,
+}
+
+/// Match the bundled YARA rules against the files a provenance survey found.
+///
+/// This is the one examination that happens in the shell rather than the
+/// agent, and that is deliberate: the rule engine carries a WebAssembly JIT,
+/// which has no business inside a LocalSystem service. It works here because
+/// privilege is needed to *find* these files, not to read them; see
+/// `kam-rules`. Nothing is trusted about the paths beyond what this process
+/// could already do for itself: it reads files as the signed-in person.
+fn match_rules(survey: ProvenanceReport, report: &mut dyn FnMut(kam_core::Progress)) -> Examined {
+    let paths: Vec<String> = survey
+        .findings
+        .iter()
+        .map(|finding| finding.path.clone())
+        .collect();
+    report(kam_core::Progress {
+        stage: "Matching rules".to_owned(),
+        done: 0,
+        total: u64::try_from(paths.len()).ok(),
+        detail: None,
+    });
+    // The rules are an addition to the survey, not a condition of it. A
+    // survey that worked is kept when they cannot run, and says why.
+    let rules = match kam_rules::Engine::load() {
+        Ok(engine) => engine.scan(&paths),
+        Err(error) => kam_rules::RuleReport {
+            problems: vec![format!("The rule scan did not run: {error}")],
+            ..Default::default()
+        },
+    };
+    Examined {
+        report: survey,
+        rules,
+    }
 }
 
 /// Read one folder for the map, below where a scan of its drive stops.
@@ -186,44 +392,6 @@ async fn remembered_result(kind: String) -> Result<Option<String>, String> {
     .map_err(|error| format!("it did not finish: {error}"))?
 }
 
-/// What every installed application really occupies.
-///
-/// Needs a privileged agent, and takes a couple of seconds — it reads the whole
-/// master file table to answer.
-#[tauri::command]
-async fn list_applications(drive: String) -> Result<ApplicationReport, String> {
-    off_the_window(move || {
-        match kam_ipc::client::call(&Request::ListApplications { drive })
-            .map_err(|error| error.to_string())?
-        {
-            Response::Applications {
-                apps,
-                summary,
-                orphans,
-                orphan_summary,
-                downloads,
-                download_summary,
-                old_files,
-                old_file_summary,
-                timings,
-            } => Ok(ApplicationReport {
-                apps,
-                summary,
-                orphans,
-                orphan_summary,
-                downloads,
-                download_summary: *download_summary,
-                old_files,
-                old_file_summary: *old_file_summary,
-                timings: *timings,
-            }),
-            Response::Error { message } => Err(message),
-            other => Err(unexpected(&other)),
-        }
-    })
-    .await
-}
-
 /// Everything one read of the master file table produced, in one reply.
 #[derive(serde::Serialize)]
 struct ApplicationReport {
@@ -258,33 +426,6 @@ async fn list_applications_preview() -> Result<Vec<AppFootprint>, String> {
     .await
 }
 
-/// Byte-for-byte duplicate files.
-///
-/// Its own command rather than part of the survey: this one reads file
-/// contents, so it takes tens of seconds where everything else takes three.
-/// That is also why it streams its progress.
-#[tauri::command]
-async fn find_duplicates(
-    app: tauri::AppHandle,
-    drive: String,
-    job: String,
-) -> Result<Option<DuplicateReport>, String> {
-    stream_job(
-        app,
-        job.clone(),
-        Request::FindDuplicates { drive, job },
-        |response| match response {
-            Response::Duplicates { groups, summary } => {
-                Ok(Some(DuplicateReport { groups, summary }))
-            }
-            Response::Stopped => Ok(None),
-            Response::Error { message } => Err(message),
-            other => Err(unexpected(&other)),
-        },
-    )
-    .await
-}
-
 #[derive(serde::Serialize)]
 struct DuplicateReport {
     groups: Vec<DuplicateGroup>,
@@ -300,35 +441,6 @@ struct DuplicateReport {
 #[tauri::command]
 fn duplicate_set_without(group: DuplicateGroup, path: String) -> Option<DuplicateGroup> {
     kam_storage::duplicates::without(&group, &path)
-}
-
-/// Ask Windows Defender to scan, and bring back what it found.
-///
-/// Runs in the agent because `MpCmdRun` wants to be LocalSystem, and streams
-/// like the duplicate search because a full scan runs for hours and has to be
-/// stoppable from the window that started it.
-///
-/// Defender is asked to *report*, not to act — see the request's own note. So a
-/// result carrying detections is a list of things still sitting where they were,
-/// and the decision about them comes back here.
-#[tauri::command]
-async fn defender_scan(
-    app: tauri::AppHandle,
-    kind: kam_scanner::defender_scan::ScanKind,
-    job: String,
-) -> Result<Option<kam_scanner::defender_scan::ScanOutcome>, String> {
-    stream_job(
-        app,
-        job.clone(),
-        Request::DefenderScan { kind, job },
-        |response| match response {
-            Response::DefenderScanned(outcome) => Ok(Some(outcome)),
-            Response::Stopped => Ok(None),
-            Response::Error { message } => Err(message),
-            other => Err(unexpected(&other)),
-        },
-    )
-    .await
 }
 
 /// Compare the machine with what it looked like last time.
@@ -569,20 +681,7 @@ async fn run_check() -> Result<Vec<kam_ipc::CheckFinding>, String> {
     .await
 }
 
-/// Every cache and scratch directory holding anything, largest first.
-#[tauri::command]
-async fn survey_caches() -> Result<Vec<kam_storage::Cache>, String> {
-    off_the_window(move || {
-        match kam_ipc::client::call(&Request::SurveyCaches).map_err(|error| error.to_string())? {
-            Response::Caches { caches } => Ok(caches),
-            Response::Error { message } => Err(message),
-            other => Err(unexpected(&other)),
-        }
-    })
-    .await
-}
-
-/// Empty one of them.
+/// Empty one cache.
 ///
 /// Only the id travels. The agent holds the catalogue and resolves the paths
 /// itself, so nothing this process is told can widen what gets deleted.
@@ -752,20 +851,6 @@ async fn display_names(names: Vec<String>) -> Result<Vec<String>, String> {
             .iter()
             .map(|name| kam_core::mui::display(name))
             .collect())
-    })
-    .await
-}
-
-#[tauri::command]
-async fn find_organise_proposals(drive: String) -> Result<OrganiseReport, String> {
-    off_the_window(move || {
-        match kam_ipc::client::call(&Request::FindOrganiseProposals { drive })
-            .map_err(|error| error.to_string())?
-        {
-            Response::Organise { proposals, summary } => Ok(OrganiseReport { proposals, summary }),
-            Response::Error { message } => Err(message),
-            other => Err(unexpected(&other)),
-        }
     })
     .await
 }
@@ -984,34 +1069,6 @@ async fn set_canary_auditing(enabled: bool) -> Result<kam_canary::Report, String
     }
 }
 
-/// Judge every executable that starts itself or arrived from outside.
-///
-/// Read-only by construction: the agent gathers evidence and says what it
-/// means, and there is deliberately no counterpart command that acts on the
-/// result.
-#[tauri::command]
-async fn survey_provenance(
-    app: tauri::AppHandle,
-    job: String,
-) -> Result<Option<ProvenanceReport>, String> {
-    stream_job(
-        app,
-        job.clone(),
-        Request::SurveyProvenance { job },
-        |response| {
-            match response {
-                Response::Provenance(report) => Ok(Some(report)),
-                // Stopping is not a failure, so it comes back as an absent result
-                // rather than an error the interface would have to render in red.
-                Response::Stopped => Ok(None),
-                Response::Error { message } => Err(message),
-                other => Err(unexpected(&other)),
-            }
-        },
-    )
-    .await
-}
-
 /// Run a request that reports progress, forwarding each update to the window.
 ///
 /// Progress arrives on the pipe as frames and leaves as Tauri events named
@@ -1164,29 +1221,6 @@ async fn cancel_job(job: String) -> Result<(), String> {
         }
     })
     .await
-}
-
-/// Match the bundled YARA rules against files the agent identified.
-///
-/// This is the one examination that happens in the shell rather than the agent,
-/// and that is deliberate: the rule engine carries a WebAssembly JIT, which has
-/// no business inside a LocalSystem service. It works here because privilege is
-/// needed to *find* these files, not to read them — see `kam-rules`.
-///
-/// The paths come from a provenance survey the agent produced moments earlier.
-/// Nothing is trusted about them beyond what this process could already do for
-/// itself: it reads files as the signed-in user, which is exactly the authority
-/// the shell already has.
-#[tauri::command]
-async fn scan_rules(paths: Vec<String>) -> Result<kam_rules::RuleReport, String> {
-    // Compiling rules and reading several hundred files takes seconds, so it
-    // runs off the interface thread rather than freezing the window.
-    tauri::async_runtime::spawn_blocking(move || {
-        let engine = kam_rules::Engine::load().map_err(|error| error.to_string())?;
-        Ok(engine.scan(&paths))
-    })
-    .await
-    .map_err(|error| format!("the rule scan did not finish: {error}"))?
 }
 
 /// Whether a VirusTotal key has been stored, without revealing it.
@@ -1618,6 +1652,7 @@ pub fn run() {
             tray::install(app.handle())?;
             app.manage(FirstRun(startup::apply_first_run_default()));
             app.manage(downloads::Downloads::default());
+            app.manage(jobs::Jobs::default());
             app.manage(std::sync::Arc::new(service::Watch::default()));
 
             // The first copy can be started from the right-click menu too.
@@ -1663,16 +1698,17 @@ pub fn run() {
             service_check,
             recent_audit,
             list_volumes,
-            scan_path,
+            start_job,
+            job_state,
+            job_outcome,
+            job_taken,
+            stop_job,
             scan_folder,
             get_growth,
             remember_result,
             remembered_result,
-            list_applications,
             list_applications_preview,
-            find_duplicates,
             duplicate_set_without,
-            defender_scan,
             defender_status,
             defender_threats,
             behaviour_events,
@@ -1684,7 +1720,6 @@ pub fn run() {
             canaries,
             set_canaries,
             set_canary_auditing,
-            survey_provenance,
             cancel_job,
             find_remnants,
             firewall,
@@ -1693,18 +1728,15 @@ pub fn run() {
             root_certificates,
             block_program,
             unblock_program,
-            scan_rules,
             virustotal_key_present,
             set_virustotal_key,
             virustotal_lookup,
-            find_organise_proposals,
             apply_move,
             undo_move,
             list_moves,
             quarantine_path,
             quarantine_copy,
             check_still_twins,
-            survey_caches,
             clear_cache,
             schedule,
             set_schedule,

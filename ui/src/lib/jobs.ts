@@ -1,5 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
+import type { ScanKind } from "./types";
 
 /**
  * Running a job that reports its progress, and stopping it.
@@ -69,4 +70,63 @@ export async function stopJob(job: string): Promise<void> {
     // The job may have finished between the click and the request, which is
     // the ordinary case rather than a failure worth reporting.
   }
+}
+
+/**
+ * A page's long job, run in the window's own half rather than in the page
+ * (`jobs` in the shell, where its rules are tested), so it carries on when
+ * the page is left or the window is closed, and the page finds it again.
+ *
+ * What a page asks for, by the place the job has. Mirrors `jobs::Asked`.
+ */
+export type Asked =
+  | { slot: "storage"; path: string }
+  | { slot: "applications"; drive: string }
+  | { slot: "cleanup-survey"; drive: string }
+  | { slot: "cleanup-duplicates"; drive: string }
+  | { slot: "cleanup-caches" }
+  | { slot: "cleanup-loose"; drive: string }
+  | { slot: "defender-scan"; scan: ScanKind }
+  | { slot: "examine" };
+
+export type JobSlot = Asked["slot"];
+
+/** How a run ended, and when, by the window's clock. */
+export type Ended =
+  | { how: "finished"; at: number }
+  | { how: "stopped"; at: number }
+  | { how: "failed"; at: number; reason: string };
+
+/** One run as the page draws it. What it came to is asked for separately. */
+export type PageJob = {
+  /** This run's name. */
+  job: string;
+  asked: Asked;
+  /** Larger is newer, among views of the same place. */
+  sequence: number;
+  started_at: number;
+  stoppable: boolean;
+  progress: Progress | null;
+  /** How it ended. Null while it runs. */
+  ended: Ended | null;
+};
+
+/** A run that has ended, with its answer when it finished. */
+export type PageJobOutcome<T> = { view: PageJob; answer: T | null };
+
+/**
+ * Of two views of the same place, the newer.
+ *
+ * A view reaches the page by two roads, the reply to starting the job and
+ * the event the shell sends at each change, and the two can arrive in either
+ * order. Taken in arrival order, a reply landing after the event that the
+ * job had ended would put the page back to "running" for good.
+ */
+export function newer(current: PageJob | null, incoming: PageJob): PageJob {
+  return current !== null && current.sequence > incoming.sequence ? current : incoming;
+}
+
+/** Whole seconds since a run started, never less than none. */
+export function secondsSince(startedAt: number, now: number): number {
+  return Math.max(0, Math.round((now - startedAt) / 1000));
 }
