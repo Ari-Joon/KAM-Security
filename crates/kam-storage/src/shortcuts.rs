@@ -473,11 +473,18 @@ pub(crate) mod testing {
 
     impl Scratch {
         pub(crate) fn new(tag: &str) -> Self {
-            let root =
+            let scratch =
                 std::env::temp_dir().join(format!("kam-shortcuts-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(root.join("profile").join("Desktop")).unwrap();
-            std::fs::create_dir_all(root.join("program")).unwrap();
+            let _ = std::fs::remove_dir_all(&scratch);
+            std::fs::create_dir_all(scratch.join("profile").join("Desktop")).unwrap();
+            std::fs::create_dir_all(scratch.join("program")).unwrap();
+            // Spelled by its real, long path. The temporary folder is often
+            // named through a short name such as `RUNNER~1`, and Windows'
+            // shell answers with the long one, so a target spelled through
+            // the short name would never match what the shortcut says.
+            let real = std::fs::canonicalize(&scratch).unwrap();
+            let text = real.to_string_lossy();
+            let root = std::path::PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
             Self { root }
         }
 

@@ -2810,11 +2810,19 @@ mod tests {
         copy: &[u8],
         keep: &[u8],
     ) -> (std::path::PathBuf, UserContext, String, String) {
-        let profile = std::env::temp_dir().join(format!(
+        let scratch = std::env::temp_dir().join(format!(
             "kam-dispatch-copy-profile-{tag}-{}",
             std::process::id()
         ));
-        let _ = std::fs::remove_dir_all(&profile);
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        // Spelled by its real, long path. The temporary folder is often named
+        // through a short name such as `RUNNER~1`, and the fence judges a file
+        // by where it really is, so a profile spelled through a short name
+        // would hold none of its own files.
+        let real = std::fs::canonicalize(&scratch).unwrap();
+        let text = real.to_string_lossy();
+        let profile = std::path::PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
         let downloads = profile.join("Downloads");
         std::fs::create_dir_all(&downloads).unwrap();
         std::fs::write(downloads.join("copy.bin"), copy).unwrap();

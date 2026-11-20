@@ -930,7 +930,15 @@ mod tests {
                 kam_core::clock::now_utc_iso().replace([':', '.'], "")
             ));
             std::fs::create_dir_all(&path).unwrap();
-            Self(path)
+            // Spelled by its real, long path. The temporary folder is often
+            // named through a short name such as `RUNNER~1`, and Windows'
+            // shell answers with the long one, so a target spelled through
+            // the short name would never match what the shortcut says.
+            let real = std::fs::canonicalize(&path).unwrap();
+            let text = real.to_string_lossy();
+            Self(std::path::PathBuf::from(
+                text.strip_prefix(r"\\?\").unwrap_or(&text),
+            ))
         }
 
         fn write(&self, name: &str, built: &Built) -> std::path::PathBuf {
