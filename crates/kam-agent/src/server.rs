@@ -586,18 +586,37 @@ mod tests {
             let _ = serve(&listener, &context, &loop_shutdown);
         });
 
-        thread::sleep(Duration::from_millis(200));
-
+        // The server thread has to create the pipe before anything can
+        // connect, and how long that takes depends on how busy the machine
+        // is. A fixed wait of 200 ms was once too short, under a full rebuild,
+        // and the test failed for a reason that had nothing to do with what it
+        // checks. So it asks again until the pipe is there, for up to ten
+        // seconds. A refused connection sends nothing, so asking again is safe.
         let (tx, rx) = mpsc::channel();
-        let response = kam_ipc::client::call_streaming_on(
-            &name,
-            &Request::SurveyProvenance {
-                job: "test-job".to_owned(),
-            },
-            move |progress| {
-                let _ = tx.send(progress);
-            },
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let response = loop {
+            let sender = tx.clone();
+            let attempt = kam_ipc::client::call_streaming_on(
+                &name,
+                &Request::SurveyProvenance {
+                    job: "test-job".to_owned(),
+                },
+                move |progress| {
+                    let _ = sender.send(progress);
+                },
+            );
+            match attempt {
+                Err(error)
+                    if error.to_string().contains("could not connect")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                other => break other,
+            }
+        };
+        // Every sender left is dropped, so reading the progress below ends.
+        drop(tx);
 
         shutdown.signal();
         let _ = server.join();
