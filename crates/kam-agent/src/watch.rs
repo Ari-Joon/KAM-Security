@@ -19,7 +19,9 @@
 //! while idle, and this spends a little of that. Every [`INTERVAL`] it reads the
 //! Run keys, the Startup folders, the service list and the task store — the same
 //! read the weekly check does, which is registry and small files, well under a
-//! second and no disk to speak of. It is not a scan. But it is not nothing, and
+//! second and no disk to speak of. It also reads the quieter places a program
+//! can be started from, which are registry keys and two questions to WMI, a
+//! fraction of a second all told. It is not a scan. But it is not nothing, and
 //! it is written down here rather than hidden: a machine that watches itself
 //! pays for it, and the price is one cheap snapshot a couple of times a minute.
 //!
@@ -66,7 +68,7 @@ use kam_core::audit::{Effect, Entry};
 use kam_core::db::Watched;
 use kam_core::{Store, UserContext};
 use kam_scanner::behaviour::{self, Observation};
-use kam_scanner::persistence;
+use kam_scanner::{persistence, quiet};
 
 use crate::server;
 use crate::service::Shutdown;
@@ -144,6 +146,17 @@ impl Log {
 /// The part of the record the machine's own startup entries are held against.
 const MACHINE: &str = "startup of the machine";
 
+/// The part of the record the machine's quieter startup places are held
+/// against: Winlogon, debugger redirections, AppInit libraries, WMI
+/// subscriptions.
+///
+/// A part of its own, not the machine's startup part. That part has been on
+/// record since the watcher first looked, so these places, which came after
+/// it, would be held against it straight away, and anything already set in
+/// them when the update arrived would be reported as having just appeared.
+/// A part not on record is learned whole on its first look, as every part is.
+const QUIET_MACHINE: &str = "quiet places of the machine";
+
 /// What marks a row of the record as a read of a decoy.
 const DECOY_READ: &str = "decoy_read";
 
@@ -159,6 +172,12 @@ fn account(user: &UserContext) -> String {
 /// The part of the record one account's own startup entries are held against.
 fn startup_of(user: &UserContext) -> String {
     format!("startup of {}", account(user))
+}
+
+/// The part of the record one account's quieter startup places are held
+/// against, for the reason [`QUIET_MACHINE`] is a part of its own.
+fn quiet_places_of(user: &UserContext) -> String {
+    format!("quiet places of {}", account(user))
 }
 
 /// The part of the record the reads of one account's decoys are held against.
@@ -290,22 +309,59 @@ fn appeared(memory: &Store, part: &str, survey: &persistence::Survey) -> Vec<per
 /// Take one snapshot, and report anything new that is worth a line.
 ///
 /// The machine's own entries and each signed-in account's are read apart and
-/// held against their own parts of the record. An account that is not signed
-/// in is not read, and its part is left exactly as it was.
+/// held against their own parts of the record, and so are the quieter places
+/// a program can be started from. An account that is not signed in is not
+/// read, and its parts are left exactly as they were.
 fn sweep(memory: &Store) -> Vec<Observation> {
-    let mut looks = vec![(MACHINE.to_owned(), persistence::survey_of_machine())];
-    for user in persistence::signed_in_users() {
-        // Nothing back means the account signed out while it was being read,
-        // which is the same as its not being signed in.
-        if let Some(theirs) = persistence::survey_of_account(&user) {
-            looks.push((startup_of(&user), theirs));
-        }
-    }
-    looks
+    let machine = persistence::survey_of_machine();
+    // The COM classes the tasks just read hand their work to, which each
+    // account's own registrations are read for.
+    let handlers = persistence::com_handlers(&machine);
+    let quiet_machine = quiet::of_machine();
+    let accounts = persistence::signed_in_users()
+        .into_iter()
+        .map(|user| {
+            let startup = persistence::survey_of_account(&user);
+            let quiet = quiet::of_account(&user, &handlers);
+            (user, startup, quiet)
+        })
+        .collect();
+    looks(machine, quiet_machine, accounts)
         .iter()
         .flat_map(|(part, survey)| appeared(memory, part, survey))
         .filter_map(|entry| behaviour::judge_entry(&entry))
         .collect()
+}
+
+/// What one snapshot read, each with the part of the record it is held
+/// against.
+///
+/// Apart from the reading so that which part each look belongs to can be
+/// tested with surveys that were made up.
+fn looks(
+    machine: persistence::Survey,
+    quiet_machine: persistence::Survey,
+    accounts: Vec<(
+        UserContext,
+        Option<persistence::Survey>,
+        Option<persistence::Survey>,
+    )>,
+) -> Vec<(String, persistence::Survey)> {
+    let mut looks = vec![
+        (MACHINE.to_owned(), machine),
+        (QUIET_MACHINE.to_owned(), quiet_machine),
+    ];
+    for (user, startup, quiet) in accounts {
+        // Nothing back means the account signed out while it was being read,
+        // which is the same as its not being signed in.
+        if let Some(theirs) = startup {
+            looks.push((startup_of(&user), theirs));
+        }
+        if let Some(theirs) = quiet {
+            looks.push((quiet_places_of(&user), theirs));
+        }
+    }
+    looks
 }
 
 /// One read of a decoy as the record holds it.
@@ -880,6 +936,79 @@ mod tests {
         // From then on her account is compared too.
         let account = appeared(&memory, HERS, &looked(&[&hers, &later]));
         assert_eq!(names(&account), vec!["Updater"]);
+    }
+
+    /// The quieter places are held against parts of their own, so the
+    /// watcher's first look at them after this update learns what is already
+    /// set there instead of reporting it, though the machine and the account
+    /// have been watched for months. Something set there after that is
+    /// reported.
+    #[test]
+    fn a_quiet_place_already_set_is_learned_and_one_set_later_is_reported() {
+        let her = UserContext::new(Some("S-1-5-21-1-2-3-1001".to_owned()), r"C:\Users\her");
+        let service = starts(
+            persistence::Anchor::Service,
+            &format!(r"{SERVICES}\Thing"),
+            "Thing",
+            "thing.exe",
+        );
+        let hers = starts(
+            persistence::Anchor::RunKey,
+            HER_RUN_KEY,
+            "Shell",
+            "kam-shell.exe",
+        );
+        let debugger = starts(
+            persistence::Anchor::Debugger,
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe",
+            "taskmgr.exe",
+            r"C:\Tools\procexp64.exe",
+        );
+        let script = starts(
+            persistence::Anchor::LogonScript,
+            r"HKEY_USERS\S-1-5-21-1-2-3-1001\Environment",
+            "UserInitMprLogonScript",
+            r"C:\Users\her\logon.cmd",
+        );
+        let subscription = starts(
+            persistence::Anchor::WmiSubscription,
+            r#"ROOT\subscription:CommandLineEventConsumer.Name="Vendor""#,
+            "Vendor",
+            r"C:\Program Files\Vendor\agent.exe",
+        );
+
+        // Months of watching before the update, which read no quiet place.
+        let memory = Store::open_in_memory().unwrap();
+        for _ in 0..2 {
+            appeared(&memory, MACHINE, &looked(&[&service]));
+            appeared(&memory, HERS, &looked(&[&hers]));
+        }
+
+        let snapshot = |quiet: &[&persistence::Entry], her_quiet: &[&persistence::Entry]| {
+            let seen: Vec<persistence::Entry> = looks(
+                looked(&[&service]),
+                looked(quiet),
+                vec![(her.clone(), Some(looked(&[&hers])), Some(looked(her_quiet)))],
+            )
+            .iter()
+            .flat_map(|(part, survey)| appeared(&memory, part, survey))
+            .collect();
+            seen
+        };
+
+        // The first look after the update: a debugger and her sign-in script
+        // were already set.
+        let first = snapshot(&[&debugger], &[&script]);
+        assert!(
+            first.is_empty(),
+            "what was already set was reported as having just appeared: {:?}",
+            names(&first)
+        );
+        assert!(snapshot(&[&debugger], &[&script]).is_empty());
+
+        // A subscription set after that is reported, and only it.
+        let later = snapshot(&[&debugger, &subscription], &[&script]);
+        assert_eq!(names(&later), vec!["Vendor"]);
     }
 
     /// The same entry running something else is a different entry: the file
