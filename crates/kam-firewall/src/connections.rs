@@ -32,7 +32,8 @@ use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, NO_ERRO
 use windows::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
     MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
-    MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
+    MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+    TCP_TABLE_OWNER_PID_LISTENER, UDP_TABLE_OWNER_PID,
 };
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 use windows::Win32::System::Threading::{
@@ -285,6 +286,55 @@ unsafe fn rows<Table, Row>(bytes: &[u8]) -> &[Row] {
     let available = (bytes.len() - std::mem::size_of::<Table>() + std::mem::size_of::<Row>())
         / std::mem::size_of::<Row>();
     unsafe { std::slice::from_raw_parts(first, count.min(available)) }
+}
+
+/// Whether anything is listening for TCP connections on `wanted`, over IPv4
+/// or IPv6.
+///
+/// Its own read of the two listening tables, rather than [`survey`], which
+/// also checks who signed every program holding a socket. An `Err` names the
+/// table that could not be read: not knowing is not the same as nothing
+/// listening.
+pub fn listening_on(wanted: u16) -> Result<bool, String> {
+    let unread = |family: &str, code: u32| {
+        format!(
+            "Windows' table of programs listening over {family} could not be read (Windows \
+             error {code})"
+        )
+    };
+    let v4 = table_bytes(|buffer, size| unsafe {
+        GetExtendedTcpTable(
+            buffer,
+            size,
+            false,
+            AF_INET.0 as u32,
+            TCP_TABLE_OWNER_PID_LISTENER,
+            0,
+        )
+    })
+    .map_err(|code| unread("IPv4", code))?;
+    if unsafe { rows::<MIB_TCPTABLE_OWNER_PID, MIB_TCPROW_OWNER_PID>(&v4) }
+        .iter()
+        .any(|row| port(row.dwLocalPort) == wanted)
+    {
+        return Ok(true);
+    }
+    let v6 = table_bytes(|buffer, size| unsafe {
+        GetExtendedTcpTable(
+            buffer,
+            size,
+            false,
+            AF_INET6.0 as u32,
+            TCP_TABLE_OWNER_PID_LISTENER,
+            0,
+        )
+    })
+    .map_err(|code| unread("IPv6", code))?;
+    Ok(
+        unsafe { rows::<MIB_TCP6TABLE_OWNER_PID, MIB_TCP6ROW_OWNER_PID>(&v6) }
+            .iter()
+            .any(|row| port(row.dwLocalPort) == wanted),
+    )
 }
 
 /// Read every open TCP and UDP socket, joined to the program that owns it.
@@ -792,5 +842,32 @@ mod tests {
             well_known > 0,
             "no socket on any well-known port, which suggests the port bytes are the wrong way round"
         );
+    }
+
+    /// A port this test listens on is found, over either family, and one it
+    /// has just stopped listening on is not.
+    #[test]
+    fn a_port_something_listens_on_is_found_and_one_nothing_does_is_not() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let listener = match std::net::TcpListener::bind(address) {
+                Ok(listener) => listener,
+                // A machine with IPv6 switched off has no [::1] to listen on,
+                // which is not this code's failure.
+                Err(error) if address.starts_with('[') => {
+                    println!("{address} cannot be listened on here ({error}); skipping");
+                    continue;
+                }
+                Err(error) => panic!("{address} could not be listened on: {error}"),
+            };
+            let port = listener.local_addr().unwrap().port();
+            assert_eq!(listening_on(port), Ok(true), "{address} was not found");
+
+            drop(listener);
+            assert_eq!(
+                listening_on(port),
+                Ok(false),
+                "{port} was found after it was let go"
+            );
+        }
     }
 }

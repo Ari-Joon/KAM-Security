@@ -207,8 +207,9 @@ fn run(winget: &std::path::Path) -> Answer {
 }
 
 /// Read a pipe on its own thread for as long as winget runs. A pipe nobody
-/// reads fills up and stalls winget until the timeout.
-fn drain<Pipe: std::io::Read + Send + 'static>(
+/// reads fills up and stalls winget until the timeout. `device` reads
+/// `tpmtool` the same way.
+pub(crate) fn drain<Pipe: std::io::Read + Send + 'static>(
     pipe: Option<Pipe>,
 ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
     pipe.map(|mut pipe| {
@@ -231,7 +232,7 @@ fn drain<Pipe: std::io::Read + Send + 'static>(
 }
 
 /// What a drained pipe held. winget writes UTF-8.
-fn text_of(reader: Option<std::thread::JoinHandle<Vec<u8>>>) -> String {
+pub(crate) fn text_of(reader: Option<std::thread::JoinHandle<Vec<u8>>>) -> String {
     reader
         .and_then(|reader| reader.join().ok())
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())

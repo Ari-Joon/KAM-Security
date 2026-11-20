@@ -11,6 +11,7 @@
 mod archive;
 pub mod consent;
 mod context_menu;
+mod device;
 mod downloads;
 mod notice;
 mod recycle;
@@ -1507,6 +1508,13 @@ async fn windows_update() -> Result<windows_update::Report, String> {
     off_the_window(|| Ok(windows_update::survey())).await
 }
 
+/// Facts about this device: Secure Boot, the TPM, whether drive C: is
+/// encrypted, Remote Desktop. Each read where it can be; see `device`.
+#[tauri::command]
+async fn device_facts() -> Result<device::Facts, String> {
+    off_the_window(|| Ok(device::facts())).await
+}
+
 /// Version of the protocol this build speaks, so the UI can say plainly when it
 /// and the agent disagree rather than silently mis-rendering.
 #[tauri::command]
@@ -1724,7 +1732,8 @@ pub fn run() {
             take_launch,
             launch_waiting,
             newer_versions,
-            windows_update
+            windows_update,
+            device_facts
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| {

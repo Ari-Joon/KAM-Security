@@ -486,6 +486,11 @@ pub enum Request {
     /// Nothing is fetched from the network. A read, shown on every visit to
     /// the Scanner page, so not audited.
     GetRootCertificates,
+    /// Whether there is a TPM and it is ready, and whether drive C: is
+    /// encrypted and protected, from Windows' own providers. Those answer
+    /// only an administrator, but Windows shows both facts to any account,
+    /// in Windows Security and in Explorer, so anyone may ask.
+    GetDeviceFacts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -638,6 +643,8 @@ pub enum Response {
     TrafficSettings(Box<kam_scanner::traffic::Report>),
     /// The trusted root certificates by store, and Microsoft's list.
     RootCertificates(Box<kam_scanner::roots::Report>),
+    /// The TPM and drive C:, each read or said not to have been.
+    DeviceFacts(Box<kam_scanner::device::Held>),
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {
         message: String,
@@ -1140,5 +1147,56 @@ mod tests {
                 unreadable: Vec::new(),
             })));
         }
+    }
+
+    /// The TPM and drive C: go over and come back, read or not, and a fact
+    /// from an agent that never said why it was asked elsewhere reads as
+    /// asked nowhere else.
+    #[test]
+    fn device_facts_survive_the_wire() {
+        use kam_scanner::device::{
+            Conversion, Encryption, EncryptionSource, Held, Reading, Tpm, TpmSource,
+        };
+
+        round_trip(Response::DeviceFacts(Box::new(Held {
+            tpm: Reading::Read {
+                value: Tpm {
+                    present: true,
+                    version: Some("2.0".to_owned()),
+                    ready: Some(true),
+                    source: TpmSource::Provider,
+                    instead_of: None,
+                },
+            },
+            encryption: Reading::Read {
+                value: Encryption {
+                    drive: "C:".to_owned(),
+                    conversion: Some(Conversion::Encrypted),
+                    protection: None,
+                    source: EncryptionSource::Provider,
+                    instead_of: None,
+                },
+            },
+        })));
+        round_trip(Response::DeviceFacts(Box::new(Held {
+            tpm: Reading::Unread {
+                why: "Windows' TPM provider gave an empty answer".to_owned(),
+            },
+            encryption: Reading::Unread {
+                why: "denied".to_owned(),
+            },
+        })));
+
+        let older: Tpm = serde_json::from_value(serde_json::json!({
+            "present": true, "version": "2.0", "ready": null, "source": "provider"
+        }))
+        .unwrap();
+        assert!(older.instead_of.is_none());
+
+        let request = serde_json::to_string(&Request::GetDeviceFacts).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Request>(&request).unwrap(),
+            Request::GetDeviceFacts
+        ));
     }
 }

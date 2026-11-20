@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, reason } from "../lib/api";
+import DeviceFacts from "../components/DeviceFacts";
 import ProgressBar from "../components/ProgressBar";
 import StateGrid, {
   GridLegend,
@@ -1392,6 +1393,8 @@ function Hardening() {
           </p>
         </>
       )}
+
+      <DeviceFacts />
     </section>
   );
 }

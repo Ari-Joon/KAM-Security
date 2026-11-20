@@ -48,6 +48,7 @@ import type {
   RootReport,
   WingetAsked,
   WindowsUpdateReport,
+  DeviceFacts,
 } from "./types";
 
 /**
@@ -270,6 +271,8 @@ export const api = {
   newerVersions: () => invoke<WingetAsked>("newer_versions"),
   /** What Windows says about its own updates, read by the window as the person. */
   windowsUpdate: () => invoke<WindowsUpdateReport>("windows_update"),
+  /** Secure Boot, the TPM, drive C:'s encryption and Remote Desktop. */
+  deviceFacts: () => invoke<DeviceFacts>("device_facts"),
 };
 
 /** Tauri rejects with a plain string; normalise anything else into one. */

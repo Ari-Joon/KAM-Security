@@ -1680,3 +1680,54 @@ export type WindowsUpdateReport = {
   pause: Reading<UpdatePause>;
   service_disabled: Reading<boolean>;
 };
+
+/** The security chip. See `device.rs` in the scanner. */
+export type DeviceTpm = {
+  /** False only when tpmtool says there is none. */
+  present: boolean;
+  version: string | null;
+  ready: boolean | null;
+  source: "provider" | "tpmtool";
+  /** Why the service's source did not answer, when tpmtool did instead. */
+  instead_of: string | null;
+};
+
+export type DriveConversion =
+  | "decrypted"
+  | "encrypted"
+  | "encrypting"
+  | "decrypting"
+  | "encryption_paused"
+  | "decryption_paused";
+
+export type DeviceEncryption = {
+  drive: string;
+  conversion: DriveConversion | null;
+  protection: boolean | null;
+  source: "provider" | "explorer";
+  /** Why the service's source did not answer, when Explorer did instead. */
+  instead_of: string | null;
+};
+
+export type DeviceSecureBoot = {
+  on: boolean;
+  /** As Windows writes it: "NotStarted", "InProgress", "Updated", or other. */
+  certificates: string | null;
+  certificate_error: number | null;
+};
+
+export type DeviceRemoteDesktop = {
+  on: boolean;
+  by_policy: boolean;
+  /** Null when Windows records none, and 3389 was looked at. */
+  port: number | null;
+  listening: Reading<boolean>;
+};
+
+/** The "This device" facts, each read where it can be. */
+export type DeviceFacts = {
+  secure_boot: Reading<DeviceSecureBoot>;
+  tpm: Reading<DeviceTpm>;
+  encryption: Reading<DeviceEncryption>;
+  remote_desktop: Reading<DeviceRemoteDesktop>;
+};

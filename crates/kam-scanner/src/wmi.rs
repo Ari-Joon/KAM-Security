@@ -8,7 +8,10 @@
 //!
 //! Deliberately read-only. Invoking WMI methods means `GetMethod`,
 //! `SpawnInstance` and `ExecMethod`, a good deal more machinery, and nothing
-//! here needs to change Defender's mind about anything yet.
+//! here needs to change Defender's mind about anything yet. The one method
+//! call there is, [`call`], takes no arguments, so it needs `ExecMethod`
+//! alone: it is how Windows answers whether its TPM is ready, which no
+//! property says, and it changes nothing.
 //!
 //! # Threading
 //!
@@ -29,13 +32,14 @@ use kam_core::{Error, Result};
 use windows::core::{BSTR, PCWSTR};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CoUninitialize, CLSCTX_INPROC_SERVER,
-    COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+    COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL, RPC_C_AUTHN_LEVEL_CALL,
+    RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_IMP_LEVEL_IMPERSONATE,
 };
 use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
 use windows::Win32::System::Variant::{VariantClear, VARIANT};
 use windows::Win32::System::Wmi::{
     IWbemClassObject, IWbemLocator, IWbemServices, WbemLocator, WBEM_FLAG_FORWARD_ONLY,
-    WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_S_TIMEDOUT,
+    WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_GENERIC_FLAG_TYPE, WBEM_S_TIMEDOUT,
 };
 
 /// One property value, reduced to the few shapes Defender actually uses.
@@ -187,14 +191,34 @@ fn read_object(object: &IWbemClassObject, wanted: &[&str]) -> Row {
     row
 }
 
-/// Run a WQL query and return the properties named in `wanted`.
-///
-/// Properties are named rather than enumerated because the caller always knows
-/// which it wants, and enumerating means walking every property of every object
-/// to discard most of them.
-pub fn query(namespace: &str, wql: &str, wanted: &[&str]) -> Result<Vec<Row>> {
-    // Declared first so it drops last, after the interfaces below.
-    let _guard = unsafe {
+/// How the calls on a connection are protected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protection {
+    /// Checked call by call, which is what Defender's classes accept.
+    Call,
+    /// Encrypted. Microsoft's page for the drive encryption class says its
+    /// connection must be; the TPM's provider is asked the same way.
+    Private,
+}
+
+impl Protection {
+    fn level(self) -> RPC_C_AUTHN_LEVEL {
+        match self {
+            Self::Call => RPC_C_AUTHN_LEVEL_CALL,
+            Self::Private => RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+        }
+    }
+}
+
+/// A connection to one namespace, with COM held for as long as it lives.
+struct Connection {
+    // Before the guard, so it is released first: fields drop in order.
+    services: IWbemServices,
+    _guard: ComGuard,
+}
+
+fn connect(namespace: &str, protection: Protection) -> Result<Connection> {
+    let guard = unsafe {
         let outcome = CoInitializeEx(None, COINIT_MULTITHREADED);
         if outcome.is_err() {
             return Err(Error::Privileged(format!(
@@ -229,13 +253,38 @@ pub fn query(namespace: &str, wql: &str, wanted: &[&str]) -> Result<Vec<Row>> {
             RPC_C_AUTHN_WINNT,
             RPC_C_AUTHZ_NONE,
             None,
-            RPC_C_AUTHN_LEVEL_CALL,
+            protection.level(),
             RPC_C_IMP_LEVEL_IMPERSONATE,
             None,
             EOAC_NONE,
         )
     }
     .map_err(|error| com_error(error, "could not set the WMI proxy blanket"))?;
+
+    Ok(Connection {
+        services,
+        _guard: guard,
+    })
+}
+
+/// Run a WQL query and return the properties named in `wanted`.
+///
+/// Properties are named rather than enumerated because the caller always knows
+/// which it wants, and enumerating means walking every property of every object
+/// to discard most of them.
+pub fn query(namespace: &str, wql: &str, wanted: &[&str]) -> Result<Vec<Row>> {
+    query_with(namespace, wql, wanted, Protection::Call)
+}
+
+/// [`query`], over a connection protected as `protection` says.
+pub fn query_with(
+    namespace: &str,
+    wql: &str,
+    wanted: &[&str],
+    protection: Protection,
+) -> Result<Vec<Row>> {
+    let connection = connect(namespace, protection)?;
+    let services = &connection.services;
 
     let enumerator = unsafe {
         services.ExecQuery(
@@ -287,6 +336,37 @@ pub fn query(namespace: &str, wql: &str, wanted: &[&str]) -> Result<Vec<Row>> {
     }
 
     Ok(rows)
+}
+
+/// Call a method that takes no arguments on the object at `path`, and return
+/// the properties named in `wanted` from what it answers.
+///
+/// `path` is one a query handed back as `__PATH`, never one built from what a
+/// caller sent.
+pub fn call(
+    namespace: &str,
+    path: &str,
+    method: &str,
+    wanted: &[&str],
+    protection: Protection,
+) -> Result<Row> {
+    let connection = connect(namespace, protection)?;
+    let mut answer: Option<IWbemClassObject> = None;
+    unsafe {
+        connection.services.ExecMethod(
+            &BSTR::from(path),
+            &BSTR::from(method),
+            WBEM_GENERIC_FLAG_TYPE(0),
+            None,
+            None,
+            Some(&mut answer),
+            None,
+        )
+    }
+    .map_err(|error| com_error(error, &format!("WMI could not call {method}")))?;
+    let answer = answer
+        .ok_or_else(|| Error::Privileged(format!("WMI's call to {method} gave nothing back")))?;
+    Ok(read_object(&answer, wanted))
 }
 
 #[cfg(test)]
@@ -341,5 +421,69 @@ mod tests {
     #[test]
     fn a_query_against_a_missing_namespace_fails_rather_than_hanging() {
         assert!(query(r"ROOT\NoSuchNamespace", "SELECT * FROM Nothing", &[]).is_err());
+    }
+
+    /// The encrypted connection the drive encryption class asks for answers
+    /// the same trivial query.
+    #[test]
+    fn an_encrypted_connection_answers_a_trivial_query() {
+        let rows = query_with(
+            r"ROOT\CIMV2",
+            "SELECT BuildNumber FROM Win32_OperatingSystem",
+            &["BuildNumber"],
+            Protection::Private,
+        )
+        .expect("WMI should answer over an encrypted connection");
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// A method that takes nothing, called on an object a query handed back:
+    /// asking who owns this very process, which any account may ask of its
+    /// own. Proves the call end to end without depending on a TPM.
+    #[test]
+    fn a_method_that_takes_nothing_answers_on_an_object_a_query_found() {
+        let rows = query(
+            r"ROOT\CIMV2",
+            &format!(
+                "SELECT * FROM Win32_Process WHERE ProcessId = {}",
+                std::process::id()
+            ),
+            &["__PATH"],
+        )
+        .unwrap();
+        let path = rows[0]
+            .get("__PATH")
+            .and_then(Value::text)
+            .expect("an object found by a query has a path")
+            .to_owned();
+
+        let answer = call(
+            r"ROOT\CIMV2",
+            &path,
+            "GetOwner",
+            &["ReturnValue", "User"],
+            Protection::Private,
+        )
+        .expect("the call should be answered");
+        assert_eq!(answer.get("ReturnValue").and_then(Value::number), Some(0));
+        assert!(
+            answer
+                .get("User")
+                .and_then(Value::text)
+                .is_some_and(|user| !user.is_empty()),
+            "{answer:?}"
+        );
+
+        assert!(
+            call(
+                r"ROOT\CIMV2",
+                &path,
+                "NoSuchMethod",
+                &[],
+                Protection::Private
+            )
+            .is_err(),
+            "a method that does not exist was answered"
+        );
     }
 }

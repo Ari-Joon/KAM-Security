@@ -220,6 +220,11 @@ pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
         // Reading where traffic is sent and which certificates are trusted:
         // any account can read these from Windows' own settings.
         Request::GetTrafficSettings | Request::GetRootCertificates => false,
+        // Whether there is a TPM and it is ready, and whether drive C: is
+        // encrypted: Windows tells any account both, in Windows Security and
+        // in Explorer. Its documented providers answer only an administrator,
+        // which is the only reason the service is the one that asks them.
+        Request::GetDeviceFacts => false,
     }
 }
 
@@ -1237,6 +1242,9 @@ pub fn handle(
         Request::GetRootCertificates => {
             Response::RootCertificates(Box::new(kam_scanner::roots::survey(user)))
         }
+        // Not audited, as the hardening state is not: a read of facts any
+        // account can see, made on every visit to the Scanner.
+        Request::GetDeviceFacts => Response::DeviceFacts(Box::new(kam_scanner::device::held())),
     }
 }
 
@@ -1794,12 +1802,32 @@ mod tests {
             Request::GetProtection,
             Request::SurveyCaches,
             Request::ReadComparison { id: 1 },
+            Request::GetDeviceFacts,
         ] {
             assert!(
                 !needs_administrator(&request, &user),
                 "{request:?} demanded an administrator for a read"
             );
         }
+    }
+
+    /// The TPM and drive C: are answered whatever the machine allows, each
+    /// read or said not to have been, and asking is not written to the log:
+    /// the Scanner asks on every visit.
+    #[test]
+    fn device_facts_are_answered_and_not_recorded() {
+        let context = context(Mode::Console);
+        let response = handle(
+            Request::GetDeviceFacts,
+            &context,
+            &Reporter::silent(),
+            &someone(),
+        );
+        assert!(
+            matches!(response, Response::DeviceFacts(_)),
+            "unexpected answer: {response:?}"
+        );
+        assert!(context.store.recent_audit(10).unwrap().is_empty());
     }
 
     /// A cache is the caller's to clear when it is in their profile, and the
