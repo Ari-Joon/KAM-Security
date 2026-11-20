@@ -236,6 +236,34 @@ permission prompt, and an approved copy makes that one change and exits.
 
 See [PLAN.md](PLAN.md) for the full design and phase breakdown.
 
+### When the service is not answering
+
+While the window is open it asks the service the smallest question there is,
+what version it is, five seconds after each answer. The service answers from
+memory and does not write it to the Activity log. Only one question is ever
+waiting, and one with no answer after five seconds counts as none, so a service
+that has stopped, crashed or hung is noticed within about ten seconds without
+questions piling up behind it.
+
+What the window found is said once, above whichever page is open, and stays in
+view as the page scrolls:
+
+- **Not answering**, since when, and what that means: if the service itself has
+  stopped, nothing is watching what starts itself or checking new downloads,
+  and what is on screen was read before it stopped answering.
+- **From a different install**, when the service answers in a version of the
+  pipe's language the window does not speak. The two would misread each other,
+  so the pages are not to be relied on until KAM Security is installed again.
+- **Turned this window away**, in the service's own words. That is usually a
+  copy of the window kept outside the service's folder, and the service writes
+  each such caller to the Activity log, so the window then asks once a minute.
+- **Answering again**, and when, for fifteen seconds.
+
+While the service answers, nothing is said at all. A line that always says all
+is well is one people stop reading. The window never starts, stops or restarts
+the service, and the icon in the notification area asks nothing while the
+window is closed.
+
 ## Status
 
 Phases 0 to 4 are complete and phase 5 is in progress. Nothing claims to be
@@ -313,6 +341,19 @@ are doing as they do it, and can be stopped. A scan behind a disabled button is
 indistinguishable from one that has hung, and people reasonably assume the
 second. The agent streams named stages and counts down the same pipe that
 carries the result, and a second connection carries the request to stop.
+
+They also carry on when you open another page, and the page finds them again.
+A Storage scan, Applications' Measure, Cleanup's searches, a Defender scan and
+the Scanner's Examine run in the window's own half rather than inside the page,
+so coming back shows how far the job has got and its Stop button, or what it
+came to and when it finished. A job that failed meanwhile says which job it
+was, when it ended and why, and is never shown as nothing found. One of each
+runs at a time. The results Storage, Applications and Cleanup already kept on
+disk are still kept there and nowhere else; the Defender scan's, Examine's and
+the loose files' are kept until the program quits. Closing the window to the
+notification area is not a Stop either, and the result is there when the
+window is opened again. Only quitting the program loses an answer that has not
+arrived yet.
 
 Results are reported as "N of M engines", never as a bare count. A handful of
 detections against a large majority is the everyday signature of a false
