@@ -317,6 +317,15 @@ fn per_account_kinds() -> Vec<&'static str> {
             // A service lives in `HKLM` and a task in a machine-wide file
             // store, so neither is hidden by a hive nobody loaded.
             Anchor::Service | Anchor::ScheduledTask => false,
+            // The quieter places are read apart, by `kam_scanner::quiet`, and
+            // are not among the anchors above.
+            Anchor::Winlogon
+            | Anchor::Debugger
+            | Anchor::ExitMonitor
+            | Anchor::LogonScript
+            | Anchor::AppInit
+            | Anchor::WmiSubscription
+            | Anchor::ComOverride => false,
         }
     })
     .map(Anchor::kind)

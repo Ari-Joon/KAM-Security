@@ -65,6 +65,28 @@ pub enum Anchor {
     Service,
     /// A scheduled task with a trigger.
     ScheduledTask,
+    /// A program Windows starts at every sign-in beside its own, or in place
+    /// of its shell (Winlogon `Userinit` and `Shell`). The quieter places
+    /// from here on are read by [`crate::quiet`], and only depart from what
+    /// Windows ships when something is set in them.
+    Winlogon,
+    /// A program set as the debugger of another under Image File Execution
+    /// Options, which Windows starts in its place whenever it is started.
+    Debugger,
+    /// A program set to start whenever another closes (`SilentProcessExit`).
+    ExitMonitor,
+    /// A script an account runs at every sign-in (`UserInitMprLogonScript`).
+    LogonScript,
+    /// A library loaded into every program that uses Windows' own window
+    /// functions (`AppInit_DLLs`).
+    AppInit,
+    /// A WMI event subscription that runs a command or a script when its
+    /// event fires.
+    WmiSubscription,
+    /// An account's own registration of a COM class a scheduled task uses,
+    /// which Windows prefers to the machine's when the task runs as that
+    /// account.
+    ComOverride,
 }
 
 impl Anchor {
@@ -74,9 +96,15 @@ impl Anchor {
         match self {
             Self::RunOnceKey => 1,
             Self::StartupFolder => 2,
-            Self::RunKey => 3,
-            Self::ScheduledTask => 4,
+            Self::RunKey | Self::LogonScript => 3,
+            Self::ScheduledTask | Self::ComOverride => 4,
             Self::Service => 5,
+            // Nothing in Windows' own settings pages shows any of these.
+            Self::Winlogon
+            | Self::Debugger
+            | Self::ExitMonitor
+            | Self::AppInit
+            | Self::WmiSubscription => 6,
         }
     }
 
@@ -95,6 +123,13 @@ impl Anchor {
             Self::StartupFolder => "startup_item",
             Self::Service => "service",
             Self::ScheduledTask => "scheduled_task",
+            Self::Winlogon => "winlogon",
+            Self::Debugger => "image_debugger",
+            Self::ExitMonitor => "exit_monitor",
+            Self::LogonScript => "logon_script",
+            Self::AppInit => "appinit_dll",
+            Self::WmiSubscription => "wmi_subscription",
+            Self::ComOverride => "com_override",
         }
     }
 
@@ -109,6 +144,32 @@ impl Anchor {
             Self::StartupFolder => "a Startup folder item",
             Self::Service => "a Windows service",
             Self::ScheduledTask => "a scheduled task",
+            Self::Winlogon => "a Windows sign-in program",
+            Self::Debugger => "a debugger set for a program",
+            Self::ExitMonitor => "a program set to start when another closes",
+            Self::LogonScript => "a sign-in script",
+            Self::AppInit => "an AppInit library",
+            Self::WmiSubscription => "a WMI event subscription",
+            Self::ComOverride => "an account's own COM registration",
+        }
+    }
+
+    /// Whether this is one of the quieter places [`crate::quiet`] reads, which
+    /// are watched and compared as parts of their own.
+    pub fn is_quiet(self) -> bool {
+        match self {
+            Self::RunKey
+            | Self::RunOnceKey
+            | Self::StartupFolder
+            | Self::Service
+            | Self::ScheduledTask => false,
+            Self::Winlogon
+            | Self::Debugger
+            | Self::ExitMonitor
+            | Self::LogonScript
+            | Self::AppInit
+            | Self::WmiSubscription
+            | Self::ComOverride => true,
         }
     }
 }
@@ -777,7 +838,7 @@ fn shown(path: &str, view: View) -> String {
 /// `owner` is the person whose hive the command came from, so that their own
 /// `%TEMP%` and `%LOCALAPPDATA%` are what it is read with. `None` for
 /// machine-wide sources.
-fn entry(
+pub(crate) fn entry(
     name: String,
     anchor: Anchor,
     location: String,
@@ -1577,6 +1638,26 @@ fn task_actions(xml: &str) -> Vec<TaskAction> {
     actions
 }
 
+/// How a task's COM handler is written as its command, before the class id.
+const COM_HANDLER: &str = "COM handler ";
+
+/// The COM classes the scheduled tasks in a survey hand their work to, each
+/// with the task that uses it: the task's name and its class id.
+///
+/// An account's own registration of one of these classes is what runs when
+/// the task runs as that account, which [`crate::quiet`] reads for.
+pub fn com_handlers(survey: &Survey) -> Vec<(String, String)> {
+    survey
+        .entries
+        .iter()
+        .filter(|entry| entry.anchor == Anchor::ScheduledTask)
+        .filter_map(|entry| {
+            let class_id = entry.command.strip_prefix(COM_HANDLER)?.trim();
+            (!class_id.is_empty()).then(|| (entry.name.clone(), class_id.to_owned()))
+        })
+        .collect()
+}
+
 /// The file a COM class is loaded from, as this machine registers it.
 ///
 /// A COM handler names a class rather than a file, and the class names the
@@ -1584,7 +1665,7 @@ fn task_actions(xml: &str) -> Vec<TaskAction> {
 /// process of its own). Both registry views are read, because a 32-bit class
 /// registers under `WOW6432Node`. `None` when the class is not registered, or
 /// names nothing that is there.
-fn com_server(class_id: &str) -> Option<PathBuf> {
+pub(crate) fn com_server(class_id: &str) -> Option<PathBuf> {
     let class_id = class_id.trim();
     for view in [View::Native, View::Wow6432] {
         for server in ["InprocServer32", "LocalServer32"] {
@@ -1689,7 +1770,7 @@ fn task_entries_or(root: &Path, path: &Path) -> Result<Vec<Entry>, std::io::Erro
                     name,
                     anchor: Anchor::ScheduledTask,
                     location: location.clone(),
-                    command: format!("COM handler {class_id}"),
+                    command: format!("{COM_HANDLER}{class_id}"),
                     executable: com_server(&class_id),
                     payload: None,
                     host: None,

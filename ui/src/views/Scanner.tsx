@@ -538,6 +538,13 @@ const ANCHOR_LABELS: Record<Anchor, string> = {
   startup_folder: "a Startup folder item",
   service: "a Windows service",
   scheduled_task: "a scheduled task",
+  winlogon: "a Windows sign-in program",
+  debugger: "a debugger set for a program",
+  exit_monitor: "a program set to start when another closes",
+  logon_script: "a sign-in script",
+  app_init: "an AppInit library",
+  wmi_subscription: "a WMI event subscription",
+  com_override: "an account's own COM registration",
 };
 
 const LOCATION_LABELS: Record<Location, string> = {
@@ -1766,6 +1773,7 @@ const OBSERVATION_KINDS: Record<Observation["kind"], string> = {
   sign_in_entry: "a sign-in entry appeared",
   startup_folder: "a Startup folder item appeared",
   service: "a service appeared",
+  startup_place: "a quiet startup place was set",
 };
 
 function concernLabel(concern: Concern): string {
@@ -2115,6 +2123,12 @@ function Provenance() {
               </ul>
             </div>
           )}
+
+          {/* The quieter places a program can be started from. They add no
+              rows while they are as Windows ships them, so they are named
+              here instead, with whatever is set in them. The agent writes
+              this line from what it read. */}
+          {report.also_checked && <p className="footnote">{report.also_checked}</p>}
 
           {/* The clean sentence only for a complete read: "nothing on this
               machine" is a claim about all of it. */}

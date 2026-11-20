@@ -259,6 +259,11 @@ pub struct Report {
     /// Folders swept for downloaded executables, so the reader knows what was
     /// and was not covered.
     pub swept: Vec<String>,
+    /// The quieter places a program can be started from, named in one line
+    /// with what was found set in them beyond what Windows ships. What is set
+    /// there is also examined with everything else that starts itself.
+    #[serde(default)]
+    pub also_checked: Option<String>,
 }
 
 impl Report {
@@ -745,7 +750,14 @@ pub fn survey(reporter: &Reporter, user: &UserContext) -> Result<Report, Cancell
     // useful thing to know while waiting is what is being done, not how far
     // through an opaque sequence it is.
     reporter.stage("Reading what starts itself", None);
-    let persistence = persistence::survey(user);
+    let mut persistence = persistence::survey(user);
+    // The quieter places, for the same person, are examined with the rest:
+    // what is set there runs as surely as anything in a Run key.
+    let handlers = persistence::com_handlers(&persistence);
+    let quiet = crate::quiet::survey_for(std::slice::from_ref(user), &handlers);
+    let also_checked = crate::quiet::also_checked(&quiet);
+    persistence.entries.extend(quiet.entries);
+    persistence.unreadable.extend(quiet.unreadable);
     reporter.check()?;
 
     // One file, many anchors: svchost hosts dozens of services, and an updater
@@ -877,6 +889,7 @@ pub fn survey(reporter: &Reporter, user: &UserContext) -> Result<Report, Cancell
         findings,
         unreadable,
         swept,
+        also_checked: Some(also_checked),
     })
 }
 

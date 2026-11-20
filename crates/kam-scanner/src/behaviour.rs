@@ -88,6 +88,9 @@ pub enum Kind {
     SignInEntry,
     StartupFolder,
     Service,
+    /// One of the quieter places a program can be started from, which the
+    /// entry's own anchor names.
+    StartupPlace,
 }
 
 impl Kind {
@@ -99,6 +102,7 @@ impl Kind {
             Self::SignInEntry => "sign_in_entry_appeared",
             Self::StartupFolder => "startup_item_appeared",
             Self::Service => "service_appeared",
+            Self::StartupPlace => "startup_place_set",
         }
     }
 
@@ -109,6 +113,7 @@ impl Kind {
             Self::SignInEntry => "a sign-in entry appeared",
             Self::StartupFolder => "a Startup folder item appeared",
             Self::Service => "a service appeared",
+            Self::StartupPlace => "a quiet startup place was set",
         }
     }
 
@@ -118,6 +123,13 @@ impl Kind {
             Anchor::RunKey | Anchor::RunOnceKey => Self::SignInEntry,
             Anchor::StartupFolder => Self::StartupFolder,
             Anchor::Service => Self::Service,
+            Anchor::Winlogon
+            | Anchor::Debugger
+            | Anchor::ExitMonitor
+            | Anchor::LogonScript
+            | Anchor::AppInit
+            | Anchor::WmiSubscription
+            | Anchor::ComOverride => Self::StartupPlace,
         }
     }
 }
@@ -301,6 +313,7 @@ fn named(kind: Kind, name: &str) -> String {
         Kind::SignInEntry => "sign-in entry",
         Kind::StartupFolder => "Startup folder item",
         Kind::Service => "service",
+        Kind::StartupPlace => "startup place",
     };
     if name.trim().is_empty() {
         format!("A {what} with no name")
@@ -655,6 +668,20 @@ pub fn judge_entry(entry: &Entry) -> Option<Observation> {
             )
         }
         Kind::Service => format!("A service now runs {} from {where_}", file_name(target)),
+        // Said with the place's own name: "A debugger set for a program now
+        // runs ...", "A WMI event subscription now runs ...".
+        Kind::StartupPlace => {
+            let label = entry.anchor.label();
+            let label = label.strip_prefix("an ").map_or_else(
+                || label.strip_prefix("a ").map(|rest| format!("A {rest}")),
+                |rest| Some(format!("An {rest}")),
+            );
+            format!(
+                "{} now runs {} from {where_}",
+                label.unwrap_or_else(|| "A startup place".to_owned()),
+                file_name(target)
+            )
+        }
         Kind::ProcessStart => unreachable!("entries are never process starts"),
     };
 

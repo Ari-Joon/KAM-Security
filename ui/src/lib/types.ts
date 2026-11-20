@@ -714,7 +714,16 @@ export type Anchor =
   | "run_once_key"
   | "startup_folder"
   | "service"
-  | "scheduled_task";
+  | "scheduled_task"
+  // The quieter places, which only have an entry when something is set in
+  // them beyond what Windows ships.
+  | "winlogon"
+  | "debugger"
+  | "exit_monitor"
+  | "logon_script"
+  | "app_init"
+  | "wmi_subscription"
+  | "com_override";
 
 export type PersistenceEntry = {
   name: string;
@@ -751,7 +760,8 @@ export type ObservationKind =
   | "scheduled_task"
   | "sign_in_entry"
   | "startup_folder"
-  | "service";
+  | "service"
+  | "startup_place";
 
 export type Observation = {
   at: string;
@@ -805,6 +815,11 @@ export type ProvenanceReport = {
   swept_files: number;
   unreadable: string[];
   swept: string[];
+  /**
+   * The quieter startup places, named in one line with what is set in them
+   * beyond what Windows ships. Null from an agent that did not read them.
+   */
+  also_checked?: string | null;
 };
 
 /**
