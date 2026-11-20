@@ -44,20 +44,20 @@ Presenting circumstantial evidence as a verdict is the whole business model of
 the software this replaces.
 
 <p align="center">
-  <img src="docs/images/overview.png" width="900" alt="The Overview: protection on, starting at sign-in in the notification area, the update check, and the drives it can see">
+  <img src="docs/images/overview.png" width="900" alt="The Overview: protection on, starting at sign-in in the notification area, what Windows says about its own updates, and the update check finding 0.6.0 is the latest release">
 </p>
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/images/storage.png" alt="Storage: 845 GB across 1.67 million files measured from the master file table in 2.9 seconds, drawn as a treemap"></td>
-    <td width="50%"><img src="docs/images/applications.png" alt="Applications: 484 GB actually used against the 55.7 GB Control Panel claims, sorted by real size"></td>
+    <td width="50%"><img src="docs/images/storage.png" alt="Storage: drive C: drawn to scale as a treemap from one read of the master file table, with the biggest folders and the largest single files below it"></td>
+    <td width="50%"><img src="docs/images/applications.png" alt="Applications: 282 GB actually used against the 64.7 GB Control Panel claims, measured in 3.0 seconds, with winget's list of newer versions one press away"></td>
   </tr>
   <tr>
     <td><b>Storage:</b> a whole drive read from the master file table in about three seconds, drawn to scale.</td>
     <td><b>Applications:</b> what each program really occupies, against what its installer claimed.</td>
   </tr>
   <tr>
-    <td><img src="docs/images/firewall.png" alt="Firewall: 698 rules, 71 open connections, and every connection grouped by the publisher that signed the program, with a colour legend"></td>
+    <td><img src="docs/images/firewall.png" alt="Firewall: 23 programs with open connections, grouped by the publisher that signed each one, with a colour legend"></td>
     <td><img src="docs/images/scanner.png" alt="Scanner: Defender's own protections read from Defender, with the same quick or full scan as Windows Security started from here"></td>
   </tr>
   <tr>
@@ -65,7 +65,7 @@ the software this replaces.
     <td><b>Scanner:</b> Defender's real state, and the same scan as Windows Security, started from here.</td>
   </tr>
   <tr>
-    <td><img src="docs/images/cleanup.png" alt="Cleanup: ten caches holding 76.9 GB, each marked with whether clearing it costs anything"></td>
+    <td><img src="docs/images/cleanup.png" alt="Cleanup: eighteen caches holding 105 GB, each marked with whether clearing it costs anything"></td>
     <td><img src="docs/images/overview-activity.png" alt="The weekly check registered for Monday at 09:00, and the audit log of recent activity"></td>
   </tr>
   <tr>
@@ -475,7 +475,7 @@ There is no score, because a score needs an idea of what a correct machine
 looks like, and this software does not have one.
 
 <p align="center">
-  <img src="docs/images/changes.png" width="900" alt="Changes: fifteen things different since the last look, with a source that could not be read said out loud rather than reported as gone">
+  <img src="docs/images/changes.png" width="900" alt="Changes: a past comparison kept as it was shown, ten things different since the one before, with what could not be read and what was recorded afresh said out loud rather than reported as changed">
 </p>
 
 Things disappearing count at least as much as things appearing. An antivirus
