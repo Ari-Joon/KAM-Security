@@ -15,6 +15,13 @@
 //! The window never runs elevated, and nothing is changed without the prompt
 //! being answered.
 //!
+//! # And one read
+//!
+//! What Defender has been told to skip is not a change, and Windows still
+//! shows it only to an administrator, behind the same prompt in Windows
+//! Security. So reading it comes this way too, and what this says when the
+//! prompt is declined or fails is that nothing was read.
+//!
 //! # What the approved copy will do
 //!
 //! Exactly one request, and only one of the kinds listed in `allowed`. The
@@ -61,10 +68,44 @@ fn allowed(request: &Request) -> bool {
             | Request::BlockProgram { .. }
             | Request::UnblockProgram { .. }
             | Request::ClearCache { .. }
+            | Request::ReadDefenderExclusions
     )
 }
 
-/// Make a machine-wide change, asking Windows for consent if it is needed.
+/// Whether a request only reads, so that what goes wrong is said as nothing
+/// read rather than nothing changed.
+fn reads(request: &Request) -> bool {
+    matches!(request, Request::ReadDefenderExclusions)
+}
+
+/// "change" or "read", for the sentences below.
+fn act(request: &Request) -> &'static str {
+    if reads(request) {
+        "read"
+    } else {
+        "change"
+    }
+}
+
+/// What nothing happened means for this request.
+fn nothing(request: &Request) -> &'static str {
+    if reads(request) {
+        "nothing was read"
+    } else {
+        "nothing was changed"
+    }
+}
+
+/// What a person who declined the prompt is told.
+fn declined(request: &Request) -> String {
+    format!(
+        "You declined Windows' permission prompt, so {}.",
+        nothing(request)
+    )
+}
+
+/// Make a machine-wide change, or the one read Windows keeps to
+/// administrators, asking Windows for consent if it is needed.
 ///
 /// Blocks until the prompt is answered and the change is made, so it must be
 /// called off the window's thread.
@@ -109,11 +150,13 @@ fn ask_windows(request: &Request) -> Result<Response, String> {
 
     if let Err(error) = unsafe { ShellExecuteExW(&mut info) } {
         if error.code() == ERROR_CANCELLED.to_hresult() {
-            return Err(
-                "You declined Windows' permission prompt, so nothing was changed.".to_owned(),
-            );
+            return Err(declined(request));
         }
-        return Err(format!("Windows could not ask for permission: {error}"));
+        return Err(if reads(request) {
+            format!("Windows could not ask for permission, so nothing was read: {error}")
+        } else {
+            format!("Windows could not ask for permission: {error}")
+        });
     }
 
     let process = Owned(info.hProcess);
@@ -130,17 +173,19 @@ fn ask_windows(request: &Request) -> Result<Response, String> {
         // usual cause is an administrator other than the signed-in person
         // approving the prompt: the approved copy then runs as them, with their
         // temporary folder, and will not write its answer into somebody else's.
-        Err(_) if code == 2 => Err(
-            "Permission was given, but the change was never attempted, so nothing was changed. \
-             This happens when the account that approved the prompt is not the one signed in."
-                .to_owned(),
-        ),
+        Err(_) if code == 2 => Err(format!(
+            "Permission was given, but the {} was never attempted, so {}. \
+             This happens when the account that approved the prompt is not the one signed in.",
+            act(request),
+            nothing(request)
+        )),
         // Nothing usable came back. Not "it worked": the window re-reads the
         // real state afterwards, and this says plainly that the answer is
         // missing rather than inventing one.
         Err(_) => Err(format!(
-            "The change was approved but no answer came back (exit code {code}). \
-             What the agent actually did is recorded in Activity."
+            "The {} was approved but no answer came back (exit code {code}). \
+             What the agent actually did is recorded in Activity.",
+            act(request)
         )),
     }
 }
@@ -324,6 +369,8 @@ mod tests {
         assert!(allowed(&Request::UnblockProgram {
             rule: String::new()
         }));
+        // The one read Windows keeps to administrators, as the agent does.
+        assert!(allowed(&Request::ReadDefenderExclusions));
         for other in [
             Request::GetSystemStatus,
             Request::ListVolumes,
@@ -354,6 +401,27 @@ mod tests {
                 bad.display()
             );
         }
+    }
+
+    /// A declined or failed prompt for the one read says nothing was read,
+    /// and for a change still says nothing was changed, as it always has.
+    #[test]
+    fn a_read_that_did_not_happen_is_said_as_nothing_read() {
+        assert_eq!(
+            declined(&Request::ReadDefenderExclusions),
+            "You declined Windows' permission prompt, so nothing was read."
+        );
+        assert_eq!(
+            declined(&Request::SetProtection { enabled: false }),
+            "You declined Windows' permission prompt, so nothing was changed."
+        );
+        assert_eq!(act(&Request::ReadDefenderExclusions), "read");
+        assert_eq!(
+            act(&Request::BlockProgram {
+                path: String::new()
+            }),
+            "change"
+        );
     }
 
     #[test]

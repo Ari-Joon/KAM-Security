@@ -1731,3 +1731,24 @@ export type DeviceFacts = {
   encryption: Reading<DeviceEncryption>;
   remote_desktop: Reading<DeviceRemoteDesktop>;
 };
+
+/** What one of Defender's exclusion lists holds. */
+export type ExclusionKind =
+  | { kind: "paths" }
+  | { kind: "extensions" }
+  | { kind: "processes" }
+  | { kind: "ip_addresses" }
+  | { kind: "other"; name: string };
+
+export type ExclusionList = {
+  kind: ExclusionKind;
+  /** Set by a policy, under HKLM\SOFTWARE\Policies. */
+  by_policy: boolean;
+  /** Each as Defender holds it; `exact` is false when part of it is hidden. */
+  entries: { value: string; exact: boolean }[];
+  /** False when it changed while it was read. */
+  whole: boolean;
+};
+
+/** What Defender has been told to skip. Shown only after consent, kept nowhere. */
+export type DefenderExclusions = { lists: ExclusionList[]; unread: string[] };

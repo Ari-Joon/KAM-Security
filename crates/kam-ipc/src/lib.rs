@@ -491,6 +491,15 @@ pub enum Request {
     /// only an administrator, but Windows shows both facts to any account,
     /// in Windows Security and in Explorer, so anyone may ask.
     GetDeviceFacts,
+    /// What Defender has been told to skip: excluded paths, extensions,
+    /// processes and IP addresses, and which a policy set.
+    ///
+    /// Windows shows these only to an administrator, because knowing them
+    /// tells an attacker where to hide, so only a caller with administrator
+    /// rights is answered; the window asks through Windows' own permission
+    /// prompt. The audit log records that the list was read and how many
+    /// entries it held, never the entries: every account can read the log.
+    ReadDefenderExclusions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -645,6 +654,9 @@ pub enum Response {
     RootCertificates(Box<kam_scanner::roots::Report>),
     /// The TPM and drive C:, each read or said not to have been.
     DeviceFacts(Box<kam_scanner::device::Held>),
+    /// What Defender has been told to skip, for a caller with administrator
+    /// rights.
+    DefenderExclusions(Box<kam_scanner::exclusions::Exclusions>),
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {
         message: String,
@@ -1197,6 +1209,43 @@ mod tests {
         assert!(matches!(
             serde_json::from_str::<Request>(&request).unwrap(),
             Request::GetDeviceFacts
+        ));
+    }
+
+    /// Defender's exclusions go over and come back, the lists' own `kind`
+    /// nested where it cannot meet the reply's.
+    #[test]
+    fn defender_exclusions_survive_the_wire() {
+        use kam_scanner::exclusions::{Entry, Exclusions, Kind, List};
+
+        round_trip(Response::DefenderExclusions(Box::new(Exclusions {
+            lists: vec![
+                List {
+                    kind: Kind::Paths,
+                    by_policy: true,
+                    entries: vec![Entry {
+                        value: r"C:\Program Files\Company Agent".to_owned(),
+                        exact: true,
+                    }],
+                    whole: true,
+                },
+                List {
+                    kind: Kind::Other {
+                        name: "TemporaryPaths".to_owned(),
+                    },
+                    by_policy: false,
+                    entries: Vec::new(),
+                    whole: false,
+                },
+            ],
+            unread: vec!["The exclusions a policy sets could not be read".to_owned()],
+        })));
+        round_trip(Response::DefenderExclusions(Box::default()));
+
+        let request = serde_json::to_string(&Request::ReadDefenderExclusions).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Request>(&request).unwrap(),
+            Request::ReadDefenderExclusions
         ));
     }
 }

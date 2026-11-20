@@ -1515,6 +1515,20 @@ async fn device_facts() -> Result<device::Facts, String> {
     off_the_window(|| Ok(device::facts())).await
 }
 
+/// What Defender has been told to skip, after Windows' own permission prompt.
+///
+/// Windows shows these only to an administrator, and so does the service. The
+/// answer is handed straight to the page and kept nowhere here, so it is gone
+/// when the page is left.
+#[tauri::command]
+async fn defender_exclusions() -> Result<kam_scanner::exclusions::Exclusions, String> {
+    match with_consent(Request::ReadDefenderExclusions).await? {
+        Response::DefenderExclusions(found) => Ok(*found),
+        Response::Error { message } => Err(message),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Version of the protocol this build speaks, so the UI can say plainly when it
 /// and the agent disagree rather than silently mis-rendering.
 #[tauri::command]
@@ -1733,7 +1747,8 @@ pub fn run() {
             launch_waiting,
             newer_versions,
             windows_update,
-            device_facts
+            device_facts,
+            defender_exclusions
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| {

@@ -158,19 +158,20 @@ fn handle_connection(
     if dispatch::needs_administrator(&request, &user)
         && !stream.client_is_elevated().unwrap_or(false)
     {
+        let (message, asked) = dispatch::refusal(&request);
         context.audit(
             "agent",
             "refuse_unelevated",
             Effect::Refused,
             format!(
-                "{} asked for a machine-wide change without administrator rights",
+                "{} asked {asked} without administrator rights",
                 user.profile()
             ),
         );
         write_frame(
             stream,
             &Reply::Done(Response::Error {
-                message: dispatch::NEEDS_ADMINISTRATOR.to_owned(),
+                message: message.to_owned(),
             }),
         )?;
         return Ok(());

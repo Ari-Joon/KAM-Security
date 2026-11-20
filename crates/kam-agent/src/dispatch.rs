@@ -116,8 +116,9 @@ impl Context {
     }
 }
 
-/// Whether a request changes something machine-wide, and so may be made only
-/// for a caller running with administrator rights.
+/// Whether a request changes something machine-wide, or reads something
+/// Windows shows only to an administrator, and so may be made only for a
+/// caller running with administrator rights.
 ///
 /// # The rule
 ///
@@ -225,12 +226,33 @@ pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
         // in Explorer. Its documented providers answer only an administrator,
         // which is the only reason the service is the one that asks them.
         Request::GetDeviceFacts => false,
+
+        // What Defender has been told to skip. Windows shows it only to an
+        // administrator, because knowing it tells an attacker where to hide;
+        // the service can read it, and so must not tell anybody else.
+        Request::ReadDefenderExclusions => true,
     }
 }
 
 /// What a caller without administrator rights is told, in their terms.
 pub const NEEDS_ADMINISTRATOR: &str = "Changing this needs administrator rights, the same as \
     changing it in Windows itself.";
+
+/// How a refusal for want of administrator rights is put: what the caller is
+/// told, and how the log says what they asked for.
+///
+/// Most such requests are changes. The one read among them is said as a read,
+/// so neither the caller nor the log is told a change was asked for.
+pub fn refusal(request: &Request) -> (&'static str, &'static str) {
+    match request {
+        Request::ReadDefenderExclusions => (
+            "Reading this needs administrator rights, the same as reading it in Windows itself, \
+             so nothing was read.",
+            "to read Defender's exclusions",
+        ),
+        _ => (NEEDS_ADMINISTRATOR, "for a machine-wide change"),
+    }
+}
 
 pub fn handle(
     request: Request,
@@ -1245,7 +1267,68 @@ pub fn handle(
         // Not audited, as the hardening state is not: a read of facts any
         // account can see, made on every visit to the Scanner.
         Request::GetDeviceFacts => Response::DeviceFacts(Box::new(kam_scanner::device::held())),
+
+        // Reached only by a caller with administrator rights: see
+        // `needs_administrator`.
+        Request::ReadDefenderExclusions => read_exclusions(context, kam_scanner::exclusions::read),
     }
+}
+
+/// Read Defender's exclusions with `read`, and record that they were read.
+///
+/// `read` is the real reader in the service and a made-up one in the tests,
+/// which must never read Defender's own key.
+///
+/// Recorded, because it is a deliberate look at something Windows guards.
+/// Recorded as counts only: every account can read the log, and the entries
+/// are exactly what Windows keeps from anyone who is not an administrator.
+fn read_exclusions(
+    context: &Context,
+    read: impl FnOnce() -> kam_scanner::exclusions::Exclusions,
+) -> Response {
+    let found = read();
+    context.audit(
+        "defender",
+        "read_exclusions",
+        Effect::Observed,
+        exclusions_line(&found),
+    );
+    Response::DefenderExclusions(Box::new(found))
+}
+
+/// What the log says about a read of the exclusions: how many, of what kind
+/// and from where, and never which.
+fn exclusions_line(found: &kam_scanner::exclusions::Exclusions) -> String {
+    use kam_scanner::exclusions::Kind;
+
+    let counted = |count: usize, one: &str, many: &str| {
+        format!("{count} {}", if count == 1 { one } else { many })
+    };
+    let mut line = format!(
+        "read what Defender has been told to skip, for a caller with administrator rights: {} \
+         ({}, {}, {}, {}{}), {} of them set by a policy; the entries themselves are not \
+         recorded here",
+        counted(found.total(), "entry", "entries"),
+        counted(found.count(&Kind::Paths), "path", "paths"),
+        counted(found.count(&Kind::Extensions), "extension", "extensions"),
+        counted(found.count(&Kind::Processes), "process", "processes"),
+        counted(
+            found.count(&Kind::IpAddresses),
+            "IP address",
+            "IP addresses"
+        ),
+        match found.others() {
+            0 => String::new(),
+            others => format!(", {others} in other lists"),
+        },
+        found.by_policy(),
+    );
+    match found.unread.len() {
+        0 => {}
+        1 => line.push_str("; 1 part of it could not be read"),
+        unread => line.push_str(&format!("; {unread} parts of it could not be read")),
+    }
+    line
 }
 
 fn now_seconds() -> u64 {
@@ -1807,6 +1890,100 @@ mod tests {
             assert!(
                 !needs_administrator(&request, &user),
                 "{request:?} demanded an administrator for a read"
+            );
+        }
+    }
+
+    /// What Defender has been told to skip is answered only for a caller
+    /// with administrator rights, as Windows answers it, and the refusal is
+    /// put as a read refused, not as a change.
+    #[test]
+    fn defenders_exclusions_are_refused_to_a_caller_without_administrator_rights() {
+        let user = someone();
+        assert!(
+            needs_administrator(&Request::ReadDefenderExclusions, &user),
+            "the exclusions would be told to any caller"
+        );
+
+        let (told, asked) = refusal(&Request::ReadDefenderExclusions);
+        assert!(
+            told.starts_with("Reading this needs administrator rights"),
+            "{told}"
+        );
+        assert!(told.contains("nothing was read"), "{told}");
+        assert_eq!(asked, "to read Defender's exclusions");
+
+        // Every other refusal is put exactly as it was.
+        assert_eq!(
+            refusal(&Request::SetProtection { enabled: false }),
+            (NEEDS_ADMINISTRATOR, "for a machine-wide change")
+        );
+    }
+
+    /// A read of the exclusions is recorded with how many there were, of what
+    /// kind and from where, and never with the entries: every account can
+    /// read the log. Made-up lists stand in for Defender's, whose real key no
+    /// test reads.
+    #[test]
+    fn a_read_of_the_exclusions_is_recorded_as_counts_never_the_entries() {
+        use kam_scanner::exclusions::{Entry, Exclusions, Kind, List};
+
+        let entry = |value: &str| Entry {
+            value: value.to_owned(),
+            exact: true,
+        };
+        let made_up = Exclusions {
+            lists: vec![
+                List {
+                    kind: Kind::Paths,
+                    by_policy: false,
+                    entries: vec![entry(r"C:\Hidden Here"), entry(r"D:\Also Here")],
+                    whole: true,
+                },
+                List {
+                    kind: Kind::Processes,
+                    by_policy: true,
+                    entries: vec![entry("sneaky.exe")],
+                    whole: true,
+                },
+            ],
+            unread: vec!["The exclusions a policy sets could not be read".to_owned()],
+        };
+
+        let context = context(Mode::Console);
+        let Response::DefenderExclusions(sent) = read_exclusions(&context, || made_up.clone())
+        else {
+            panic!("expected the exclusions");
+        };
+        assert_eq!(*sent, made_up, "the caller was not given what was read");
+
+        let recorded = context.store.recent_audit(10).unwrap();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let line = &recorded[0];
+        assert_eq!(
+            (line.module.as_str(), line.action.as_str(), line.effect),
+            ("defender", "read_exclusions", Effect::Observed)
+        );
+        for counted in [
+            "3 entries",
+            "2 paths",
+            "0 extensions",
+            "1 process",
+            "0 IP addresses",
+            "1 of them set by a policy",
+            "1 part of it could not be read",
+        ] {
+            assert!(
+                line.detail.contains(counted),
+                "{counted:?} missing: {}",
+                line.detail
+            );
+        }
+        for secret in ["Hidden Here", "Also Here", "sneaky.exe"] {
+            assert!(
+                !line.detail.contains(secret),
+                "an entry was written to the log: {}",
+                line.detail
             );
         }
     }

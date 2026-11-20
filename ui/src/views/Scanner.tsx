@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, reason } from "../lib/api";
+import DefenderExclusions from "../components/DefenderExclusions";
 import DeviceFacts from "../components/DeviceFacts";
 import ProgressBar from "../components/ProgressBar";
 import StateGrid, {
@@ -364,6 +365,8 @@ export default function Scanner() {
           </section>
         </>
       )}
+
+      <DefenderExclusions />
 
       <Canaries />
 

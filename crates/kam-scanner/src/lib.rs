@@ -17,6 +17,7 @@ pub mod defender_file;
 pub mod defender_scan;
 pub mod device;
 pub mod downloads;
+pub mod exclusions;
 pub mod extensions;
 pub mod hardening;
 pub mod persistence;

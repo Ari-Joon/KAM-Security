@@ -49,6 +49,7 @@ import type {
   WingetAsked,
   WindowsUpdateReport,
   DeviceFacts,
+  DefenderExclusions,
 } from "./types";
 
 /**
@@ -273,6 +274,11 @@ export const api = {
   windowsUpdate: () => invoke<WindowsUpdateReport>("windows_update"),
   /** Secure Boot, the TPM, drive C:'s encryption and Remote Desktop. */
   deviceFacts: () => invoke<DeviceFacts>("device_facts"),
+  /**
+   * What Defender has been told to skip. Goes through Windows' permission
+   * prompt every time; the answer is for the page to hold, not to keep.
+   */
+  defenderExclusions: () => invoke<DefenderExclusions>("defender_exclusions"),
 };
 
 /** Tauri rejects with a plain string; normalise anything else into one. */
