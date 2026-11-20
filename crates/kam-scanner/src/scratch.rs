@@ -12,8 +12,8 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteTreeW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE,
-    REG_SZ, REG_VALUE_TYPE,
+    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_BINARY, REG_DWORD, REG_EXPAND_SZ,
+    REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
 };
 
 pub(crate) struct ScratchKey {
@@ -103,6 +103,10 @@ impl ScratchKey {
 
     pub fn number(&self, key: &str, name: &str, value: u32) {
         self.put(key, name, REG_DWORD, &value.to_le_bytes());
+    }
+
+    pub fn bytes(&self, key: &str, name: &str, value: &[u8]) {
+        self.put(key, name, REG_BINARY, value);
     }
 }
 

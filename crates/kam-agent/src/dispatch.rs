@@ -217,9 +217,9 @@ pub fn needs_administrator(request: &Request, user: &UserContext) -> bool {
         | Request::ListDownloads { .. }
         | Request::CountDownloadsSince { .. } => false,
 
-        // Reading where traffic is sent: any account can read these from
-        // Windows' own settings.
-        Request::GetTrafficSettings => false,
+        // Reading where traffic is sent and which certificates are trusted:
+        // any account can read these from Windows' own settings.
+        Request::GetTrafficSettings | Request::GetRootCertificates => false,
     }
 }
 
@@ -1230,6 +1230,12 @@ pub fn handle(
         // caller's own, read from their hive.
         Request::GetTrafficSettings => {
             Response::TrafficSettings(Box::new(kam_scanner::traffic::survey(user)))
+        }
+
+        // Not audited either, as the hardening state is not: the Scanner reads
+        // it on every visit. The account's own stores are the caller's.
+        Request::GetRootCertificates => {
+            Response::RootCertificates(Box::new(kam_scanner::roots::survey(user)))
         }
     }
 }

@@ -45,6 +45,7 @@ import type {
   Launch,
   UnseenDownloads,
   TrafficReport,
+  RootReport,
 } from "./types";
 
 /**
@@ -107,6 +108,8 @@ export const api = {
   connections: () => invoke<ConnectionReport>("connections"),
   /** The hosts file, hand-set DNS servers, this account's proxy and Windows' own. */
   trafficSettings: () => invoke<TrafficReport>("traffic_settings"),
+  /** Every trusted root certificate by store, against Microsoft's cached list. */
+  rootCertificates: () => invoke<RootReport>("root_certificates"),
   blockProgram: (path: string) => invoke<string>("block_program", { path }),
   unblockProgram: (rule: string) => invoke<void>("unblock_program", { rule }),
   scanRules: (paths: string[]) => invoke<RuleReport>("scan_rules", { paths }),

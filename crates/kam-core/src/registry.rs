@@ -591,6 +591,14 @@ impl Key {
         self.open_child(name)
     }
 
+    /// The handle itself, for a Windows function that reads a key it is
+    /// handed open: the certificate functions read a certificate store kept
+    /// in the registry this way. It is still this key's, closed when this is
+    /// dropped, so it must not be kept past it.
+    pub fn handle(&self) -> HKEY {
+        self.0
+    }
+
     /// Read a string value. Empty strings come back as `None`, since an empty
     /// `InstallLocation` is as useless as an absent one.
     pub fn string(&self, value: &str) -> Option<String> {

@@ -21,6 +21,8 @@ import type {
   Location,
   Observation,
   ProvenanceReport,
+  RootCertificate,
+  RootReport,
   RuleReport,
   Signature,
   Verdict,
@@ -365,6 +367,8 @@ export default function Scanner() {
       <Canaries />
 
       <Hardening />
+
+      <RootCertificates />
 
       <Extensions />
 
@@ -1379,6 +1383,180 @@ function Hardening() {
             ignores the second. And what you see afterwards is Defender read
             back, not the fact that the request did not error.
           </p>
+        </>
+      )}
+    </section>
+  );
+}
+
+/** A date as a person writes it: 17 February 2036. */
+function longDate(iso: string): string {
+  const when = new Date(iso);
+  if (Number.isNaN(when.getTime())) return iso;
+  return when.toLocaleDateString(undefined, { day: "numeric", month: "long", year: "numeric" });
+}
+
+/** When a certificate stops being valid, or stopped. */
+function expiry(certificate: RootCertificate): string {
+  if (certificate.expires === null) return "its expiry could not be read";
+  const when = Date.parse(certificate.expires);
+  return Number.isNaN(when) || when > Date.now()
+    ? `valid until ${longDate(certificate.expires)}`
+    : `expired on ${longDate(certificate.expires)}`;
+}
+
+/**
+ * The certificate authorities this PC trusts.
+ *
+ * Each is compared with Microsoft's own list as Windows last fetched it, and
+ * the ones not on it are named. That is a fact with a source and a date: a
+ * certificate that a program the person installed added on purpose is not on
+ * the list either, so nothing here says whether one should be trusted.
+ */
+function RootCertificates() {
+  const [report, setReport] = useState<RootReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      setReport(await api.rootCertificates());
+      setError(null);
+    } catch (cause) {
+      setError(reason(cause));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const all = report?.stores.flatMap((store) => store.certificates) ?? [];
+  const onList = all.filter((certificate) => certificate.listed === true).length;
+  const list = report?.list;
+  // By store, so each says where it is trusted.
+  const shown =
+    report?.stores
+      .map((store) => ({
+        store,
+        certificates:
+          list?.state === "cached"
+            ? store.certificates.filter((certificate) => certificate.listed !== true)
+            : store.certificates,
+      }))
+      .filter((group) => group.certificates.length > 0) ?? [];
+  const notListed = shown.reduce((sum, group) => sum + group.certificates.length, 0);
+
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>Certificates this PC trusts</h2>
+        <button onClick={() => void refresh()} disabled={loading}>
+          {loading ? "Reading…" : "Refresh"}
+        </button>
+      </div>
+
+      <p className="lede panel-lede">
+        A trusted root certificate lets whoever holds its key present any website
+        to this PC with a valid padlock. Security products, debugging tools and
+        game launchers add their own on purpose, and so does malware. Each one is
+        compared here with Microsoft's own list as Windows last fetched it.
+        Nothing is fetched to do that.
+      </p>
+
+      {error && (
+        <div className="notice notice-down">
+          <strong>The certificate stores could not be read.</strong> Nothing is
+          claimed about them either way.
+          <pre className="error">{error}</pre>
+        </div>
+      )}
+
+      {report && list && (
+        <>
+          <div className="notice">
+            <strong>{all.length}</strong>{" "}
+            {all.length === 1 ? "certificate authority is" : "certificate authorities are"}{" "}
+            trusted on this PC.{" "}
+            {list.state === "cached" ? (
+              <>
+                <strong>{onList}</strong> {onList === 1 ? "is" : "are"} on Microsoft's
+                published list
+                {list.fetched
+                  ? ` (as Windows last fetched it, on ${longDate(list.fetched)})`
+                  : " (when Windows fetched it is not recorded)"}
+                .{" "}
+                {notListed === 0 ? (
+                  "Every one of them is on it."
+                ) : (
+                  <>
+                    <strong>{notListed}</strong> {notListed === 1 ? "is" : "are"} not:
+                  </>
+                )}
+              </>
+            ) : (
+              <>{list.why}. They are listed below by store.</>
+            )}
+          </div>
+
+          {shown.length > 0 && (
+            <ul className="findings">
+              {shown.flatMap(({ store, certificates }) =>
+                certificates.map((certificate) => (
+                  <li
+                    key={`${store.location}|${certificate.thumbprint}`}
+                    className="finding finding-notable"
+                  >
+                    <div className="finding-head">
+                      <span className="finding-name">{certificate.name}</span>
+                      <span className="badge attention-notable">
+                        {certificate.listed === false
+                          ? "not on Microsoft's list"
+                          : "not compared"}
+                      </span>
+                    </div>
+                    <dl className="finding-facts">
+                      <div>
+                        <dt>Thumbprint</dt>
+                        <dd>{certificate.thumbprint}</dd>
+                      </div>
+                      <div>
+                        <dt>Expiry</dt>
+                        <dd>{expiry(certificate)}</dd>
+                      </div>
+                      <div>
+                        <dt>Trusted in</dt>
+                        <dd>{store.label}</dd>
+                      </div>
+                    </dl>
+                    <p className="footnote">{store.location}</p>
+                  </li>
+                )),
+              )}
+            </ul>
+          )}
+
+          <p className="small muted">
+            {report.stores
+              .map((store) => `${store.label}: ${store.certificates.length}`)
+              .join(". ")}
+            .
+          </p>
+
+          {report.unreadable.length > 0 && (
+            <div className="notice notice-warn">
+              <strong>Not every store could be read,</strong> so nothing is claimed
+              about what is in these:
+              <ul className="concerns">
+                {report.unreadable.map((gap) => (
+                  <li key={gap.what}>{gap.what}</li>
+                ))}
+              </ul>
+            </div>
+          )}
         </>
       )}
     </section>

@@ -21,6 +21,7 @@ pub mod hardening;
 pub mod persistence;
 pub mod places;
 pub mod provenance;
+pub mod roots;
 #[cfg(test)]
 mod scratch;
 mod shortcut;

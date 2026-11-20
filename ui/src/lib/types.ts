@@ -1030,6 +1030,37 @@ export type TrafficReport = {
   unreadable: Gap[];
 };
 
+/**
+ * The trusted root certificates, by store. `listed` is null when Microsoft's
+ * list could not be used, which is not the same as not being on it.
+ */
+export type RootCertificate = {
+  thumbprint: string;
+  name: string;
+  expires: string | null;
+  listed: boolean | null;
+};
+
+export type RootStore = {
+  label: string;
+  location: string;
+  /** The account's profile folder, or null for one of the machine's stores. */
+  account: string | null;
+  /** The store Windows fills by itself from Microsoft's list. */
+  fills_itself: boolean;
+  certificates: RootCertificate[];
+};
+
+export type RootList =
+  | { state: "cached"; fetched: string | null; entries: number }
+  | { state: "missing"; why: string };
+
+export type RootReport = {
+  stores: RootStore[];
+  list: RootList;
+  unreadable: Gap[];
+};
+
 /** What an uninstaller left behind, and the shortcuts pointing at it. */
 export type ShortcutPlace = "start_menu" | "desktop" | "taskbar";
 

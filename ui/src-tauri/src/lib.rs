@@ -1106,6 +1106,20 @@ async fn traffic_settings() -> Result<kam_scanner::traffic::Report, String> {
     .await
 }
 
+/// The trusted root certificates by store, each looked up in Microsoft's list
+/// as Windows last fetched it.
+#[tauri::command]
+async fn root_certificates() -> Result<kam_scanner::roots::Report, String> {
+    off_the_window(move || {
+        match kam_ipc::client::call(&Request::GetRootCertificates).map_err(|e| e.to_string())? {
+            Response::RootCertificates(report) => Ok(*report),
+            Response::Error { message } => Err(message),
+            other => Err(unexpected(&other)),
+        }
+    })
+    .await
+}
+
 /// Stop a program reaching the network.
 ///
 /// The first command in the product that changes the machine. The agent
@@ -1637,6 +1651,7 @@ pub fn run() {
             firewall,
             connections,
             traffic_settings,
+            root_certificates,
             block_program,
             unblock_program,
             scan_rules,

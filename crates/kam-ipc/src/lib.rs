@@ -481,6 +481,11 @@ pub enum Request {
     /// visit to the Firewall page, so not audited, as the firewall's own
     /// state is not.
     GetTrafficSettings,
+    /// Every trusted root certificate, the machine's and the caller's own, by
+    /// store, each looked up in Microsoft's list as Windows last fetched it.
+    /// Nothing is fetched from the network. A read, shown on every visit to
+    /// the Scanner page, so not audited.
+    GetRootCertificates,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -631,6 +636,8 @@ pub enum Response {
     },
     /// Where this PC's traffic is sent, and what of that could not be read.
     TrafficSettings(Box<kam_scanner::traffic::Report>),
+    /// The trusted root certificates by store, and Microsoft's list.
+    RootCertificates(Box<kam_scanner::roots::Report>),
     /// The agent declined or failed. `message` is safe to show to the user.
     Error {
         message: String,
@@ -1099,5 +1106,39 @@ mod tests {
             serde_json::from_str::<Request>(&request).unwrap(),
             Request::GetTrafficSettings
         ));
+    }
+
+    /// The trusted root certificates survive the wire, with Microsoft's list
+    /// either there or not.
+    #[test]
+    fn trusted_root_certificates_survive_the_wire() {
+        use kam_scanner::roots::{Certificate, List, Report, Store};
+
+        for list in [
+            List::Cached {
+                fetched: Some("2026-11-12T15:56:00.000Z".to_owned()),
+                entries: 545,
+            },
+            List::Missing {
+                why: "Microsoft's list is not on this PC".to_owned(),
+            },
+        ] {
+            round_trip(Response::RootCertificates(Box::new(Report {
+                stores: vec![Store {
+                    label: "The machine's own root store".to_owned(),
+                    location: r"HKLM\SOFTWARE\Microsoft\SystemCertificates\ROOT".to_owned(),
+                    account: None,
+                    fills_itself: false,
+                    certificates: vec![Certificate {
+                        thumbprint: "5CF9D43A01717303FBAC4B3F04D12338D303F7C6".to_owned(),
+                        name: "Blizzard Battle.net Local Cert".to_owned(),
+                        expires: Some("2036-02-17T20:18:06.000Z".to_owned()),
+                        listed: Some(false),
+                    }],
+                }],
+                list,
+                unreadable: Vec::new(),
+            })));
+        }
     }
 }
