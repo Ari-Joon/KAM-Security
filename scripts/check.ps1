@@ -14,6 +14,11 @@
         whatever `node_modules` happens to hold.
       - CI runs `cargo deny check` in a second job, which was never run locally
         at all.
+      - CI's runner names its temporary folder through a short name,
+        C:\Users\RUNNER~1\AppData\Local\Temp. Tests that built paths there and
+        compared them with paths Windows had resolved passed here and failed
+        there for most of a day, because the temporary folder here had no
+        short name in it. So the tests run in a folder spelled the same way.
 
     So this script is the CI workflow, in order, with the same environment. If
     it passes, the push passes. If it cannot run something, it says so rather
@@ -82,7 +87,38 @@ if (-not $SkipFrontend) {
 
 Step 'Format' { & cargo fmt --all -- --check }
 Step 'Clippy (warnings are errors, as in CI)' { & cargo clippy --workspace --all-targets }
-Step 'Test' { & cargo test --workspace }
+# A temporary folder spelled through a short name, as the runner's is, or
+# nothing when this drive gives folders no short names. A folder with a long
+# name is made for it, and its short name is what the tests are given.
+function Get-ShortTemporaryFolder {
+    $long = Join-Path ([IO.Path]::GetTempPath()) 'kam-check-temporary-folder'
+    New-Item -ItemType Directory -Force $long | Out-Null
+    try {
+        $short = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($long).ShortPath
+    } catch {
+        return $null
+    }
+    if ($short -and $short -ne $long) { return $short }
+    return $null
+}
+
+Step 'Test' {
+    $short = Get-ShortTemporaryFolder
+    $saved = @($env:TMP, $env:TEMP)
+    if ($short) {
+        Write-Host "  In a temporary folder spelled through a short name, as on the runner: $short"
+        $env:TMP = $short
+        $env:TEMP = $short
+    } else {
+        Write-Host '  This drive gives folders no short names, so the temporary folder is spelled as usual and the runner may still differ.' -ForegroundColor Yellow
+    }
+    try {
+        & cargo test --workspace
+    } finally {
+        $env:TMP = $saved[0]
+        $env:TEMP = $saved[1]
+    }
+}
 
 # The second CI job. Needs a tool that may not be installed; say which rather
 # than passing silently.
