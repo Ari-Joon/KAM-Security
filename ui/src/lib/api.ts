@@ -46,6 +46,7 @@ import type {
   UnseenDownloads,
   TrafficReport,
   RootReport,
+  WingetAsked,
 } from "./types";
 
 /**
@@ -259,6 +260,13 @@ export const api = {
   takeLaunch: (archiveFree: boolean) =>
     invoke<Launch | null>("take_launch", { archiveFree }),
   launchWaiting: () => invoke<boolean>("launch_waiting"),
+
+  /**
+   * Which installed apps winget says have a newer version. Runs winget as
+   * the person: seconds, and its catalogue comes over the network. Lists
+   * only; nothing is installed.
+   */
+  newerVersions: () => invoke<WingetAsked>("newer_versions"),
 };
 
 /** Tauri rejects with a plain string; normalise anything else into one. */

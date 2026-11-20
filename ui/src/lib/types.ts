@@ -1617,3 +1617,28 @@ export type Launch = {
   action: "check" | "extract" | "show";
   path: string;
 };
+
+/** One app winget says has a newer version, as winget gave it. */
+export type NewerVersion = {
+  /** As winget shows it, which may be cut short and end in "…". */
+  name: string;
+  id: string;
+  /** Can be a range, such as "< 3.14.7". */
+  installed: string;
+  available: string;
+};
+
+/** What asking winget came to. See `winget.rs` in the shell. */
+export type WingetAnswer =
+  | { kind: "not_installed"; looked_at: string }
+  | { kind: "not_answered"; said: string }
+  | { kind: "not_recognised"; why: string; said: string }
+  | {
+      kind: "listed";
+      apps: NewerVersion[];
+      /** How many winget said it could not compare, when it said so. */
+      not_compared: number | null;
+      also_said: string[];
+    };
+
+export type WingetAsked = { answer: WingetAnswer; asked_at: string; took_ms: number };

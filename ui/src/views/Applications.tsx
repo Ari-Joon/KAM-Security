@@ -4,6 +4,7 @@ import * as fmt from "../lib/format";
 import PathLink from "../components/PathLink";
 import MeasuredAt, { whenMeasured } from "../components/MeasuredAt";
 import { KeptNote, NotKeptNote, UnreadableNote } from "../components/Kept";
+import NewerVersions from "../components/NewerVersions";
 import { recall, remember, type Kept } from "../lib/remembered";
 import type {
   AppFootprint,
@@ -1119,6 +1120,8 @@ export default function Applications({ volumes, onMeasured }: Props) {
           </div>
         )}
       </section>
+
+      <NewerVersions />
 
       {(report || preview) && (
         <section className="panel">

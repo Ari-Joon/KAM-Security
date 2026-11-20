@@ -19,6 +19,7 @@ mod seen;
 mod startup;
 mod uninstall;
 mod update;
+mod winget;
 
 use kam_core::audit::Record;
 use kam_ipc::{Request, Response, SystemStatus};
@@ -1489,6 +1490,14 @@ async fn launch_waiting(app: tauri::AppHandle) -> Result<bool, String> {
     off_the_window(move || Ok(app.state::<downloads::Downloads>().has_launch())).await
 }
 
+/// Which installed apps winget, Windows' own package tool, says have a newer
+/// version. Runs winget as the person, only when asked, and installs nothing.
+/// See `winget`.
+#[tauri::command]
+async fn newer_versions() -> Result<winget::Asked, String> {
+    off_the_window(|| Ok(winget::ask())).await
+}
+
 /// Version of the protocol this build speaks, so the UI can say plainly when it
 /// and the agent disagree rather than silently mis-rendering.
 #[tauri::command]
@@ -1704,7 +1713,8 @@ pub fn run() {
             downloads_looked,
             set_context_menu,
             take_launch,
-            launch_waiting
+            launch_waiting,
+            newer_versions
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| {
