@@ -31,6 +31,18 @@ const CATEGORY: Record<string, { colour: string; label: string }> = {
   run_once_key: { colour: "#2ec4b6", label: "Startup registry" },
   startup_item: { colour: "#e0a458", label: "Startup folder" },
   administrator: { colour: "#d96fa8", label: "Administrators" },
+  hosts_entry: { colour: "#a47148", label: "Where traffic is sent" },
+  dns_servers: { colour: "#a47148", label: "Where traffic is sent" },
+  proxy: { colour: "#a47148", label: "Where traffic is sent" },
+  root_certificate: { colour: "#4cc9f0", label: "Root certificates" },
+  browser_extension: { colour: "#b5179e", label: "Browser extensions" },
+  winlogon: { colour: "#9bc53d", label: "Quiet startup places" },
+  image_debugger: { colour: "#9bc53d", label: "Quiet startup places" },
+  exit_monitor: { colour: "#9bc53d", label: "Quiet startup places" },
+  logon_script: { colour: "#9bc53d", label: "Quiet startup places" },
+  appinit_dll: { colour: "#9bc53d", label: "Quiet startup places" },
+  wmi_subscription: { colour: "#9bc53d", label: "Quiet startup places" },
+  com_override: { colour: "#9bc53d", label: "Quiet startup places" },
 };
 
 const OTHER = { colour: "#6b7a99", label: "Other" };

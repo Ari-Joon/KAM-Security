@@ -40,8 +40,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use kam_core::changes::{Part, Reading, Sighting, Unreadable};
+use kam_core::changes::{Part, Reading, Sighting, Unreadable, NOT_A_FILE};
 use kam_scanner::persistence::{self, Anchor, Entry};
+use kam_scanner::{extensions, quiet, roots, traffic};
 
 /// The name a sighting is filed under for each kind of thing.
 ///
@@ -157,16 +158,22 @@ pub fn collect() -> Look {
     // as a source with nothing in it.
     let users = persistence::signed_in_users();
     let survey = persistence::survey_for(&users);
+    // The quieter places, for the machine and the same accounts, with the
+    // COM classes the tasks just read hand their work to.
+    let quiet = quiet::survey_for(&users, &persistence::com_handlers(&survey));
     // Signatures are verified once per distinct executable, not once per
     // entry: three hundred entries sit behind far fewer files.
     let mut trust: HashMap<PathBuf, String> = HashMap::new();
     let mut sightings: Vec<Sighting> = survey
         .entries
         .iter()
+        .chain(&quiet.entries)
         .map(|entry| sighting_of(entry, &mut trust))
         .collect();
 
     let mut unreadable = survey.unreadable;
+    unreadable.extend(quiet.unreadable);
+    settings(&users, &mut sightings, &mut unreadable);
 
     match administrators() {
         Ok(accounts) => sightings.extend(accounts),
@@ -202,7 +209,7 @@ pub fn collect() -> Look {
         // feature, switched off for the life of the machine, behind one polite
         // sentence.
         unreadable.push(Unreadable::covering(
-            &per_account_kinds(),
+            &account_kinds(),
             &missing.places,
             missing.what,
         ));
@@ -211,7 +218,171 @@ pub fn collect() -> Look {
     Look {
         seen: sightings,
         unreadable,
-        parts: users.iter().map(part_of).collect(),
+        parts: users
+            .iter()
+            .flat_map(|user| [part_of(user), later_part_of(user)])
+            .collect(),
+    }
+}
+
+/// Where this PC's traffic is sent, which root certificates it trusts and
+/// which extensions its browsers run, for the machine and each account
+/// signed in, as sightings.
+///
+/// None of these is a file, so none has a signature to vouch for it, and
+/// each is recorded as not a file, as an administrator is: the list of what
+/// nobody vouched for on a first look is about files.
+fn settings(
+    users: &[kam_core::UserContext],
+    seen: &mut Vec<Sighting>,
+    unreadable: &mut Vec<Unreadable>,
+) {
+    if let Some(hosts) = traffic::hosts(unreadable) {
+        seen.extend(hosts.entries.iter().map(|entry| Sighting {
+            kind: traffic::HOSTS_ENTRY.to_owned(),
+            scope: hosts.path.to_lowercase(),
+            // Names are not told apart by case, by Windows or by DNS.
+            name: entry.name.to_lowercase(),
+            detail: entry.addresses.join(", "),
+            trust: NOT_A_FILE.to_owned(),
+        }));
+    }
+    let (dns, _) = traffic::hand_set_dns(unreadable);
+    seen.extend(dns.iter().map(|set| Sighting {
+        kind: traffic::DNS_SERVERS.to_owned(),
+        scope: set.location.to_lowercase(),
+        name: format!("{} ({})", set.adapter, set.family.label()),
+        detail: set.servers.join(", "),
+        trust: NOT_A_FILE.to_owned(),
+    }));
+    if let Some(windows) = traffic::windows_proxy(unreadable) {
+        seen.extend(proxy_sightings(&windows));
+    }
+
+    let list = roots::MicrosoftList::read();
+    for store in roots::machine_stores(&list, unreadable) {
+        seen.extend(certificate_sightings(&store));
+    }
+
+    for user in users {
+        match traffic::proxy_of(user, unreadable) {
+            Some(proxy) => seen.extend(proxy_sightings(&proxy)),
+            // Gone while it was read, so its proxy is not known. A key that
+            // would not read has already said so.
+            None if persistence::hive_gone(user) => {
+                unreadable.push(signed_out(user, &[traffic::PROXY], "proxy"))
+            }
+            None => {}
+        }
+        match roots::account_stores(user, &list, unreadable) {
+            Some(stores) => {
+                for store in &stores {
+                    seen.extend(certificate_sightings(store));
+                }
+            }
+            None => unreadable.push(signed_out(
+                user,
+                &[roots::ROOT_CERTIFICATE],
+                "own root certificates",
+            )),
+        }
+        // Read from the profile folder, which is there whether or not
+        // anybody is signed in, so this has no hive to lose.
+        let browsers = extensions::survey(user);
+        seen.extend(browsers.extensions.iter().map(|extension| Sighting {
+            kind: extensions::BROWSER_EXTENSION.to_owned(),
+            // The profile folder, which names the account, the browser and
+            // the profile all at once.
+            scope: extension.profile_folder.to_lowercase(),
+            name: extension.id.clone(),
+            detail: match extension.source {
+                extensions::Source::Folder => format!(
+                    "{}, loaded from a folder on this PC: {}",
+                    extension.name, extension.path
+                ),
+                source => format!("{}, {}", extension.name, source.label()),
+            },
+            trust: NOT_A_FILE.to_owned(),
+        }));
+        unreadable.extend(browsers.unreadable);
+    }
+}
+
+/// A proxy as sightings: one for the server it sends requests through, and
+/// one for a configuration script, each only while it is set. Switching one
+/// on is an appearance, changing its address a change, switching it off a
+/// disappearance.
+fn proxy_sightings(proxy: &traffic::Proxy) -> Vec<Sighting> {
+    let mut found = Vec::new();
+    let scope = proxy.location.to_lowercase();
+    if let Some(server) = &proxy.server {
+        found.push(Sighting {
+            kind: traffic::PROXY.to_owned(),
+            scope: scope.clone(),
+            name: "proxy server".to_owned(),
+            detail: match &proxy.bypass {
+                Some(bypass) => format!("{server}, not used for {bypass}"),
+                None => server.clone(),
+            },
+            trust: NOT_A_FILE.to_owned(),
+        });
+    }
+    if let Some(script) = &proxy.script {
+        found.push(Sighting {
+            kind: traffic::PROXY.to_owned(),
+            scope,
+            name: "automatic configuration script".to_owned(),
+            detail: script.clone(),
+            trust: NOT_A_FILE.to_owned(),
+        });
+    }
+    found
+}
+
+/// One store's certificates as sightings: known by thumbprint, in the store
+/// as their scope. What else is recorded is the certificate's own and cannot
+/// change without the thumbprint changing, so a certificate is never
+/// reported as changed in place.
+fn certificate_sightings(store: &roots::Store) -> impl Iterator<Item = Sighting> + '_ {
+    store.certificates.iter().map(|certificate| Sighting {
+        kind: roots::ROOT_CERTIFICATE.to_owned(),
+        scope: store.location.to_lowercase(),
+        name: certificate.thumbprint.clone(),
+        detail: format!(
+            "{} (valid to {})",
+            certificate.name,
+            certificate
+                .expires
+                .as_deref()
+                .and_then(|expires| expires.get(..10))
+                .unwrap_or("a date that could not be read")
+        ),
+        trust: NOT_A_FILE.to_owned(),
+    })
+}
+
+/// An account that signed out while one of its own settings was read, as a
+/// gap confined to its own hive, so nothing of its is concluded to have gone.
+fn signed_out(user: &kam_core::UserContext, kinds: &[&str], what: &str) -> Unreadable {
+    let (_, hive) = account_of(user);
+    Unreadable::covering(
+        kinds,
+        &[hive],
+        format!(
+            "the account at {} signed out while its {what} was being read, so it is not shown",
+            user.profile()
+        ),
+    )
+}
+
+/// How an account is named in the store's record, and its hive as a place.
+///
+/// By SID, as the watcher names the same account, and its hive as the prefix
+/// its entries are filed under.
+fn account_of(user: &kam_core::UserContext) -> (String, String) {
+    match user.sid() {
+        Some(sid) => (sid.to_owned(), format!("HKEY_USERS\\{sid}\\")),
+        None => (user.profile().to_lowercase(), "HKCU\\".to_owned()),
     }
 }
 
@@ -221,10 +392,7 @@ pub fn collect() -> Look {
 /// are the prefixes its entries are filed under, its hive and its profile
 /// folder, the same two a gap for an account nobody is signed in as names.
 fn part_of(user: &kam_core::UserContext) -> Part {
-    let (name, hive) = match user.sid() {
-        Some(sid) => (sid.to_owned(), format!("HKEY_USERS\\{sid}\\")),
-        None => (user.profile().to_lowercase(), "HKCU\\".to_owned()),
-    };
+    let (name, hive) = account_of(user);
     Part::new(
         format!("startup of {name}"),
         &per_account_kinds(),
@@ -235,6 +403,51 @@ fn part_of(user: &kam_core::UserContext) -> Part {
             user.profile()
         ),
     )
+}
+
+/// One account's own proxy, root certificates, browser extensions and quieter
+/// startup places, as a part of what is compared.
+///
+/// A part of their own, not added to the account's startup part. That part is
+/// on record for every account a comparison has already met, so these kinds,
+/// which came after it, would be compared under it straight away: an account
+/// nobody was signed in as at the first comparison after this update would
+/// have its proxy, certificates and extensions reported as having appeared
+/// the first time it signed in again, though they had been there all along.
+/// A part not on record gives each account the first look its kinds had.
+fn later_part_of(user: &kam_core::UserContext) -> Part {
+    let (name, hive) = account_of(user);
+    Part::new(
+        format!("proxy, certificates, extensions and quiet places of {name}"),
+        &later_account_kinds(),
+        &[hive, format!("{}\\", user.profile())],
+        format!(
+            "The proxy, trusted root certificates, browser extensions and quieter startup \
+             places of the account at {} had not been looked at before, so they were recorded \
+             as they are this time and not compared with anything.",
+            user.profile()
+        ),
+    )
+}
+
+/// The kinds the later part holds: those that live inside one person's
+/// account and came after the account's startup part.
+fn later_account_kinds() -> Vec<&'static str> {
+    let mut kinds = vec![
+        traffic::PROXY,
+        roots::ROOT_CERTIFICATE,
+        extensions::BROWSER_EXTENSION,
+    ];
+    kinds.extend(quiet::PER_ACCOUNT.map(Anchor::kind));
+    kinds
+}
+
+/// Every kind that lives inside one person's account, which is what an
+/// account nobody was signed in as rules nothing out about.
+fn account_kinds() -> Vec<&'static str> {
+    let mut kinds = per_account_kinds();
+    kinds.extend(later_account_kinds());
+    kinds
 }
 
 /// How each kind this module files anything under is read, for the store to
@@ -251,7 +464,7 @@ pub fn readings() -> Vec<Reading> {
              they are and not compared with anything."
         )
     };
-    vec![
+    let mut readings = vec![
         Reading::of(
             kind_of(Anchor::RunKey),
             1,
@@ -294,7 +507,40 @@ pub fn readings() -> Vec<Reading> {
             never_before("Scheduled tasks"),
         ),
         Reading::of(ADMINISTRATOR, 1, never_before("The local administrators")),
-    ]
+    ];
+    // The kinds that came in together, after the store kept a number for
+    // each, so their first look is their own: nothing recorded them before.
+    // Each group shares one sentence, which the store says once.
+    let traffic_note = "Where this PC's traffic is sent (the hosts file, DNS servers set by hand \
+                        and proxies) had not been recorded before, so this time it was recorded \
+                        as it is and not compared with anything.";
+    let quiet_note = "The quieter places a program can be started from (the Windows sign-in \
+                      programs, debugger redirections, programs set to start when another \
+                      closes, sign-in scripts, AppInit libraries, WMI event subscriptions and \
+                      accounts' own registrations of the COM classes scheduled tasks use) had \
+                      not been recorded before, so this time they were recorded as they are \
+                      and not compared with anything.";
+    readings.extend([
+        Reading::of(traffic::HOSTS_ENTRY, 1, traffic_note),
+        Reading::of(traffic::DNS_SERVERS, 1, traffic_note),
+        Reading::of(traffic::PROXY, 1, traffic_note),
+        Reading::of(
+            roots::ROOT_CERTIFICATE,
+            1,
+            never_before("Trusted root certificates"),
+        ),
+        Reading::of(
+            extensions::BROWSER_EXTENSION,
+            1,
+            never_before("Browser extensions"),
+        ),
+    ]);
+    readings.extend(
+        quiet::PLACES
+            .iter()
+            .map(|(_, anchor)| Reading::of(kind_of(*anchor), 1, quiet_note)),
+    );
+    readings
 }
 
 /// The kinds that live inside one person's account rather than the machine's.
@@ -624,6 +870,33 @@ mod tests {
         assert_eq!(kind_of(Anchor::ScheduledTask), "scheduled_task");
         assert_eq!(kind_of(Anchor::StartupFolder), "startup_item");
         assert_eq!(kind_of(Anchor::RunOnceKey), "run_once_key");
+        assert_eq!(kind_of(Anchor::Winlogon), "winlogon");
+        assert_eq!(kind_of(Anchor::Debugger), "image_debugger");
+        assert_eq!(kind_of(Anchor::ExitMonitor), "exit_monitor");
+        assert_eq!(kind_of(Anchor::LogonScript), "logon_script");
+        assert_eq!(kind_of(Anchor::AppInit), "appinit_dll");
+        assert_eq!(kind_of(Anchor::WmiSubscription), "wmi_subscription");
+        assert_eq!(kind_of(Anchor::ComOverride), "com_override");
+        assert_eq!(traffic::HOSTS_ENTRY, "hosts_entry");
+        assert_eq!(traffic::DNS_SERVERS, "dns_servers");
+        assert_eq!(traffic::PROXY, "proxy");
+        assert_eq!(roots::ROOT_CERTIFICATE, "root_certificate");
+        assert_eq!(extensions::BROWSER_EXTENSION, "browser_extension");
+    }
+
+    /// The kinds that came after the store kept a number for each: where
+    /// traffic is sent, root certificates, browser extensions and the quieter
+    /// startup places.
+    fn later_kinds() -> Vec<&'static str> {
+        let mut kinds = vec![
+            traffic::HOSTS_ENTRY,
+            traffic::DNS_SERVERS,
+            traffic::PROXY,
+            roots::ROOT_CERTIFICATE,
+            extensions::BROWSER_EXTENSION,
+        ];
+        kinds.extend(quiet::PLACES.iter().map(|(_, anchor)| anchor.kind()));
+        kinds
     }
 
     /// Every kind is told to the store, and under the token the store was
@@ -635,16 +908,27 @@ mod tests {
     /// the second loses its own first look. A kind missing from the third is
     /// taken for new on a store that has held it for months, and everything
     /// that changed in it since the last sweep goes unreported.
+    ///
+    /// The kinds that came later are told too, and are not among those the
+    /// step wrote down: nothing recorded them before, so their first look,
+    /// recorded and not reported, is their own.
     #[test]
     fn every_kind_is_told_to_the_store_under_the_token_it_knows() {
         let mut told: Vec<String> = readings().into_iter().map(|one| one.kind).collect();
         told.sort();
         let mut known: Vec<String> = kam_core::changes::KINDS_BEFORE_READINGS
             .iter()
+            .chain(later_kinds().iter())
             .map(|kind| (*kind).to_owned())
             .collect();
         known.sort();
         assert_eq!(told, known);
+        for later in later_kinds() {
+            assert!(
+                !kam_core::changes::KINDS_BEFORE_READINGS.contains(&later),
+                "{later} would be taken for already looked at, and lose its first look"
+            );
+        }
 
         for reading in readings() {
             assert!(reading.version >= 1, "{reading:?}");
@@ -711,6 +995,283 @@ mod tests {
             after.differences
         );
         assert_eq!(after.afresh.len(), 1, "{:?}", after.afresh);
+    }
+
+    /// The readings as the version before this one told them: the kinds the
+    /// store has held all along, at the numbers they have now.
+    fn readings_before_the_later_kinds() -> Vec<Reading> {
+        readings()
+            .into_iter()
+            .filter(|reading| {
+                kam_core::changes::KINDS_BEFORE_READINGS.contains(&reading.kind.as_str())
+            })
+            .collect()
+    }
+
+    fn found(kind: &str, scope: &str, name: &str, detail: &str) -> Sighting {
+        Sighting {
+            kind: kind.to_owned(),
+            scope: scope.to_lowercase(),
+            name: name.to_owned(),
+            detail: detail.to_owned(),
+            trust: NOT_A_FILE.to_owned(),
+        }
+    }
+
+    /// What the later kinds find for the machine on one shaped like the
+    /// development machine, with one of each where it has none, spelled as
+    /// the readers file them.
+    fn machine_found() -> Vec<Sighting> {
+        vec![
+            found(
+                traffic::HOSTS_ENTRY,
+                r"C:\Windows\System32\drivers\etc\hosts",
+                "onlineconfigservice.ubi.com",
+                "192.168.1.155",
+            ),
+            found(
+                traffic::DNS_SERVERS,
+                r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{11111111-2222-3333-4444-555555555555}",
+                "VPN (IPv4)",
+                "10.7.0.2",
+            ),
+            found(
+                traffic::PROXY,
+                traffic::WINHTTP_LOCATION,
+                "proxy server",
+                "proxy.corp.example:3128",
+            ),
+            found(
+                roots::ROOT_CERTIFICATE,
+                r"HKLM\SOFTWARE\Microsoft\SystemCertificates\ROOT",
+                "5CF9D43A01717303FBAC4B3F04D12338D303F7C6",
+                "Blizzard Battle.net Local Cert (valid to 2036-02-17)",
+            ),
+            found(
+                roots::ROOT_CERTIFICATE,
+                r"HKLM\SOFTWARE\Microsoft\SystemCertificates\AuthRoot",
+                "D4DE20D05E66FC53FE1A50882C78DB2852CAE474",
+                "Baltimore CyberTrust Root (valid to 2025-05-12)",
+            ),
+            found(
+                kind_of(Anchor::Debugger),
+                r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe",
+                "taskmgr.exe",
+                r"C:\Tools\procexp64.exe",
+            ),
+            found(
+                kind_of(Anchor::WmiSubscription),
+                r#"ROOT\subscription:CommandLineEventConsumer.Name="Vendor""#,
+                "Vendor",
+                r"C:\Program Files\Vendor\agent.exe",
+            ),
+        ]
+    }
+
+    /// What the later kinds find in one account, spelled as the readers file
+    /// them: under its hive, or under its profile folder.
+    fn account_found(user: &kam_core::UserContext) -> Vec<Sighting> {
+        let (_, hive) = account_of(user);
+        let chrome = format!(
+            r"{}\AppData\Local\Google\Chrome\User Data\Default",
+            user.profile()
+        );
+        vec![
+            found(
+                traffic::PROXY,
+                &format!(r"{hive}Software\Microsoft\Windows\CurrentVersion\Internet Settings"),
+                "proxy server",
+                "127.0.0.1:8080",
+            ),
+            found(
+                roots::ROOT_CERTIFICATE,
+                &format!(r"{hive}Software\Microsoft\SystemCertificates\Root"),
+                "4503EADFFC69CBDC85BF4B77D1BD5E62B9AD4B89",
+                "A Developer's Own Root (valid to 2036-02-17)",
+            ),
+            found(
+                extensions::BROWSER_EXTENSION,
+                &chrome,
+                "jghecgabfgfdldnmbfkhmffcabddioke",
+                &format!(
+                    r"Volume Booster for Chrome, loaded from a folder on this PC: {}\Desktop\Projects\Volume Booster for Chrome",
+                    user.profile()
+                ),
+            ),
+            found(
+                extensions::BROWSER_EXTENSION,
+                &chrome,
+                "nmmhkkegccagdldgiimedpiccmgmieda",
+                "Google Docs Offline, installed from a store",
+            ),
+            found(
+                kind_of(Anchor::LogonScript),
+                &format!(r"{hive}Environment"),
+                "UserInitMprLogonScript",
+                &format!(r"{}\logon.cmd", user.profile()),
+            ),
+        ]
+    }
+
+    fn signed_in_entry(user: &kam_core::UserContext, name: &str) -> Sighting {
+        let (_, hive) = account_of(user);
+        Sighting {
+            kind: kind_of(Anchor::RunKey).to_owned(),
+            scope: format!(r"{hive}Software\Microsoft\Windows\CurrentVersion\Run").to_lowercase(),
+            name: name.to_owned(),
+            detail: format!(r"{}\AppData\Local\{name}\{name}.exe", user.profile()),
+            trust: "signed by Somebody Ltd".to_owned(),
+        }
+    }
+
+    /// The first comparison after this update reports none of what the
+    /// later kinds find as having appeared, for the machine or for any
+    /// account, including one nobody was signed in as that day.
+    ///
+    /// Without a first look of their own, a store that already held a
+    /// baseline would meet every hosts entry, certificate and extension for
+    /// the first time and report the lot: 57 certificates on the development
+    /// machine alone. And an account the store already knew, signing in again
+    /// after the update, would have its proxy, certificates and extensions
+    /// reported the same way, because its startup part is on record.
+    #[test]
+    fn the_first_comparison_after_the_update_reports_none_of_the_later_kinds() {
+        use kam_core::changes::{Change, TakenBy};
+
+        let store = kam_core::Store::open_in_memory().unwrap();
+        let her =
+            kam_core::UserContext::new(Some("S-1-5-21-1-2-3-1001".to_owned()), r"C:\Users\her");
+        let him =
+            kam_core::UserContext::new(Some("S-1-5-21-1-2-3-1002".to_owned()), r"C:\Users\him");
+        let service = Sighting {
+            kind: kind_of(Anchor::Service).to_owned(),
+            scope: r"hklm\system\currentcontrolset\services\thing".to_owned(),
+            name: "Thing".to_owned(),
+            detail: r"C:\Program Files\Thing\thing.exe".to_owned(),
+            trust: "signed by Thing Ltd".to_owned(),
+        };
+
+        // Before the update, with both of them signed in.
+        let before = vec![
+            service.clone(),
+            signed_in_entry(&her, "Helper"),
+            signed_in_entry(&him, "Sync"),
+        ];
+        for _ in 0..2 {
+            store
+                .compare(
+                    &before,
+                    &[],
+                    &readings_before_the_later_kinds(),
+                    &[part_of(&her), part_of(&him)],
+                    TakenBy::Page,
+                )
+                .unwrap();
+        }
+
+        // The first comparison after it. She is signed in and he is not.
+        let mut first_seen = vec![service.clone(), signed_in_entry(&her, "Helper")];
+        first_seen.extend(machine_found());
+        first_seen.extend(account_found(&her));
+        let his_absence = Unreadable::covering(
+            &account_kinds(),
+            &[
+                r"HKEY_USERS\S-1-5-21-1-2-3-1002\".to_owned(),
+                r"C:\Users\him\".to_owned(),
+            ],
+            "1 account on this machine was not signed in",
+        );
+        let first = store
+            .compare(
+                &first_seen,
+                &[his_absence],
+                &readings(),
+                &[part_of(&her), later_part_of(&her)],
+                TakenBy::Page,
+            )
+            .unwrap();
+        assert!(
+            first.differences.is_empty(),
+            "what the later kinds found was reported on their first look: {:#?}",
+            first.differences
+        );
+        // One sentence for each group of kinds, and none again for her.
+        assert_eq!(first.afresh.len(), 4, "{:#?}", first.afresh);
+
+        // He signs in again. What is his was there all along and is
+        // recorded for his own first look, not reported.
+        let mut second_seen = first_seen.clone();
+        second_seen.push(signed_in_entry(&him, "Sync"));
+        second_seen.extend(account_found(&him));
+        let everyone = [
+            part_of(&her),
+            later_part_of(&her),
+            part_of(&him),
+            later_part_of(&him),
+        ];
+        let second = store
+            .compare(&second_seen, &[], &readings(), &everyone, TakenBy::Page)
+            .unwrap();
+        assert!(
+            second.differences.is_empty(),
+            "his own, there all along, were reported as new when he signed in: {:#?}",
+            second.differences
+        );
+        assert_eq!(second.afresh, vec![later_part_of(&him).note]);
+
+        // From then on his are compared like anything else.
+        let mut third_seen = second_seen.clone();
+        third_seen.push(found(
+            extensions::BROWSER_EXTENSION,
+            r"C:\Users\him\AppData\Local\Google\Chrome\User Data\Default",
+            "aapocclcgogkmnckokdopfmhonfmgoek",
+            "Google Slides, installed from a store",
+        ));
+        let third = store
+            .compare(&third_seen, &[], &readings(), &everyone, TakenBy::Page)
+            .unwrap();
+        let reported: Vec<(&str, Change)> = third
+            .differences
+            .iter()
+            .map(|one| (one.name.as_str(), one.change))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![("aapocclcgogkmnckokdopfmhonfmgoek", Change::Appeared)]
+        );
+    }
+
+    /// An account's later part holds its own proxy, certificates, extensions
+    /// and quieter startup places, and nothing of the machine's, nor anything
+    /// of its startup part's.
+    #[test]
+    fn the_later_part_holds_the_accounts_own_settings_and_nothing_else() {
+        let her =
+            kam_core::UserContext::new(Some("S-1-5-21-1-2-3-1001".to_owned()), r"C:\Users\her");
+        let part = later_part_of(&her);
+        for sighting in account_found(&her) {
+            assert!(
+                part.holds(&sighting.kind, &sighting.scope),
+                "the account's own is not in its part: {sighting:?}"
+            );
+        }
+        for sighting in machine_found() {
+            assert!(
+                !part.holds(&sighting.kind, &sighting.scope),
+                "one of the machine's is in an account's part: {sighting:?}"
+            );
+        }
+        let entry = signed_in_entry(&her, "Helper");
+        assert!(
+            !part.holds(&entry.kind, &entry.scope),
+            "a sign-in entry is the startup part's"
+        );
+        assert!(!part_of(&her).holds(
+            extensions::BROWSER_EXTENSION,
+            r"c:\users\her\appdata\local\google\chrome\user data\default"
+        ));
+        assert_ne!(part.name, part_of(&her).name);
+        assert!(part.note.ends_with('.'), "{}", part.note);
     }
 
     /// What is compared for a service inside svchost.exe is the file it

@@ -1202,6 +1202,16 @@ impl Store {
             .map_err(to_db_error)?;
         drop(gone);
 
+        // Looked up rather than searched for. Searching what was seen once
+        // for every row on record costs the one count times the other, which
+        // was nothing at a few hundred startup entries and is minutes, inside
+        // this transaction, at the tens of thousands of names an ad blocker's
+        // hosts file holds.
+        let seen_now: std::collections::HashSet<(&str, &str, &str)> = seen
+            .iter()
+            .map(|one| (one.kind.as_str(), one.scope.as_str(), one.name.as_str()))
+            .collect();
+
         for Recorded {
             kind,
             scope,
@@ -1214,9 +1224,7 @@ impl Store {
             trust,
         } in candidates
         {
-            let still_here = seen
-                .iter()
-                .any(|one| one.kind == kind && one.scope == scope && one.name == name);
+            let still_here = seen_now.contains(&(kind.as_str(), scope.as_str(), name.as_str()));
             if still_here {
                 continue;
             }
@@ -1275,9 +1283,14 @@ impl Store {
                 continue;
             }
             // The very first sweep compares nothing at all, and the
-            // interface says so in its own words.
+            // interface says so in its own words. Kinds that came in
+            // together can share one sentence, which is said once.
             let uncompared = afresh.iter().any(|one| one.kind == reading.kind);
-            if uncompared && !baseline && !reading.note.is_empty() {
+            if uncompared
+                && !baseline
+                && !reading.note.is_empty()
+                && !afresh_said.contains(&reading.note)
+            {
                 afresh_said.push(reading.note.clone());
             }
             connection
@@ -1297,7 +1310,13 @@ impl Store {
                 continue;
             }
             let first = new_parts.iter().any(|new| new.name == part.name);
-            if first && !baseline && !part.note.is_empty() {
+            // A part whose every kind is new to the store this time is
+            // already said, in those kinds' own words, for every account.
+            let said_for_its_kinds = part
+                .kinds
+                .iter()
+                .all(|kind| afresh.iter().any(|reading| &reading.kind == kind));
+            if first && !baseline && !part.note.is_empty() && !said_for_its_kinds {
                 afresh_said.push(part.note.clone());
             }
             connection
@@ -3842,6 +3861,99 @@ mod tests {
         assert_eq!(
             readings_in(&store.lock().unwrap()),
             vec![("service".to_owned(), 2)]
+        );
+    }
+
+    /// Kinds that came in together can share the sentence that says they
+    /// were recorded afresh, and it is said once, not once for each.
+    #[test]
+    fn a_sentence_several_new_kinds_share_is_said_once() {
+        use crate::changes::Reading;
+
+        let store = Store::open_in_memory().unwrap();
+        store
+            .sweep_read_as(
+                &[seen("service", "One", "a")],
+                &[],
+                &[read_as("service", 1)],
+            )
+            .unwrap();
+
+        let shared = "Where this PC's traffic is sent had not been recorded before.";
+        let sweep = store
+            .sweep_read_as(
+                &[
+                    seen("service", "One", "a"),
+                    seen("hosts_entry", "example.com", "127.0.0.1"),
+                    seen("proxy", "proxy server", "127.0.0.1:8080"),
+                ],
+                &[],
+                &[
+                    read_as("service", 1),
+                    Reading::of("hosts_entry", 1, shared),
+                    Reading::of("dns_servers", 1, shared),
+                    Reading::of("proxy", 1, shared),
+                ],
+            )
+            .unwrap();
+        assert!(sweep.differences.is_empty(), "{:?}", sweep.differences);
+        assert_eq!(sweep.afresh, vec![shared.to_owned()]);
+    }
+
+    /// An account's part whose every kind is new to the store this time is
+    /// not said again for the account: the kinds' own sentence covers every
+    /// account. A part that holds a kind already on record is said.
+    #[test]
+    fn a_part_of_kinds_all_new_this_time_is_not_said_again_for_each_account() {
+        use crate::changes::{Part, Reading};
+
+        let store = Store::open_in_memory().unwrap();
+        store
+            .compare(
+                &[seen("service", "One", "a")],
+                &[],
+                &[read_as("service", 1)],
+                &[],
+                PAGE,
+            )
+            .unwrap();
+
+        let places = [
+            r"HKEY_USERS\S-1-5-21-1-2-3-1001\".to_owned(),
+            r"C:\Users\her\".to_owned(),
+        ];
+        let settings = Part::new(
+            "proxy of S-1-5-21-1-2-3-1001",
+            &["proxy"],
+            &places,
+            "her proxy was looked at for the first time",
+        );
+        let proxy = scoped(
+            "proxy",
+            r"hkey_users\s-1-5-21-1-2-3-1001\software\microsoft\windows\currentversion\internet settings",
+            "proxy server",
+            "127.0.0.1:8080",
+        );
+        let sweep = store
+            .compare(
+                &[seen("service", "One", "a"), proxy.clone()],
+                &[],
+                &[
+                    read_as("service", 1),
+                    Reading::of("proxy", 1, "Proxies were new."),
+                ],
+                &[settings.clone(), hers()],
+                PAGE,
+            )
+            .unwrap();
+        assert!(sweep.differences.is_empty(), "{:?}", sweep.differences);
+        assert_eq!(
+            sweep.afresh,
+            vec![
+                "Proxies were new.".to_owned(),
+                "her account was looked at for the first time".to_owned()
+            ],
+            "the proxy part was said beside the proxies' own sentence, or her startup part was not"
         );
     }
 

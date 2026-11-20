@@ -33,7 +33,46 @@ const KIND_LABEL: Record<string, string> = {
   run_once_key: "run-once registry entry",
   startup_item: "startup folder item",
   administrator: "administrator",
+  hosts_entry: "hosts file entry",
+  dns_servers: "DNS servers set by hand",
+  proxy: "proxy",
+  root_certificate: "trusted root certificate",
+  browser_extension: "browser extension",
+  winlogon: "Windows sign-in program",
+  image_debugger: "debugger redirection",
+  exit_monitor: "program started when another closes",
+  logon_script: "sign-in script",
+  appinit_dll: "AppInit library",
+  wmi_subscription: "WMI event subscription",
+  com_override: "account's own COM registration",
 };
+
+/**
+ * Kinds that are settings rather than files, so nobody's signature is ever
+ * recorded for them and none is shown.
+ */
+const NOT_FILES = new Set([
+  "hosts_entry",
+  "dns_servers",
+  "proxy",
+  "root_certificate",
+  "browser_extension",
+]);
+
+/**
+ * The root store Windows fills by itself, adding certificates from
+ * Microsoft's list as sites that use them are visited. Arrivals there are
+ * Windows doing its job, so they are counted rather than listed, as Windows'
+ * own tasks are. One leaving, or anything arriving in any other store, is
+ * listed.
+ */
+function isWindowsOwnRoot(item: Difference): boolean {
+  return (
+    item.kind === "root_certificate" &&
+    item.change === "appeared" &&
+    item.scope.toLowerCase() === "hklm\\software\\microsoft\\systemcertificates\\authroot"
+  );
+}
 
 /**
  * Windows' own scheduled tasks, which turn over about 9% a month as Windows
@@ -118,7 +157,12 @@ function Row({ item, whole }: { item: Difference; whole: boolean }) {
               {item.times_seen > 1 ? ` · seen ${fmt.count(item.times_seen)} times` : null}
             </>
           )}
-          {item.was_trusted || !whole ? null : <>{" · "}{item.trust}</>}
+          {item.was_trusted || !whole || NOT_FILES.has(item.kind) ? null : (
+            <>
+              {" · "}
+              {item.trust}
+            </>
+          )}
         </div>
       </div>
     </li>
@@ -171,18 +215,24 @@ function List({
   before: TakenBy | null;
   onNewest: () => void;
 }) {
-  const { shown, windowsTasks } = useMemo(() => {
+  const { shown, windowsTasks, windowsRoots } = useMemo(() => {
     const shown: Difference[] = [];
     let windowsTasks = 0;
+    let windowsRoots = 0;
     // The agent already orders these most-notable-first, with a disappearance
     // ranked above an appearance. That ordering is deliberate and is not
     // re-sorted here.
     for (const item of list.differences) {
       if (isWindowsOwnTask(item)) windowsTasks += 1;
+      else if (isWindowsOwnRoot(item)) windowsRoots += 1;
       else shown.push(item);
     }
-    return { shown, windowsTasks };
+    return { shown, windowsTasks, windowsRoots };
   }, [list]);
+  const windowsOwn = [
+    windowsTasks > 0 ? "Windows' own tasks" : null,
+    windowsRoots > 0 ? "the certificates Windows adds by itself" : null,
+  ].filter((part): part is string => part !== null);
 
   const total = shown.length;
   const unread = list.unreadable.length > 0;
@@ -217,8 +267,8 @@ function List({
                 ? "Nothing changed in what could be read"
                 : !complete
                   ? "Nothing changed in what was compared"
-                  : windowsTasks > 0
-                    ? "Only Windows' own tasks changed"
+                  : windowsOwn.length > 0
+                    ? `Only ${windowsOwn.join(" and ")} changed`
                     : "Nothing changed"}
         </h2>
         {total > 0 ? <span className="panel-count">{total}</span> : null}
@@ -302,8 +352,9 @@ function List({
         <p className="empty">
           {complete ? (
             <>
-              Nothing that starts itself or holds a privilege {changed} since{" "}
-              {since}.
+              Nothing this looks at {changed} since {since}: what starts itself,
+              who can administer the machine, where its traffic is sent, which
+              root certificates it trusts and which extensions its browsers run.
             </>
           ) : unread && afresh.length > 0 ? (
             <>
@@ -340,6 +391,16 @@ function List({
           {fmt.count(windowsTasks)} of Windows' own scheduled tasks also
           changed. Those turn over as Windows updates itself, so they are
           counted here rather than listed.
+        </p>
+      ) : null}
+
+      {windowsRoots > 0 ? (
+        <p className="footnote">
+          {fmt.count(windowsRoots)}{" "}
+          {windowsRoots === 1 ? "certificate also arrived" : "certificates also arrived"} in
+          the root store Windows fills by itself from Microsoft's list. Windows
+          adds those as sites that use them are visited, so they are counted
+          here rather than listed.
         </p>
       ) : null}
     </section>
@@ -423,10 +484,13 @@ export default function Changes({
         <div>
           <h1>What changed</h1>
           <p className="lede">
-            The things that start themselves or hold a privilege, compared
-            against the last time this machine was looked at. A change is not a
-            problem: software installs itself, updates move things. This says
-            what is different and leaves the conclusion to you.
+            The things that start themselves or hold a privilege, where this
+            machine's traffic is sent, the root certificates it trusts and the
+            extensions its browsers run, compared against the last time this
+            machine was looked at. A change is not a problem: software installs
+            itself, updates move things, and people change these settings on
+            purpose. This says what is different and leaves the conclusion to
+            you.
           </p>
         </div>
       </div>
