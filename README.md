@@ -319,6 +319,35 @@ detections against a large majority is the everyday signature of a false
 positive, and the interface says so in as many words rather than colouring it
 red.
 
+### What Windows already knows, in one place
+
+Some of the plainest facts about a PC's safety are known to Windows and shown
+across several of its screens, or none. KAM gathers four of them, each with
+where it came from, and none with a verdict:
+
+- **Windows Update**, on the Overview: the build Windows is on, the newest
+  update to the system itself and when it was installed (matched by the running
+  build, not by the date of the last thing installed, which counts Defender's
+  daily definitions and Store apps), whether a restart is waiting, and whether
+  updates are paused and until when. It never says "up to date": from the PC
+  alone nobody can know whether a newer update exists.
+- **Newer versions, according to winget**, on Applications: one button asks
+  winget, Windows' own package tool, which installed programs have a newer
+  version. It runs as you, uses the network and takes seconds, so it runs only
+  when asked. It lists, and never installs. winget prints a table rather than
+  data, so the table is read by column position and checked against winget's
+  own count, and an answer that does not add up is said to be one that could
+  not be read.
+- **This device**, on the Scanner: Secure Boot, the security chip (TPM), whether
+  drive C: is encrypted, and whether Remote Desktop is on and anything is
+  listening for it. An empty answer is "could not be read", never "none".
+- **What Defender has been told to skip.** Windows shows Defender's exclusions
+  only to an administrator, on purpose: they tell an attacker where Defender
+  does not look. So the panel shows nothing about them, not even how many,
+  until you press its button and approve Windows' own permission prompt. The
+  list is gone when you leave the page, and the Activity log records that it
+  was read and how many entries it held, never the entries.
+
 ## Cleaning, and what it refuses to do
 
 There is no registry cleaner and no health score. Both are how this category of
