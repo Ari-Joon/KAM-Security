@@ -157,7 +157,7 @@ const KNOWN: &[(&str, &str, &str, bool)] = &[
     (
         "e6db77e5-3df2-4cf1-b95a-636979351e5b",
         "Block persistence through WMI event subscription",
-        "A way of arranging to be run again that leaves nothing in the startup folders, the Run keys, or the task store, and so is invisible to most tools that list what starts itself, including this one.",
+        "A way of arranging to be run again that leaves nothing in the startup folders, the Run keys, or the task store, and so is invisible to most tools that list what starts itself. This one reads these subscriptions with the quiet startup places, and names one that runs a command or a script.",
         true,
     ),
     (

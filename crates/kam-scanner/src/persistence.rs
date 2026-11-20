@@ -17,12 +17,14 @@
 //! - scheduled tasks, which are read as files because the COM interface for
 //!   them is an unpleasant dependency for what amounts to reading XML
 //!
-//! Deliberately absent: WMI event subscriptions, COM hijacks, AppInit DLLs,
-//! image-file-execution options. They are real techniques, they are also almost
-//! never what is bothering a person cleaning up their own machine, and each one
-//! added would dilute a list whose value is that it is short enough to read.
-//! The interface says which places were examined rather than implying the
-//! result is exhaustive.
+//! Not read here: WMI event subscriptions, COM hijacks, AppInit DLLs,
+//! image-file-execution options and the like. They are real techniques, they
+//! are also almost never what is bothering a person cleaning up their own
+//! machine, and each one listed would dilute a list whose value is that it is
+//! short enough to read. [`crate::quiet`] reads them apart, and has an entry
+//! only for a place set beyond what Windows ships, so they lengthen the list
+//! only on the day one is used. The interface says which places were examined
+//! rather than implying the result is exhaustive.
 //!
 //! # What an entry actually runs
 //!
