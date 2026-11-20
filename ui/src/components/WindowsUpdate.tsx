@@ -36,19 +36,15 @@ function listed(names: string[]): string {
 /** What the two registry marks for a waiting restart say, in words. */
 function marks(restart: WindowsUpdateReport["restart"]): { there: string[]; unread: string[] } {
   const said = { there: [] as string[], unread: [] as string[] };
-  const mark = (reading: Reading<boolean>, there: string, name: string) => {
-    if (reading.state === "unread") said.unread.push(`${name} could not be read: ${stop(reading.why)}`);
+  // An unread mark's reason names the mark itself.
+  const mark = (reading: Reading<boolean>, there: string) => {
+    if (reading.state === "unread") said.unread.push(stop(reading.why));
     else if (reading.value) said.there.push(there);
   };
-  mark(
-    restart.update_marker,
-    "Windows Update's mark for a waiting restart is in the registry.",
-    "Windows Update's mark for a waiting restart",
-  );
+  mark(restart.update_marker, "Windows Update's mark for a waiting restart is in the registry.");
   mark(
     restart.servicing_marker,
     "Windows' servicing has marked a restart as pending in the registry.",
-    "Windows' servicing mark for a pending restart",
   );
   return said;
 }
@@ -61,7 +57,7 @@ function restartSentence(restart: WindowsUpdateReport["restart"]): string {
       : "No restart is waiting to finish an update, according to Windows Update.";
   }
   const both = [restart.update_marker, restart.servicing_marker];
-  const unasked = `Windows Update could not be asked whether a restart is waiting (${asked.why}).`;
+  const unasked = stop(asked.why);
   if (both.some((mark) => mark.state === "read" && mark.value)) {
     return `${unasked} A restart is waiting to finish an update, according to the registry.`;
   }
@@ -131,12 +127,12 @@ export default function WindowsUpdate() {
         <ul className="entries compact">
           <li className="entry">
             <div className="entry-body">
-              <span className="action">
+              <span className="setting-label">
                 {build?.state === "read"
                   ? `Windows is on build ${build.value.build}${
                       build.value.revision !== null ? `.${build.value.revision}` : ""
                     }${build.value.version ? `, version ${build.value.version}` : ""}, according to Windows' own record of its version.`
-                  : `The build Windows is on could not be read: ${stop(build?.why ?? "")}`}
+                  : `The build Windows is on is not known. ${stop(build?.why ?? "")}`}
               </span>
             </div>
           </li>
@@ -144,14 +140,14 @@ export default function WindowsUpdate() {
           <li className="entry">
             <div className="entry-body">
               {newest?.kind === "history" && (
-                <span className="action">
+                <span className="setting-label">
                   The update that brought this build, {newest.title}, was installed on{" "}
                   {day(newest.installed_at)}, according to Windows Update's history.
                 </span>
               )}
               {newest?.kind === "list" && (
                 <>
-                  <span className="action">
+                  <span className="setting-label">
                     {newest.updates.length === 1
                       ? `The newest entry in Windows' list of installed updates is ${newest.updates[0]}, installed on ${day(newest.installed_on)}.`
                       : `The newest entries in Windows' list of installed updates are ${listed(newest.updates)}, installed on ${day(newest.installed_on)}.`}
@@ -163,8 +159,8 @@ export default function WindowsUpdate() {
                 </>
               )}
               {newest?.kind === "unread" && (
-                <span className="action">
-                  When Windows last installed an update could not be read. {stop(newest.why)}
+                <span className="setting-label">
+                  When Windows last installed an update is not known. {stop(newest.why)}
                 </span>
               )}
             </div>
@@ -172,7 +168,7 @@ export default function WindowsUpdate() {
 
           <li className="entry">
             <div className="entry-body">
-              <span className="action">{restartSentence(report.restart)}</span>
+              <span className="setting-label">{restartSentence(report.restart)}</span>
               {extraMarks.map((line) => (
                 <span key={line} className="detail">
                   {line}
@@ -183,9 +179,9 @@ export default function WindowsUpdate() {
 
           <li className="entry">
             <div className="entry-body">
-              <span className="action">
+              <span className="setting-label">
                 {pause?.state === "unread"
-                  ? `Whether updates are paused could not be read: ${stop(pause.why)}`
+                  ? `Whether updates are paused is not known. ${stop(pause.why)}`
                   : pause?.value.kind === "until"
                     ? `Updates are paused until ${day(pause.value.at)}, according to the Windows Update settings.`
                     : pause?.value.kind === "ended"
@@ -200,7 +196,7 @@ export default function WindowsUpdate() {
           {disabled?.state === "read" && disabled.value && (
             <li className="entry">
               <div className="entry-body">
-                <span className="action">
+                <span className="setting-label">
                   The Windows Update service is set to Disabled, according to its settings in the
                   registry.
                 </span>
@@ -210,8 +206,8 @@ export default function WindowsUpdate() {
           {disabled?.state === "unread" && (
             <li className="entry">
               <div className="entry-body">
-                <span className="action">
-                  Whether the Windows Update service is switched off could not be read:{" "}
+                <span className="setting-label">
+                  Whether the Windows Update service is switched off is not known.{" "}
                   {stop(disabled.why)}
                 </span>
               </div>

@@ -106,7 +106,7 @@ function remoteDesktop(fact: DeviceRemoteDesktop): string {
       ? `its port (${fact.port})`
       : "3389, its usual port, as Windows records none";
   if (fact.listening.state === "unread") {
-    return `${switched}. Whether anything is listening on ${port} could not be read: ${stop(fact.listening.why)}`;
+    return `${switched}. Whether anything is listening on ${port} is not known. ${stop(fact.listening.why)}`;
   }
   return `${switched}, and ${fact.listening.value ? "something is" : "nothing is"} listening on ${port}.`;
 }
@@ -148,13 +148,13 @@ export default function DeviceFacts() {
             <div className="entry-body">
               {facts.secure_boot.state === "read" ? (
                 secureBoot(facts.secure_boot.value).map((line, index) => (
-                  <span key={line} className={index === 0 ? "action" : "detail"}>
+                  <span key={line} className={index === 0 ? "setting-label" : "detail"}>
                     {line}
                   </span>
                 ))
               ) : (
-                <span className="action">
-                  Whether Secure Boot is on could not be read: {stop(facts.secure_boot.why)}
+                <span className="setting-label">
+                  Whether Secure Boot is on is not known. {stop(facts.secure_boot.why)}
                 </span>
               )}
               <span className="detail">
@@ -167,7 +167,7 @@ export default function DeviceFacts() {
             <div className="entry-body">
               {facts.tpm.state === "read" ? (
                 <>
-                  <span className="action">{tpm(facts.tpm.value)}</span>
+                  <span className="setting-label">{tpm(facts.tpm.value)}</span>
                   {facts.tpm.value.instead_of && (
                     <span className="detail">
                       {stop(facts.tpm.value.instead_of)} So this is tpmtool's answer, run as
@@ -176,8 +176,8 @@ export default function DeviceFacts() {
                   )}
                 </>
               ) : (
-                <span className="action">
-                  Whether this PC has a TPM could not be read: {stop(facts.tpm.why)}
+                <span className="setting-label">
+                  Whether this PC has a TPM is not known. {stop(facts.tpm.why)}
                 </span>
               )}
               <span className="detail">
@@ -191,7 +191,7 @@ export default function DeviceFacts() {
             <div className="entry-body">
               {facts.encryption.state === "read" ? (
                 <>
-                  <span className="action">{encryption(facts.encryption.value)}</span>
+                  <span className="setting-label">{encryption(facts.encryption.value)}</span>
                   {facts.encryption.value.instead_of && (
                     <span className="detail">
                       {stop(facts.encryption.value.instead_of)} So this is what Explorer
@@ -200,8 +200,8 @@ export default function DeviceFacts() {
                   )}
                 </>
               ) : (
-                <span className="action">
-                  Whether drive C: is encrypted could not be read: {stop(facts.encryption.why)}
+                <span className="setting-label">
+                  Whether drive C: is encrypted is not known. {stop(facts.encryption.why)}
                 </span>
               )}
               <span className="detail">
@@ -213,10 +213,10 @@ export default function DeviceFacts() {
 
           <li className="entry">
             <div className="entry-body">
-              <span className="action">
+              <span className="setting-label">
                 {facts.remote_desktop.state === "read"
                   ? remoteDesktop(facts.remote_desktop.value)
-                  : `Whether Remote Desktop is on could not be read: ${stop(facts.remote_desktop.why)}`}
+                  : `Whether Remote Desktop is on is not known. ${stop(facts.remote_desktop.why)}`}
               </span>
               <span className="detail">
                 Remote Desktop lets another computer sign in to this one over the network.

@@ -153,7 +153,11 @@ pub fn survey() -> Report {
     let (windows_update, history) = match &com {
         Ok(_) => (restart_from_windows_update(), history()),
         Err(why) => (
-            Reading::Unread { why: why.clone() },
+            Reading::Unread {
+                why: format!(
+                    "Windows Update could not be asked whether a restart is waiting: {why}"
+                ),
+            },
             Err(format!("Windows Update's history could not be read: {why}")),
         ),
     };
@@ -165,8 +169,11 @@ pub fn survey() -> Report {
         newest,
         restart: Restart {
             windows_update,
-            update_marker: marker(UPDATE_MARKER),
-            servicing_marker: marker(SERVICING_MARKER),
+            update_marker: marker(UPDATE_MARKER, "Windows Update's mark for a waiting restart"),
+            servicing_marker: marker(
+                SERVICING_MARKER,
+                "Windows' servicing mark for a pending restart",
+            ),
         },
         pause: read_pause(&kam_core::clock::now_utc_iso()),
         service_disabled: read_service_disabled(),
@@ -240,7 +247,7 @@ fn restart_from_windows_update() -> Reading<bool> {
             value: required.as_bool(),
         },
         Err(error) => Reading::Unread {
-            why: format!("Windows Update could not be asked: {error}"),
+            why: format!("Windows Update could not be asked whether a restart is waiting: {error}"),
         },
     }
 }
@@ -444,11 +451,11 @@ fn iso_from_ole_date(date: f64) -> Option<String> {
         .then(|| kam_core::clock::iso_from_unix_millis(millis.round() as u64))
 }
 
-fn marker(path: &str) -> Reading<bool> {
+fn marker(path: &str, name: &str) -> Reading<bool> {
     match Key::look(HKEY_LOCAL_MACHINE, path, View::Native) {
         Ok(_) => Reading::Read { value: true },
         Err(Unopened::Absent) => Reading::Read { value: false },
-        Err(why) => unread("The mark", why),
+        Err(why) => unread(name, why),
     }
 }
 

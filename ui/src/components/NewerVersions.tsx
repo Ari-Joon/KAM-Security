@@ -113,7 +113,7 @@ export default function NewerVersions() {
               {answer.apps.map((app) => (
                 <li key={`${app.id}\u0000${app.installed}`} className="entry">
                   <div className="entry-body">
-                    <span className="action">
+                    <span className="setting-label">
                       {app.name}: {app.installed} installed, {app.available}{" "}
                       available, according to winget.
                     </span>
