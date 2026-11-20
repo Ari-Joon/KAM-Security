@@ -146,26 +146,18 @@ export const api = {
   deleteQuarantined: (id: string) => invoke<Removal>("delete_quarantined", { id }),
   emptyQuarantine: () => invoke<Removal>("empty_quarantine"),
   /**
-   * Send something to the Recycle Bin.
+   * Send something to the Recycle Bin, or leave it exactly where it is.
    *
    * Done in this process rather than by the agent, and that is deliberate: the
    * Recycle Bin is per user, so a delete performed by the LocalSystem service
    * would land in SYSTEM's bin where nobody can reach it. Here it goes to the
    * person's own, and needs no privilege at all.
    *
-   * `in_bin` is false when the item is gone but never arrived — Windows does
-   * that silently for anything too large for the bin — and `warning` says so in
-   * words. Do not report a recycle without checking it.
-   */
-  recycleItem: (path: string) =>
-    invoke<{ in_bin: boolean; warning: string | null }>("recycle_item", { path }),
-  /**
-   * Send something to the Recycle Bin, or leave it exactly where it is.
-   *
-   * `recycleItem` reports afterwards when Windows deleted an item outright
-   * because the bin could not take it. This stops that delete before it
-   * happens and rejects with why the file is still there. For the list of
-   * large old files, where too large for the bin is the ordinary case.
+   * Windows deletes an item outright, silently, when the bin cannot take it.
+   * This stops that delete before it happens and rejects with why the item is
+   * still there. Should it go all the same, `in_bin` is false and `warning`
+   * says so; `in_bin` with a `warning` means the bin could not be counted to
+   * confirm it arrived. Do not report a recycle without checking both.
    */
   recycleOrLeave: (path: string) =>
     invoke<{ in_bin: boolean; warning: string | null }>("recycle_or_leave", { path }),

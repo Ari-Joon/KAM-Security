@@ -514,20 +514,22 @@ async fn check_still_twins(remove: String, keep: String) -> Result<(), String> {
     .await
 }
 
-/// Send one thing to the Recycle Bin.
+/// Send one thing to the Recycle Bin, or leave it exactly where it is.
 ///
 /// Done here rather than through the agent, and that is the point rather than a
 /// convenience: the Recycle Bin is per user, so a LocalSystem delete lands in
 /// SYSTEM's bin where the person cannot see it or get it back. This process
 /// runs as them. See `recycle` for the rest of the reasoning.
 ///
-/// `in_bin` is false when the item is gone but did not reach the bin, which
-/// Windows does silently for items too large for it. The window must say so
-/// rather than repeating the reassurance.
+/// Windows deletes an item outright, silently, when the bin cannot take it.
+/// This stops Windows before it does and says why the item is still there:
+/// see `recycle::to_recycle_bin_or_leave`. Every Recycle Bin button on Cleanup
+/// comes here. `in_bin` is false if the item went without reaching the bin all
+/// the same, and the window must say so rather than repeating the reassurance.
 #[tauri::command]
-async fn recycle_item(path: String) -> Result<RecycleOutcome, String> {
+async fn recycle_or_leave(path: String) -> Result<RecycleOutcome, String> {
     off_the_window(move || {
-        let outcome = recycle::to_recycle_bin(std::path::Path::new(&path))?;
+        let outcome = recycle::to_recycle_bin_or_leave(std::path::Path::new(&path))?;
 
         // Recorded after the fact, and only after it worked.
         //
@@ -551,32 +553,6 @@ async fn recycle_item(path: String) -> Result<RecycleOutcome, String> {
             eprintln!("the recycle could not be recorded in the audit log: {error}");
         }
 
-        Ok(RecycleOutcome {
-            in_bin: outcome.in_bin,
-            warning: outcome.warning,
-        })
-    })
-    .await
-}
-
-/// Send one thing to the Recycle Bin, or leave it exactly where it is.
-///
-/// For the list of large old files, where a file too large for the bin is the
-/// ordinary case and not the rare one. [`recycle_item`] reports afterwards
-/// that Windows deleted such a file outright. This stops Windows before it
-/// does and says why the file is still there: see
-/// `recycle::to_recycle_bin_or_leave`. Recorded as [`recycle_item`] records,
-/// after it worked and for the reasons given there.
-#[tauri::command]
-async fn recycle_or_leave(path: String) -> Result<RecycleOutcome, String> {
-    off_the_window(move || {
-        let outcome = recycle::to_recycle_bin_or_leave(std::path::Path::new(&path))?;
-        if let Err(error) = kam_ipc::client::call(&Request::RecordRecycle {
-            path,
-            in_bin: outcome.in_bin,
-        }) {
-            eprintln!("the recycle could not be recorded in the audit log: {error}");
-        }
         Ok(RecycleOutcome {
             in_bin: outcome.in_bin,
             warning: outcome.warning,
@@ -1766,7 +1742,6 @@ pub fn run() {
             empty_quarantine,
             sweep_for_changes,
             read_comparison,
-            recycle_item,
             recycle_or_leave,
             can_recycle_all,
             reveal_in_explorer,

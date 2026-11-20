@@ -27,8 +27,10 @@
 //! Windows permanently deletes rather than recycles when an item will not fit
 //! in the bin, and with confirmations suppressed it does so silently. Telling
 //! somebody their 12 GB folder is "in the Recycle Bin" when it has actually
-//! been destroyed would be the worst thing this module could do, so the bin is
-//! counted before and after and the answer says which really happened.
+//! been destroyed would be the worst thing this module could do. So the delete
+//! is watched and stopped before Windows destroys anything, which leaves the
+//! item where it was, and the bin is counted before and after as well, so the
+//! answer says what really happened even if Windows does something else.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -142,36 +144,27 @@ impl Drop for Com {
     }
 }
 
-/// Send one path to the Recycle Bin.
+/// Send one path to the Recycle Bin, or leave it exactly where it is.
+///
+/// # Why not simply ask Windows to recycle it
+///
+/// When an item is larger than the bin on its drive is set to hold, or the bin
+/// is switched off for that drive, Windows deletes the item outright, and with
+/// its own question suppressed it does so without a word. Counting the bin
+/// afterwards can say that it happened, which is an honest report of
+/// something that cannot be taken back, and nothing more. Every Recycle Bin
+/// button promises the bin and no permanent delete: for leftovers, for
+/// duplicate copies and for the large old files, where too large for the bin
+/// is the ordinary case.
+///
+/// Windows tells whoever is watching a delete, before each item goes, whether
+/// it is about to be recycled. [`RecycleOrStop`] watches, and stops the delete
+/// when the answer is no. The item is then still there, and the person is
+/// told why. The bin is still counted, in case Windows does something else.
 ///
 /// Fails rather than falling back to a permanent delete. If the item is gone
 /// but the bin did not gain anything, that is reported in `warning` rather than
 /// being quietly presented as a recycle.
-pub fn to_recycle_bin(path: &Path) -> Result<Recycled, String> {
-    send(path, None)
-}
-
-/// Send one path to the Recycle Bin, or leave it exactly where it is.
-///
-/// # Why there is a second way to do this
-///
-/// [`to_recycle_bin`] asks Windows to recycle and then counts the bin to see
-/// whether it did. When an item is larger than the bin on its drive is set to
-/// hold, or the bin is switched off for that drive, Windows deletes the item
-/// outright, and with its own question suppressed it does so without a word.
-/// The count then says so, afterwards. That is an honest report of something
-/// that cannot be taken back.
-///
-/// For the leftovers and duplicate copies that function serves, the item is
-/// usually small and the report has been judged enough. The list of large old
-/// files is the opposite case in both respects: every row is large, which is
-/// exactly when the bin cannot take it, and the list promises a Recycle Bin
-/// button and no permanent delete. So that list uses this.
-///
-/// Windows tells whoever is watching a delete, before each item goes, whether
-/// it is about to be recycled. [`RecycleOrStop`] watches, and stops the delete
-/// when the answer is no. The file is then still there, and the person is
-/// told why.
 pub fn to_recycle_bin_or_leave(path: &Path) -> Result<Recycled, String> {
     let stopped = Arc::new(AtomicBool::new(false));
     let watcher: IFileOperationProgressSink = RecycleOrStop {
@@ -179,14 +172,14 @@ pub fn to_recycle_bin_or_leave(path: &Path) -> Result<Recycled, String> {
     }
     .into();
 
-    let outcome = send(path, Some(&watcher));
+    let outcome = send(path, &watcher);
     if !stopped.load(Ordering::SeqCst) {
         return outcome;
     }
     if path.exists() {
         return Err(format!(
             "{} was left where it is. Windows was not going to put it in the Recycle \
-             Bin, and would have deleted it outright: that happens when a file is \
+             Bin, and would have deleted it outright: that happens when something is \
              larger than the Recycle Bin on its drive is set to hold, or when the bin \
              is switched off for that drive",
             path.display()
@@ -354,8 +347,8 @@ impl IFileOperationProgressSink_Impl for RecycleOrStop_Impl {
     }
 }
 
-/// Ask Windows to recycle one path, with or without somebody watching.
-fn send(path: &Path, watcher: Option<&IFileOperationProgressSink>) -> Result<Recycled, String> {
+/// Ask Windows to recycle one path, with `watcher` told before each delete.
+fn send(path: &Path, watcher: &IFileOperationProgressSink) -> Result<Recycled, String> {
     if !path.exists() {
         return Err(format!("{} is not there", path.display()));
     }
@@ -378,7 +371,7 @@ fn send(path: &Path, watcher: Option<&IFileOperationProgressSink>) -> Result<Rec
             .map_err(|error| format!("{} could not be opened: {error}", path.display()))?;
 
         operation
-            .DeleteItem(&item, watcher)
+            .DeleteItem(&item, Some(watcher))
             .map_err(|error| format!("{} could not be queued: {error}", path.display()))?;
 
         operation.PerformOperations().map_err(|error| {
@@ -471,6 +464,11 @@ pub fn deletable_by_this_account(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// Being watched changes nothing for a file the bin can take: it goes to
+    /// the bin, and the bin gains it. This is also what shows, on the machine
+    /// the tests run on, that Windows does hand the watcher "recycle if
+    /// possible" for a file it is going to recycle. If it did not, every
+    /// Recycle Bin button would leave every file where it was.
     #[test]
     fn a_file_goes_to_the_bin_and_can_be_found_there() {
         let scratch = std::env::temp_dir().join(format!("kam-recycle-{}", std::process::id()));
@@ -480,7 +478,7 @@ mod tests {
         std::fs::write(&victim, b"this can go").unwrap();
 
         let before = bin_count();
-        let result = to_recycle_bin(&victim).expect("a small file should recycle");
+        let result = to_recycle_bin_or_leave(&victim).expect("a small file should recycle");
 
         assert!(!victim.exists(), "the file is still on disk");
         assert!(
@@ -533,31 +531,6 @@ mod tests {
         assert!(stopped.load(Ordering::SeqCst));
     }
 
-    /// Being watched changes nothing for a file the bin can take: it goes to
-    /// the bin as before. This is also what shows, on the machine the tests
-    /// run on, that Windows does hand the watcher "recycle if possible" for a
-    /// file it is going to recycle. If it did not, every use of this would
-    /// leave the file where it was.
-    #[test]
-    fn a_file_the_bin_can_take_still_goes_to_it_when_the_delete_is_watched() {
-        let scratch =
-            std::env::temp_dir().join(format!("kam-recycle-watched-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&scratch);
-        std::fs::create_dir_all(&scratch).unwrap();
-        let victim = scratch.join("throwaway.txt");
-        std::fs::write(&victim, b"this can go").unwrap();
-
-        let result = to_recycle_bin_or_leave(&victim).expect("a small file should recycle");
-        assert!(!victim.exists(), "the file is still on disk");
-        assert!(
-            result.in_bin,
-            "a small file must reach the bin: {:?}",
-            result.warning
-        );
-
-        let _ = std::fs::remove_dir_all(&scratch);
-    }
-
     /// A bin that cannot be counted is neither a yes nor a no.
     ///
     /// It was read as a yes, so the window said "Sent to the Recycle Bin"
@@ -576,7 +549,7 @@ mod tests {
     fn a_path_that_is_not_there_is_refused_rather_than_reported_as_recycled() {
         let absent = std::env::temp_dir().join("kam-recycle-never-existed");
         let _ = std::fs::remove_file(&absent);
-        assert!(to_recycle_bin(&absent).is_err());
+        assert!(to_recycle_bin_or_leave(&absent).is_err());
     }
 
     /// Both answers, without asking whether Windows is feeling permissive.

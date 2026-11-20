@@ -1134,11 +1134,11 @@ export default function Cleanup({ volumes, onChanged }: Props) {
 
 
   /**
-   * Send one redundant copy to the Recycle Bin.
+   * Send one redundant copy to the Recycle Bin, or leave it where it is.
    *
    * Same reasoning as `recycleOrphan`: the window does it, so the copy lands in
    * this person's bin rather than SYSTEM's, and no privilege is involved in
-   * removing a file they own.
+   * removing a file they own. A copy the bin cannot take stays where it is.
    *
    * It is first compared with the copy that stays, as the agent compares one
    * before quarantining it: this list may be days old.
@@ -1155,7 +1155,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       return;
     }
     try {
-      const outcome = await api.recycleItem(path);
+      const outcome = await api.recycleOrLeave(path);
       reportRecycle(
         outcome,
         `Sent ${fmt.bytes(bytes)} to the Recycle Bin: ${path}`,
@@ -1163,9 +1163,11 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       );
       await dropCopy(path);
     } catch (cause) {
+      // Refused, failed, or left where it was because the bin could not take
+      // it: in each case the copy is still there, and quarantine can hold it.
       setError(
-        `${reason(cause)}. If this copy is not yours to delete, hold it instead ` +
-          `and it can be put back for 30 days.`,
+        `${reason(cause)}. "Remove this one" moves it to quarantine instead, ` +
+          `where it can be put back for 30 days.`,
       );
     } finally {
       release(key);
@@ -1261,7 +1263,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   }
 
   /**
-   * Send a leftover directory to the Recycle Bin.
+   * Send a leftover directory to the Recycle Bin, or leave it where it is.
    *
    * The window does this itself rather than asking the agent, and that is the
    * point rather than a shortcut: the Recycle Bin is per user, so a delete
@@ -1269,15 +1271,21 @@ export default function Cleanup({ volumes, onChanged }: Props) {
    * person can neither see nor restore from. Doing it here puts it in theirs,
    * where it comes back with a right-click in a program they already know.
    *
-   * If it will not go — a path this account cannot write — the answer is
-   * quarantine, never a privileged delete standing in for a recycle.
+   * When the bin cannot take something, because it is larger than the bin on
+   * its drive is set to hold or the bin is switched off there, Windows deletes
+   * it outright instead, without a word. Every Recycle Bin button on this page
+   * stops that before it happens: the item stays where it is, and the reason
+   * is shown.
+   *
+   * If it will not go, because this account cannot write the path, the answer
+   * is quarantine, never a privileged delete standing in for a recycle.
    */
   async function recycleOrphan(orphan: Orphan) {
     const key = `orphan:${orphan.path}`;
     if (!claim(key)) return;
     setError(null);
     try {
-      const outcome = await api.recycleItem(orphan.path);
+      const outcome = await api.recycleOrLeave(orphan.path);
       reportRecycle(
         outcome,
         `Sent ${orphan.name} (${fmt.bytes(orphan.bytes)}) to the Recycle Bin. ` +
@@ -1288,10 +1296,9 @@ export default function Cleanup({ volumes, onChanged }: Props) {
         current ? current.filter((item) => item.path !== orphan.path) : current,
       );
     } catch (cause) {
-      setError(
-        `${reason(cause)}. If this folder is not yours to delete, quarantine it ` +
-          `instead and it can be put back for 30 days.`,
-      );
+      // Refused, failed, or left where it was because the bin could not take
+      // it: in each case the folder is still there, and quarantine can hold it.
+      setError(`${reason(cause)}. Quarantine it instead, and it can be put back for 30 days.`);
     } finally {
       release(key);
       onChanged();
@@ -1302,10 +1309,10 @@ export default function Cleanup({ volumes, onChanged }: Props) {
    * Send one large old file to the Recycle Bin, or leave it where it is.
    *
    * The window does it, as everywhere on this page, so the file lands in this
-   * person's own bin. Unlike everywhere else on this page it will not let
-   * Windows delete the file outright when the bin cannot take it: every row
-   * of this list is large, which is when that happens. Such a file stays
-   * where it is and the reason is shown beside the list.
+   * person's own bin, and as everywhere on this page a file the bin cannot
+   * take stays where it is (see `recycleOrphan`). Every row of this list is
+   * large, which is when that happens most, so the answer is shown beside the
+   * list rather than at the top of the page.
    */
   async function recycleOldFile(file: OldFile) {
     const key = `old:${file.path}`;
@@ -2913,8 +2920,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             copy arrived, not when it was last written, and, where Windows
             records it, not when it was last opened. It is a list of sizes and
             dates. A date says when something last happened to a file, not
-            whether you still need it. The Recycle Bin button there leaves a
-            file where it is if the bin cannot take it.
+            whether you still need it.
           </li>
           <li>
             <strong>Duplicates</strong> are files that are byte-for-byte
@@ -2949,7 +2955,11 @@ export default function Cleanup({ volumes, onChanged }: Props) {
             goes, and comes back the same way. Use it when you would rather not
             learn a second place things are kept. It is your bin, not the
             service's, so it appears where you expect, and this program records
-            that it happened without pretending it did it for you.
+            that it happened without pretending it did it for you. When the bin
+            cannot take something, because it is larger than the bin is set to
+            hold or the bin is switched off for that drive, Windows would delete
+            it outright without a word. This program leaves it where it is
+            instead, and the page says why.
           </li>
           <li>
             Deleting something so that it is <em>really</em> gone is a separate

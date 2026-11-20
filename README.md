@@ -181,7 +181,8 @@ Where Windows is not recording opens, the list is built from the other two
 dates and says it was. Each row can go to your Recycle Bin, and if Windows would
 not put a file there (it is larger than the bin is set to hold, or the bin is
 switched off for that drive) the file is left where it is and the page says so,
-because otherwise Windows deletes it outright without a word.
+because otherwise Windows deletes it outright without a word. Every Recycle Bin
+button on Cleanup works this way, for leftovers and duplicate copies too.
 
 ## What this is not
 
