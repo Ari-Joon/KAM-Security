@@ -146,6 +146,43 @@ away; only the size column waits, and it shows a waiting mark rather than a zero
 because a zero in that column is a claim and it would be wrong for every row on
 screen.
 
+### Going deeper, and what grew
+
+The map of a drive arrives four folders deep, which on a gaming and development
+PC is above most of what anybody is looking for: `AppData\Local` and a Steam
+library's `common` folder used to be rectangles that could not be opened. Now a
+folder at that floor opens. The service reads the file table again, finds that
+one folder and sends its own tree, built by the same function from the same
+index as the drive's, so its figure is the rectangle's figure. It opens the same
+way below that, as far as the drive goes.
+
+Each scan of a whole drive also leaves a small summary behind: the total, and
+every folder holding 100 MB or more. The next scan is compared with it, and the
+Storage page says how much more or less the drive holds since then, draws what
+grew (area is bytes grown, a real magnitude) and lists what shrank, which cannot
+be an area. A folder missing from the older summary is "under 100 MB then", not
+new. A table read is never compared with a folder walk, because they count a
+file with several names differently, and a different volume serial is a
+different drive. The summaries are kept per person and pruned to a dozen and
+one a month.
+
+Storage, Applications and Cleanup open on their last result, each saying when it
+was measured, so a page left yesterday is not an empty page today. They are
+kept in your own profile, not the service's store.
+
+### Large files nothing has opened in a year
+
+The same table read holds three dates for every file, so Cleanup also lists the
+large files, 100 MB or more, in your own folders whose created, last written and
+last opened dates are all more than a year old, with each date as a sortable
+column. It is a list of sizes and dates and says so: a disk image kept for the
+day a machine has to be rebuilt looks exactly like one that was forgotten.
+Where Windows is not recording opens, the list is built from the other two
+dates and says it was. Each row can go to your Recycle Bin, and if Windows would
+not put a file there (it is larger than the bin is set to hold, or the bin is
+switched off for that drive) the file is left where it is and the page says so,
+because otherwise Windows deletes it outright without a word.
+
 ## What this is not
 
 - **Not a new antivirus engine.** It orchestrates Defender rather than competing
@@ -332,7 +369,10 @@ So every copy is judged by where it lives, and there are two numbers rather than
 one, *duplicated* and *reclaimable*, which are usually very different. Only a
 copy in a folder you own is ever offered, anything it cannot attribute is shown
 without a recommendation, and removing one goes through quarantine like
-everything else.
+everything else. A list of duplicates is true of the moment it was made, and the
+page keeps it, so before a copy goes it is compared in full with the copy that
+stays. One edited since the search is refused, because it may now hold the only
+copy of what it contains.
 
 ## The firewall
 
@@ -373,6 +413,14 @@ nowhere else. It also notices when an entry's path stays the same but the file
 behind it is now signed by someone else, or by nobody. Changes this program
 made itself are labelled rather than hidden, so malware cannot hide by using
 its name.
+
+Each comparison's list is kept as it was shown, so opening the page no longer
+uses one up: earlier comparisons are offered by date and can be read again.
+The weekly check takes a comparison too, so a week in which nobody opened the
+page is still looked at, and each list says what took it. Something looked at
+for the first time, a whole account's startup places or a kind of thing this
+version reads differently, is recorded quietly and said, never announced as
+having appeared.
 
 ## Downloads
 
