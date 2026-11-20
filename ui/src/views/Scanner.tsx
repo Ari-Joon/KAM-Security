@@ -1594,9 +1594,10 @@ function Extensions() {
 
   const all = report?.extensions ?? [];
   const flagged = all.filter(
-    (extension) => extension.source === "sideloaded" || extension.notes.length > 0,
+    (extension) => extension.source !== "store" || extension.notes.length > 0,
   );
   const shown = showAll ? all : flagged;
+  const builtIn = report?.built_in ?? [];
 
   return (
     <section className="panel">
@@ -1662,19 +1663,21 @@ function Extensions() {
                 <li
                   key={`${extension.browser}-${extension.profile}-${extension.id}`}
                   className={`finding finding-${
-                    extension.source === "sideloaded" ? "unusual" : "notable"
+                    extension.source === "store" ? "notable" : "unusual"
                   }`}
                 >
                   <div className="finding-head">
                     <span className="finding-name">{extension.name}</span>
                     <span
                       className={`badge attention-${
-                        extension.source === "sideloaded" ? "unusual" : "notable"
+                        extension.source === "store" ? "notable" : "unusual"
                       }`}
                     >
-                      {extension.source === "sideloaded"
-                        ? "not from a store"
-                        : "from a store"}
+                      {extension.source === "folder"
+                        ? "loaded from a folder"
+                        : extension.source === "sideloaded"
+                          ? "not from a store"
+                          : "from a store"}
                     </span>
                   </div>
 
@@ -1727,11 +1730,26 @@ function Extensions() {
             </button>
           )}
 
+          {builtIn.length > 0 && (
+            /* Parts of the browser itself, which its settings file lists
+               beside the extensions. They come and go with the browser's own
+               updates, so they are counted rather than listed. */
+            <p className="footnote">
+              Each browser's settings file also lists parts of the browser
+              itself, built as extensions, which are counted here rather than
+              listed:{" "}
+              {builtIn
+                .map((parts) => `${parts.browser} (${parts.profile}) ${parts.count}`)
+                .join(", ")}
+              .
+            </p>
+          )}
+
           {report.unreadable.length > 0 && (
             <div className="notice notice-warn">
               <ul className="concerns">
-                {report.unreadable.map((note) => (
-                  <li key={note}>{note}</li>
+                {report.unreadable.map((gap) => (
+                  <li key={gap.what}>{gap.what}</li>
                 ))}
               </ul>
             </div>

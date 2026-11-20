@@ -1134,7 +1134,11 @@ export type Remnants = {
  * reads every page is stating a fact about its permissions, not an accusation:
  * ad blockers and password managers legitimately do exactly that.
  */
-export type ExtensionSource = "store" | "sideloaded";
+/**
+ * `folder`: loaded from a folder elsewhere on this PC, which the browser's
+ * settings file names, rather than installed into the profile.
+ */
+export type ExtensionSource = "store" | "sideloaded" | "folder";
 
 export type BrowserExtension = {
   browser: string;
@@ -1150,12 +1154,22 @@ export type BrowserExtension = {
   notes: string[];
   path: string;
   added_days_ago: number | null;
+  /** The browser profile folder it is installed in. */
+  profile_folder: string;
+};
+
+/** How many of a browser's own built-in parts one profile lists: counted, not listed. */
+export type BuiltInParts = {
+  browser: string;
+  profile: string;
+  count: number;
 };
 
 export type ExtensionReport = {
   extensions: BrowserExtension[];
   examined: string[];
-  unreadable: string[];
+  built_in: BuiltInParts[];
+  unreadable: Gap[];
 };
 
 /**
