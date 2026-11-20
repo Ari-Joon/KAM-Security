@@ -5,7 +5,7 @@ import PathLink from "../components/PathLink";
 import MeasuredAt, { whenMeasured } from "../components/MeasuredAt";
 import { KeptNote, NotKeptNote, UnreadableNote } from "../components/Kept";
 import NewerVersions from "../components/NewerVersions";
-import type { PageJobOutcome } from "../lib/jobs";
+import { endedWithout, type PageJobOutcome } from "../lib/jobs";
 import { recall, remember, type Kept } from "../lib/remembered";
 import { usePageJob } from "../lib/usePageJob";
 import type {
@@ -432,10 +432,11 @@ export default function Applications({ volumes, onMeasured }: Props) {
   async function measured(outcome: PageJobOutcome<ApplicationReport>) {
     const ended = outcome.view.ended;
     const result = outcome.answer;
+    const asked = outcome.view.asked;
+    const measuredDrive = asked.slot === "applications" ? asked.drive : drive;
     if (ended?.how === "finished" && result !== null) {
       arrived.current = true;
-      const measuredDrive =
-        outcome.view.asked.slot === "applications" ? outcome.view.asked.drive : drive;
+      setDrive(measuredDrive);
       setReport(result);
       setMeasuredAt(ended.at);
       setPreview(null);
@@ -450,7 +451,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
       setKeptUnreadable(null);
       setNotKept(await remember("applications", ended.at, keeping));
     } else if (ended?.how === "failed") {
-      setError(ended.reason);
+      setError(endedWithout(`Measuring ${measuredDrive}`, ended, whenMeasured));
       setUnmeasured(ended.reason);
       setReport(null);
       // The preview stays: knowing what is installed is still worth having
@@ -458,9 +459,25 @@ export default function Applications({ volumes, onMeasured }: Props) {
       // rather than left saying it is being measured.
     }
     onMeasured();
+    if (measureAgain.current) {
+      measureAgain.current = false;
+      runningNow.current = false;
+      void measure();
+    }
   }
   const measureJob = usePageJob<ApplicationReport>("applications", measured);
   const running = measureJob.running;
+  /** Whether a measurement is going, as of the latest drawing, for code that runs later. */
+  const runningNow = useRef(false);
+  runningNow.current = running;
+  /**
+   * Whether the programs changed while a measurement was going (an
+   * uninstaller finished, leftovers went to quarantine), so it is measured
+   * again once that one ends. One runs at a time, and the one going may
+   * have read the disk before the change. Each of those measured again,
+   * always, before measurements ran one at a time.
+   */
+  const measureAgain = useRef(false);
   /** The drive being measured now, which the picker shows meanwhile. */
   const measuringDrive =
     measureJob.running && measureJob.view?.asked.slot === "applications"
@@ -508,12 +525,16 @@ export default function Applications({ volumes, onMeasured }: Props) {
    * column has to wait, and it says it is waiting rather than showing a zero.
    *
    * The measuring is the window's own half's to do, so it carries on if this
-   * page is left, and `measured` takes what it came to. While one is going,
-   * asking again (after an uninstaller, say) follows that one.
+   * page is left, and `measured` takes what it came to. Asked again while
+   * one is going (after an uninstaller, say), it measures again once that
+   * one has ended.
    */
   const startMeasuring = measureJob.start;
   const measure = useCallback(async () => {
-    if (running) return;
+    if (runningNow.current) {
+      measureAgain.current = true;
+      return;
+    }
     setError(null);
     setUnmeasured(null);
     setReport(null);
@@ -533,7 +554,7 @@ export default function Applications({ volumes, onMeasured }: Props) {
     } catch (cause) {
       setError(reason(cause));
     }
-  }, [drive, running, startMeasuring]);
+  }, [drive, startMeasuring]);
 
   /**
    * Re-measure when the window comes back after an uninstaller ran.

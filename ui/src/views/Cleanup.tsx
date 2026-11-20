@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, reason } from "../lib/api";
 import ProgressBar from "../components/ProgressBar";
-import type { PageJobOutcome } from "../lib/jobs";
+import { endedWithout, type PageJobOutcome } from "../lib/jobs";
 import { usePageJob } from "../lib/usePageJob";
 import * as fmt from "../lib/format";
 import { useRecyclable } from "../lib/recyclable";
@@ -674,12 +674,24 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   // lets go of it once the handler has run, and a page left before drawing it
   // would otherwise lose it.
 
+  /**
+   * Say that a search ended without an answer, beside anything said already.
+   *
+   * The service stopping ends every search it was running at once, and the
+   * page opened afterwards is handed all their failures together. Each used
+   * to take the place of the last, so only one was ever said, and the others
+   * had already been let go.
+   */
+  function sayFailed(sentence: string) {
+    setError((current) => (current ? `${current}\n${sentence}` : sentence));
+  }
+
   async function surveyArrived(outcome: PageJobOutcome<ApplicationReport>) {
     searched.current.survey = true;
     const ended = outcome.view.ended;
+    const asked = outcome.view.asked;
+    const searchedDrive = asked.slot === "cleanup-survey" ? asked.drive : drive;
     if (ended?.how === "finished" && outcome.answer !== null) {
-      const asked = outcome.view.asked;
-      const searchedDrive = asked.slot === "cleanup-survey" ? asked.drive : drive;
       const found = surveyed(searchedDrive, outcome.answer);
       setSurveyDrive(found.drive);
       setUnreadableKept((current) => without(current, "survey"));
@@ -694,7 +706,13 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       setFoundAt(ended.at);
       await keep<KeptSurvey>("survey", "cleanup-survey", ended.at, found);
     } else if (ended?.how === "failed") {
-      setError(ended.reason);
+      sayFailed(
+        endedWithout(
+          `The search of ${searchedDrive} for leftovers, downloads and large old files`,
+          ended,
+          whenMeasured,
+        ),
+      );
       // Everything this run would have replaced goes, the totals included.
       // The totals stayed, so a failed re-run left the last run's numbers on
       // screen as though they were this one's.
@@ -714,9 +732,9 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   async function duplicatesArrived(outcome: PageJobOutcome<DuplicateReport>) {
     searched.current.duplicates = true;
     const ended = outcome.view.ended;
+    const asked = outcome.view.asked;
+    const searchedDrive = asked.slot === "cleanup-duplicates" ? asked.drive : drive;
     if (ended?.how === "finished" && outcome.answer !== null) {
-      const asked = outcome.view.asked;
-      const searchedDrive = asked.slot === "cleanup-duplicates" ? asked.drive : drive;
       const sets = asSets(outcome.answer.groups);
       setDuplicatesDrive(searchedDrive);
       setUnreadableKept((current) => without(current, "duplicates"));
@@ -733,7 +751,9 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       setDuplicates(null);
       setDuplicateSummary(null);
     } else if (ended?.how === "failed") {
-      setError(ended.reason);
+      sayFailed(
+        endedWithout(`The search of ${searchedDrive} for identical files`, ended, whenMeasured),
+      );
       // The summary feeds the stat row and the block on the map, and both went
       // on showing the previous run's figures after this one failed.
       setDuplicates(null);
@@ -763,14 +783,55 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       // After a clear, the figures from before it are wrong, so they go
       // rather than stay; and a failed measurement does not leave the last
       // one's figures standing in for it either.
-      setError(
-        again ? `Measuring again after the clear failed: ${ended.reason}` : ended.reason,
+      sayFailed(
+        endedWithout(
+          again ? "Measuring the caches again after the clear" : "Measuring the caches",
+          ended,
+          whenMeasured,
+        ),
       );
       setCaches(null);
+    }
+    if (measureCachesAgain.current) {
+      measureCachesAgain.current = false;
+      cachesRunningNow.current = false;
+      await measureCachesAfterClear();
     }
   }
   const cachesJob = usePageJob<Cache[]>("cleanup-caches", cachesArrived);
   const measuringCaches = cachesJob.running;
+  /** Whether caches are being measured, as of the latest drawing, for code that runs later. */
+  const cachesRunningNow = useRef(false);
+  cachesRunningNow.current = measuringCaches;
+  /** A cache was cleared while they were being measured: measure again once that ends. */
+  const measureCachesAgain = useRef(false);
+
+  /**
+   * Measure the caches again after one has been cleared, rather than take the
+   * clear's figure from the old one: what was in use stayed, and guessing at
+   * the new figure would put a number on screen that nothing checked.
+   *
+   * It is the same measurement as Measure, so it carries on if the page is
+   * left. One already going may have read the cache before the clear, so this
+   * waits for it and measures again once it has ended.
+   */
+  async function measureCachesAfterClear() {
+    searched.current.caches = true;
+    if (cachesRunningNow.current) {
+      measureCachesAgain.current = true;
+      return;
+    }
+    afterClear.current = true;
+    try {
+      await cachesJob.start({ slot: "cleanup-caches" });
+    } catch (cause) {
+      afterClear.current = false;
+      // The clear happened; the figures from before it are now wrong, so
+      // they go rather than stay.
+      setCaches(null);
+      setError(`Measuring again after the clear failed: ${reason(cause)}`);
+    }
+  }
 
   /**
    * What the search for loose files came to. This page does not keep it, so
@@ -779,12 +840,16 @@ export default function Cleanup({ volumes, onChanged }: Props) {
    */
   function looseArrived(outcome: PageJobOutcome<OrganiseReport>) {
     const ended = outcome.view.ended;
+    const asked = outcome.view.asked;
     if (ended?.how === "finished" && outcome.answer !== null) {
       setProposals(outcome.answer.proposals);
       setOrganiseSummary(outcome.answer.summary);
       setLooseAt(ended.at);
     } else if (ended?.how === "failed") {
-      setError(ended.reason);
+      const searchedDrive = asked.slot === "cleanup-loose" ? asked.drive : drive;
+      sayFailed(
+        endedWithout(`The search of ${searchedDrive} for loose files`, ended, whenMeasured),
+      );
       setProposals(null);
       setOrganiseSummary(null);
     }
@@ -967,23 +1032,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       const result = await api.clearCache(cache.id);
       setCleared((current) => ({ ...current, [cache.id]: result }));
       setNote(`Freed ${fmt.bytes(result.bytes_freed)} from ${cache.name}.`);
-      // Measure again rather than subtracting: what was in use stayed, and
-      // guessing at the new figure would put a number on screen that nothing
-      // checked. It is the same measurement as Measure, so it carries on if
-      // the page is left. One already going is what will be shown instead.
-      searched.current.caches = true;
-      afterClear.current = true;
-      try {
-        await cachesJob.start({ slot: "cleanup-caches" });
-      } catch (cause) {
-        afterClear.current = false;
-        if (!measuringCaches) {
-          // The clear happened; the figures from before it are now wrong, so
-          // they go rather than stay.
-          setCaches(null);
-          setError(`Measuring again after the clear failed: ${reason(cause)}`);
-        }
-      }
+      await measureCachesAfterClear();
     } catch (cause) {
       setError(reason(cause));
     } finally {

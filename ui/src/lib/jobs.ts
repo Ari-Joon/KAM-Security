@@ -86,7 +86,16 @@ export type Asked =
   | { slot: "cleanup-duplicates"; drive: string }
   | { slot: "cleanup-caches" }
   | { slot: "cleanup-loose"; drive: string }
-  | { slot: "defender-scan"; scan: ScanKind }
+  | {
+      slot: "defender-scan";
+      scan: ScanKind;
+      /**
+       * Defender's definitions as the page read them when it started the
+       * scan, kept with the run so its result can say what it looked with.
+       */
+      definitions: string | null;
+      definitions_age_days: number | null;
+    }
   | { slot: "examine" };
 
 export type JobSlot = Asked["slot"];
@@ -129,4 +138,20 @@ export function newer(current: PageJob | null, incoming: PageJob): PageJob {
 /** Whole seconds since a run started, never less than none. */
 export function secondsSince(startedAt: number, now: number): number {
   return Math.max(0, Math.round((now - startedAt) / 1000));
+}
+
+/**
+ * A run that ended without an answer, in a sentence: which it was, when it
+ * ended and why.
+ *
+ * A failure can be read long after it happened, by a page opened later, and
+ * beside another job's failure. Without its name and its time it would read
+ * as something that had just happened, to nobody knows which search.
+ */
+export function endedWithout(
+  what: string,
+  ended: { at: number; reason: string },
+  when: (at: number) => string,
+): string {
+  return `${what} ended at ${when(ended.at)} without finishing: ${ended.reason.replace(/\.$/, "")}.`;
 }

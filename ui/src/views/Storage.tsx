@@ -5,7 +5,7 @@ import GrowthPanel from "../components/Growth";
 import { KeptNote, NotKeptNote, UnreadableNote } from "../components/Kept";
 import MeasuredAt, { whenMeasured } from "../components/MeasuredAt";
 import { api, reason } from "../lib/api";
-import { secondsSince, type PageJobOutcome } from "../lib/jobs";
+import { endedWithout, secondsSince, type PageJobOutcome } from "../lib/jobs";
 import { recall, remember } from "../lib/remembered";
 import { usePageJob } from "../lib/usePageJob";
 import * as fmt from "../lib/format";
@@ -183,9 +183,14 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
     setNotOpened(null);
     const ended = outcome.view.ended;
     const result = outcome.answer;
+    const asked = outcome.view.asked;
+    const scannedPath = asked.slot === "storage" ? asked.path : target;
     if (ended?.how === "finished" && result !== null) {
-      const asked = outcome.view.asked;
-      const scannedPath = asked.slot === "storage" ? asked.path : target;
+      // The picker, and the Drive figure beside the map, follow the drive
+      // that was scanned, which the page may not have had picked when it
+      // opened. Not over a drive handed over from Overview, which is what
+      // the next press of Scan is for, as with the scan kept from before.
+      if (!initialRoot) setTarget(scannedPath);
       setScan(result);
       setScannedAt(ended.at);
       setKeptAt(null);
@@ -201,7 +206,7 @@ export default function Storage({ volumes, initialRoot, onScanned }: Props) {
         }),
       );
     } else if (ended?.how === "failed") {
-      setError(ended.reason);
+      setError(endedWithout(`The scan of ${scannedPath}`, ended, whenMeasured));
       setScan(null);
       setTrail([]);
     }

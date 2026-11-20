@@ -9,7 +9,7 @@ import StateGrid, {
   useGridSelection,
   type GridTile,
 } from "../components/StateGrid";
-import { secondsSince, type PageJobOutcome } from "../lib/jobs";
+import { endedWithout, secondsSince, type PageJobOutcome } from "../lib/jobs";
 import { usePageJob } from "../lib/usePageJob";
 import * as fmt from "../lib/format";
 import type {
@@ -630,6 +630,11 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
   const [outcome, setOutcome] = useState<ScanOutcome | null>(null);
   /** When the scan on screen ended, by this computer's clock. */
   const [endedAt, setEndedAt] = useState(0);
+  /** Defender's definitions as they were when the scan on screen started. */
+  const [lookedWith, setLookedWith] = useState<{
+    version: string | null;
+    age: number | null;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   /**
@@ -639,9 +644,15 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
    */
   function scanned(result: PageJobOutcome<ScanOutcome>) {
     const ended = result.view.ended;
+    const asked = result.view.asked;
     if (ended?.how === "finished" && result.answer !== null) {
       setOutcome(result.answer);
       setEndedAt(ended.at);
+      setLookedWith(
+        asked.slot === "defender-scan"
+          ? { version: asked.definitions, age: asked.definitions_age_days }
+          : null,
+      );
       setError(null);
     } else if (ended?.how === "stopped") {
       // Stopped before Defender had anything to say, which is not a result
@@ -649,7 +660,10 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
       setOutcome(null);
     } else if (ended?.how === "failed") {
       setOutcome(null);
-      setError(ended.reason);
+      const kind = asked.slot === "defender-scan" ? asked.scan.kind : "";
+      setError(
+        endedWithout(kind === "full" ? "The full scan" : "The quick scan", ended, whenMeasured),
+      );
     }
   }
   const scanJob = usePageJob<ScanOutcome>("defender-scan", scanned);
@@ -674,7 +688,14 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
     setOutcome(null);
     setError(null);
     try {
-      await scanJob.start({ slot: "defender-scan", scan: { kind: which } });
+      await scanJob.start({
+        slot: "defender-scan",
+        scan: { kind: which },
+        // Kept with the run, because the result can be read long after the
+        // definitions on this page have been updated.
+        definitions: status?.antivirus_signature_version ?? null,
+        definitions_age_days: status?.signature_age_days ?? null,
+      });
     } catch (cause) {
       setError(reason(cause));
     }
@@ -820,11 +841,14 @@ function DefenderScan({ status }: { status: DefenderStatus | null }) {
             </>
           )}
           {/* Which definitions the answer came from. Without this, the
-              result is undateable a week later. */}
-          {status?.antivirus_signature_version && (
+              result is undateable a week later. As they were when the scan
+              started, not as they are now: the result is kept for as long as
+              the program runs, which can be days, and Defender updates its
+              definitions several times a day. */}
+          {lookedWith?.version && (
             <p className="small muted">
-              Looked with definitions {status.antivirus_signature_version},{" "}
-              {definitionsAge(status.signature_age_days)}.
+              When the scan started, Defender's definitions were{" "}
+              {lookedWith.version}, {definitionsAge(lookedWith.age)}.
             </p>
           )}
           {outcome.caveat &&
@@ -1953,6 +1977,11 @@ function Provenance() {
   /** When the examination on screen finished, by this computer's clock. */
   const [examinedAt, setExaminedAt] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * When the examination that failed ended. It is kept, and shown again on
+   * every visit, so it says when rather than reading as just now.
+   */
+  const [failedAt, setFailedAt] = useState<number | null>(null);
   const [stopped, setStopped] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [hasKey, setHasKey] = useState(false);
@@ -1984,11 +2013,13 @@ function Provenance() {
       setExaminedAt(ended.at);
       setStopped(false);
       setError(null);
+      setFailedAt(null);
     } else if (ended?.how === "stopped") {
       // Stopped, which is not a failure.
       setStopped(true);
     } else if (ended?.how === "failed") {
       setError(ended.reason);
+      setFailedAt(ended.at);
     }
   }
   const examineJob = usePageJob<Examined>("examine", examined);
@@ -1997,6 +2028,7 @@ function Provenance() {
 
   async function run() {
     setError(null);
+    setFailedAt(null);
     setRules(null);
     setStopped(false);
     try {
@@ -2058,7 +2090,10 @@ function Provenance() {
 
       {error && (
         <div className="notice notice-down">
-          <strong>The examination did not finish.</strong>
+          <strong>
+            The examination did not finish
+            {failedAt !== null ? `: it ended at ${whenMeasured(failedAt)}` : ""}.
+          </strong>
           <pre className="error">{error}</pre>
         </div>
       )}
