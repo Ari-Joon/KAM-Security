@@ -560,6 +560,37 @@ measurable CPU while idle; the watcher spends a little of that on one registry
 read a couple of times a minute. That trade is written down here rather than
 hidden, and the snapshot is deliberately not a scan.
 
+### The quiet places, and where traffic goes
+
+A few places can start a program without appearing in any list of what starts
+itself: the Windows sign-in programs (`Userinit` and `Shell`), a debugger
+redirection under Image File Execution Options, a per-account sign-in script,
+`AppInit_DLLs`, a WMI event subscription that runs a command, and a per-account
+COM class that quietly replaces the one a scheduled task uses. On a normal
+machine every one of them is exactly as Windows ships it, so they are compared
+against Windows' own values and say nothing until one departs from them. The
+watcher and What changed both read them, and the Scanner page names them in one
+line when nothing is set.
+
+Three small settings decide where a browser's traffic really goes: the hosts
+file, DNS servers set by hand, and a proxy. All three are things people set on
+purpose, and all three are what adware changes. The Firewall page shows each
+with where it was read from, and What changed notices when one moves. Only DNS
+servers set by hand are compared; the ones a network hands out change with every
+network joined.
+
+A certificate in the trusted root store lets whoever holds its key show any
+website to this PC with a valid padlock. The Scanner page lists every trusted
+root by store and names each one that is not on Microsoft's published list, as
+Windows last fetched that list, with no request of its own. On the machine this
+was written on that is a game launcher's local certificate and two Microsoft
+roots that expired in 1999. Not being on the list is a fact, not a verdict.
+
+Browser extensions loaded from a folder rather than a store never appear in the
+browser's extension folder, so the browser's own settings file is read for them
+as well. Each of these is a kind in What changed with its own quiet first look,
+so the first comparison after this was added reported none of them as new.
+
 ## Files that exist only to be stolen
 
 Everything above weighs circumstantial evidence, and says so. This does not.
