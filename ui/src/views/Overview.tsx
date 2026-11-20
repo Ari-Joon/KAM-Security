@@ -13,6 +13,7 @@ import type {
 import { unseenSentence } from "../lib/unseen";
 import EffectBadge from "../components/EffectBadge";
 import UpdateCheck from "../components/UpdateCheck";
+import WindowsUpdate from "../components/WindowsUpdate";
 
 const DAYS = [
   "Sunday",
@@ -470,6 +471,8 @@ export default function Overview({
       <DownloadsNotLookedAt unseen={unseenDownloads} onOpen={onOpenDownloads} />
 
       <Protection />
+
+      <WindowsUpdate />
 
       <UpdateCheck />
 

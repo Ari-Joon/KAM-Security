@@ -1642,3 +1642,41 @@ export type WingetAnswer =
     };
 
 export type WingetAsked = { answer: WingetAnswer; asked_at: string; took_ms: number };
+
+/** One fact, or why it could not be read. Never drawn as empty. */
+export type Reading<T> = { state: "read"; value: T } | { state: "unread"; why: string };
+
+/** The build Windows is running, from its own record of its version. */
+export type WindowsBuild = { build: string; revision: number | null; version: string | null };
+
+/** The newest operating system update installed, and where that was read. */
+export type NewestUpdate =
+  | { kind: "history"; title: string; installed_at: string }
+  | {
+      kind: "list";
+      updates: string[];
+      /** `2026-11-11`. */
+      installed_on: string;
+      /** Why Windows Update's history did not answer. */
+      history: string;
+    }
+  | { kind: "unread"; why: string };
+
+export type UpdatePause =
+  | { kind: "not_paused" }
+  | { kind: "until"; at: string }
+  | { kind: "ended"; at: string }
+  | { kind: "unrecognised"; value: string };
+
+/** What Windows says about its own updates. See `windows_update.rs` in the shell. */
+export type WindowsUpdateReport = {
+  build: Reading<WindowsBuild>;
+  newest: NewestUpdate;
+  restart: {
+    windows_update: Reading<boolean>;
+    update_marker: Reading<boolean>;
+    servicing_marker: Reading<boolean>;
+  };
+  pause: Reading<UpdatePause>;
+  service_disabled: Reading<boolean>;
+};

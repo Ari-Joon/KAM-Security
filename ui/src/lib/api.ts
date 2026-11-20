@@ -47,6 +47,7 @@ import type {
   TrafficReport,
   RootReport,
   WingetAsked,
+  WindowsUpdateReport,
 } from "./types";
 
 /**
@@ -267,6 +268,8 @@ export const api = {
    * only; nothing is installed.
    */
   newerVersions: () => invoke<WingetAsked>("newer_versions"),
+  /** What Windows says about its own updates, read by the window as the person. */
+  windowsUpdate: () => invoke<WindowsUpdateReport>("windows_update"),
 };
 
 /** Tauri rejects with a plain string; normalise anything else into one. */

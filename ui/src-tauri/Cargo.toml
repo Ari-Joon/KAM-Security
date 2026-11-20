@@ -34,8 +34,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { version = "2", features = ["tray-icon"] }
 # Windows' own notification interfaces, used only here: the window is what
-# tells the person a download has landed.
-windows = { workspace = true, features = ["Data_Xml_Dom", "Foundation", "UI_Notifications"] }
+# tells the person a download has landed. And Windows Update's own interfaces,
+# for what the Overview says about updates, which any account may read.
+windows = { workspace = true, features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "UI_Notifications",
+    "Win32_System_UpdateAgent",
+] }
 # Named only because the `implement` macro refers to it by name. That macro
 # writes the one COM object this program provides, which watches a delete so
 # that a file too large for the Recycle Bin is left alone (see `recycle.rs`).

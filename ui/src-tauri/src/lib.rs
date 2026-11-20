@@ -19,6 +19,7 @@ mod seen;
 mod startup;
 mod uninstall;
 mod update;
+mod windows_update;
 mod winget;
 
 use kam_core::audit::Record;
@@ -1498,6 +1499,14 @@ async fn newer_versions() -> Result<winget::Asked, String> {
     off_the_window(|| Ok(winget::ask())).await
 }
 
+/// What Windows says about its own updates: the build, the newest operating
+/// system update and when, a restart waiting, a pause. Read here, as the
+/// person, because any account may read all of it. See `windows_update`.
+#[tauri::command]
+async fn windows_update() -> Result<windows_update::Report, String> {
+    off_the_window(|| Ok(windows_update::survey())).await
+}
+
 /// Version of the protocol this build speaks, so the UI can say plainly when it
 /// and the agent disagree rather than silently mis-rendering.
 #[tauri::command]
@@ -1714,7 +1723,8 @@ pub fn run() {
             set_context_menu,
             take_launch,
             launch_waiting,
-            newer_versions
+            newer_versions,
+            windows_update
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| {
