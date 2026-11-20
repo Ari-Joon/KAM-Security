@@ -377,9 +377,6 @@ pub fn start(app: &AppHandle, asked: Asked, work: Work) -> Result<View, String> 
     let jobs = app.state::<Jobs>();
     let view = jobs.begin(asked, now())?;
     let slot = view.asked.slot();
-    // Said before the thread can say anything, so that nothing it says is
-    // followed by this.
-    let _ = app.emit(&event(slot), view.clone());
 
     let worker = app.clone();
     let running = view.clone();
@@ -394,7 +391,13 @@ pub fn start(app: &AppHandle, asked: Asked, work: Work) -> Result<View, String> 
             });
         });
     match spawned {
-        Ok(_) => Ok(view),
+        Ok(_) => {
+            // Said only once there is a thread to do the work: said before,
+            // a page would follow a run that never started. The thread may
+            // have said more already, and the page keeps the newer view.
+            let _ = app.emit(&event(slot), view.clone());
+            Ok(view)
+        }
         Err(error) => {
             jobs.abandon(slot, &view.job);
             Err(format!("it could not be started: {error}"))
