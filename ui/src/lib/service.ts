@@ -82,9 +82,11 @@ export function serviceWords(
         headline: "KAM Security's service is not answering.",
         sentences: [
           stopped,
-          "While it is not answering, the watching and the checks it does are not running: it is not watching what starts itself, and it cannot check new downloads as they arrive.",
+          // Not answering is all the window knows. A service that has hung,
+          // or one with every connection busy, may still be watching.
+          "If the service itself has stopped, the watching and the checks it does are not running: it is not watching what starts itself, and it cannot check new downloads as they arrive.",
           notice.last_answered !== null
-            ? "What is on screen was read before it stopped, and anything that needs the service will fail until it answers."
+            ? "What is on screen was read before it stopped answering, and anything that needs the service will fail until it answers."
             : "Nothing has been read from it, and anything that needs the service will fail until it answers.",
           "This window keeps asking, and says here when it answers again.",
         ],

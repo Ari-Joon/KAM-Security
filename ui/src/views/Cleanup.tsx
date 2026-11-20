@@ -482,6 +482,8 @@ export default function Cleanup({ volumes, onChanged }: Props) {
   const [organiseSummary, setOrganiseSummary] = useState<OrganiseSummary | null>(null);
   /** When the search for loose files on screen finished. */
   const [looseAt, setLooseAt] = useState(0);
+  /** When the search for loose files on screen started. */
+  const [looseFrom, setLooseFrom] = useState(0);
   const [moves, setMoves] = useState<MoveRecord[]>([]);
   const [held, setHeld] = useState<Manifest[]>([]);
   /**
@@ -845,6 +847,7 @@ export default function Cleanup({ volumes, onChanged }: Props) {
       setProposals(outcome.answer.proposals);
       setOrganiseSummary(outcome.answer.summary);
       setLooseAt(ended.at);
+      setLooseFrom(outcome.view.started_at);
     } else if (ended?.how === "failed") {
       const searchedDrive = asked.slot === "cleanup-loose" ? asked.drive : drive;
       sayFailed(
@@ -1509,8 +1512,16 @@ export default function Cleanup({ volumes, onChanged }: Props) {
 
   // The search for loose files is kept by the window's own half and handed
   // over again each time the page opens, so a file moved since it was found
-  // is left out here rather than offered to be moved a second time.
-  const movedAway = new Set(moves.filter((move) => !move.undone).map((move) => move.from));
+  // is left out here rather than offered to be moved a second time. Only
+  // moves made since the search started count: a file that arrived later
+  // where an older move took one from is a different file, still to be
+  // offered. A move is timed in whole seconds and the search in milliseconds,
+  // so a move in the same second as the start counts as after it.
+  const movedAway = new Set(
+    moves
+      .filter((move) => !move.undone && (move.moved_at + 1) * 1000 > looseFrom)
+      .map((move) => move.from),
+  );
   const looseLeft = proposals?.filter((proposal) => !movedAway.has(proposal.from)) ?? null;
 
   const orderedDownloads = useMemo(
