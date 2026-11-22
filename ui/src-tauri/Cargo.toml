@@ -46,7 +46,7 @@ windows = { workspace = true, features = [
 # writes the one COM object this program provides, which watches a delete so
 # that a file too large for the Recycle Bin is left alone (see `recycle.rs`).
 # It is the `windows` crate's own core, at the version that crate brings in.
-windows-core = "0.62"
+windows-core = "0.100"
 # Taking zip archives apart, as the person, never in the agent. Reading needs
 # only deflate; any other compression method is reported as one this cannot
 # unpack rather than pulled in.
